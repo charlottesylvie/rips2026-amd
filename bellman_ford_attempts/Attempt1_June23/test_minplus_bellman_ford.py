@@ -29,10 +29,10 @@ import numpy as np
 import scipy.sparse as sp
 import random
 
-from minplus_algebra import (
+from bellman_ford_attempts.Attempt1_June23.minplus_algebra import (
     INF, tropical_spmv, tropical_spmv_dense_row, tropical_matrix_from_edges
 )
-from minplus_bellman_ford import (
+from bellman_ford_attempts.Attempt1_June23.minplus_bellman_ford import (
     sssp_min_plus_bellman_ford, sssp_classical_bellman_ford, reconstruct_path
 )
 
