@@ -1,0 +1,71 @@
+def bucketted_bellman_ford(rowptr, col, weight, source, num_nodes,
+                     delta=1.0, max_iters=10_000, device="cuda"):
+    """
+    CSR graph:
+      rowptr: [num_nodes + 1] int64
+      col:    [num_edges] int64
+      weight: [num_edges] float32
+
+    Returns:
+      dist: [num_nodes] shortest distances
+    """
+
+    rowptr = rowptr.to(device=device, dtype=torch.long)
+    col = col.to(device=device, dtype=torch.long)
+    weight = weight.to(device=device, dtype=torch.float32)
+
+    inf = torch.tensor(float("inf"), device=device)
+    dist = torch.full((num_nodes,), inf, device=device)
+    dist[source] = 0.0
+
+    active = torch.zeros(num_nodes, dtype=torch.bool, device=device)
+    active[source] = True
+
+    cur_bucket = 0
+
+    for _ in range(max_iters):
+        frontier = torch.nonzero(active, as_tuple=False).flatten()
+        active.zero_()
+
+        if frontier.numel() == 0:
+            remaining = torch.isfinite(dist) & (torch.floor(dist / delta).long() >= cur_bucket)
+            if not remaining.any():
+                break
+
+            cur_bucket = torch.floor(dist[remaining].min() / delta).long().item()
+            active = torch.floor(dist / delta).long().eq(cur_bucket)
+            continue
+
+        starts = rowptr[frontier]
+        ends = rowptr[frontier + 1]
+        deg = ends - starts
+
+        edge_ids = torch.repeat_interleave(starts, deg)
+        offsets = torch.arange(deg.sum(), device=device) - torch.repeat_interleave(
+            torch.cumsum(deg, dim=0) - deg, deg
+        )
+        edge_ids = edge_ids + offsets
+
+        src = torch.repeat_interleave(frontier, deg)
+        dst = col[edge_ids]
+        cand = dist[src] + weight[edge_ids]
+
+        old = dist[dst].clone()
+
+        # PyTorch scatter_reduce is the closest high-level equivalent to atomicMin.
+        dist.scatter_reduce_(0, dst, cand, reduce="amin", include_self=True)
+
+        improved = dist[dst] < old
+
+        if improved.any():
+            new_dst = dst[improved]
+            new_bucket = torch.floor(dist[new_dst] / delta).long()
+
+            # Process current bucket immediately; defer farther buckets.
+            active[new_dst[new_bucket <= cur_bucket]] = True
+
+        if not active.any():
+            cur_bucket += 1
+            active = torch.floor(dist / delta).long().eq(cur_bucket)
+
+    return dist
