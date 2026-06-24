@@ -1,0 +1,47 @@
+import math
+
+@torch.no_grad()
+def bf_fixed_iters(W, source):
+    n = W.shape[0]
+
+    dist = torch.full((n,), float("inf"), device=W.device)
+    dist[source] = 0.0
+
+    D = dist.unsqueeze(0)
+
+    for _ in range(n):
+        D = torch.minimum(D, min_plus_matmul(D, W))
+
+    return D.squeeze(0)
+
+def benchmark_bellman_ford_fast(device_name):
+    device = torch.device(device_name)
+
+    n = 2048
+    W = torch.randn(n, n, device=device).abs()
+    W.fill_diagonal_(0)
+
+    source = 0
+
+    # warmup
+    for _ in range(3):
+        _ = bf_fixed_iters(W, source)
+
+    if device.type == "cuda":
+        torch.cuda.synchronize()
+
+    start = time.time()
+
+    for _ in range(10):
+        _ = bf_fixed_iters(W, source)
+
+    if device.type == "cuda":
+        torch.cuda.synchronize()
+
+    end = time.time()
+
+    print(device_name, "avg time:", (end - start) / 10)
+
+benchmark_bellman_ford_fast("cpu")
+if torch.cuda.is_available():
+    benchmark_bellman_ford_fast("cuda")  
