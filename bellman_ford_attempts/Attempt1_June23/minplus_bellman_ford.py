@@ -36,7 +36,7 @@ from dataclasses import dataclass
 import numpy as np
 import scipy.sparse as sp
 
-from bellman_ford_attempts.Attempt1_June23.minplus_algebra import INF, tropical_spmv, tropical_matrix_from_edges
+from minplus_algebra import INF, tropical_spmv, tropical_matrix_from_edges
 
 
 @dataclass
@@ -99,7 +99,7 @@ def sssp_min_plus_bellman_ford(A: sp.csr_matrix, source: int,
         has_negative_cycle = True
 
     return SSSPResult(dist=d, pred=pred, iterations_used=it_used,
-                       converged=converged, has_negative_cycle=has_negative_cycle)
+                       converged=converged, has_negative_cycle=has_negative_cycle) 
 
 
 def _update_predecessors(A: sp.csr_matrix, d_old: np.ndarray,
