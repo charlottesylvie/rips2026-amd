@@ -8,7 +8,7 @@
 
 namespace {
 
-constexpr float INF = std::numeric_limits<float>::infinity();
+constexpr float TEST_INF = std::numeric_limits<float>::infinity();
 
 void require_close(float actual, float expected, int node) {
   if (std::isinf(expected)) {
@@ -32,7 +32,7 @@ int main() {
   const int n = 5;
   const int source = 0;
 
-  std::vector<float> adjacency(n * n, INF);
+  std::vector<float> adjacency(n * n, TEST_INF);
 
   // Incoming-edge orientation:
   // adjacency[v * n + u] = weight of edge u -> v.
