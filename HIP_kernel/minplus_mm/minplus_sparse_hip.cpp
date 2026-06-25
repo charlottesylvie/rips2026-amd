@@ -46,7 +46,9 @@ inline bool make_row_grid(Offset rows, dim3* grid) {
   return true;
 }
 
-inline bool checked_bytes(Offset count, std::size_t elem_size, std::size_t* out) {
+inline bool checked_bytes(Offset count,
+                          std::size_t elem_size,
+                          std::size_t* out) {
   if (count < 0) {
     return false;
   }
@@ -80,7 +82,6 @@ __device__ __forceinline__ Offset logical_block_id_1d() {
 }
 
 __device__ __forceinline__ unsigned hash_u32(unsigned x) {
-  // Small integer hash suitable for open addressing.
   x ^= x >> 16;
   x *= 0x7feb352du;
   x ^= x >> 15;
@@ -92,14 +93,13 @@ __device__ __forceinline__ unsigned hash_u32(unsigned x) {
 __device__ __forceinline__ bool store_candidate(float x, float INF) {
   // Skip NaN and +INF.
   //
-  // Missing sparse entries represent +INF, so explicitly storing +INF would
-  // only make the sparse matrix denser without changing min-plus semantics.
+  // Sparse absence represents +INF, so explicitly storing +INF would only make
+  // the sparse matrix denser without changing min-plus semantics.
   return x == x && x != INF;
 }
 
 __device__ __forceinline__ void atomic_min_float(float* addr, float value) {
-  // Generic CAS-based float min.
-  // Works for positive and negative finite values, +INF, and -INF.
+  // CAS-based float min.
   // Assumes value is not NaN.
   unsigned int* addr_u = reinterpret_cast<unsigned int*>(addr);
   unsigned int old_bits = *addr_u;
@@ -122,7 +122,8 @@ __device__ __forceinline__ void hash_insert_key(Index* keys,
                 "HASH_CAP must be a power of two");
 
   unsigned slot =
-      hash_u32(static_cast<unsigned>(col)) & static_cast<unsigned>(HASH_CAP - 1);
+      hash_u32(static_cast<unsigned>(col)) &
+      static_cast<unsigned>(HASH_CAP - 1);
 
 #pragma unroll 1
   for (int probe = 0; probe < HASH_CAP; ++probe) {
@@ -148,7 +149,8 @@ __device__ __forceinline__ void hash_insert_min(Index* keys,
                 "HASH_CAP must be a power of two");
 
   unsigned slot =
-      hash_u32(static_cast<unsigned>(col)) & static_cast<unsigned>(HASH_CAP - 1);
+      hash_u32(static_cast<unsigned>(col)) &
+      static_cast<unsigned>(HASH_CAP - 1);
 
 #pragma unroll 1
   for (int probe = 0; probe < HASH_CAP; ++probe) {
@@ -469,32 +471,32 @@ hipError_t minplus_spgemm_csr_f32_tuned(
 
   auto cleanup_on_error = [&]() {
     if (d_row_counts) {
-      hipFree(d_row_counts);
+      (void)hipFree(d_row_counts);
       d_row_counts = nullptr;
     }
 
     if (d_status) {
-      hipFree(d_status);
+      (void)hipFree(d_status);
       d_status = nullptr;
     }
 
     if (d_scan_temp) {
-      hipFree(d_scan_temp);
+      (void)hipFree(d_scan_temp);
       d_scan_temp = nullptr;
     }
 
     if (*d_C_rowptr) {
-      hipFree(*d_C_rowptr);
+      (void)hipFree(*d_C_rowptr);
       *d_C_rowptr = nullptr;
     }
 
     if (*d_C_colind) {
-      hipFree(*d_C_colind);
+      (void)hipFree(*d_C_colind);
       *d_C_colind = nullptr;
     }
 
     if (*d_C_values) {
-      hipFree(*d_C_values);
+      (void)hipFree(*d_C_values);
       *d_C_values = nullptr;
     }
 
@@ -519,16 +521,22 @@ hipError_t minplus_spgemm_csr_f32_tuned(
   //
   // If A.nnz == 0 or B.nnz == 0, C has no finite entries.
   if (A.rows == 0 || A.cols == 0 || A.nnz == 0 || B.nnz == 0) {
+    std::size_t rowptr_bytes = 0;
+
+    if (!checked_bytes(A.rows + 1, sizeof(Offset), &rowptr_bytes)) {
+      cleanup_on_error();
+      return hipErrorInvalidValue;
+    }
+
     HIP_TRY_CLEAN(hipMemsetAsync(
         *d_C_rowptr,
         0,
-        static_cast<std::size_t>(A.rows + 1) * sizeof(Offset),
+        rowptr_bytes,
         stream));
 
     HIP_TRY_CLEAN(hipStreamSynchronize(stream));
-    *h_C_nnz = 0;
 
-#undef HIP_TRY_CLEAN
+    *h_C_nnz = 0;
 
     return hipSuccess;
   }
@@ -648,8 +656,6 @@ hipError_t minplus_spgemm_csr_f32_tuned(
   if (*h_C_nnz == 0) {
     HIP_TRY_CLEAN(hipFree(d_status));
     d_status = nullptr;
-
-#undef HIP_TRY_CLEAN
 
     return hipSuccess;
   }
