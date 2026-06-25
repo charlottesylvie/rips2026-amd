@@ -1,6 +1,5 @@
+#include "bellman_ford_hip.hpp"
 #include "../minplus_mm/minplus_hip.hpp"
-
-#include <hip/hip_runtime.h>
 
 #include <cstddef>
 #include <limits>
@@ -55,14 +54,6 @@ __global__ void detect_change_kernel(const float* dist,
 }
 
 } 
-
-// Host-side result returned after the GPU Bellman-Ford run finishes.
-struct BellmanFordResult {
-  std::vector<float> dist;
-  int iterations_used = 0;
-  bool converged = false;
-  bool has_negative_cycle = false;
-};
 
 // Runs Bellman-Ford using an already-GPU-resident dense min-plus adjacency matrix.
 BellmanFordResult bellman_ford_minplus_hip(const float* d_adjacency,
