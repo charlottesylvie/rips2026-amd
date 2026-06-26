@@ -299,7 +299,7 @@ static __global__ void compute_merge_counts_kernel(
   merged_values_by_row[row] = merged;
   row_counts[row] = (merged == merged && merged != INF) ? 1 : 0;
 
-  if (relaxed_value < old_value) {
+  if (changed && relaxed_value < old_value) {
     atomicExch(changed, 1);
   }
 }
@@ -385,10 +385,12 @@ inline DeviceCsrOwner merge_distances_on_device(const DeviceCsrF32& old_dist,
     check_hip(hipMalloc(reinterpret_cast<void**>(&d_merged_by_row),
                         values_capacity),
               "hipMalloc merge values by row");
-    check_hip(hipMalloc(reinterpret_cast<void**>(&d_changed), sizeof(int)),
-              "hipMalloc merge changed flag");
-    check_hip(hipMemsetAsync(d_changed, 0, sizeof(int), stream),
-              "reset merge changed flag");
+    if (h_changed) {
+      check_hip(hipMalloc(reinterpret_cast<void**>(&d_changed), sizeof(int)),
+                "hipMalloc merge changed flag");
+      check_hip(hipMemsetAsync(d_changed, 0, sizeof(int), stream),
+                "reset merge changed flag");
+    }
 
     constexpr int threads = 256;
     const int blocks = static_cast<int>((rows + threads - 1) / threads);
