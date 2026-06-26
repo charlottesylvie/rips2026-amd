@@ -323,19 +323,17 @@ __global__ void fill_outgoing_from_incoming_kernel(Offset rows,
   }
 }
 
-__global__ void initialize_delta_state_kernel(Offset n,
-                                              int source,
-                                              float inf,
-                                              float* dist,
-                                              int* in_current,
-                                              int* in_pending,
-                                              int* in_heavy,
-                                              int* current_queue,
-                                              int* current_count,
-                                              int* next_count,
-                                              int* pending_count,
-                                              int* heavy_count,
-                                              int* overflow) {
+__global__ void initialize_delta_arrays_kernel(Offset n,
+                                                float inf,
+                                                float* dist,
+                                                int* in_current,
+                                                int* in_pending,
+                                                int* in_heavy,
+                                                int* current_count,
+                                                int* next_count,
+                                                int* pending_count,
+                                                int* heavy_count,
+                                                int* overflow) {
   for (Offset v = static_cast<Offset>(blockIdx.x) * blockDim.x + threadIdx.x;
        v < n;
        v += static_cast<Offset>(blockDim.x) * gridDim.x) {
@@ -345,14 +343,24 @@ __global__ void initialize_delta_state_kernel(Offset n,
     in_heavy[v] = 0;
   }
   if (blockIdx.x == 0 && threadIdx.x == 0) {
-    dist[source] = 0.0f;
-    in_current[source] = 1;
-    current_queue[0] = source;
-    *current_count = 1;
+    *current_count = 0;
     *next_count = 0;
     *pending_count = 0;
     *heavy_count = 0;
     *overflow = 0;
+  }
+}
+
+__global__ void initialize_delta_source_kernel(int source,
+                                              float* dist,
+                                              int* in_current,
+                                              int* current_queue,
+                                              int* current_count) {
+  if (blockIdx.x == 0 && threadIdx.x == 0) {
+    dist[source] = 0.0f;
+    in_current[source] = 1;
+    current_queue[0] = source;
+    *current_count = 1;
   }
 }
 
@@ -379,9 +387,10 @@ __global__ void relax_light_edges_kernel(const int* frontier,
   // One block cooperates on one active vertex at a time; grid-stride over frontier.
   for (int fi = blockIdx.x; fi < frontier_count; fi += gridDim.x) {
     const int u = frontier[fi];
-    if (threadIdx.x == 0) atomicExch(&in_current[u], 0);
-    __syncthreads();
-
+    // The in_current flags for this whole frontier are cleared by a separate
+    // kernel before relaxation starts.  Do not clear them here: doing so races
+    // with other blocks that may need to re-enqueue this vertex after a same-
+    // bucket distance decrease.
     const float du = dist[u];
     const bool active = isfinite(du) && bucket_index(du, inv_delta) == current_bucket;
     if (active) {
@@ -397,6 +406,11 @@ __global__ void relax_light_edges_kernel(const int* frontier,
         if (nd < old) {
           const int b = bucket_index(nd, inv_delta);
           if (b == current_bucket) {
+            // If v had previously been discovered in a later bucket, the new
+            // distance has moved it back into the current bucket.  Clear the
+            // pending flag so stale pending-queue entries cannot affect later
+            // bucket selection.
+            atomicExch(&in_pending[v], 0);
             enqueue_unique(v, in_current, next_frontier, next_count, queue_capacity, overflow);
           } else if (b > current_bucket && b < kNoBucket) {
             enqueue_unique(v, in_pending, pending_queue, pending_count, queue_capacity, overflow);
@@ -665,10 +679,13 @@ DeltaSteppingCsrResult delta_stepping_minplus_hip_csr(
   DeviceBuffer<int> d_new_pending_count(1), d_heavy_count(1), d_overflow(1);
   DeviceBuffer<int> d_block_mins(static_cast<std::size_t>((n_int + kBlockSize - 1) / kBlockSize + 1));
 
-  initialize_delta_state_kernel<<<grid_for_items(n), kBlockSize, 0, stream>>>(
-      n, source, inf, d_dist.get(), d_in_current.get(), d_in_pending.get(), d_in_heavy.get(),
-      d_current_queue.get(), d_current_count.get(), d_next_count.get(), d_pending_count.get(),
+  initialize_delta_arrays_kernel<<<grid_for_items(n), kBlockSize, 0, stream>>>(
+      n, inf, d_dist.get(), d_in_current.get(), d_in_pending.get(), d_in_heavy.get(),
+      d_current_count.get(), d_next_count.get(), d_pending_count.get(),
       d_heavy_count.get(), d_overflow.get());
+  DS_DELTA_HIP_CHECK(hipGetLastError());
+  initialize_delta_source_kernel<<<1, 1, 0, stream>>>(
+      source, d_dist.get(), d_in_current.get(), d_current_queue.get(), d_current_count.get());
   DS_DELTA_HIP_CHECK(hipGetLastError());
 
   int* current_queue = d_current_queue.get();
@@ -687,6 +704,16 @@ DeltaSteppingCsrResult delta_stepping_minplus_hip_csr(
     while (current_count > 0) {
       reset_int_zero_async(d_next_count.get(), stream);
       reset_int_zero_async(d_overflow.get(), stream);
+
+      // Correctness-critical: clear membership for every vertex in the current
+      // frontier before any block starts relaxing light edges.  The previous
+      // implementation cleared one vertex inside relax_light_edges_kernel;
+      // other blocks could then observe stale in_current[v] == 1 and drop a
+      // required same-bucket re-enqueue, causing premature bucket convergence.
+      clear_flags_from_queue_kernel<<<grid_for_items(current_count), kBlockSize, 0, stream>>>(
+          current_queue, current_count, d_in_current.get());
+      DS_DELTA_HIP_CHECK(hipGetLastError());
+
       relax_light_edges_kernel<<<grid_for_frontier(current_count), kBlockSize, 0, stream>>>(
           current_queue, current_count, current_bucket, delta, inv_delta,
           outgoing.rowptr.get(), outgoing.colind.get(), outgoing.values.get(), d_dist.get(),
