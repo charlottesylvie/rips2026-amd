@@ -30,7 +30,9 @@ BellmanFordCsrResult bellman_ford_minplus_hip_csr(
     const minplus_sparse::DeviceCsrF32& d_adjacency,
     int source,
     int max_iters,
-    hipStream_t stream) {
+    hipStream_t stream,
+    BellmanFordCsrProgressCallback progress_callback,
+    void* progress_user_data) {
   using namespace bf_csr_detail;
 
   validate_device_csr_adjacency(d_adjacency, source);
@@ -55,6 +57,15 @@ BellmanFordCsrResult bellman_ford_minplus_hip_csr(
     d_dist = std::move(d_next);
     result.iterations_used = iter + 1;
 
+    if (progress_callback) {
+      BellmanFordCsrProgress progress;
+      progress.iteration = result.iterations_used;
+      progress.max_iters = max_iters;
+      progress.convergence_checked = true;
+      progress.changed = changed != 0;
+      progress_callback(progress, progress_user_data);
+    }
+
     if (!changed) {
       result.converged = true;
       break;
@@ -72,14 +83,18 @@ BellmanFordCsrResult bellman_ford_minplus_hip_csr(
   return bellman_ford_minplus_hip_csr(d_adjacency,
                                       source,
                                       static_cast<int>(d_adjacency.rows) - 1,
-                                      stream);
+                                      stream,
+                                      nullptr,
+                                      nullptr);
 }
 
 BellmanFordCsrResult bellman_ford_minplus_hip_csr(
     const HostCsrF32& adjacency,
     int source,
     int max_iters,
-    hipStream_t stream) {
+    hipStream_t stream,
+    BellmanFordCsrProgressCallback progress_callback,
+    void* progress_user_data) {
   using namespace bf_csr_detail;
 
   validate_host_csr_adjacency(adjacency, source);
@@ -87,7 +102,9 @@ BellmanFordCsrResult bellman_ford_minplus_hip_csr(
   return bellman_ford_minplus_hip_csr(d_adjacency.view,
                                       source,
                                       max_iters,
-                                      stream);
+                                      stream,
+                                      progress_callback,
+                                      progress_user_data);
 }
 
 BellmanFordCsrResult bellman_ford_minplus_hip_csr(
@@ -97,5 +114,7 @@ BellmanFordCsrResult bellman_ford_minplus_hip_csr(
   return bellman_ford_minplus_hip_csr(adjacency,
                                       source,
                                       static_cast<int>(adjacency.rows) - 1,
-                                      stream);
+                                      stream,
+                                      nullptr,
+                                      nullptr);
 }

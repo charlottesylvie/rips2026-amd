@@ -12,7 +12,7 @@
 // Run from the repository root with a .csrbin file from data/ and a 1-based
 // source node:
 //
-//   ./big_test USA-road-d.BAY.csrbin 1 50
+//   ./big_test USA-road-d.BAY.csrbin 1 50000
 //
 // The final argument is optional max_iters. If omitted, both implementations
 // use n - 1 iterations.
@@ -47,6 +47,7 @@ constexpr std::uint64_t EXPECTED_FORMAT_VERSION = 1;
 constexpr std::uint64_t EXPECTED_INCOMING_EDGE_ORIENTATION = 1;
 const std::filesystem::path kDataDir =
     std::filesystem::path("HIP_kernel") / "bellman_ford" / "data";
+constexpr int kProgressInterval = 10000;
 
 static_assert(sizeof(minplus_sparse::Offset) == sizeof(std::int64_t),
               "CSR rowptr format expects 64-bit offsets");
@@ -350,6 +351,58 @@ double elapsed_ms(std::chrono::steady_clock::time_point start,
   return std::chrono::duration<double, std::milli>(end - start).count();
 }
 
+struct ProgressPrinter {
+  std::string label;
+  std::chrono::steady_clock::time_point start;
+};
+
+void print_progress(const BellmanFordCsrProgress& progress, void* user_data) {
+  if (progress.iteration <= 0 ||
+      progress.iteration % kProgressInterval != 0) {
+    return;
+  }
+
+  const auto* printer = static_cast<const ProgressPrinter*>(user_data);
+  const auto now = std::chrono::steady_clock::now();
+  const double so_far_ms = elapsed_ms(printer->start, now);
+  const double avg_ms_per_iter =
+      so_far_ms > 0.0 ? so_far_ms / static_cast<double>(progress.iteration)
+                       : 0.0;
+  const double iterations_per_second =
+      so_far_ms > 0.0
+          ? 1000.0 * static_cast<double>(progress.iteration) / so_far_ms
+          : 0.0;
+
+  std::cout << printer->label << " progress\n";
+  std::cout << "iteration: " << progress.iteration << " / "
+            << progress.max_iters << "\n";
+  if (progress.max_iters > 0) {
+    std::cout << "percent_complete: "
+              << (100.0 * static_cast<double>(progress.iteration) /
+                  static_cast<double>(progress.max_iters))
+              << "\n";
+  }
+  std::cout << "elapsed_ms_so_far: " << so_far_ms << "\n";
+  std::cout << "avg_ms_per_iteration: " << avg_ms_per_iter << "\n";
+  std::cout << "iterations_per_second: " << iterations_per_second << "\n";
+
+  if (progress.max_iters > progress.iteration) {
+    const int remaining_iters = progress.max_iters - progress.iteration;
+    std::cout << "estimated_remaining_ms: "
+              << (avg_ms_per_iter * static_cast<double>(remaining_iters))
+              << "\n";
+  }
+
+  if (progress.convergence_checked) {
+    std::cout << "changed_on_this_iteration: "
+              << (progress.changed ? "true" : "false") << "\n";
+  } else {
+    std::cout << "changed_on_this_iteration: not checked\n";
+  }
+
+  std::cout << "\n" << std::flush;
+}
+
 int count_reachable(const std::vector<float>& dist) {
   int count = 0;
   for (float value : dist) {
@@ -424,6 +477,8 @@ int main(int argc, char** argv) {
     HostCsrF32 graph = load_csrbin(csr_path);
     const int source = parse_source_1_based(argv[2], graph.rows);
     const int max_iters = argc == 4 ? parse_max_iters(argv[3]) : -1;
+    const int effective_max_iters =
+        max_iters < 0 ? static_cast<int>(graph.rows) - 1 : max_iters;
 
     HipStreamOwner stream_owner;
     stream_owner.create();
@@ -434,19 +489,23 @@ int main(int argc, char** argv) {
     std::cout << "nodes: " << graph.rows << "\n";
     std::cout << "nnz: " << graph.nnz << "\n";
     std::cout << "source_node_1_based: " << (source + 1) << "\n";
-    std::cout << "max_iters: "
-              << (max_iters < 0 ? graph.rows - 1 : max_iters) << "\n\n";
+    std::cout << "max_iters: " << effective_max_iters << "\n";
+    std::cout << "progress_interval_iterations: " << kProgressInterval
+              << "\n\n";
 
     const auto checked_copy_start = std::chrono::steady_clock::now();
     DeviceCsrOwner checked_graph = copy_csr_to_device(graph, stream);
     const auto checked_copy_end = std::chrono::steady_clock::now();
 
     const auto checked_start = std::chrono::steady_clock::now();
+    ProgressPrinter checked_progress{"bf_hip_CSR", checked_start};
     const BellmanFordCsrResult checked_result =
         bellman_ford_minplus_hip_csr(checked_graph.view,
                                      source,
                                      max_iters,
-                                     stream);
+                                     stream,
+                                     print_progress,
+                                     &checked_progress);
     const auto checked_end = std::chrono::steady_clock::now();
 
     checked_graph.reset();
@@ -456,11 +515,15 @@ int main(int argc, char** argv) {
     const auto no_checks_copy_end = std::chrono::steady_clock::now();
 
     const auto no_checks_start = std::chrono::steady_clock::now();
+    ProgressPrinter no_checks_progress{"bf_hip_no_checks_CSR",
+                                       no_checks_start};
     const BellmanFordCsrNoChecksResult no_checks_result =
         bellman_ford_minplus_hip_csr_no_checks(no_checks_graph.view,
                                                source,
                                                max_iters,
-                                               stream);
+                                               stream,
+                                               print_progress,
+                                               &no_checks_progress);
     const auto no_checks_end = std::chrono::steady_clock::now();
 
     no_checks_graph.reset();

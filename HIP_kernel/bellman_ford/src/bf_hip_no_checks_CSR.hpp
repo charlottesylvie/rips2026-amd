@@ -18,7 +18,9 @@ BellmanFordCsrNoChecksResult bellman_ford_minplus_hip_csr_no_checks(
     const minplus_sparse::DeviceCsrF32& d_adjacency,
     int source,
     int max_iters,
-    hipStream_t stream = nullptr);
+    hipStream_t stream = nullptr,
+    BellmanFordCsrProgressCallback progress_callback = nullptr,
+    void* progress_user_data = nullptr);
 
 BellmanFordCsrNoChecksResult bellman_ford_minplus_hip_csr_no_checks(
     const minplus_sparse::DeviceCsrF32& d_adjacency,
@@ -30,7 +32,9 @@ BellmanFordCsrNoChecksResult bellman_ford_minplus_hip_csr_no_checks(
     const HostCsrF32& adjacency,
     int source,
     int max_iters,
-    hipStream_t stream = nullptr);
+    hipStream_t stream = nullptr,
+    BellmanFordCsrProgressCallback progress_callback = nullptr,
+    void* progress_user_data = nullptr);
 
 BellmanFordCsrNoChecksResult bellman_ford_minplus_hip_csr_no_checks(
     const HostCsrF32& adjacency,

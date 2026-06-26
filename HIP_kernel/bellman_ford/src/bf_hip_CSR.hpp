@@ -6,6 +6,16 @@
 
 #include <vector>
 
+struct BellmanFordCsrProgress {
+  int iteration = 0;
+  int max_iters = 0;
+  bool convergence_checked = false;
+  bool changed = false;
+};
+
+using BellmanFordCsrProgressCallback =
+    void (*)(const BellmanFordCsrProgress& progress, void* user_data);
+
 struct BellmanFordCsrResult {
   std::vector<float> dist;
   int iterations_used = 0;
@@ -32,7 +42,9 @@ BellmanFordCsrResult bellman_ford_minplus_hip_csr(
     const minplus_sparse::DeviceCsrF32& d_adjacency,
     int source,
     int max_iters,
-    hipStream_t stream = nullptr);
+    hipStream_t stream = nullptr,
+    BellmanFordCsrProgressCallback progress_callback = nullptr,
+    void* progress_user_data = nullptr);
 
 BellmanFordCsrResult bellman_ford_minplus_hip_csr(
     const minplus_sparse::DeviceCsrF32& d_adjacency,
@@ -44,7 +56,9 @@ BellmanFordCsrResult bellman_ford_minplus_hip_csr(
     const HostCsrF32& adjacency,
     int source,
     int max_iters,
-    hipStream_t stream = nullptr);
+    hipStream_t stream = nullptr,
+    BellmanFordCsrProgressCallback progress_callback = nullptr,
+    void* progress_user_data = nullptr);
 
 BellmanFordCsrResult bellman_ford_minplus_hip_csr(
     const HostCsrF32& adjacency,

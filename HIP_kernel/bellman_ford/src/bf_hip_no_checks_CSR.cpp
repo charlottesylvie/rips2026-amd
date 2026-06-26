@@ -30,7 +30,9 @@ BellmanFordCsrNoChecksResult bellman_ford_minplus_hip_csr_no_checks(
     const minplus_sparse::DeviceCsrF32& d_adjacency,
     int source,
     int max_iters,
-    hipStream_t stream) {
+    hipStream_t stream,
+    BellmanFordCsrProgressCallback progress_callback,
+    void* progress_user_data) {
   using namespace bf_csr_detail;
 
   validate_device_csr_adjacency(d_adjacency, source);
@@ -52,6 +54,15 @@ BellmanFordCsrNoChecksResult bellman_ford_minplus_hip_csr_no_checks(
 
     d_dist = std::move(d_next);
     result.iterations_used = iter + 1;
+
+    if (progress_callback) {
+      BellmanFordCsrProgress progress;
+      progress.iteration = result.iterations_used;
+      progress.max_iters = max_iters;
+      progress.convergence_checked = false;
+      progress.changed = false;
+      progress_callback(progress, progress_user_data);
+    }
   }
 
   result.dist = copy_dist_vector_to_host(d_dist.view, stream);
@@ -66,14 +77,18 @@ BellmanFordCsrNoChecksResult bellman_ford_minplus_hip_csr_no_checks(
       d_adjacency,
       source,
       static_cast<int>(d_adjacency.rows) - 1,
-      stream);
+      stream,
+      nullptr,
+      nullptr);
 }
 
 BellmanFordCsrNoChecksResult bellman_ford_minplus_hip_csr_no_checks(
     const HostCsrF32& adjacency,
     int source,
     int max_iters,
-    hipStream_t stream) {
+    hipStream_t stream,
+    BellmanFordCsrProgressCallback progress_callback,
+    void* progress_user_data) {
   using namespace bf_csr_detail;
 
   validate_host_csr_adjacency(adjacency, source);
@@ -81,7 +96,9 @@ BellmanFordCsrNoChecksResult bellman_ford_minplus_hip_csr_no_checks(
   return bellman_ford_minplus_hip_csr_no_checks(d_adjacency.view,
                                                 source,
                                                 max_iters,
-                                                stream);
+                                                stream,
+                                                progress_callback,
+                                                progress_user_data);
 }
 
 BellmanFordCsrNoChecksResult bellman_ford_minplus_hip_csr_no_checks(
@@ -92,5 +109,7 @@ BellmanFordCsrNoChecksResult bellman_ford_minplus_hip_csr_no_checks(
       adjacency,
       source,
       static_cast<int>(adjacency.rows) - 1,
-      stream);
+      stream,
+      nullptr,
+      nullptr);
 }
