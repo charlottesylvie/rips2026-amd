@@ -115,4 +115,9 @@ PathfinderResult run_pathfinder(const HostCsrF32& base_graph,
 
 std::string string_at(const RoutingMetadata& metadata, std::uint64_t index);
 
+void write_routes_jsonl(const std::filesystem::path& path,
+                        const HostCsrF32& graph,
+                        const RoutingMetadata& metadata,
+                        const PathfinderResult& result);
+
 }  // namespace routing

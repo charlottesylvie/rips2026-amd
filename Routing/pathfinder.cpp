@@ -22,6 +22,7 @@
 #include <limits>
 #include <sstream>
 #include <stdexcept>
+#include <unordered_set>
 #include <utility>
 
 namespace routing {
@@ -192,6 +193,7 @@ HostCsrF32 make_costed_graph(const HostCsrF32& base_graph,
 
 RoutedSink route_sink_from_tree(const HostCsrF32& graph,
                                const std::vector<int>& source_candidates,
+                               const std::vector<std::uint8_t>& tree_seen,
                                int target,
                                const PathfinderOptions& options,
                                hipStream_t stream) {
@@ -234,6 +236,19 @@ RoutedSink route_sink_from_tree(const HostCsrF32& graph,
       candidate.distance = sssp.dist[static_cast<std::size_t>(target)];
       candidate.edges = reconstruct_shortest_path(graph, sssp.dist, source, target);
       candidate.nodes = nodes_from_path(source, candidate.edges);
+      bool reenters_tree = false;
+      for (std::size_t i = 1; i < candidate.nodes.size(); ++i) {
+        const int node = candidate.nodes[i];
+        if (node >= 0 &&
+            static_cast<std::size_t>(node) < tree_seen.size() &&
+            tree_seen[static_cast<std::size_t>(node)] != 0) {
+          reenters_tree = true;
+          break;
+        }
+      }
+      if (reenters_tree) {
+        continue;
+      }
       candidate.reached = true;
     }
 
@@ -274,7 +289,7 @@ RoutedNet route_net(const HostCsrF32& graph,
   bool reached_all = true;
   for (const SitePinNode& sink : request.sinks) {
     RoutedSink routed_sink =
-        route_sink_from_tree(graph, source_candidates, sink.node, options, stream);
+        route_sink_from_tree(graph, source_candidates, tree_seen, sink.node, options, stream);
     if (!routed_sink.reached) {
       reached_all = false;
     } else {
@@ -313,6 +328,54 @@ void update_congestion_stats(const std::vector<int>& occupancy,
       ++(*overused_nodes);
     }
   }
+}
+
+std::string json_escape(const std::string& text) {
+  std::ostringstream out;
+  for (const unsigned char ch : text) {
+    switch (ch) {
+      case '"':
+        out << "\\\"";
+        break;
+      case '\\':
+        out << "\\\\";
+        break;
+      case '\b':
+        out << "\\b";
+        break;
+      case '\f':
+        out << "\\f";
+        break;
+      case '\n':
+        out << "\\n";
+        break;
+      case '\r':
+        out << "\\r";
+        break;
+      case '\t':
+        out << "\\t";
+        break;
+      default:
+        if (ch < 0x20) {
+          out << "\\u";
+          const char* hex = "0123456789abcdef";
+          out << '0' << '0' << hex[(ch >> 4) & 0xf] << hex[ch & 0xf];
+        } else {
+          out << static_cast<char>(ch);
+        }
+        break;
+    }
+  }
+  return out.str();
+}
+
+void write_json_string(std::ostream& out, const std::string& text) {
+  out << '"' << json_escape(text) << '"';
+}
+
+std::uint64_t edge_key(int from, int to) {
+  return (static_cast<std::uint64_t>(static_cast<std::uint32_t>(from)) << 32) |
+         static_cast<std::uint32_t>(to);
 }
 
 }  // namespace
@@ -367,7 +430,8 @@ void print_usage(const char* program) {
       << "  --present-factor <float>        Initial present congestion factor. Default: 1\n"
       << "  --present-multiplier <float>    Per-iteration factor multiplier. Default: 2\n"
       << "  --history-factor <float>        Historical congestion increment. Default: 1\n"
-      << "  --net-limit <count>             Route only the first count requests.\n";
+      << "  --net-limit <count>             Route only the first count requests.\n"
+      << "  --routes-out <path>             Write routed PIP tree data as JSONL.\n";
 }
 
 HostCsrF32 load_csrbin(const std::filesystem::path& path) {
@@ -691,6 +755,112 @@ std::string string_at(const RoutingMetadata& metadata, std::uint64_t index) {
   return metadata.strings[static_cast<std::size_t>(index)];
 }
 
+void write_routes_jsonl(const std::filesystem::path& path,
+                        const HostCsrF32& graph,
+                        const RoutingMetadata& metadata,
+                        const PathfinderResult& result) {
+  validate_csr(graph);
+  if (metadata.edge_attrs.size() != static_cast<std::size_t>(graph.nnz)) {
+    throw std::runtime_error("metadata edge attributes do not match CSR nnz");
+  }
+  if (result.nets.size() > metadata.route_requests.size()) {
+    throw std::runtime_error("pathfinder result has more nets than metadata requests");
+  }
+  if (path.has_parent_path()) {
+    std::filesystem::create_directories(path.parent_path());
+  }
+
+  std::ofstream out(path);
+  if (!out) {
+    throw std::runtime_error("could not open routes output file: " + path.string());
+  }
+
+  for (std::size_t net_index = 0; net_index < result.nets.size(); ++net_index) {
+    const RouteRequest& request = metadata.route_requests[net_index];
+    const RoutedNet& net = result.nets[net_index];
+
+    out << "{\"net\":";
+    write_json_string(out, string_at(metadata, request.net_string));
+    out << ",\"routed\":" << (net.reached_all_sinks ? "true" : "false");
+
+    out << ",\"sources\":[";
+    for (std::size_t i = 0; i < request.sources.size(); ++i) {
+      const SitePinNode& source = request.sources[i];
+      if (i != 0) {
+        out << ',';
+      }
+      out << "{\"node\":" << source.node << ",\"site\":";
+      write_json_string(out, string_at(metadata, source.site_string));
+      out << ",\"pin\":";
+      write_json_string(out, string_at(metadata, source.pin_string));
+      out << '}';
+    }
+    out << ']';
+
+    out << ",\"sinks\":[";
+    for (std::size_t i = 0; i < request.sinks.size(); ++i) {
+      const SitePinNode& sink_pin = request.sinks[i];
+      const bool has_sink_result = i < net.sinks.size();
+      const RoutedSink* sink = has_sink_result ? &net.sinks[i] : nullptr;
+      if (i != 0) {
+        out << ',';
+      }
+      out << "{\"node\":" << sink_pin.node << ",\"site\":";
+      write_json_string(out, string_at(metadata, sink_pin.site_string));
+      out << ",\"pin\":";
+      write_json_string(out, string_at(metadata, sink_pin.pin_string));
+      out << ",\"reached\":" << (sink != nullptr && sink->reached ? "true" : "false");
+      out << ",\"source\":" << (sink != nullptr ? sink->source : -1);
+      out << '}';
+    }
+    out << ']';
+
+    std::unordered_set<std::uint64_t> seen_edges;
+    out << ",\"edges\":[";
+    bool first_edge = true;
+    for (const RoutedSink& sink : net.sinks) {
+      if (!sink.reached) {
+        continue;
+      }
+      for (const PathEdge& path_edge : sink.edges) {
+        if (path_edge.csr_edge < 0 ||
+            path_edge.csr_edge >= graph.nnz ||
+            !valid_node(path_edge.from, graph.rows) ||
+            !valid_node(path_edge.to, graph.rows)) {
+          throw std::runtime_error("pathfinder result contains an invalid path edge");
+        }
+        if (!seen_edges.insert(edge_key(path_edge.from, path_edge.to)).second) {
+          continue;
+        }
+
+        const EdgeAttr& attr =
+            metadata.edge_attrs[static_cast<std::size_t>(path_edge.csr_edge)];
+        if (attr.pip_data_index >= metadata.pip_data.size()) {
+          throw std::runtime_error("route edge references invalid PIP data");
+        }
+        const PipData& pip =
+            metadata.pip_data[static_cast<std::size_t>(attr.pip_data_index)];
+
+        if (!first_edge) {
+          out << ',';
+        }
+        first_edge = false;
+        out << "{\"from\":" << path_edge.from
+            << ",\"to\":" << path_edge.to
+            << ",\"csr_edge\":" << path_edge.csr_edge
+            << ",\"tile\":";
+        write_json_string(out, string_at(metadata, attr.tile_string));
+        out << ",\"wire0\":";
+        write_json_string(out, string_at(metadata, pip.wire0_string));
+        out << ",\"wire1\":";
+        write_json_string(out, string_at(metadata, pip.wire1_string));
+        out << ",\"forward\":" << (pip.forward ? "true" : "false") << '}';
+      }
+    }
+    out << "]}\n";
+  }
+}
+
 }  // namespace routing
 
 #ifndef ROUTING_PATHFINDER_NO_MAIN
@@ -705,6 +875,7 @@ int main(int argc, char** argv) {
 
     const std::filesystem::path csr_path = argv[1];
     std::filesystem::path metadata_path;
+    std::filesystem::path routes_out_path;
     routing::PathfinderOptions options;
 
     int arg = 2;
@@ -751,6 +922,8 @@ int main(int argc, char** argv) {
       } else if (option == "--net-limit") {
         options.net_limit =
             routing::parse_size_arg(require_value("--net-limit"), "net-limit");
+      } else if (option == "--routes-out") {
+        routes_out_path = require_value("--routes-out");
       } else {
         throw std::runtime_error("unknown option: " + option);
       }
@@ -772,6 +945,15 @@ int main(int argc, char** argv) {
     std::cout << "overused_nodes: " << result.overused_nodes << "\n";
     std::cout << "max_occupancy: " << result.max_occupancy << "\n";
     std::cout << "routed: " << (result.routed ? "true" : "false") << "\n";
+
+    if (!routes_out_path.empty()) {
+      if (!result.routed) {
+        std::cerr << "error: refusing to write routes for an unrouted or congested result\n";
+        return 2;
+      }
+      routing::write_routes_jsonl(routes_out_path, graph, metadata, result);
+      std::cout << "routes_out: " << routes_out_path << "\n";
+    }
 
     const std::size_t printed_nets = std::min<std::size_t>(result.nets.size(), 10);
     for (std::size_t i = 0; i < printed_nets; ++i) {

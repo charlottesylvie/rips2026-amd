@@ -2,6 +2,7 @@
 
 #include "../pathfinder.cpp"
 
+#include <fstream>
 #include <queue>
 
 namespace {
@@ -65,15 +66,29 @@ HostCsrF32 make_tree_graph() {
 
 routing::RoutingMetadata make_metadata() {
   routing::RoutingMetadata metadata;
-  metadata.strings = {"net0"};
+  metadata.strings = {"net0",      "SRC_SITE", "SRC_PIN", "SINK_SITE_0",
+                      "SINK_PIN_0", "SINK_SITE_1", "SINK_PIN_1",
+                      "TILE_A",    "WIRE_0",   "WIRE_1", "WIRE_2",
+                      "WIRE_3"};
   metadata.node_device_ids = {0, 1, 2, 3};
-  metadata.edge_attrs.resize(4);
+  metadata.edge_attrs = {
+      {7, 0},
+      {7, 1},
+      {7, 2},
+      {7, 3},
+  };
+  metadata.pip_data = {
+      {8, 9, true},
+      {9, 10, true},
+      {9, 11, true},
+      {8, 11, true},
+  };
 
   routing::RouteRequest request;
   request.net_string = 0;
-  request.sources.push_back({0, 0, 0});
-  request.sinks.push_back({2, 0, 0});
-  request.sinks.push_back({3, 0, 0});
+  request.sources.push_back({0, 1, 2});
+  request.sinks.push_back({2, 3, 4});
+  request.sinks.push_back({3, 5, 6});
   metadata.route_requests.push_back(std::move(request));
   return metadata;
 }
@@ -120,8 +135,9 @@ int main() {
   options.max_pathfinder_iterations = 1;
   options.delta = 1.0f;
 
+  const routing::RoutingMetadata metadata = make_metadata();
   routing::PathfinderResult result =
-      routing::run_pathfinder(graph, make_metadata(), options, nullptr);
+      routing::run_pathfinder(graph, metadata, options, nullptr);
   require(result.routed, "PathFinder should route the simple tree graph");
   require(result.all_sinks_reached, "all sinks should be reached");
   require(result.overused_nodes == 0, "simple route should have no overused nodes");
@@ -144,7 +160,20 @@ int main() {
   require(g_targeted_delta_calls == 4,
           "PathFinder should call targeted delta stepping for source candidates");
 
+  const std::filesystem::path routes_path = "/tmp/pathfinder_cpu_stub_routes.jsonl";
+  routing::write_routes_jsonl(routes_path, graph, metadata, result);
+  std::ifstream routes_file(routes_path);
+  const std::string routes_json((std::istreambuf_iterator<char>(routes_file)),
+                                std::istreambuf_iterator<char>());
+  require(routes_json.find("\"net\":\"net0\"") != std::string::npos,
+          "routes JSONL should include the routed net name");
+  require(routes_json.find("\"site\":\"SINK_SITE_0\"") != std::string::npos,
+          "routes JSONL should include sink site pins");
+  require(routes_json.find("\"tile\":\"TILE_A\"") != std::string::npos,
+          "routes JSONL should include PIP tile names");
+  require(routes_json.find("\"from\":1,\"to\":3") != std::string::npos,
+          "routes JSONL should include tree edge from existing route node");
+
   std::cout << "PathFinder CPU-stub test passed\n";
   return 0;
 }
-
