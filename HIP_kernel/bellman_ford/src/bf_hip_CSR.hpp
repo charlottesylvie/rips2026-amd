@@ -4,6 +4,7 @@
 
 #include <hip/hip_runtime.h>
 
+#include <limits>
 #include <vector>
 
 struct BellmanFordCsrProgress {
@@ -20,6 +21,10 @@ struct BellmanFordCsrResult {
   std::vector<float> dist;
   int iterations_used = 0;
   bool converged = false;
+  int target = -1;
+  float target_distance = std::numeric_limits<float>::infinity();
+  bool target_reached = false;
+  bool stopped_on_target = false;
 };
 
 struct HostCsrF32 {

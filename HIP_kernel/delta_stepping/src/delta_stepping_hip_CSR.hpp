@@ -15,6 +15,16 @@ using DeltaSteppingCsrResult = BellmanFordCsrResult;
 DeltaSteppingCsrResult delta_stepping_minplus_hip_csr(
     const minplus_sparse::DeviceCsrF32& d_adjacency,
     int source,
+    int target,
+    float delta,
+    int max_iters,
+    hipStream_t stream = nullptr,
+    DeltaSteppingCsrProgressCallback progress_callback = nullptr,
+    void* progress_user_data = nullptr);
+
+DeltaSteppingCsrResult delta_stepping_minplus_hip_csr(
+    const minplus_sparse::DeviceCsrF32& d_adjacency,
+    int source,
     float delta,
     int max_iters,
     hipStream_t stream = nullptr,
@@ -30,6 +40,16 @@ DeltaSteppingCsrResult delta_stepping_minplus_hip_csr(
 DeltaSteppingCsrResult delta_stepping_minplus_hip_csr(
     const HostCsrF32& adjacency,
     int source,
+    int target,
+    float delta,
+    int max_iters,
+    hipStream_t stream = nullptr,
+    DeltaSteppingCsrProgressCallback progress_callback = nullptr,
+    void* progress_user_data = nullptr);
+
+DeltaSteppingCsrResult delta_stepping_minplus_hip_csr(
+    const HostCsrF32& adjacency,
+    int source,
     float delta,
     int max_iters,
     hipStream_t stream = nullptr,
@@ -41,6 +61,32 @@ DeltaSteppingCsrResult delta_stepping_minplus_hip_csr(
     int source,
     float delta,
     hipStream_t stream = nullptr);
+
+inline DeltaSteppingCsrResult delta_stepping_hip_csr(
+    const minplus_sparse::DeviceCsrF32& d_adjacency,
+    int source,
+    int target,
+    float delta,
+    int max_iters,
+    hipStream_t stream = nullptr,
+    DeltaSteppingCsrProgressCallback progress_callback = nullptr,
+    void* progress_user_data = nullptr) {
+  return delta_stepping_minplus_hip_csr(d_adjacency, source, target, delta, max_iters,
+                                        stream, progress_callback, progress_user_data);
+}
+
+inline DeltaSteppingCsrResult delta_stepping_hip_csr(
+    const HostCsrF32& adjacency,
+    int source,
+    int target,
+    float delta,
+    int max_iters,
+    hipStream_t stream = nullptr,
+    DeltaSteppingCsrProgressCallback progress_callback = nullptr,
+    void* progress_user_data = nullptr) {
+  return delta_stepping_minplus_hip_csr(adjacency, source, target, delta, max_iters,
+                                        stream, progress_callback, progress_user_data);
+}
 
 inline DeltaSteppingCsrResult delta_stepping_hip_csr(
     const minplus_sparse::DeviceCsrF32& d_adjacency,
