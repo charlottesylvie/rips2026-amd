@@ -64,6 +64,39 @@ HostCsrF32 make_tree_graph() {
   return graph;
 }
 
+HostCsrF32 make_self_loop_predecessor_graph() {
+  HostCsrF32 graph;
+  graph.rows = 4;
+  graph.cols = 4;
+  graph.nnz = 2;
+  graph.rowptr = {0, 0, 0, 2, 2};
+  graph.colind = {2, 3};
+  graph.values = {0.0f, 1.0f};
+  return graph;
+}
+
+HostCsrF32 make_two_path_graph() {
+  HostCsrF32 graph;
+  graph.rows = 4;
+  graph.cols = 4;
+  graph.nnz = 4;
+  graph.rowptr = {0, 0, 1, 2, 4};
+  graph.colind = {0, 0, 1, 2};
+  graph.values = {1.0f, 1.0f, 1.0f, 1.0f};
+  return graph;
+}
+
+HostCsrF32 make_two_net_congestion_graph() {
+  HostCsrF32 graph;
+  graph.rows = 6;
+  graph.cols = 6;
+  graph.nnz = 6;
+  graph.rowptr = {0, 0, 0, 2, 3, 4, 6};
+  graph.colind = {0, 1, 1, 2, 2, 3};
+  graph.values = {1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f};
+  return graph;
+}
+
 routing::RoutingMetadata make_metadata() {
   routing::RoutingMetadata metadata;
   metadata.strings = {"net0",      "SRC_SITE", "SRC_PIN", "SINK_SITE_0",
@@ -90,6 +123,29 @@ routing::RoutingMetadata make_metadata() {
   request.sinks.push_back({2, 3, 4});
   request.sinks.push_back({3, 5, 6});
   metadata.route_requests.push_back(std::move(request));
+  return metadata;
+}
+
+routing::RoutingMetadata make_two_net_metadata(const HostCsrF32& graph) {
+  routing::RoutingMetadata metadata;
+  metadata.strings = {"net_a", "net_b", "SRC_SITE_A", "SRC_SITE_B",
+                      "SRC_PIN", "SINK_SITE_A", "SINK_SITE_B", "SINK_PIN",
+                      "TILE_A", "WIRE_0", "WIRE_1"};
+  metadata.node_device_ids = {0, 1, 2, 3, 4, 5};
+  metadata.edge_attrs.assign(static_cast<std::size_t>(graph.nnz), {8, 0});
+  metadata.pip_data = {{9, 10, true}};
+
+  routing::RouteRequest net_a;
+  net_a.net_string = 0;
+  net_a.sources.push_back({0, 2, 4});
+  net_a.sinks.push_back({4, 5, 7});
+  metadata.route_requests.push_back(std::move(net_a));
+
+  routing::RouteRequest net_b;
+  net_b.net_string = 1;
+  net_b.sources.push_back({1, 3, 4});
+  net_b.sinks.push_back({5, 6, 7});
+  metadata.route_requests.push_back(std::move(net_b));
   return metadata;
 }
 
@@ -131,6 +187,55 @@ int main() {
   require(path[0].from == 0 && path[0].to == 1, "first path edge should be 0->1");
   require(path[1].from == 1 && path[1].to == 2, "second path edge should be 1->2");
 
+  const HostCsrF32 self_loop_graph = make_self_loop_predecessor_graph();
+  const std::vector<float> self_loop_dist =
+      cpu_dijkstra_incoming_csr(self_loop_graph, 3);
+  const std::vector<routing::PathEdge> self_loop_path =
+      routing::reconstruct_shortest_path(self_loop_graph, self_loop_dist, 3, 2);
+  require(self_loop_path.size() == 1,
+          "self-loop predecessor graph should reconstruct one real edge");
+  require(self_loop_path[0].from == 3 && self_loop_path[0].to == 2,
+          "reconstruction should ignore no-progress self-loop predecessors");
+
+  const HostCsrF32 two_path_graph = make_two_path_graph();
+  std::vector<int> occupancy = {10, 1, 0, 0};
+  std::vector<float> history = {0.0f, 0.0f, 0.0f, 0.0f};
+  routing::PathfinderOptions cost_options;
+  cost_options.capacity = 1;
+  const HostCsrF32 costed_graph =
+      routing::make_costed_graph(two_path_graph, occupancy, history, cost_options, 5.0f);
+  require(std::fabs(costed_graph.values[0] - 6.0f) < 1e-6f,
+          "entering occupied vertex 1 should receive present congestion cost");
+  require(std::fabs(costed_graph.values[1] - 1.0f) < 1e-6f,
+          "congested source vertex 0 should not inflate outgoing edge 0->2");
+  const std::vector<float> costed_dist =
+      cpu_dijkstra_incoming_csr(costed_graph, 0);
+  const std::vector<routing::PathEdge> costed_path =
+      routing::reconstruct_shortest_path(costed_graph, costed_dist, 0, 3);
+  require(costed_path.size() == 2, "vertex-weighted two-path graph should use two edges");
+  require(costed_path[0].from == 0 && costed_path[0].to == 2,
+          "PathFinder vertex costs should steer away from occupied destination nodes");
+  require(costed_path[1].from == 2 && costed_path[1].to == 3,
+          "PathFinder vertex costs should preserve a valid path to the sink");
+
+  const HostCsrF32 congestion_graph = make_two_net_congestion_graph();
+  const routing::RoutingMetadata congestion_metadata =
+      make_two_net_metadata(congestion_graph);
+  routing::PathfinderOptions congestion_options;
+  congestion_options.max_pathfinder_iterations = 1;
+  congestion_options.delta = 1.0f;
+  routing::PathfinderResult congestion_result =
+      routing::run_pathfinder(congestion_graph, congestion_metadata, congestion_options, nullptr);
+  require(congestion_result.routed,
+          "two-net congestion graph should route without overuse");
+  require(congestion_result.overused_nodes == 0,
+          "present congestion should steer the second net off the occupied node");
+  require(congestion_result.nets[0].sinks[0].nodes == std::vector<int>({0, 2, 4}),
+          "first net should use the shared direct path");
+  require(congestion_result.nets[1].sinks[0].nodes == std::vector<int>({1, 3, 5}),
+          "second net should use the bypass path after node 2 is occupied");
+
+  g_targeted_delta_calls = 0;
   routing::PathfinderOptions options;
   options.max_pathfinder_iterations = 1;
   options.delta = 1.0f;

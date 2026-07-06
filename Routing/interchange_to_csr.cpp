@@ -1011,6 +1011,10 @@ void build_device_routing_graph(const std::filesystem::path& device_path,
     }
 
     ++graph.raw_edges_seen;
+    if (from == to) {
+      return;
+    }
+
     const std::uint64_t key = edge_key(from, to);
     const auto found = edge_index_by_pair.find(key);
     if (found != edge_index_by_pair.end()) {

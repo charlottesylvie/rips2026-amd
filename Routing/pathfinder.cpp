@@ -642,6 +642,9 @@ std::vector<PathEdge> reconstruct_shortest_path(const HostCsrF32& graph,
          edge < graph.rowptr[row + 1];
          ++edge) {
       const int pred = graph.colind[static_cast<std::size_t>(edge)];
+      if (pred == current) {
+        continue;
+      }
       const float pred_dist = dist[static_cast<std::size_t>(pred)];
       if (!std::isfinite(pred_dist)) {
         continue;
