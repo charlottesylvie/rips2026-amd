@@ -627,9 +627,9 @@ void collect_site_pin_branches(
     PhysicalNetlist::PhysNetlist::RouteBranch::Builder branch,
     const std::vector<std::string>& strings,
     std::vector<std::pair<SitePinKey, PhysicalNetlist::PhysNetlist::RouteBranch::Builder>>& out) {
-  const auto segment = branch.getRouteSegment();
+  auto segment = branch.getRouteSegment();
   if (segment.isSitePin()) {
-    const auto site_pin = segment.getSitePin();
+    auto site_pin = segment.getSitePin();
     out.push_back({{phys_string_at(strings, site_pin.getSite()),
                     phys_string_at(strings, site_pin.getPin())},
                    branch});
