@@ -26,6 +26,7 @@ struct Options {
   std::filesystem::path logical_netlist;
   std::filesystem::path device = "xcvu3p.device";
   std::filesystem::path work_dir;
+  bool work_dir_was_provided = false;
   bool keep_work_dir = false;
 
   std::string interchange_to_csr = "./interchange_to_csr";
@@ -173,6 +174,7 @@ Options parse_args(int argc, char** argv) {
       options.device = require_value("--device");
     } else if (option == "--work-dir") {
       options.work_dir = require_value("--work-dir");
+      options.work_dir_was_provided = true;
     } else if (option == "--keep-work-dir") {
       options.keep_work_dir = true;
     } else if (option == "--interchange-to-csr") {
@@ -230,7 +232,7 @@ int main(int argc, char** argv) {
 
     work_dir = make_work_dir(options);
     std::filesystem::create_directories(work_dir);
-    cleanup_work_dir = !options.keep_work_dir;
+    cleanup_work_dir = !options.keep_work_dir && !options.work_dir_was_provided;
 
     const std::filesystem::path csr_path =
         work_dir / (options.output_phys.stem().string() + ".csrbin");
