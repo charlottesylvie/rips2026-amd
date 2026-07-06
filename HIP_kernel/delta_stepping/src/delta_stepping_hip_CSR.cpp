@@ -66,7 +66,7 @@ class DeviceBuffer {
  private:
   void release() noexcept {
     if (ptr_ != nullptr) {
-      hipFree(ptr_);
+      (void)hipFree(ptr_);
       ptr_ = nullptr;
     }
     count_ = 0;

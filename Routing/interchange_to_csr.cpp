@@ -1247,13 +1247,19 @@ void parse_physical_netlist(const std::filesystem::path& phys_path,
     }
 
     // Nets without stubs are already routed, and non-signal nets are treated
-    // as fixed resources. Walk their route tree and block the driven node of
-    // every PhysPIP so future routes cannot use it as a driven resource.
+    // as fixed resources. RapidWright's PhysNetlistReader imports both source
+    // branches and stub branches, then adds explicit stubNodes as null-end
+    // PIPs. Mirror that occupancy here by blocking the driven node of every
+    // PhysPIP we can resolve, plus every explicit stub node.
     std::vector<RouteBranch::Reader> queue;
     const auto sources = net.getSources();
-    queue.reserve(sources.size());
+    const auto stubs = net.getStubs();
+    queue.reserve(sources.size() + stubs.size());
     for (std::uint32_t i = 0; i < sources.size(); ++i) {
       queue.push_back(sources[i]);
+    }
+    for (std::uint32_t i = 0; i < stubs.size(); ++i) {
+      queue.push_back(stubs[i]);
     }
 
     while (!queue.empty()) {
@@ -1276,6 +1282,18 @@ void parse_physical_netlist(const std::filesystem::path& phys_path,
       const auto child_branches = branch.getBranches();
       for (std::uint32_t i = 0; i < child_branches.size(); ++i) {
         queue.push_back(child_branches[i]);
+      }
+    }
+
+    const auto stub_nodes = net.getStubNodes();
+    for (std::uint32_t i = 0; i < stub_nodes.size(); ++i) {
+      const auto stub_node = stub_nodes[i];
+      const std::string& tile_name = strings.get(stub_node.getTile());
+      const std::string& wire_name = strings.get(stub_node.getWire());
+      const std::optional<NodeId> blocked =
+          find_tile_wire_node(graph, tile_name, wire_name);
+      if (blocked.has_value()) {
+        graph.blocked_node[*blocked] = 1;
       }
     }
   }
