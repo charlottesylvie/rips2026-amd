@@ -8,6 +8,8 @@
 // CSR convention used by bellman_ford_minplus_hip_csr:
 //   adjacency row v, column u = weight of directed edge u -> v.
 // The implementation internally builds an outgoing CSR transpose on the GPU.
+// If max_iters is negative, the implementation uses the standard n - 1 bound
+// to match the Bellman-Ford entry points and benchmarking expectations.
 using DeltaSteppingCsrProgress = BellmanFordCsrProgress;
 using DeltaSteppingCsrProgressCallback = BellmanFordCsrProgressCallback;
 using DeltaSteppingCsrResult = BellmanFordCsrResult;

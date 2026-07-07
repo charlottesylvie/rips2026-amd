@@ -307,6 +307,7 @@ int main(int argc, char** argv) {
     const int seed = arg_int(argv, argc, 6, 1);
     const int source = arg_int(argv, argc, 7, 0);
     const int max_iters = arg_int(argv, argc, 8, -1);
+    const int effective_max_iters = max_iters < 0 ? n - 1 : max_iters;
 
     if (source < 0 || source >= n) throw std::invalid_argument("source out of range");
     if (!(delta > 0.0f)) throw std::invalid_argument("delta must be > 0");
@@ -328,7 +329,8 @@ int main(int argc, char** argv) {
               << "  delta:          " << delta << '\n'
               << "  warmup:         " << warmup << '\n'
               << "  repeats:        " << repeats << '\n'
-              << "  max_iters:      " << max_iters << " (-1 means algorithm default)\n\n";
+              << "  max_iters:      " << effective_max_iters
+              << " (" << max_iters << " requested; -1 means algorithm default)\n\n";
 
     BellmanFordCsrResult last_bf;
     BellmanFordCsrResult last_ds;

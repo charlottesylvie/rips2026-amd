@@ -657,10 +657,10 @@ DeltaSteppingCsrResult delta_stepping_minplus_hip_csr(
 
   validate_device_csr_shape(d_adjacency, source, delta);
   validate_device_csr_contents(d_adjacency, stream);
-  if (max_iters < 0) max_iters = std::numeric_limits<int>::max();
 
   const Offset n = d_adjacency.rows;
   const int n_int = static_cast<int>(n);
+  if (max_iters < 0) max_iters = n_int - 1;
   const float inv_delta = 1.0f / delta;
   const float inf = std::numeric_limits<float>::infinity();
 
