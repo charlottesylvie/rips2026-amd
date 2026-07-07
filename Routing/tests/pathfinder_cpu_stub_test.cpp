@@ -110,6 +110,17 @@ HostCsrF32 make_two_path_graph() {
   return graph;
 }
 
+HostCsrF32 make_multisink_tree_growth_graph() {
+  HostCsrF32 graph;
+  graph.rows = 3;
+  graph.cols = 3;
+  graph.nnz = 3;
+  graph.rowptr = {0, 0, 1, 3};
+  graph.colind = {0, 0, 1};
+  graph.values = {10.0f, 9.0f, 1.0f};
+  return graph;
+}
+
 HostCsrF32 make_two_net_congestion_graph() {
   HostCsrF32 graph;
   graph.rows = 6;
@@ -157,6 +168,23 @@ routing::RoutingMetadata make_metadata() {
   request.sources.push_back({0, 1, 2});
   request.sinks.push_back({2, 3, 4});
   request.sinks.push_back({3, 5, 6});
+  metadata.route_requests.push_back(std::move(request));
+  return metadata;
+}
+
+routing::RoutingMetadata make_multisink_tree_growth_metadata(const HostCsrF32& graph) {
+  routing::RoutingMetadata metadata;
+  metadata.strings = {"net_growth", "SRC_SITE", "SRC_PIN", "SINK_SITE_A",
+                      "SINK_SITE_B", "SINK_PIN", "TILE_A", "WIRE_0", "WIRE_1"};
+  metadata.node_device_ids = {0, 1, 2};
+  metadata.edge_attrs.assign(static_cast<std::size_t>(graph.nnz), {6, 0});
+  metadata.pip_data = {{7, 8, true}};
+
+  routing::RouteRequest request;
+  request.net_string = 0;
+  request.sources.push_back({0, 1, 2});
+  request.sinks.push_back({1, 3, 5});
+  request.sinks.push_back({2, 4, 5});
   metadata.route_requests.push_back(std::move(request));
   return metadata;
 }
@@ -258,6 +286,15 @@ void DeltaSteppingCsrWorkspace::update_vertex_costs(
   }
 }
 
+void DeltaSteppingCsrWorkspace::update_node_coordinates(
+    const std::vector<int>& node_x,
+    const std::vector<int>& node_y,
+    hipStream_t stream) {
+  (void)node_x;
+  (void)node_y;
+  (void)stream;
+}
+
 DeltaSteppingCsrResult DeltaSteppingCsrWorkspace::run(
     const std::vector<int>& sources,
     int target,
@@ -265,7 +302,9 @@ DeltaSteppingCsrResult DeltaSteppingCsrWorkspace::run(
     int max_iters,
     hipStream_t stream,
     DeltaSteppingCsrProgressCallback progress_callback,
-    void* progress_user_data) {
+    void* progress_user_data,
+    DeltaSteppingNodeBounds bounds) {
+  (void)bounds;
   return delta_stepping_minplus_hip_csr(impl_->graph,
                                         sources,
                                         target,
@@ -283,7 +322,9 @@ DeltaSteppingCsrResult DeltaSteppingCsrWorkspace::run(
     int max_iters,
     hipStream_t stream,
     DeltaSteppingCsrProgressCallback progress_callback,
-    void* progress_user_data) {
+    void* progress_user_data,
+    DeltaSteppingNodeBounds bounds) {
+  (void)bounds;
   DeltaSteppingCsrResult result =
       delta_stepping_minplus_hip_csr(impl_->graph,
                                      sources,
@@ -357,14 +398,16 @@ DeltaSteppingCsrResult DeltaSteppingCsrWorkspace::run(
     int max_iters,
     hipStream_t stream,
     DeltaSteppingCsrProgressCallback progress_callback,
-    void* progress_user_data) {
+    void* progress_user_data,
+    DeltaSteppingNodeBounds bounds) {
   return run(std::vector<int>{source},
              target,
              delta,
              max_iters,
              stream,
              progress_callback,
-             progress_user_data);
+             progress_user_data,
+             bounds);
 }
 
 DeltaSteppingCsrResult delta_stepping_minplus_hip_csr(
@@ -461,6 +504,20 @@ int main() {
   require(costed_path[1].from == 2 && costed_path[1].to == 3,
           "PathFinder vertex costs should preserve a valid path to the sink");
 
+  routing::RoutingMetadata coordinate_metadata = make_metadata();
+  coordinate_metadata.strings[7] = "CLEL_R_X12Y34";
+  const routing::NodeCoordinates coordinates =
+      routing::derive_node_coordinates(graph, coordinate_metadata);
+  require(coordinates.known_nodes == 4,
+          "coordinate derivation should mark every node touched by coordinate-bearing edges");
+  const DeltaSteppingNodeBounds spatial_bounds =
+      routing::net_spatial_bounds(coordinate_metadata.route_requests[0], coordinates, 5);
+  require(spatial_bounds.enabled, "coordinate-bearing pins should enable spatial pruning");
+  require(spatial_bounds.min_x == 7 && spatial_bounds.max_x == 17,
+          "spatial bounds should expand X by the requested margin");
+  require(spatial_bounds.min_y == 29 && spatial_bounds.max_y == 39,
+          "spatial bounds should expand Y by the requested margin");
+
   const HostCsrF32 congestion_graph = make_two_net_congestion_graph();
   const routing::RoutingMetadata congestion_metadata =
       make_two_net_metadata(congestion_graph);
@@ -478,6 +535,26 @@ int main() {
           "first net should use the shared direct path");
   require(congestion_result.nets[1].sinks[0].nodes == std::vector<int>({1, 3, 5}),
           "second net should use the bypass path after node 2 is occupied");
+
+  const HostCsrF32 growth_graph = make_multisink_tree_growth_graph();
+  const routing::RoutingMetadata growth_metadata =
+      make_multisink_tree_growth_metadata(growth_graph);
+  routing::PathfinderOptions growth_options;
+  growth_options.max_pathfinder_iterations = 1;
+  growth_options.delta = 1.0f;
+  g_multisource_delta_calls = 0;
+  routing::PathfinderResult growth_result =
+      routing::run_pathfinder(growth_graph, growth_metadata, growth_options, nullptr);
+  require(growth_result.routed,
+          "multi-sink tree-growth graph should route");
+  require(growth_result.nets[0].sinks[0].nodes == std::vector<int>({0, 1}),
+          "first sink should route from the original source");
+  require(growth_result.nets[0].sinks[1].source == 1,
+          "second sink should be re-optimized from the newly added route tree node");
+  require(growth_result.nets[0].sinks[1].nodes == std::vector<int>({1, 2}),
+          "second sink should use the short A->B attachment");
+  require(g_multisource_delta_calls == 2,
+          "multi-sink nets should run one current-tree SSSP per unrouted sink");
 
   const HostCsrF32 incremental_graph = make_incremental_reroute_graph();
   const routing::RoutingMetadata incremental_metadata =
@@ -528,8 +605,8 @@ int main() {
           "route tree should contain nodes 0,1,2,3");
   require(result.occupancy == std::vector<int>({1, 1, 1, 1}),
           "all route tree nodes should be occupied once");
-  require(g_multisource_delta_calls == 1,
-          "PathFinder should call multi-source delta stepping once per multi-sink net");
+  require(g_multisource_delta_calls == 2,
+          "PathFinder should rerun multi-source delta stepping as the route tree grows");
 
   const std::filesystem::path routes_path = "/tmp/pathfinder_cpu_stub_routes.jsonl";
   routing::write_routes_jsonl(routes_path, graph, metadata, result);

@@ -87,6 +87,7 @@ struct PathfinderOptions {
   float history_factor = 1.0f;
   std::size_t net_limit = 0;
   std::size_t route_batch_size = 256;
+  int spatial_prune_margin = -1;
 };
 
 struct PathfinderResult {

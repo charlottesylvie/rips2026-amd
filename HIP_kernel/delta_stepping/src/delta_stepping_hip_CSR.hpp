@@ -15,6 +15,14 @@ using DeltaSteppingCsrProgress = BellmanFordCsrProgress;
 using DeltaSteppingCsrProgressCallback = BellmanFordCsrProgressCallback;
 using DeltaSteppingCsrResult = BellmanFordCsrResult;
 
+struct DeltaSteppingNodeBounds {
+  bool enabled = false;
+  int min_x = 0;
+  int max_x = 0;
+  int min_y = 0;
+  int max_y = 0;
+};
+
 class DeltaSteppingCsrWorkspace {
  public:
   struct Impl;
@@ -34,6 +42,10 @@ class DeltaSteppingCsrWorkspace {
   void update_vertex_costs(const std::vector<float>& vertex_costs,
                            hipStream_t stream = nullptr);
 
+  void update_node_coordinates(const std::vector<int>& node_x,
+                               const std::vector<int>& node_y,
+                               hipStream_t stream = nullptr);
+
   DeltaSteppingCsrResult run(
       const std::vector<int>& sources,
       int target,
@@ -41,7 +53,8 @@ class DeltaSteppingCsrWorkspace {
       int max_iters,
       hipStream_t stream = nullptr,
       DeltaSteppingCsrProgressCallback progress_callback = nullptr,
-      void* progress_user_data = nullptr);
+      void* progress_user_data = nullptr,
+      DeltaSteppingNodeBounds bounds = {});
 
   DeltaSteppingCsrResult run(
       const std::vector<int>& sources,
@@ -50,7 +63,8 @@ class DeltaSteppingCsrWorkspace {
       int max_iters,
       hipStream_t stream = nullptr,
       DeltaSteppingCsrProgressCallback progress_callback = nullptr,
-      void* progress_user_data = nullptr);
+      void* progress_user_data = nullptr,
+      DeltaSteppingNodeBounds bounds = {});
 
   DeltaSteppingCsrResult run(
       int source,
@@ -59,7 +73,8 @@ class DeltaSteppingCsrWorkspace {
       int max_iters,
       hipStream_t stream = nullptr,
       DeltaSteppingCsrProgressCallback progress_callback = nullptr,
-      void* progress_user_data = nullptr);
+      void* progress_user_data = nullptr,
+      DeltaSteppingNodeBounds bounds = {});
 
  private:
   std::unique_ptr<Impl> impl_;

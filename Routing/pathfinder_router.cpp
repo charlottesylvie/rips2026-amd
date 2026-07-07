@@ -145,6 +145,7 @@ void print_usage(const char* program) {
       << "  --max-sssp-iters <int>         Forwarded to pathfinder.\n"
       << "  --net-limit <count>            Forwarded to pathfinder.\n"
       << "  --route-batch-size <count>     Forwarded to pathfinder.\n"
+      << "  --spatial-prune-margin <int>   Forwarded to pathfinder (-1 disables).\n"
       << "  --capacity <int>               Forwarded to pathfinder.\n"
       << "  --present-factor <float>       Forwarded to pathfinder.\n"
       << "  --present-multiplier <float>   Forwarded to pathfinder.\n"
@@ -202,6 +203,7 @@ Options parse_args(int argc, char** argv) {
                option == "--max-sssp-iters" ||
                option == "--net-limit" ||
                option == "--route-batch-size" ||
+               option == "--spatial-prune-margin" ||
                option == "--capacity" ||
                option == "--present-factor" ||
                option == "--present-multiplier" ||

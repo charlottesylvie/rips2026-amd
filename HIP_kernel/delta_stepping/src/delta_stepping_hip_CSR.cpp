@@ -422,6 +422,19 @@ __device__ inline int bucket_index(float distance, float inv_delta) {
   return static_cast<int>(bucket_f);
 }
 
+__device__ inline bool node_allowed_by_bounds(int v,
+                                              const int* node_x,
+                                              const int* node_y,
+                                              DeltaSteppingNodeBounds bounds) {
+  if (!bounds.enabled || node_x == nullptr || node_y == nullptr) {
+    return true;
+  }
+  const int x = node_x[v];
+  const int y = node_y[v];
+  return x >= bounds.min_x && x <= bounds.max_x &&
+         y >= bounds.min_y && y <= bounds.max_y;
+}
+
 __device__ inline void enqueue_unique(int v,
                                       int* flags,
                                       int* queue,
@@ -815,6 +828,9 @@ __global__ void relax_light_edges_kernel(const int* frontier,
                                          const float* out_values,
                                          const Offset* out_incoming_edge,
                                          const float* vertex_costs,
+                                         const int* node_x,
+                                         const int* node_y,
+                                         DeltaSteppingNodeBounds bounds,
                                          float* dist,
                                          int* in_current,
                                          int* in_pending,
@@ -848,6 +864,7 @@ __global__ void relax_light_edges_kernel(const int* frontier,
       for (Offset e = out_rowptr[u] + threadIdx.x; e < out_rowptr[u + 1]; e += blockDim.x) {
         const float w = out_values[e];
         const int v = static_cast<int>(out_colind[e]);
+        if (!node_allowed_by_bounds(v, node_x, node_y, bounds)) continue;
         const float effective_w =
             vertex_costs == nullptr ? w : w * vertex_costs[v];
         if (effective_w > delta) continue;
@@ -886,6 +903,9 @@ __global__ void relax_heavy_edges_kernel(const int* heavy_vertices,
                                          const float* out_values,
                                          const Offset* out_incoming_edge,
                                          const float* vertex_costs,
+                                         const int* node_x,
+                                         const int* node_y,
+                                         DeltaSteppingNodeBounds bounds,
                                          float* dist,
                                          int* in_pending,
                                          int* pred_node,
@@ -904,6 +924,7 @@ __global__ void relax_heavy_edges_kernel(const int* heavy_vertices,
       for (Offset e = out_rowptr[u] + threadIdx.x; e < out_rowptr[u + 1]; e += blockDim.x) {
         const float w = out_values[e];
         const int v = static_cast<int>(out_colind[e]);
+        if (!node_allowed_by_bounds(v, node_x, node_y, bounds)) continue;
         const float effective_w =
             vertex_costs == nullptr ? w : w * vertex_costs[v];
         if (effective_w <= delta) continue;
@@ -1345,6 +1366,9 @@ DeltaSteppingCsrResult run_delta_stepping_impl(
     int target,
     const std::vector<int>* targets,
     const float* vertex_costs,
+    const int* node_x,
+    const int* node_y,
+    DeltaSteppingNodeBounds bounds,
     float delta,
     int max_iters,
     hipStream_t stream,
@@ -1423,7 +1447,8 @@ DeltaSteppingCsrResult run_delta_stepping_impl(
       relax_light_edges_kernel<<<grid_for_frontier(current_count), kBlockSize, 0, stream>>>(
           current_queue, current_count, current_bucket, delta, inv_delta,
           outgoing.rowptr.get(), outgoing.colind.get(), outgoing.values.get(),
-          outgoing.incoming_edge.get(), vertex_costs, scratch.dist.get(),
+          outgoing.incoming_edge.get(), vertex_costs, node_x, node_y, bounds,
+          scratch.dist.get(),
           scratch.in_current.get(), scratch.in_pending.get(), scratch.in_heavy.get(),
           scratch.pred_node.get(), scratch.pred_edge.get(),
           scratch.in_touched.get(), scratch.touched_queue.get(), scratch.touched_count.get(),
@@ -1442,7 +1467,8 @@ DeltaSteppingCsrResult run_delta_stepping_impl(
       relax_heavy_edges_kernel<<<grid_for_frontier(heavy_count), kBlockSize, 0, stream>>>(
           scratch.heavy_queue.get(), heavy_count, current_bucket, delta, inv_delta,
           outgoing.rowptr.get(), outgoing.colind.get(), outgoing.values.get(),
-          outgoing.incoming_edge.get(), vertex_costs, scratch.dist.get(),
+          outgoing.incoming_edge.get(), vertex_costs, node_x, node_y, bounds,
+          scratch.dist.get(),
           scratch.in_pending.get(), scratch.pred_node.get(), scratch.pred_edge.get(),
           scratch.in_touched.get(), scratch.touched_queue.get(), scratch.touched_count.get(),
           pending_queue,
@@ -1566,13 +1592,18 @@ struct DeltaSteppingCsrWorkspace::Impl {
   ds_delta_detail::OutgoingCsrOwner outgoing;
   ds_delta_detail::DeltaSteppingScratch scratch;
   ds_delta_detail::DeviceBuffer<float> vertex_costs;
+  ds_delta_detail::DeviceBuffer<int> node_x;
+  ds_delta_detail::DeviceBuffer<int> node_y;
   bool has_vertex_costs = false;
+  bool has_node_coordinates = false;
 
   Impl(const HostCsrF32& host, hipStream_t stream)
       : adjacency(ds_delta_detail::copy_host_csr_to_device(host, stream)),
         outgoing(ds_delta_detail::build_outgoing_csr_from_incoming(adjacency.view, stream)),
         scratch(host.rows),
-        vertex_costs(static_cast<std::size_t>(host.rows)) {}
+        vertex_costs(static_cast<std::size_t>(host.rows)),
+        node_x(static_cast<std::size_t>(host.rows)),
+        node_y(static_cast<std::size_t>(host.rows)) {}
 };
 
 DeltaSteppingCsrWorkspace::DeltaSteppingCsrWorkspace(const HostCsrF32& adjacency,
@@ -1638,6 +1669,31 @@ void DeltaSteppingCsrWorkspace::update_vertex_costs(
   impl_->has_vertex_costs = true;
 }
 
+void DeltaSteppingCsrWorkspace::update_node_coordinates(
+    const std::vector<int>& node_x,
+    const std::vector<int>& node_y,
+    hipStream_t stream) {
+  using namespace ds_delta_detail;
+  if (!impl_) {
+    throw std::runtime_error("DeltaSteppingCsrWorkspace has no implementation");
+  }
+  const std::size_t rows = static_cast<std::size_t>(impl_->adjacency.view.rows);
+  if (node_x.size() != rows || node_y.size() != rows) {
+    throw std::invalid_argument("node coordinate sizes do not match workspace rows");
+  }
+  DS_DELTA_HIP_CHECK(hipMemcpyAsync(impl_->node_x.get(),
+                                    node_x.data(),
+                                    node_x.size() * sizeof(int),
+                                    hipMemcpyHostToDevice,
+                                    stream));
+  DS_DELTA_HIP_CHECK(hipMemcpyAsync(impl_->node_y.get(),
+                                    node_y.data(),
+                                    node_y.size() * sizeof(int),
+                                    hipMemcpyHostToDevice,
+                                    stream));
+  impl_->has_node_coordinates = true;
+}
+
 DeltaSteppingCsrResult DeltaSteppingCsrWorkspace::run(
     const std::vector<int>& sources,
     int target,
@@ -1645,7 +1701,8 @@ DeltaSteppingCsrResult DeltaSteppingCsrWorkspace::run(
     int max_iters,
     hipStream_t stream,
     DeltaSteppingCsrProgressCallback progress_callback,
-    void* progress_user_data) {
+    void* progress_user_data,
+    DeltaSteppingNodeBounds bounds) {
   using namespace ds_delta_detail;
   if (!impl_) {
     throw std::runtime_error("DeltaSteppingCsrWorkspace has no implementation");
@@ -1658,6 +1715,9 @@ DeltaSteppingCsrResult DeltaSteppingCsrWorkspace::run(
                                  target,
                                  nullptr,
                                  impl_->has_vertex_costs ? impl_->vertex_costs.get() : nullptr,
+                                 impl_->has_node_coordinates ? impl_->node_x.get() : nullptr,
+                                 impl_->has_node_coordinates ? impl_->node_y.get() : nullptr,
+                                 bounds,
                                  delta,
                                  max_iters,
                                  stream,
@@ -1672,7 +1732,8 @@ DeltaSteppingCsrResult DeltaSteppingCsrWorkspace::run(
     int max_iters,
     hipStream_t stream,
     DeltaSteppingCsrProgressCallback progress_callback,
-    void* progress_user_data) {
+    void* progress_user_data,
+    DeltaSteppingNodeBounds bounds) {
   using namespace ds_delta_detail;
   if (!impl_) {
     throw std::runtime_error("DeltaSteppingCsrWorkspace has no implementation");
@@ -1686,6 +1747,9 @@ DeltaSteppingCsrResult DeltaSteppingCsrWorkspace::run(
                                  -1,
                                  &targets,
                                  impl_->has_vertex_costs ? impl_->vertex_costs.get() : nullptr,
+                                 impl_->has_node_coordinates ? impl_->node_x.get() : nullptr,
+                                 impl_->has_node_coordinates ? impl_->node_y.get() : nullptr,
+                                 bounds,
                                  delta,
                                  max_iters,
                                  stream,
@@ -1700,14 +1764,16 @@ DeltaSteppingCsrResult DeltaSteppingCsrWorkspace::run(
     int max_iters,
     hipStream_t stream,
     DeltaSteppingCsrProgressCallback progress_callback,
-    void* progress_user_data) {
+    void* progress_user_data,
+    DeltaSteppingNodeBounds bounds) {
   return run(std::vector<int>{source},
              target,
              delta,
              max_iters,
              stream,
              progress_callback,
-             progress_user_data);
+             progress_user_data,
+             bounds);
 }
 
 DeltaSteppingCsrResult delta_stepping_minplus_hip_csr(
@@ -1726,7 +1792,15 @@ DeltaSteppingCsrResult delta_stepping_minplus_hip_csr(
   OutgoingCsrOwner outgoing = build_outgoing_csr_from_incoming(d_adjacency, stream);
   DeltaSteppingScratch scratch(d_adjacency.rows);
   return run_delta_stepping_impl(d_adjacency, outgoing, scratch, sources, target,
-                                 nullptr, nullptr, delta, max_iters, stream, progress_callback,
+                                 nullptr,
+                                 nullptr,
+                                 nullptr,
+                                 nullptr,
+                                 DeltaSteppingNodeBounds{},
+                                 delta,
+                                 max_iters,
+                                 stream,
+                                 progress_callback,
                                  progress_user_data);
 }
 

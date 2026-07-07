@@ -121,6 +121,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--history-factor", type=float)
     parser.add_argument("--net-limit", type=int)
     parser.add_argument("--route-batch-size", type=int)
+    parser.add_argument("--spatial-prune-margin", type=int)
     parser.add_argument(
         "--keep-work-dir",
         action="store_true",
@@ -146,6 +147,7 @@ def pathfinder_args(args: argparse.Namespace) -> list[str]:
         ("history_factor", "--history-factor"),
         ("net_limit", "--net-limit"),
         ("route_batch_size", "--route-batch-size"),
+        ("spatial_prune_margin", "--spatial-prune-margin"),
     ):
         value = getattr(args, attr)
         if value is not None:
