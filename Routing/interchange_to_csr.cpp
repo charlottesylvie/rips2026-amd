@@ -106,10 +106,10 @@ enum class NodeBoundsMode {
 // makes early experiments tractable; --full-device can expand to all XY tiles.
 struct Bounds {
   // Matches nxroute-poc.py's default clock-region subset.
-  int min_x = 36;
-  int max_x = 90;
-  int min_y = 60;
-  int max_y = 239;
+  int min_x = 0;
+  int max_x = 1000;
+  int min_y = 0;
+  int max_y = 1000;
 };
 
 // Concrete site instances are resolved through their tile instance, tile type,
