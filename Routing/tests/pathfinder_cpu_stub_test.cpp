@@ -7,11 +7,23 @@
 
 namespace {
 
-int g_targeted_delta_calls = 0;
+int g_multisource_delta_calls = 0;
 
-std::vector<float> cpu_dijkstra_incoming_csr(const HostCsrF32& graph,
-                                             int source) {
-  std::vector<std::vector<std::pair<int, float>>> outgoing(
+struct CpuSsspResult {
+  std::vector<float> dist;
+  std::vector<int> pred_node;
+  std::vector<minplus_sparse::Offset> pred_edge;
+};
+
+CpuSsspResult cpu_dijkstra_incoming_csr_multi(const HostCsrF32& graph,
+                                              const std::vector<int>& sources) {
+  struct OutEdge {
+    int to = -1;
+    float weight = 0.0f;
+    minplus_sparse::Offset edge = -1;
+  };
+
+  std::vector<std::vector<OutEdge>> outgoing(
       static_cast<std::size_t>(graph.rows));
   for (int dst = 0; dst < graph.rows; ++dst) {
     for (minplus_sparse::Offset edge = graph.rowptr[static_cast<std::size_t>(dst)];
@@ -19,32 +31,44 @@ std::vector<float> cpu_dijkstra_incoming_csr(const HostCsrF32& graph,
          ++edge) {
       const int src = graph.colind[static_cast<std::size_t>(edge)];
       const float weight = graph.values[static_cast<std::size_t>(edge)];
-      outgoing[static_cast<std::size_t>(src)].push_back({dst, weight});
+      outgoing[static_cast<std::size_t>(src)].push_back({dst, weight, edge});
     }
   }
 
   constexpr float inf = std::numeric_limits<float>::infinity();
-  std::vector<float> dist(static_cast<std::size_t>(graph.rows), inf);
+  CpuSsspResult result;
+  result.dist.assign(static_cast<std::size_t>(graph.rows), inf);
+  result.pred_node.assign(static_cast<std::size_t>(graph.rows), -1);
+  result.pred_edge.assign(static_cast<std::size_t>(graph.rows), -1);
   using Item = std::pair<float, int>;
   std::priority_queue<Item, std::vector<Item>, std::greater<Item>> queue;
 
-  dist[static_cast<std::size_t>(source)] = 0.0f;
-  queue.push({0.0f, source});
+  for (const int source : sources) {
+    result.dist[static_cast<std::size_t>(source)] = 0.0f;
+    queue.push({0.0f, source});
+  }
   while (!queue.empty()) {
     const auto [du, u] = queue.top();
     queue.pop();
-    if (du != dist[static_cast<std::size_t>(u)]) {
+    if (du != result.dist[static_cast<std::size_t>(u)]) {
       continue;
     }
-    for (const auto& [v, weight] : outgoing[static_cast<std::size_t>(u)]) {
-      const float candidate = du + weight;
-      if (candidate < dist[static_cast<std::size_t>(v)]) {
-        dist[static_cast<std::size_t>(v)] = candidate;
-        queue.push({candidate, v});
+    for (const OutEdge& edge : outgoing[static_cast<std::size_t>(u)]) {
+      const float candidate = du + edge.weight;
+      if (candidate < result.dist[static_cast<std::size_t>(edge.to)]) {
+        result.dist[static_cast<std::size_t>(edge.to)] = candidate;
+        result.pred_node[static_cast<std::size_t>(edge.to)] = u;
+        result.pred_edge[static_cast<std::size_t>(edge.to)] = edge.edge;
+        queue.push({candidate, edge.to});
       }
     }
   }
-  return dist;
+  return result;
+}
+
+std::vector<float> cpu_dijkstra_incoming_csr(const HostCsrF32& graph,
+                                             int source) {
+  return cpu_dijkstra_incoming_csr_multi(graph, std::vector<int>{source}).dist;
 }
 
 void require(bool condition, const char* message) {
@@ -160,16 +184,38 @@ DeltaSteppingCsrResult delta_stepping_minplus_hip_csr(
     hipStream_t stream,
     DeltaSteppingCsrProgressCallback progress_callback,
     void* progress_user_data) {
+  return delta_stepping_minplus_hip_csr(adjacency,
+                                        std::vector<int>{source},
+                                        target,
+                                        delta,
+                                        max_iters,
+                                        stream,
+                                        progress_callback,
+                                        progress_user_data);
+}
+
+DeltaSteppingCsrResult delta_stepping_minplus_hip_csr(
+    const HostCsrF32& adjacency,
+    const std::vector<int>& sources,
+    int target,
+    float delta,
+    int max_iters,
+    hipStream_t stream,
+    DeltaSteppingCsrProgressCallback progress_callback,
+    void* progress_user_data) {
   (void)delta;
   (void)max_iters;
   (void)stream;
   (void)progress_callback;
   (void)progress_user_data;
-  ++g_targeted_delta_calls;
+  ++g_multisource_delta_calls;
 
   DeltaSteppingCsrResult result;
   result.target = target;
-  result.dist = cpu_dijkstra_incoming_csr(adjacency, source);
+  CpuSsspResult cpu_result = cpu_dijkstra_incoming_csr_multi(adjacency, sources);
+  result.dist = std::move(cpu_result.dist);
+  result.pred_node = std::move(cpu_result.pred_node);
+  result.pred_edge = std::move(cpu_result.pred_edge);
   result.iterations_used = 1;
   result.target_distance = result.dist[static_cast<std::size_t>(target)];
   result.target_reached = std::isfinite(result.target_distance);
@@ -235,7 +281,7 @@ int main() {
   require(congestion_result.nets[1].sinks[0].nodes == std::vector<int>({1, 3, 5}),
           "second net should use the bypass path after node 2 is occupied");
 
-  g_targeted_delta_calls = 0;
+  g_multisource_delta_calls = 0;
   routing::PathfinderOptions options;
   options.max_pathfinder_iterations = 1;
   options.delta = 1.0f;
@@ -262,8 +308,8 @@ int main() {
           "route tree should contain nodes 0,1,2,3");
   require(result.occupancy == std::vector<int>({1, 1, 1, 1}),
           "all route tree nodes should be occupied once");
-  require(g_targeted_delta_calls == 4,
-          "PathFinder should call targeted delta stepping for source candidates");
+  require(g_multisource_delta_calls == 2,
+          "PathFinder should call multi-source delta stepping once per sink");
 
   const std::filesystem::path routes_path = "/tmp/pathfinder_cpu_stub_routes.jsonl";
   routing::write_routes_jsonl(routes_path, graph, metadata, result);

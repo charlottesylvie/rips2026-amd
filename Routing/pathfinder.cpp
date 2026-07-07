@@ -161,6 +161,137 @@ std::vector<int> nodes_from_path(int source, const std::vector<PathEdge>& edges)
   return nodes;
 }
 
+bool tree_contains(const std::vector<std::uint8_t>& tree_seen, int node) {
+  return node >= 0 &&
+         static_cast<std::size_t>(node) < tree_seen.size() &&
+         tree_seen[static_cast<std::size_t>(node)] != 0;
+}
+
+std::vector<PathEdge> reconstruct_shortest_path_from_tree_dist(
+    const HostCsrF32& graph,
+    const std::vector<float>& dist,
+    const std::vector<std::uint8_t>& tree_seen,
+    int target,
+    int* source_out) {
+  *source_out = -1;
+  validate_csr(graph);
+  if (!valid_node(target, graph.rows)) {
+    throw std::out_of_range("target is outside the CSR graph");
+  }
+  if (dist.size() != static_cast<std::size_t>(graph.rows) ||
+      tree_seen.size() != static_cast<std::size_t>(graph.rows)) {
+    throw std::invalid_argument("distance/tree vector size does not match CSR rows");
+  }
+  if (!std::isfinite(dist[static_cast<std::size_t>(target)])) {
+    return {};
+  }
+
+  std::vector<PathEdge> reversed;
+  int current = target;
+  for (minplus_sparse::Offset guard = 0; guard < graph.rows; ++guard) {
+    if (tree_contains(tree_seen, current)) {
+      *source_out = current;
+      std::reverse(reversed.begin(), reversed.end());
+      return reversed;
+    }
+
+    const std::size_t row = static_cast<std::size_t>(current);
+    const float current_dist = dist[row];
+    minplus_sparse::Offset best_edge = -1;
+    int best_pred = -1;
+    float best_error = std::numeric_limits<float>::infinity();
+
+    for (minplus_sparse::Offset edge = graph.rowptr[row];
+         edge < graph.rowptr[row + 1];
+         ++edge) {
+      const int pred = graph.colind[static_cast<std::size_t>(edge)];
+      if (pred == current) {
+        continue;
+      }
+      const float pred_dist = dist[static_cast<std::size_t>(pred)];
+      if (!std::isfinite(pred_dist)) {
+        continue;
+      }
+      const float candidate =
+          pred_dist + graph.values[static_cast<std::size_t>(edge)];
+      const float error = std::fabs(candidate - current_dist);
+      const float tolerance =
+          1e-3f * std::max({1.0f, std::fabs(candidate), std::fabs(current_dist)});
+      if (error <= tolerance && error < best_error) {
+        best_error = error;
+        best_edge = edge;
+        best_pred = pred;
+      }
+    }
+
+    if (best_edge < 0) {
+      throw std::runtime_error("could not reconstruct shortest path predecessor");
+    }
+
+    reversed.push_back({best_pred,
+                        current,
+                        best_edge,
+                        graph.values[static_cast<std::size_t>(best_edge)]});
+    current = best_pred;
+  }
+
+  throw std::runtime_error("shortest path reconstruction did not reach route tree");
+}
+
+std::vector<PathEdge> reconstruct_shortest_path_from_tree_pred(
+    const HostCsrF32& graph,
+    const DeltaSteppingCsrResult& sssp,
+    const std::vector<std::uint8_t>& tree_seen,
+    int target,
+    int* source_out) {
+  *source_out = -1;
+  if (sssp.pred_node.size() != static_cast<std::size_t>(graph.rows) ||
+      sssp.pred_edge.size() != static_cast<std::size_t>(graph.rows) ||
+      tree_seen.size() != static_cast<std::size_t>(graph.rows)) {
+    return reconstruct_shortest_path_from_tree_dist(
+        graph, sssp.dist, tree_seen, target, source_out);
+  }
+
+  std::vector<PathEdge> reversed;
+  int current = target;
+  for (minplus_sparse::Offset guard = 0; guard < graph.rows; ++guard) {
+    if (tree_contains(tree_seen, current)) {
+      *source_out = current;
+      std::reverse(reversed.begin(), reversed.end());
+      return reversed;
+    }
+
+    if (!valid_node(current, graph.rows)) {
+      throw std::runtime_error("predecessor path left the CSR graph");
+    }
+    const std::size_t current_index = static_cast<std::size_t>(current);
+    const int pred = sssp.pred_node[current_index];
+    const minplus_sparse::Offset edge = sssp.pred_edge[current_index];
+    if (!valid_node(pred, graph.rows) ||
+        edge < graph.rowptr[current_index] ||
+        edge >= graph.rowptr[current_index + 1] ||
+        graph.colind[static_cast<std::size_t>(edge)] != pred) {
+      return reconstruct_shortest_path_from_tree_dist(
+          graph, sssp.dist, tree_seen, target, source_out);
+    }
+
+    reversed.push_back({pred,
+                        current,
+                        edge,
+                        graph.values[static_cast<std::size_t>(edge)]});
+    current = pred;
+  }
+
+  throw std::runtime_error("predecessor path did not reach route tree");
+}
+
+void update_costed_graph_values(const HostCsrF32& base_graph,
+                                const std::vector<int>& occupancy,
+                                const std::vector<float>& history,
+                                const PathfinderOptions& options,
+                                float present_factor,
+                                HostCsrF32& graph);
+
 HostCsrF32 make_costed_graph(const HostCsrF32& base_graph,
                              const std::vector<int>& occupancy,
                              const std::vector<float>& history,
@@ -168,7 +299,24 @@ HostCsrF32 make_costed_graph(const HostCsrF32& base_graph,
                              float present_factor) {
   HostCsrF32 graph = base_graph;
   graph.values.resize(base_graph.values.size());
+  update_costed_graph_values(base_graph, occupancy, history, options, present_factor, graph);
+  return graph;
+}
 
+void update_costed_graph_values(const HostCsrF32& base_graph,
+                                const std::vector<int>& occupancy,
+                                const std::vector<float>& history,
+                                const PathfinderOptions& options,
+                                float present_factor,
+                                HostCsrF32& graph) {
+  if (graph.rows != base_graph.rows ||
+      graph.cols != base_graph.cols ||
+      graph.nnz != base_graph.nnz ||
+      graph.rowptr.size() != base_graph.rowptr.size() ||
+      graph.colind.size() != base_graph.colind.size()) {
+    graph = base_graph;
+  }
+  graph.values.resize(base_graph.values.size());
   for (minplus_sparse::Offset dst = 0; dst < base_graph.rows; ++dst) {
     const std::size_t dst_index = static_cast<std::size_t>(dst);
     const int overuse_if_taken =
@@ -187,8 +335,6 @@ HostCsrF32 make_costed_graph(const HostCsrF32& base_graph,
           base_graph.values[static_cast<std::size_t>(edge)] * node_cost;
     }
   }
-
-  return graph;
 }
 
 RoutedSink route_sink_from_tree(const HostCsrF32& graph,
@@ -197,75 +343,57 @@ RoutedSink route_sink_from_tree(const HostCsrF32& graph,
                                int target,
                                const PathfinderOptions& options,
                                hipStream_t stream) {
-  RoutedSink best;
-  best.target = target;
-  best.distance = std::numeric_limits<float>::infinity();
+  RoutedSink routed;
+  routed.target = target;
+  routed.distance = std::numeric_limits<float>::infinity();
 
   if (!valid_node(target, graph.rows)) {
-    return best;
+    return routed;
   }
 
-  for (const int source : source_candidates) {
-    if (!valid_node(source, graph.rows)) {
-      continue;
-    }
-
-    RoutedSink candidate;
-    candidate.source = source;
-    candidate.target = target;
-
-    if (source == target) {
-      candidate.distance = 0.0f;
-      candidate.reached = true;
-      candidate.nodes.push_back(source);
-    } else {
-      DeltaSteppingCsrResult sssp =
-          delta_stepping_minplus_hip_csr(graph,
-                                         source,
-                                         target,
-                                         options.delta,
-                                         options.max_sssp_iterations,
-                                         stream,
-                                         nullptr,
-                                         nullptr);
-      if (!sssp.target_reached ||
-          !std::isfinite(sssp.dist[static_cast<std::size_t>(target)])) {
-        continue;
-      }
-
-      candidate.distance = sssp.dist[static_cast<std::size_t>(target)];
-      candidate.edges = reconstruct_shortest_path(graph, sssp.dist, source, target);
-      candidate.nodes = nodes_from_path(source, candidate.edges);
-      bool reenters_tree = false;
-      for (std::size_t i = 1; i < candidate.nodes.size(); ++i) {
-        const int node = candidate.nodes[i];
-        if (node >= 0 &&
-            static_cast<std::size_t>(node) < tree_seen.size() &&
-            tree_seen[static_cast<std::size_t>(node)] != 0) {
-          reenters_tree = true;
-          break;
-        }
-      }
-      if (reenters_tree) {
-        continue;
-      }
-      candidate.reached = true;
-    }
-
-    if (!candidate.reached) {
-      continue;
-    }
-
-    const bool better_distance = candidate.distance < best.distance;
-    const bool equal_shorter_path =
-        candidate.distance == best.distance &&
-        candidate.nodes.size() < best.nodes.size();
-    if (!best.reached || better_distance || equal_shorter_path) {
-      best = std::move(candidate);
-    }
+  if (tree_contains(tree_seen, target)) {
+    routed.source = target;
+    routed.distance = 0.0f;
+    routed.reached = true;
+    routed.nodes.push_back(target);
+    return routed;
   }
 
-  return best;
+  DeltaSteppingCsrResult sssp =
+      delta_stepping_minplus_hip_csr(graph,
+                                     source_candidates,
+                                     target,
+                                     options.delta,
+                                     options.max_sssp_iterations,
+                                     stream,
+                                     nullptr,
+                                     nullptr);
+  if (!sssp.target_reached ||
+      !std::isfinite(sssp.dist[static_cast<std::size_t>(target)])) {
+    return routed;
+  }
+
+  int source = -1;
+  routed.edges =
+      reconstruct_shortest_path_from_tree_pred(graph, sssp, tree_seen, target, &source);
+  if (!valid_node(source, graph.rows)) {
+    return routed;
+  }
+
+  routed.source = source;
+  routed.distance = sssp.dist[static_cast<std::size_t>(target)];
+  routed.nodes = nodes_from_path(source, routed.edges);
+  for (std::size_t i = 1; i < routed.nodes.size(); ++i) {
+    if (tree_contains(tree_seen, routed.nodes[i])) {
+      routed.edges.clear();
+      routed.nodes.clear();
+      routed.source = -1;
+      routed.distance = std::numeric_limits<float>::infinity();
+      return routed;
+    }
+  }
+  routed.reached = true;
+  return routed;
 }
 
 RoutedNet route_net(const HostCsrF32& graph,
@@ -719,6 +847,7 @@ PathfinderResult run_pathfinder(const HostCsrF32& base_graph,
           ? metadata.route_requests.size()
           : std::min(options.net_limit, metadata.route_requests.size());
   float present_factor = options.initial_present_factor;
+  HostCsrF32 graph = base_graph;
   std::cout << "[pathfinder] setup complete: rows=" << base_graph.rows
             << " nnz=" << base_graph.nnz
             << " route_requests=" << metadata.route_requests.size()
@@ -757,8 +886,12 @@ PathfinderResult run_pathfinder(const HostCsrF32& base_graph,
                   << " sinks=" << request.sinks.size()
                   << "\n" << std::flush;
       }
-      HostCsrF32 graph =
-          make_costed_graph(base_graph, result.occupancy, result.history, options, present_factor);
+      update_costed_graph_values(base_graph,
+                                 result.occupancy,
+                                 result.history,
+                                 options,
+                                 present_factor,
+                                 graph);
       RoutedNet net =
           route_net(graph, metadata.route_requests[net_index], options, stream);
       if (!net.reached_all_sinks) {

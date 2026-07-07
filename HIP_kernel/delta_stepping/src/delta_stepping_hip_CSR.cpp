@@ -165,9 +165,36 @@ inline void validate_common_shape(Offset rows,
   }
 }
 
-inline void validate_host_csr(const HostCsrF32& g, int source, int target, float delta) {
-  validate_common_shape(g.rows, g.cols, g.nnz, source, target);
-  validate_delta(delta);
+inline void validate_source_list_common_shape(Offset rows,
+                                              Offset cols,
+                                              Offset nnz,
+                                              const std::vector<int>& sources,
+                                              int target) {
+  if (rows <= 0) throw std::invalid_argument("CSR graph must contain at least one vertex");
+  if (rows != cols) throw std::invalid_argument("SSSP expects a square CSR adjacency matrix");
+  if (nnz < 0) throw std::invalid_argument("CSR nnz must be nonnegative");
+  if (sources.empty()) {
+    throw std::invalid_argument("at least one source vertex is required");
+  }
+  if (sources.size() >
+      static_cast<std::size_t>(std::numeric_limits<int>::max())) {
+    throw std::overflow_error("source count must fit in int");
+  }
+  for (const int source : sources) {
+    if (source < 0 || static_cast<Offset>(source) >= rows) {
+      throw std::out_of_range("source vertex is outside CSR row range");
+    }
+  }
+  if (target < -1 || static_cast<Offset>(target) >= rows) {
+    throw std::out_of_range("target vertex is outside CSR row range");
+  }
+  if (static_cast<unsigned long long>(rows) >
+      static_cast<unsigned long long>(std::numeric_limits<int>::max())) {
+    throw std::overflow_error("frontier vertices are stored as int; rows must fit in int");
+  }
+}
+
+inline void validate_host_csr_arrays(const HostCsrF32& g) {
   const std::size_t rows = checked_size(g.rows, "rows");
   const std::size_t nnz = checked_size(g.nnz, "nnz");
   if (g.rowptr.size() != rows + 1) throw std::invalid_argument("rowptr.size() must equal rows + 1");
@@ -191,11 +218,38 @@ inline void validate_host_csr(const HostCsrF32& g, int source, int target, float
   }
 }
 
+inline void validate_host_csr(const HostCsrF32& g, int source, int target, float delta) {
+  validate_common_shape(g.rows, g.cols, g.nnz, source, target);
+  validate_delta(delta);
+  validate_host_csr_arrays(g);
+}
+
+inline void validate_host_csr(const HostCsrF32& g,
+                              const std::vector<int>& sources,
+                              int target,
+                              float delta) {
+  validate_source_list_common_shape(g.rows, g.cols, g.nnz, sources, target);
+  validate_delta(delta);
+  validate_host_csr_arrays(g);
+}
+
 inline void validate_device_csr_shape(const minplus_sparse::DeviceCsrF32& g,
                                       int source,
                                       int target,
                                       float delta) {
   validate_common_shape(g.rows, g.cols, g.nnz, source, target);
+  validate_delta(delta);
+  if (g.rowptr == nullptr) throw std::invalid_argument("device CSR rowptr is null");
+  if (g.nnz > 0 && (g.colind == nullptr || g.values == nullptr)) {
+    throw std::invalid_argument("device CSR colind/values are null for a nonempty graph");
+  }
+}
+
+inline void validate_device_csr_shape(const minplus_sparse::DeviceCsrF32& g,
+                                      const std::vector<int>& sources,
+                                      int target,
+                                      float delta) {
+  validate_source_list_common_shape(g.rows, g.cols, g.nnz, sources, target);
   validate_delta(delta);
   if (g.rowptr == nullptr) throw std::invalid_argument("device CSR rowptr is null");
   if (g.nnz > 0 && (g.colind == nullptr || g.values == nullptr)) {
@@ -367,16 +421,61 @@ __global__ void initialize_delta_arrays_kernel(Offset n,
   }
 }
 
-__global__ void initialize_delta_source_kernel(int source,
-                                              float* dist,
-                                              int* in_current,
-                                              int* current_queue,
-                                              int* current_count) {
-  if (blockIdx.x == 0 && threadIdx.x == 0) {
+__global__ void initialize_delta_sources_kernel(const int* sources,
+                                                int source_count,
+                                                float* dist,
+                                                int* in_current,
+                                                int* current_queue,
+                                                int* current_count) {
+  for (int i = blockIdx.x * blockDim.x + threadIdx.x;
+       i < source_count;
+       i += blockDim.x * gridDim.x) {
+    const int source = sources[i];
     dist[source] = 0.0f;
-    in_current[source] = 1;
-    current_queue[0] = source;
-    *current_count = 1;
+    if (atomicCAS(&in_current[source], 0, 1) == 0) {
+      const int pos = atomicAdd(current_count, 1);
+      current_queue[pos] = source;
+    }
+  }
+}
+
+__global__ void compute_predecessors_kernel(Offset rows,
+                                            const Offset* rowptr,
+                                            const Index* colind,
+                                            const float* values,
+                                            const float* dist,
+                                            int* pred_node,
+                                            Offset* pred_edge) {
+  for (Offset v = static_cast<Offset>(blockIdx.x) * blockDim.x + threadIdx.x;
+       v < rows;
+       v += static_cast<Offset>(blockDim.x) * gridDim.x) {
+    const float current_dist = dist[v];
+    int best_pred = -1;
+    Offset best_edge = static_cast<Offset>(-1);
+    float best_error = INFINITY;
+
+    if (isfinite(current_dist)) {
+      for (Offset edge = rowptr[v]; edge < rowptr[v + 1]; ++edge) {
+        const int pred = static_cast<int>(colind[edge]);
+        if (pred == static_cast<int>(v)) continue;
+        const float pred_dist = dist[pred];
+        if (!isfinite(pred_dist)) continue;
+        const float candidate = pred_dist + values[edge];
+        const float error = fabsf(candidate - current_dist);
+        const float tolerance =
+            1e-3f * fmaxf(1.0f, fmaxf(fabsf(candidate), fabsf(current_dist)));
+        if (error <= tolerance &&
+            (error < best_error ||
+             (error == best_error && (best_pred < 0 || pred < best_pred)))) {
+          best_error = error;
+          best_pred = pred;
+          best_edge = edge;
+        }
+      }
+    }
+
+    pred_node[v] = best_pred;
+    pred_edge[v] = best_edge;
   }
 }
 
@@ -633,6 +732,28 @@ float copy_dist_value_to_host(const float* d_dist, int vertex, hipStream_t strea
   return copy_scalar_to_host(d_dist + vertex, stream);
 }
 
+void copy_predecessors_to_result(DeltaSteppingCsrResult& result,
+                                 const minplus_sparse::DeviceCsrF32& graph,
+                                 const float* d_dist,
+                                 hipStream_t stream) {
+  DeviceBuffer<int> d_pred_node(static_cast<std::size_t>(graph.rows));
+  DeviceBuffer<Offset> d_pred_edge(static_cast<std::size_t>(graph.rows));
+  compute_predecessors_kernel<<<grid_for_items(graph.rows), kBlockSize, 0, stream>>>(
+      graph.rows, graph.rowptr, graph.colind, graph.values, d_dist,
+      d_pred_node.get(), d_pred_edge.get());
+  DS_DELTA_HIP_CHECK(hipGetLastError());
+
+  result.pred_node.resize(static_cast<std::size_t>(graph.rows));
+  result.pred_edge.resize(static_cast<std::size_t>(graph.rows));
+  DS_DELTA_HIP_CHECK(hipMemcpyAsync(result.pred_node.data(), d_pred_node.get(),
+                                    static_cast<std::size_t>(graph.rows) * sizeof(int),
+                                    hipMemcpyDeviceToHost, stream));
+  DS_DELTA_HIP_CHECK(hipMemcpyAsync(result.pred_edge.data(), d_pred_edge.get(),
+                                    static_cast<std::size_t>(graph.rows) * sizeof(Offset),
+                                    hipMemcpyDeviceToHost, stream));
+  DS_DELTA_HIP_CHECK(hipStreamSynchronize(stream));
+}
+
 void throw_if_overflow(const int* d_overflow, hipStream_t stream) {
   if (copy_scalar_to_host(d_overflow, stream) != 0) {
     throw std::runtime_error("delta-stepping unique frontier queue overflow");
@@ -667,7 +788,7 @@ int find_min_pending_bucket(const int* d_pending_queue,
 
 DeltaSteppingCsrResult delta_stepping_minplus_hip_csr(
     const minplus_sparse::DeviceCsrF32& d_adjacency,
-    int source,
+    const std::vector<int>& sources,
     int target,
     float delta,
     int max_iters,
@@ -676,17 +797,21 @@ DeltaSteppingCsrResult delta_stepping_minplus_hip_csr(
     void* progress_user_data) {
   using namespace ds_delta_detail;
 
-  validate_device_csr_shape(d_adjacency, source, target, delta);
+  validate_device_csr_shape(d_adjacency, sources, target, delta);
   validate_device_csr_contents(d_adjacency, stream);
   if (max_iters < 0) max_iters = std::numeric_limits<int>::max();
 
   const Offset n = d_adjacency.rows;
   const int n_int = static_cast<int>(n);
+  const int source_count = static_cast<int>(sources.size());
   const float inv_delta = 1.0f / delta;
   const float inf = std::numeric_limits<float>::infinity();
+  const bool target_is_source =
+      target >= 0 && std::find(sources.begin(), sources.end(), target) != sources.end();
 
   OutgoingCsrOwner outgoing = build_outgoing_csr_from_incoming(d_adjacency, stream);
 
+  DeviceBuffer<int> d_sources(static_cast<std::size_t>(source_count));
   DeviceBuffer<float> d_dist(static_cast<std::size_t>(n));
   DeviceBuffer<int> d_in_current(static_cast<std::size_t>(n));
   DeviceBuffer<int> d_in_pending(static_cast<std::size_t>(n));
@@ -705,8 +830,12 @@ DeltaSteppingCsrResult delta_stepping_minplus_hip_csr(
       d_current_count.get(), d_next_count.get(), d_pending_count.get(),
       d_heavy_count.get(), d_overflow.get());
   DS_DELTA_HIP_CHECK(hipGetLastError());
-  initialize_delta_source_kernel<<<1, 1, 0, stream>>>(
-      source, d_dist.get(), d_in_current.get(), d_current_queue.get(), d_current_count.get());
+  DS_DELTA_HIP_CHECK(hipMemcpyAsync(d_sources.get(), sources.data(),
+                                    static_cast<std::size_t>(source_count) * sizeof(int),
+                                    hipMemcpyHostToDevice, stream));
+  initialize_delta_sources_kernel<<<grid_for_items(source_count), kBlockSize, 0, stream>>>(
+      d_sources.get(), source_count, d_dist.get(), d_in_current.get(),
+      d_current_queue.get(), d_current_count.get());
   DS_DELTA_HIP_CHECK(hipGetLastError());
 
   int* current_queue = d_current_queue.get();
@@ -714,14 +843,15 @@ DeltaSteppingCsrResult delta_stepping_minplus_hip_csr(
   int* pending_queue = d_pending_a.get();
   int* pending_scratch = d_pending_b.get();
   int current_bucket = 0;
-  int current_count = 1;
+  int current_count = copy_scalar_to_host(d_current_count.get(), stream);
   int pending_count = 0;
   DeltaSteppingCsrResult result;
   result.target = target;
-  if (target == source) {
+  if (target_is_source) {
     result.target_distance = 0.0f;
     result.target_reached = true;
     result.stopped_on_target = true;
+    copy_predecessors_to_result(result, d_adjacency, d_dist.get(), stream);
     result.dist = copy_dist_to_host(d_dist.get(), n, stream);
     return result;
   }
@@ -829,6 +959,9 @@ DeltaSteppingCsrResult delta_stepping_minplus_hip_csr(
     std::swap(pending_queue, pending_scratch);
   }
 
+  if (target >= 0) {
+    copy_predecessors_to_result(result, d_adjacency, d_dist.get(), stream);
+  }
   result.dist = copy_dist_to_host(d_dist.get(), n, stream);
   if (target >= 0) {
     result.target_distance = result.dist[static_cast<std::size_t>(target)];
@@ -837,6 +970,25 @@ DeltaSteppingCsrResult delta_stepping_minplus_hip_csr(
         (result.target_reached || result.converged);
   }
   return result;
+}
+
+DeltaSteppingCsrResult delta_stepping_minplus_hip_csr(
+    const minplus_sparse::DeviceCsrF32& d_adjacency,
+    int source,
+    int target,
+    float delta,
+    int max_iters,
+    hipStream_t stream,
+    DeltaSteppingCsrProgressCallback progress_callback,
+    void* progress_user_data) {
+  return delta_stepping_minplus_hip_csr(d_adjacency,
+                                        std::vector<int>{source},
+                                        target,
+                                        delta,
+                                        max_iters,
+                                        stream,
+                                        progress_callback,
+                                        progress_user_data);
 }
 
 DeltaSteppingCsrResult delta_stepping_minplus_hip_csr(
@@ -872,6 +1024,22 @@ DeltaSteppingCsrResult delta_stepping_minplus_hip_csr(
   validate_host_csr(adjacency, source, target, delta);
   DeviceCsrOwner d_adjacency = copy_host_csr_to_device(adjacency, stream);
   return delta_stepping_minplus_hip_csr(d_adjacency.view, source, target, delta, max_iters,
+                                        stream, progress_callback, progress_user_data);
+}
+
+DeltaSteppingCsrResult delta_stepping_minplus_hip_csr(
+    const HostCsrF32& adjacency,
+    const std::vector<int>& sources,
+    int target,
+    float delta,
+    int max_iters,
+    hipStream_t stream,
+    DeltaSteppingCsrProgressCallback progress_callback,
+    void* progress_user_data) {
+  using namespace ds_delta_detail;
+  validate_host_csr(adjacency, sources, target, delta);
+  DeviceCsrOwner d_adjacency = copy_host_csr_to_device(adjacency, stream);
+  return delta_stepping_minplus_hip_csr(d_adjacency.view, sources, target, delta, max_iters,
                                         stream, progress_callback, progress_user_data);
 }
 

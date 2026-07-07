@@ -4,6 +4,8 @@
 
 #include <hip/hip_runtime.h>
 
+#include <vector>
+
 // Delta-Stepping SSSP for nonnegative edge weights over the same incoming-edge
 // CSR convention used by bellman_ford_minplus_hip_csr:
 //   adjacency row v, column u = weight of directed edge u -> v.
@@ -15,6 +17,16 @@ using DeltaSteppingCsrResult = BellmanFordCsrResult;
 DeltaSteppingCsrResult delta_stepping_minplus_hip_csr(
     const minplus_sparse::DeviceCsrF32& d_adjacency,
     int source,
+    int target,
+    float delta,
+    int max_iters,
+    hipStream_t stream = nullptr,
+    DeltaSteppingCsrProgressCallback progress_callback = nullptr,
+    void* progress_user_data = nullptr);
+
+DeltaSteppingCsrResult delta_stepping_minplus_hip_csr(
+    const minplus_sparse::DeviceCsrF32& d_adjacency,
+    const std::vector<int>& sources,
     int target,
     float delta,
     int max_iters,
@@ -40,6 +52,16 @@ DeltaSteppingCsrResult delta_stepping_minplus_hip_csr(
 DeltaSteppingCsrResult delta_stepping_minplus_hip_csr(
     const HostCsrF32& adjacency,
     int source,
+    int target,
+    float delta,
+    int max_iters,
+    hipStream_t stream = nullptr,
+    DeltaSteppingCsrProgressCallback progress_callback = nullptr,
+    void* progress_user_data = nullptr);
+
+DeltaSteppingCsrResult delta_stepping_minplus_hip_csr(
+    const HostCsrF32& adjacency,
+    const std::vector<int>& sources,
     int target,
     float delta,
     int max_iters,
@@ -76,6 +98,19 @@ inline DeltaSteppingCsrResult delta_stepping_hip_csr(
 }
 
 inline DeltaSteppingCsrResult delta_stepping_hip_csr(
+    const minplus_sparse::DeviceCsrF32& d_adjacency,
+    const std::vector<int>& sources,
+    int target,
+    float delta,
+    int max_iters,
+    hipStream_t stream = nullptr,
+    DeltaSteppingCsrProgressCallback progress_callback = nullptr,
+    void* progress_user_data = nullptr) {
+  return delta_stepping_minplus_hip_csr(d_adjacency, sources, target, delta, max_iters,
+                                        stream, progress_callback, progress_user_data);
+}
+
+inline DeltaSteppingCsrResult delta_stepping_hip_csr(
     const HostCsrF32& adjacency,
     int source,
     int target,
@@ -85,6 +120,19 @@ inline DeltaSteppingCsrResult delta_stepping_hip_csr(
     DeltaSteppingCsrProgressCallback progress_callback = nullptr,
     void* progress_user_data = nullptr) {
   return delta_stepping_minplus_hip_csr(adjacency, source, target, delta, max_iters,
+                                        stream, progress_callback, progress_user_data);
+}
+
+inline DeltaSteppingCsrResult delta_stepping_hip_csr(
+    const HostCsrF32& adjacency,
+    const std::vector<int>& sources,
+    int target,
+    float delta,
+    int max_iters,
+    hipStream_t stream = nullptr,
+    DeltaSteppingCsrProgressCallback progress_callback = nullptr,
+    void* progress_user_data = nullptr) {
+  return delta_stepping_minplus_hip_csr(adjacency, sources, target, delta, max_iters,
                                         stream, progress_callback, progress_user_data);
 }
 

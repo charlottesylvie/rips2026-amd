@@ -19,6 +19,8 @@ using BellmanFordCsrProgressCallback =
 
 struct BellmanFordCsrResult {
   std::vector<float> dist;
+  std::vector<int> pred_node;
+  std::vector<minplus_sparse::Offset> pred_edge;
   int iterations_used = 0;
   bool converged = false;
   int target = -1;
