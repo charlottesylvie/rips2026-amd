@@ -27,6 +27,13 @@ struct BellmanFordCsrResult {
   float target_distance = std::numeric_limits<float>::infinity();
   bool target_reached = false;
   bool stopped_on_target = false;
+
+  std::vector<float> target_distances;
+  std::vector<int> target_sources;
+  std::vector<int> target_path_offsets;
+  std::vector<int> target_edge_offsets;
+  std::vector<int> target_path_nodes;
+  std::vector<minplus_sparse::Offset> target_path_edges;
 };
 
 struct HostCsrF32 {

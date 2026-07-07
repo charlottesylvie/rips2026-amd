@@ -31,6 +31,9 @@ class DeltaSteppingCsrWorkspace {
   void update_values(const std::vector<float>& values,
                      hipStream_t stream = nullptr);
 
+  void update_vertex_costs(const std::vector<float>& vertex_costs,
+                           hipStream_t stream = nullptr);
+
   DeltaSteppingCsrResult run(
       const std::vector<int>& sources,
       int target,

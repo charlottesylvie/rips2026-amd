@@ -310,6 +310,13 @@ void update_costed_graph_values(const HostCsrF32& base_graph,
                                 float present_factor,
                                 HostCsrF32& graph);
 
+void update_vertex_costs(const HostCsrF32& base_graph,
+                         const std::vector<int>& occupancy,
+                         const std::vector<float>& history,
+                         const PathfinderOptions& options,
+                         float present_factor,
+                         std::vector<float>& vertex_costs);
+
 HostCsrF32 make_costed_graph(const HostCsrF32& base_graph,
                              const std::vector<int>& occupancy,
                              const std::vector<float>& history,
@@ -355,11 +362,42 @@ void update_costed_graph_values(const HostCsrF32& base_graph,
   }
 }
 
+void update_vertex_costs(const HostCsrF32& base_graph,
+                         const std::vector<int>& occupancy,
+                         const std::vector<float>& history,
+                         const PathfinderOptions& options,
+                         float present_factor,
+                         std::vector<float>& vertex_costs) {
+  vertex_costs.resize(static_cast<std::size_t>(base_graph.rows));
+  for (minplus_sparse::Offset dst = 0; dst < base_graph.rows; ++dst) {
+    const std::size_t dst_index = static_cast<std::size_t>(dst);
+    const int overuse_if_taken = occupancy[dst_index] + 1 - options.capacity;
+    const float present_cost =
+        overuse_if_taken > 0
+            ? 1.0f + present_factor * static_cast<float>(overuse_if_taken)
+            : 1.0f;
+    const float historical_cost = 1.0f + history[dst_index];
+    vertex_costs[dst_index] = present_cost * historical_cost;
+  }
+}
+
+float effective_edge_cost(const HostCsrF32& graph,
+                          const std::vector<float>* vertex_costs,
+                          minplus_sparse::Offset edge,
+                          int dst) {
+  const float base_cost = graph.values[static_cast<std::size_t>(edge)];
+  if (vertex_costs == nullptr) {
+    return base_cost;
+  }
+  return base_cost * (*vertex_costs)[static_cast<std::size_t>(dst)];
+}
+
 RoutedNet route_net(const HostCsrF32& graph,
                     DeltaSteppingCsrWorkspace& workspace,
                     const RouteRequest& request,
                     std::vector<std::uint32_t>& tree_seen,
                     std::uint32_t tree_stamp,
+                    const std::vector<float>* vertex_costs,
                     const PathfinderOptions& options,
                     hipStream_t stream) {
   RoutedNet net;
@@ -414,28 +452,110 @@ RoutedNet route_net(const HostCsrF32& graph,
                       nullptr,
                       nullptr);
 
-    for (const std::size_t sink_index : target_sink_indices) {
+    const bool has_compact_target_paths =
+        sssp.target_distances.size() == targets.size() &&
+        sssp.target_sources.size() == targets.size() &&
+        sssp.target_path_offsets.size() == targets.size() + 1 &&
+        sssp.target_edge_offsets.size() == targets.size() + 1;
+
+    for (std::size_t target_pos = 0; target_pos < target_sink_indices.size(); ++target_pos) {
+      const std::size_t sink_index = target_sink_indices[target_pos];
       const int target = request.sinks[sink_index].node;
       RoutedSink& routed_sink = net.sinks[sink_index];
-      if (static_cast<std::size_t>(target) >= sssp.dist.size() ||
-          !std::isfinite(sssp.dist[static_cast<std::size_t>(target)])) {
-        reached_all = false;
-        continue;
+
+      if (has_compact_target_paths) {
+        const float distance = sssp.target_distances[target_pos];
+        const int node_begin = sssp.target_path_offsets[target_pos];
+        const int node_end = sssp.target_path_offsets[target_pos + 1];
+        const int edge_begin = sssp.target_edge_offsets[target_pos];
+        const int edge_end = sssp.target_edge_offsets[target_pos + 1];
+        if (!std::isfinite(distance) ||
+            !valid_node(sssp.target_sources[target_pos], graph.rows) ||
+            node_begin < 0 ||
+            node_end <= node_begin ||
+            edge_begin < 0 ||
+            edge_end < edge_begin ||
+            static_cast<std::size_t>(node_end) > sssp.target_path_nodes.size() ||
+            static_cast<std::size_t>(edge_end) > sssp.target_path_edges.size()) {
+          reached_all = false;
+          continue;
+        }
+
+        std::vector<int> compact_nodes(sssp.target_path_nodes.begin() + node_begin,
+                                       sssp.target_path_nodes.begin() + node_end);
+        std::size_t tree_start = 0;
+        for (std::size_t i = 0; i < compact_nodes.size(); ++i) {
+          if (tree_contains(tree_seen, tree_stamp, compact_nodes[i])) {
+            tree_start = i;
+          }
+        }
+
+        routed_sink.source = compact_nodes[tree_start];
+        routed_sink.nodes.assign(compact_nodes.begin() + static_cast<std::ptrdiff_t>(tree_start),
+                                 compact_nodes.end());
+        const int trimmed_edge_begin = edge_begin + static_cast<int>(tree_start);
+        if (routed_sink.nodes.empty() ||
+            !valid_node(routed_sink.source, graph.rows) ||
+            routed_sink.nodes.back() != target ||
+            static_cast<std::size_t>(edge_end - trimmed_edge_begin) + 1 !=
+                routed_sink.nodes.size()) {
+          reached_all = false;
+          routed_sink.nodes.clear();
+          continue;
+        }
+
+        routed_sink.edges.reserve(static_cast<std::size_t>(edge_end - trimmed_edge_begin));
+        bool valid_path = true;
+        float path_distance = 0.0f;
+        for (int edge_index = trimmed_edge_begin; edge_index < edge_end; ++edge_index) {
+          const std::size_t path_index =
+              static_cast<std::size_t>(edge_index - trimmed_edge_begin);
+          const int from = routed_sink.nodes[path_index];
+          const int to = routed_sink.nodes[path_index + 1];
+          const minplus_sparse::Offset csr_edge =
+              sssp.target_path_edges[static_cast<std::size_t>(edge_index)];
+          if (!valid_node(from, graph.rows) ||
+              !valid_node(to, graph.rows) ||
+              csr_edge < graph.rowptr[static_cast<std::size_t>(to)] ||
+              csr_edge >= graph.rowptr[static_cast<std::size_t>(to + 1)] ||
+              graph.colind[static_cast<std::size_t>(csr_edge)] != from) {
+            valid_path = false;
+            break;
+          }
+          const float cost = effective_edge_cost(graph, vertex_costs, csr_edge, to);
+          path_distance += cost;
+          routed_sink.edges.push_back(
+              {from, to, csr_edge, cost});
+        }
+        if (!valid_path) {
+          reached_all = false;
+          routed_sink.edges.clear();
+          routed_sink.nodes.clear();
+          continue;
+        }
+        routed_sink.distance = path_distance;
+      } else {
+        if (static_cast<std::size_t>(target) >= sssp.dist.size() ||
+            !std::isfinite(sssp.dist[static_cast<std::size_t>(target)])) {
+          reached_all = false;
+          continue;
+        }
+
+        int source = -1;
+        routed_sink.edges =
+            reconstruct_shortest_path_from_tree_pred(
+                graph, sssp, tree_seen, tree_stamp, target, &source);
+        if (!valid_node(source, graph.rows)) {
+          reached_all = false;
+          routed_sink.edges.clear();
+          continue;
+        }
+
+        routed_sink.source = source;
+        routed_sink.distance = sssp.dist[static_cast<std::size_t>(target)];
+        routed_sink.nodes = nodes_from_path(source, routed_sink.edges);
       }
 
-      int source = -1;
-      routed_sink.edges =
-          reconstruct_shortest_path_from_tree_pred(
-              graph, sssp, tree_seen, tree_stamp, target, &source);
-      if (!valid_node(source, graph.rows)) {
-        reached_all = false;
-        routed_sink.edges.clear();
-        continue;
-      }
-
-      routed_sink.source = source;
-      routed_sink.distance = sssp.dist[static_cast<std::size_t>(target)];
-      routed_sink.nodes = nodes_from_path(source, routed_sink.edges);
       routed_sink.reached = true;
       for (const int node : routed_sink.nodes) {
         add_unique_node(source_candidates, tree_seen, tree_stamp, node);
@@ -873,8 +993,8 @@ PathfinderResult run_pathfinder(const HostCsrF32& base_graph,
           ? metadata.route_requests.size()
           : std::min(options.net_limit, metadata.route_requests.size());
   float present_factor = options.initial_present_factor;
-  HostCsrF32 graph = base_graph;
-  DeltaSteppingCsrWorkspace sssp_workspace(graph, stream);
+  DeltaSteppingCsrWorkspace sssp_workspace(base_graph, stream);
+  std::vector<float> vertex_costs(static_cast<std::size_t>(base_graph.rows), 1.0f);
   std::vector<std::uint32_t> route_tree_seen(static_cast<std::size_t>(base_graph.rows), 0);
   std::uint32_t route_tree_stamp = 0;
   std::cout << "[pathfinder] setup complete: rows=" << base_graph.rows
@@ -908,13 +1028,13 @@ PathfinderResult run_pathfinder(const HostCsrF32& base_graph,
     for (std::size_t batch_begin = 0; batch_begin < route_request_count;) {
       const std::size_t batch_end =
           std::min(route_request_count, batch_begin + options.route_batch_size);
-      update_costed_graph_values(base_graph,
-                                 result.occupancy,
-                                 result.history,
-                                 options,
-                                 present_factor,
-                                 graph);
-      sssp_workspace.update_values(graph.values, stream);
+      update_vertex_costs(base_graph,
+                          result.occupancy,
+                          result.history,
+                          options,
+                          present_factor,
+                          vertex_costs);
+      sssp_workspace.update_vertex_costs(vertex_costs, stream);
 
       const std::size_t batch_result_begin = result.nets.size();
       for (std::size_t net_index = batch_begin; net_index < batch_end; ++net_index) {
@@ -931,11 +1051,12 @@ PathfinderResult run_pathfinder(const HostCsrF32& base_graph,
         const std::uint32_t tree_stamp =
             next_tree_stamp(route_tree_seen, &route_tree_stamp);
         RoutedNet net =
-            route_net(graph,
+            route_net(base_graph,
                       sssp_workspace,
                       metadata.route_requests[net_index],
                       route_tree_seen,
                       tree_stamp,
+                      &vertex_costs,
                       options,
                       stream);
         if (!net.reached_all_sinks) {

@@ -177,6 +177,7 @@ routing::RoutingMetadata make_two_net_metadata(const HostCsrF32& graph) {
 
 struct DeltaSteppingCsrWorkspace::Impl {
   HostCsrF32 graph;
+  std::vector<float> base_values;
 };
 
 DeltaSteppingCsrWorkspace::DeltaSteppingCsrWorkspace(const HostCsrF32& adjacency,
@@ -184,6 +185,7 @@ DeltaSteppingCsrWorkspace::DeltaSteppingCsrWorkspace(const HostCsrF32& adjacency
     : impl_(std::make_unique<Impl>()) {
   (void)stream;
   impl_->graph = adjacency;
+  impl_->base_values = adjacency.values;
 }
 
 DeltaSteppingCsrWorkspace::~DeltaSteppingCsrWorkspace() = default;
@@ -196,6 +198,23 @@ void DeltaSteppingCsrWorkspace::update_values(const std::vector<float>& values,
                                               hipStream_t stream) {
   (void)stream;
   impl_->graph.values = values;
+  impl_->base_values = values;
+}
+
+void DeltaSteppingCsrWorkspace::update_vertex_costs(
+    const std::vector<float>& vertex_costs,
+    hipStream_t stream) {
+  (void)stream;
+  impl_->graph.values.resize(impl_->base_values.size());
+  for (int dst = 0; dst < impl_->graph.rows; ++dst) {
+    const float node_cost = vertex_costs[static_cast<std::size_t>(dst)];
+    for (minplus_sparse::Offset edge = impl_->graph.rowptr[static_cast<std::size_t>(dst)];
+         edge < impl_->graph.rowptr[static_cast<std::size_t>(dst + 1)];
+         ++edge) {
+      impl_->graph.values[static_cast<std::size_t>(edge)] =
+          impl_->base_values[static_cast<std::size_t>(edge)] * node_cost;
+    }
+  }
 }
 
 DeltaSteppingCsrResult DeltaSteppingCsrWorkspace::run(
@@ -224,15 +243,70 @@ DeltaSteppingCsrResult DeltaSteppingCsrWorkspace::run(
     hipStream_t stream,
     DeltaSteppingCsrProgressCallback progress_callback,
     void* progress_user_data) {
-  (void)targets;
-  return delta_stepping_minplus_hip_csr(impl_->graph,
-                                        sources,
-                                        -1,
-                                        delta,
-                                        max_iters,
-                                        stream,
-                                        progress_callback,
-                                        progress_user_data);
+  DeltaSteppingCsrResult result =
+      delta_stepping_minplus_hip_csr(impl_->graph,
+                                     sources,
+                                     -1,
+                                     delta,
+                                     max_iters,
+                                     stream,
+                                     progress_callback,
+                                     progress_user_data);
+  result.target_distances.resize(targets.size(), std::numeric_limits<float>::infinity());
+  result.target_sources.resize(targets.size(), -1);
+  result.target_path_offsets.assign(targets.size() + 1, 0);
+  result.target_edge_offsets.assign(targets.size() + 1, 0);
+  for (std::size_t i = 0; i < targets.size(); ++i) {
+    const int target = targets[i];
+    result.target_path_offsets[i] =
+        static_cast<int>(result.target_path_nodes.size());
+    result.target_edge_offsets[i] =
+        static_cast<int>(result.target_path_edges.size());
+    if (target < 0 ||
+        static_cast<std::size_t>(target) >= result.dist.size() ||
+        !std::isfinite(result.dist[static_cast<std::size_t>(target)])) {
+      result.target_reached = false;
+      continue;
+    }
+
+    result.target_distances[i] = result.dist[static_cast<std::size_t>(target)];
+    std::vector<int> reversed_nodes;
+    std::vector<minplus_sparse::Offset> reversed_edges;
+    int current = target;
+    for (int guard = 0; guard < impl_->graph.rows; ++guard) {
+      reversed_nodes.push_back(current);
+      if (std::find(sources.begin(), sources.end(), current) != sources.end()) {
+        result.target_sources[i] = current;
+        break;
+      }
+      const int pred = result.pred_node[static_cast<std::size_t>(current)];
+      if (pred < 0) {
+        break;
+      }
+      reversed_edges.push_back(result.pred_edge[static_cast<std::size_t>(current)]);
+      current = pred;
+    }
+    if (result.target_sources[i] < 0) {
+      result.target_reached = false;
+      continue;
+    }
+    std::reverse(reversed_nodes.begin(), reversed_nodes.end());
+    std::reverse(reversed_edges.begin(), reversed_edges.end());
+    result.target_path_nodes.insert(result.target_path_nodes.end(),
+                                    reversed_nodes.begin(),
+                                    reversed_nodes.end());
+    result.target_path_edges.insert(result.target_path_edges.end(),
+                                    reversed_edges.begin(),
+                                    reversed_edges.end());
+  }
+  result.target_path_offsets[targets.size()] =
+      static_cast<int>(result.target_path_nodes.size());
+  result.target_edge_offsets[targets.size()] =
+      static_cast<int>(result.target_path_edges.size());
+  result.dist.clear();
+  result.pred_node.clear();
+  result.pred_edge.clear();
+  return result;
 }
 
 DeltaSteppingCsrResult DeltaSteppingCsrWorkspace::run(
