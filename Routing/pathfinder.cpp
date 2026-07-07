@@ -378,6 +378,23 @@ std::uint64_t edge_key(int from, int to) {
          static_cast<std::uint32_t>(to);
 }
 
+void print_pathfinder_progress(int iteration,
+                               int max_iterations,
+                               std::size_t completed_nets,
+                               std::size_t total_nets) {
+  constexpr int kWidth = 30;
+  const int filled =
+      total_nets == 0 ? kWidth : static_cast<int>((completed_nets * kWidth) / total_nets);
+  std::cout << "\r[pathfinder] iter " << iteration << "/" << max_iterations << " [";
+  for (int i = 0; i < kWidth; ++i) {
+    std::cout << (i < filled ? '#' : '-');
+  }
+  std::cout << "] " << completed_nets << "/" << total_nets << " nets" << std::flush;
+  if (completed_nets >= total_nets) {
+    std::cout << "\n";
+  }
+}
+
 }  // namespace
 
 std::filesystem::path default_metadata_path(const std::filesystem::path& csr_path) {
@@ -709,6 +726,14 @@ PathfinderResult run_pathfinder(const HostCsrF32& base_graph,
     std::fill(result.occupancy.begin(), result.occupancy.end(), 0);
     result.nets.clear();
     result.nets.reserve(route_request_count);
+    const std::size_t progress_interval =
+        std::max<std::size_t>(1, route_request_count / 100);
+    if (route_request_count == 0) {
+      print_pathfinder_progress(iteration + 1,
+                                options.max_pathfinder_iterations,
+                                0,
+                                0);
+    }
 
     bool all_sinks_reached = true;
     for (std::size_t net_index = 0; net_index < route_request_count; ++net_index) {
@@ -721,6 +746,13 @@ PathfinderResult run_pathfinder(const HostCsrF32& base_graph,
       }
       commit_net_occupancy(net, result.occupancy);
       result.nets.push_back(std::move(net));
+      if ((net_index + 1) == route_request_count ||
+          (net_index + 1) % progress_interval == 0) {
+        print_pathfinder_progress(iteration + 1,
+                                  options.max_pathfinder_iterations,
+                                  net_index + 1,
+                                  route_request_count);
+      }
     }
 
     result.iterations_used = iteration + 1;
@@ -730,6 +762,12 @@ PathfinderResult run_pathfinder(const HostCsrF32& base_graph,
                             &result.overused_nodes,
                             &result.max_occupancy);
     result.routed = all_sinks_reached && result.overused_nodes == 0;
+    std::cout << "[pathfinder] iter " << result.iterations_used
+              << " summary: all_sinks_reached="
+              << (result.all_sinks_reached ? "true" : "false")
+              << " overused_nodes=" << result.overused_nodes
+              << " max_occupancy=" << result.max_occupancy
+              << " routed=" << (result.routed ? "true" : "false") << "\n";
     if (result.routed) {
       break;
     }

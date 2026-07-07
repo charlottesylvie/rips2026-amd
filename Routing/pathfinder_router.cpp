@@ -86,6 +86,16 @@ std::string command_to_string(const std::vector<std::string>& argv) {
   return out.str();
 }
 
+void print_progress(int completed, int total, const std::string& label) {
+  constexpr int kWidth = 28;
+  const int filled = total == 0 ? kWidth : (completed * kWidth) / total;
+  std::cout << "[pathfinder-router] [";
+  for (int i = 0; i < kWidth; ++i) {
+    std::cout << (i < filled ? '#' : '-');
+  }
+  std::cout << "] " << completed << "/" << total << " " << label << "\n";
+}
+
 void run_command(const std::vector<std::string>& argv, const char* label) {
   const std::string command = command_to_string(argv);
   std::cout << "[pathfinder-router] " << label << ": " << command << "\n";
@@ -241,6 +251,8 @@ int main(int argc, char** argv) {
     const std::filesystem::path routes_path =
         work_dir / (options.output_phys.stem().string() + ".routes.jsonl");
 
+    print_progress(0, 3, "starting");
+
     std::vector<std::string> convert_cmd = {
         options.interchange_to_csr,
         options.input_phys.string(),
@@ -255,6 +267,7 @@ int main(int argc, char** argv) {
                        options.converter_args.begin(),
                        options.converter_args.end());
     run_command(convert_cmd, "convert FPGAIF to CSR");
+    print_progress(1, 3, "CSR conversion complete");
 
     std::vector<std::string> pathfinder_cmd = {
         options.pathfinder,
@@ -267,6 +280,7 @@ int main(int argc, char** argv) {
                           options.pathfinder_args.begin(),
                           options.pathfinder_args.end());
     run_command(pathfinder_cmd, "run PathFinder");
+    print_progress(2, 3, "PathFinder complete");
 
     run_command({options.routes_to_phys,
                  options.input_phys.string(),
@@ -274,6 +288,7 @@ int main(int argc, char** argv) {
                  routes_path.string(),
                  options.output_phys.string()},
                 "reconstruct routed PhysicalNetlist");
+    print_progress(3, 3, "routed PhysicalNetlist written");
 
     if (cleanup_work_dir) {
       std::filesystem::remove_all(work_dir);
