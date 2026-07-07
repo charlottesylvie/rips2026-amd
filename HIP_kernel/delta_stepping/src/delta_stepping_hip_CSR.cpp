@@ -126,6 +126,8 @@ struct OutgoingCsrOwner {
 struct DeltaSteppingScratch {
   Offset rows = 0;
   DeviceBuffer<int> sources;
+  DeviceBuffer<int> targets;
+  DeviceBuffer<int> target_settled;
   DeviceBuffer<float> dist;
   DeviceBuffer<int> in_current;
   DeviceBuffer<int> in_pending;
@@ -141,6 +143,7 @@ struct DeltaSteppingScratch {
   DeviceBuffer<int> new_pending_count;
   DeviceBuffer<int> heavy_count;
   DeviceBuffer<int> overflow;
+  DeviceBuffer<int> settled_target_count;
   DeviceBuffer<int> block_mins;
   DeviceBuffer<int> pred_node;
   DeviceBuffer<Offset> pred_edge;
@@ -164,6 +167,7 @@ struct DeltaSteppingScratch {
         new_pending_count(1),
         heavy_count(1),
         overflow(1),
+        settled_target_count(1),
         block_mins(static_cast<std::size_t>(
             (static_cast<int>(rows_) + kBlockSize - 1) / kBlockSize + 1)),
         pred_node(static_cast<std::size_t>(rows_)),
@@ -172,6 +176,13 @@ struct DeltaSteppingScratch {
   void ensure_source_capacity(std::size_t source_count) {
     if (sources.size() < source_count) {
       sources.reset(source_count);
+    }
+  }
+
+  void ensure_target_capacity(std::size_t target_count) {
+    if (targets.size() < target_count) {
+      targets.reset(target_count);
+      target_settled.reset(target_count);
     }
   }
 };
@@ -246,6 +257,22 @@ inline void validate_source_list_common_shape(Offset rows,
   if (static_cast<unsigned long long>(rows) >
       static_cast<unsigned long long>(std::numeric_limits<int>::max())) {
     throw std::overflow_error("frontier vertices are stored as int; rows must fit in int");
+  }
+}
+
+inline void validate_target_list_common_shape(Offset rows,
+                                              const std::vector<int>& targets) {
+  if (targets.empty()) {
+    throw std::invalid_argument("at least one target vertex is required");
+  }
+  if (targets.size() >
+      static_cast<std::size_t>(std::numeric_limits<int>::max())) {
+    throw std::overflow_error("target count must fit in int");
+  }
+  for (const int target : targets) {
+    if (target < 0 || static_cast<Offset>(target) >= rows) {
+      throw std::out_of_range("target vertex is outside CSR row range");
+    }
   }
 }
 
@@ -544,6 +571,27 @@ __global__ void compute_predecessors_kernel(Offset rows,
 
     pred_node[v] = best_pred;
     pred_edge[v] = best_edge;
+  }
+}
+
+__global__ void mark_settled_targets_kernel(const int* targets,
+                                            int target_count,
+                                            int current_bucket,
+                                            float inv_delta,
+                                            const float* dist,
+                                            int* target_settled,
+                                            int* settled_count) {
+  for (int i = blockIdx.x * blockDim.x + threadIdx.x;
+       i < target_count;
+       i += blockDim.x * gridDim.x) {
+    if (target_settled[i] != 0) continue;
+    const int target = targets[i];
+    const float target_distance = dist[target];
+    if (isfinite(target_distance) &&
+        bucket_index(target_distance, inv_delta) <= current_bucket &&
+        atomicCAS(&target_settled[i], 0, 1) == 0) {
+      atomicAdd(settled_count, 1);
+    }
   }
 }
 
@@ -867,12 +915,26 @@ int find_min_pending_bucket(const int* d_pending_queue,
   return min_bucket;
 }
 
+int mark_and_count_settled_targets(DeltaSteppingScratch& scratch,
+                                   int target_count,
+                                   int current_bucket,
+                                   float inv_delta,
+                                   hipStream_t stream) {
+  mark_settled_targets_kernel<<<grid_for_items(target_count), kBlockSize, 0, stream>>>(
+      scratch.targets.get(), target_count, current_bucket, inv_delta,
+      scratch.dist.get(), scratch.target_settled.get(),
+      scratch.settled_target_count.get());
+  DS_DELTA_HIP_CHECK(hipGetLastError());
+  return copy_scalar_to_host(scratch.settled_target_count.get(), stream);
+}
+
 DeltaSteppingCsrResult run_delta_stepping_impl(
     const minplus_sparse::DeviceCsrF32& d_adjacency,
     const OutgoingCsrOwner& outgoing,
     DeltaSteppingScratch& scratch,
     const std::vector<int>& sources,
     int target,
+    const std::vector<int>* targets,
     float delta,
     int max_iters,
     hipStream_t stream,
@@ -883,12 +945,26 @@ DeltaSteppingCsrResult run_delta_stepping_impl(
   const Offset n = d_adjacency.rows;
   const int n_int = static_cast<int>(n);
   const int source_count = static_cast<int>(sources.size());
+  const bool use_target_set = targets != nullptr;
+  const int target_count = use_target_set ? static_cast<int>(targets->size()) : 0;
   const float inv_delta = 1.0f / delta;
   const float inf = std::numeric_limits<float>::infinity();
   const bool target_is_source =
+      !use_target_set &&
       target >= 0 && std::find(sources.begin(), sources.end(), target) != sources.end();
 
   scratch.ensure_source_capacity(static_cast<std::size_t>(source_count));
+  if (use_target_set) {
+    scratch.ensure_target_capacity(static_cast<std::size_t>(target_count));
+    DS_DELTA_HIP_CHECK(hipMemcpyAsync(scratch.targets.get(), targets->data(),
+                                      static_cast<std::size_t>(target_count) * sizeof(int),
+                                      hipMemcpyHostToDevice, stream));
+    DS_DELTA_HIP_CHECK(hipMemsetAsync(scratch.target_settled.get(),
+                                      0,
+                                      static_cast<std::size_t>(target_count) * sizeof(int),
+                                      stream));
+    reset_int_zero_async(scratch.settled_target_count.get(), stream);
+  }
   initialize_delta_arrays_kernel<<<grid_for_items(n), kBlockSize, 0, stream>>>(
       n, inf, scratch.dist.get(), scratch.in_current.get(), scratch.in_pending.get(),
       scratch.in_heavy.get(), scratch.current_count.get(), scratch.next_count.get(),
@@ -961,7 +1037,24 @@ DeltaSteppingCsrResult run_delta_stepping_impl(
     }
 
     result.iterations_used = iter + 1;
-    if (target >= 0) {
+    if (use_target_set) {
+      const int settled_count =
+          mark_and_count_settled_targets(scratch, target_count, current_bucket,
+                                         inv_delta, stream);
+      if (settled_count >= target_count) {
+        result.target_reached = true;
+        result.stopped_on_target = true;
+        if (progress_callback) {
+          DeltaSteppingCsrProgress progress;
+          progress.iteration = result.iterations_used;
+          progress.max_iters = max_iters;
+          progress.convergence_checked = true;
+          progress.changed = true;
+          progress_callback(progress, progress_user_data);
+        }
+        break;
+      }
+    } else if (target >= 0) {
       const float target_distance = copy_dist_value_to_host(scratch.dist.get(), target, stream);
       const bool target_settled =
           std::isfinite(target_distance) &&
@@ -1025,12 +1118,22 @@ DeltaSteppingCsrResult run_delta_stepping_impl(
     std::swap(pending_queue, pending_scratch);
   }
 
-  if (target >= 0) {
+  if (target >= 0 || use_target_set) {
     copy_predecessors_to_result(result, d_adjacency, scratch.dist.get(),
                                 scratch.pred_node.get(), scratch.pred_edge.get(), stream);
   }
   result.dist = copy_dist_to_host(scratch.dist.get(), n, stream);
-  if (target >= 0) {
+  if (use_target_set) {
+    bool all_targets_reached = true;
+    for (const int sink : *targets) {
+      if (!std::isfinite(result.dist[static_cast<std::size_t>(sink)])) {
+        all_targets_reached = false;
+        break;
+      }
+    }
+    result.target = -1;
+    result.target_reached = all_targets_reached;
+  } else if (target >= 0) {
     result.target_distance = result.dist[static_cast<std::size_t>(target)];
     result.target_reached =
         !std::isinf(result.target_distance) &&
@@ -1110,6 +1213,34 @@ DeltaSteppingCsrResult DeltaSteppingCsrWorkspace::run(
                                  impl_->scratch,
                                  sources,
                                  target,
+                                 nullptr,
+                                 delta,
+                                 max_iters,
+                                 stream,
+                                 progress_callback,
+                                 progress_user_data);
+}
+
+DeltaSteppingCsrResult DeltaSteppingCsrWorkspace::run(
+    const std::vector<int>& sources,
+    const std::vector<int>& targets,
+    float delta,
+    int max_iters,
+    hipStream_t stream,
+    DeltaSteppingCsrProgressCallback progress_callback,
+    void* progress_user_data) {
+  using namespace ds_delta_detail;
+  if (!impl_) {
+    throw std::runtime_error("DeltaSteppingCsrWorkspace has no implementation");
+  }
+  validate_device_csr_shape(impl_->adjacency.view, sources, -1, delta);
+  validate_target_list_common_shape(impl_->adjacency.view.rows, targets);
+  return run_delta_stepping_impl(impl_->adjacency.view,
+                                 impl_->outgoing,
+                                 impl_->scratch,
+                                 sources,
+                                 -1,
+                                 &targets,
                                  delta,
                                  max_iters,
                                  stream,
@@ -1150,7 +1281,7 @@ DeltaSteppingCsrResult delta_stepping_minplus_hip_csr(
   OutgoingCsrOwner outgoing = build_outgoing_csr_from_incoming(d_adjacency, stream);
   DeltaSteppingScratch scratch(d_adjacency.rows);
   return run_delta_stepping_impl(d_adjacency, outgoing, scratch, sources, target,
-                                 delta, max_iters, stream, progress_callback,
+                                 nullptr, delta, max_iters, stream, progress_callback,
                                  progress_user_data);
 }
 

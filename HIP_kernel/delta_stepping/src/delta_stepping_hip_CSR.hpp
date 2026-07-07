@@ -41,6 +41,15 @@ class DeltaSteppingCsrWorkspace {
       void* progress_user_data = nullptr);
 
   DeltaSteppingCsrResult run(
+      const std::vector<int>& sources,
+      const std::vector<int>& targets,
+      float delta,
+      int max_iters,
+      hipStream_t stream = nullptr,
+      DeltaSteppingCsrProgressCallback progress_callback = nullptr,
+      void* progress_user_data = nullptr);
+
+  DeltaSteppingCsrResult run(
       int source,
       int target,
       float delta,

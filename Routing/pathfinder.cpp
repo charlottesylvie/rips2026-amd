@@ -132,6 +132,9 @@ void validate_options(const PathfinderOptions& options) {
   if (!(options.history_factor >= 0.0f) || !std::isfinite(options.history_factor)) {
     throw std::invalid_argument("history_factor must be finite and nonnegative");
   }
+  if (options.route_batch_size == 0) {
+    throw std::invalid_argument("route_batch_size must be positive");
+  }
 }
 
 bool valid_node(int node, minplus_sparse::Offset rows) {
@@ -139,16 +142,27 @@ bool valid_node(int node, minplus_sparse::Offset rows) {
 }
 
 void add_unique_node(std::vector<int>& nodes,
-                     std::vector<std::uint8_t>& seen,
+                     std::vector<std::uint32_t>& seen,
+                     std::uint32_t tree_stamp,
                      int node) {
   if (node < 0 || static_cast<std::size_t>(node) >= seen.size()) {
     return;
   }
-  if (seen[static_cast<std::size_t>(node)] != 0) {
+  if (seen[static_cast<std::size_t>(node)] == tree_stamp) {
     return;
   }
-  seen[static_cast<std::size_t>(node)] = 1;
+  seen[static_cast<std::size_t>(node)] = tree_stamp;
   nodes.push_back(node);
+}
+
+std::uint32_t next_tree_stamp(std::vector<std::uint32_t>& seen,
+                              std::uint32_t* current_stamp) {
+  if (*current_stamp == std::numeric_limits<std::uint32_t>::max()) {
+    std::fill(seen.begin(), seen.end(), 0);
+    *current_stamp = 0;
+  }
+  ++(*current_stamp);
+  return *current_stamp;
 }
 
 std::vector<int> nodes_from_path(int source, const std::vector<PathEdge>& edges) {
@@ -161,16 +175,19 @@ std::vector<int> nodes_from_path(int source, const std::vector<PathEdge>& edges)
   return nodes;
 }
 
-bool tree_contains(const std::vector<std::uint8_t>& tree_seen, int node) {
+bool tree_contains(const std::vector<std::uint32_t>& tree_seen,
+                   std::uint32_t tree_stamp,
+                   int node) {
   return node >= 0 &&
          static_cast<std::size_t>(node) < tree_seen.size() &&
-         tree_seen[static_cast<std::size_t>(node)] != 0;
+         tree_seen[static_cast<std::size_t>(node)] == tree_stamp;
 }
 
 std::vector<PathEdge> reconstruct_shortest_path_from_tree_dist(
     const HostCsrF32& graph,
     const std::vector<float>& dist,
-    const std::vector<std::uint8_t>& tree_seen,
+    const std::vector<std::uint32_t>& tree_seen,
+    std::uint32_t tree_stamp,
     int target,
     int* source_out) {
   *source_out = -1;
@@ -189,7 +206,7 @@ std::vector<PathEdge> reconstruct_shortest_path_from_tree_dist(
   std::vector<PathEdge> reversed;
   int current = target;
   for (minplus_sparse::Offset guard = 0; guard < graph.rows; ++guard) {
-    if (tree_contains(tree_seen, current)) {
+    if (tree_contains(tree_seen, tree_stamp, current)) {
       *source_out = current;
       std::reverse(reversed.begin(), reversed.end());
       return reversed;
@@ -241,7 +258,8 @@ std::vector<PathEdge> reconstruct_shortest_path_from_tree_dist(
 std::vector<PathEdge> reconstruct_shortest_path_from_tree_pred(
     const HostCsrF32& graph,
     const DeltaSteppingCsrResult& sssp,
-    const std::vector<std::uint8_t>& tree_seen,
+    const std::vector<std::uint32_t>& tree_seen,
+    std::uint32_t tree_stamp,
     int target,
     int* source_out) {
   *source_out = -1;
@@ -249,13 +267,13 @@ std::vector<PathEdge> reconstruct_shortest_path_from_tree_pred(
       sssp.pred_edge.size() != static_cast<std::size_t>(graph.rows) ||
       tree_seen.size() != static_cast<std::size_t>(graph.rows)) {
     return reconstruct_shortest_path_from_tree_dist(
-        graph, sssp.dist, tree_seen, target, source_out);
+        graph, sssp.dist, tree_seen, tree_stamp, target, source_out);
   }
 
   std::vector<PathEdge> reversed;
   int current = target;
   for (minplus_sparse::Offset guard = 0; guard < graph.rows; ++guard) {
-    if (tree_contains(tree_seen, current)) {
+    if (tree_contains(tree_seen, tree_stamp, current)) {
       *source_out = current;
       std::reverse(reversed.begin(), reversed.end());
       return reversed;
@@ -272,7 +290,7 @@ std::vector<PathEdge> reconstruct_shortest_path_from_tree_pred(
         edge >= graph.rowptr[current_index + 1] ||
         graph.colind[static_cast<std::size_t>(edge)] != pred) {
       return reconstruct_shortest_path_from_tree_dist(
-          graph, sssp.dist, tree_seen, target, source_out);
+          graph, sssp.dist, tree_seen, tree_stamp, target, source_out);
     }
 
     reversed.push_back({pred,
@@ -337,77 +355,22 @@ void update_costed_graph_values(const HostCsrF32& base_graph,
   }
 }
 
-RoutedSink route_sink_from_tree(const HostCsrF32& graph,
-                               DeltaSteppingCsrWorkspace& workspace,
-                               const std::vector<int>& source_candidates,
-                               const std::vector<std::uint8_t>& tree_seen,
-                               int target,
-                               const PathfinderOptions& options,
-                               hipStream_t stream) {
-  RoutedSink routed;
-  routed.target = target;
-  routed.distance = std::numeric_limits<float>::infinity();
-
-  if (!valid_node(target, graph.rows)) {
-    return routed;
-  }
-
-  if (tree_contains(tree_seen, target)) {
-    routed.source = target;
-    routed.distance = 0.0f;
-    routed.reached = true;
-    routed.nodes.push_back(target);
-    return routed;
-  }
-
-  DeltaSteppingCsrResult sssp =
-      workspace.run(source_candidates,
-                    target,
-                    options.delta,
-                    options.max_sssp_iterations,
-                    stream,
-                    nullptr,
-                    nullptr);
-  if (!sssp.target_reached ||
-      !std::isfinite(sssp.dist[static_cast<std::size_t>(target)])) {
-    return routed;
-  }
-
-  int source = -1;
-  routed.edges =
-      reconstruct_shortest_path_from_tree_pred(graph, sssp, tree_seen, target, &source);
-  if (!valid_node(source, graph.rows)) {
-    return routed;
-  }
-
-  routed.source = source;
-  routed.distance = sssp.dist[static_cast<std::size_t>(target)];
-  routed.nodes = nodes_from_path(source, routed.edges);
-  for (std::size_t i = 1; i < routed.nodes.size(); ++i) {
-    if (tree_contains(tree_seen, routed.nodes[i])) {
-      routed.edges.clear();
-      routed.nodes.clear();
-      routed.source = -1;
-      routed.distance = std::numeric_limits<float>::infinity();
-      return routed;
-    }
-  }
-  routed.reached = true;
-  return routed;
-}
-
 RoutedNet route_net(const HostCsrF32& graph,
                     DeltaSteppingCsrWorkspace& workspace,
                     const RouteRequest& request,
+                    std::vector<std::uint32_t>& tree_seen,
+                    std::uint32_t tree_stamp,
                     const PathfinderOptions& options,
                     hipStream_t stream) {
   RoutedNet net;
   net.net_string = request.net_string;
+  if (tree_seen.size() != static_cast<std::size_t>(graph.rows)) {
+    throw std::invalid_argument("route tree scratch size does not match CSR rows");
+  }
 
   std::vector<int> source_candidates;
-  std::vector<std::uint8_t> tree_seen(static_cast<std::size_t>(graph.rows), 0);
   for (const SitePinNode& source : request.sources) {
-    add_unique_node(source_candidates, tree_seen, source.node);
+    add_unique_node(source_candidates, tree_seen, tree_stamp, source.node);
   }
 
   if (source_candidates.empty()) {
@@ -415,19 +378,79 @@ RoutedNet route_net(const HostCsrF32& graph,
     return net;
   }
 
+  std::vector<int> targets;
+  targets.reserve(request.sinks.size());
+  std::vector<std::size_t> target_sink_indices;
+  target_sink_indices.reserve(request.sinks.size());
   bool reached_all = true;
-  for (const SitePinNode& sink : request.sinks) {
-    RoutedSink routed_sink =
-        route_sink_from_tree(graph, workspace, source_candidates, tree_seen,
-                             sink.node, options, stream);
+  net.sinks.resize(request.sinks.size());
+  for (std::size_t sink_index = 0; sink_index < request.sinks.size(); ++sink_index) {
+    const SitePinNode& sink = request.sinks[sink_index];
+    net.sinks[sink_index].target = sink.node;
+    net.sinks[sink_index].distance = std::numeric_limits<float>::infinity();
+    if (!valid_node(sink.node, graph.rows)) {
+      reached_all = false;
+      continue;
+    }
+    if (tree_contains(tree_seen, tree_stamp, sink.node)) {
+      RoutedSink& routed_sink = net.sinks[sink_index];
+      routed_sink.source = sink.node;
+      routed_sink.distance = 0.0f;
+      routed_sink.reached = true;
+      routed_sink.nodes.push_back(sink.node);
+      continue;
+    }
+    targets.push_back(sink.node);
+    target_sink_indices.push_back(sink_index);
+  }
+
+  if (!targets.empty()) {
+    DeltaSteppingCsrResult sssp =
+        workspace.run(source_candidates,
+                      targets,
+                      options.delta,
+                      options.max_sssp_iterations,
+                      stream,
+                      nullptr,
+                      nullptr);
+
+    for (const std::size_t sink_index : target_sink_indices) {
+      const int target = request.sinks[sink_index].node;
+      RoutedSink& routed_sink = net.sinks[sink_index];
+      if (static_cast<std::size_t>(target) >= sssp.dist.size() ||
+          !std::isfinite(sssp.dist[static_cast<std::size_t>(target)])) {
+        reached_all = false;
+        continue;
+      }
+
+      int source = -1;
+      routed_sink.edges =
+          reconstruct_shortest_path_from_tree_pred(
+              graph, sssp, tree_seen, tree_stamp, target, &source);
+      if (!valid_node(source, graph.rows)) {
+        reached_all = false;
+        routed_sink.edges.clear();
+        continue;
+      }
+
+      routed_sink.source = source;
+      routed_sink.distance = sssp.dist[static_cast<std::size_t>(target)];
+      routed_sink.nodes = nodes_from_path(source, routed_sink.edges);
+      routed_sink.reached = true;
+      for (const int node : routed_sink.nodes) {
+        add_unique_node(source_candidates, tree_seen, tree_stamp, node);
+      }
+    }
+  }
+
+  for (const RoutedSink& routed_sink : net.sinks) {
     if (!routed_sink.reached) {
       reached_all = false;
     } else {
       for (const int node : routed_sink.nodes) {
-        add_unique_node(source_candidates, tree_seen, node);
+        add_unique_node(source_candidates, tree_seen, tree_stamp, node);
       }
     }
-    net.sinks.push_back(std::move(routed_sink));
   }
 
   net.reached_all_sinks = reached_all;
@@ -575,6 +598,7 @@ void print_usage(const char* program) {
       << "  --present-multiplier <float>    Per-iteration factor multiplier. Default: 2\n"
       << "  --history-factor <float>        Historical congestion increment. Default: 1\n"
       << "  --net-limit <count>             Route only the first count requests.\n"
+      << "  --route-batch-size <count>      Nets routed per congestion snapshot. Default: 256\n"
       << "  --routes-out <path>             Write routed PIP tree data as JSONL.\n";
 }
 
@@ -851,6 +875,8 @@ PathfinderResult run_pathfinder(const HostCsrF32& base_graph,
   float present_factor = options.initial_present_factor;
   HostCsrF32 graph = base_graph;
   DeltaSteppingCsrWorkspace sssp_workspace(graph, stream);
+  std::vector<std::uint32_t> route_tree_seen(static_cast<std::size_t>(base_graph.rows), 0);
+  std::uint32_t route_tree_stamp = 0;
   std::cout << "[pathfinder] setup complete: rows=" << base_graph.rows
             << " nnz=" << base_graph.nnz
             << " route_requests=" << metadata.route_requests.size()
@@ -858,6 +884,7 @@ PathfinderResult run_pathfinder(const HostCsrF32& base_graph,
             << " max_pathfinder_iters=" << options.max_pathfinder_iterations
             << " delta=" << options.delta
             << " capacity=" << options.capacity
+            << " route_batch_size=" << options.route_batch_size
             << "\n" << std::flush;
 
   for (int iteration = 0; iteration < options.max_pathfinder_iterations; ++iteration) {
@@ -878,17 +905,9 @@ PathfinderResult run_pathfinder(const HostCsrF32& base_graph,
     }
 
     bool all_sinks_reached = true;
-    for (std::size_t net_index = 0; net_index < route_request_count; ++net_index) {
-      if (net_index == 0 || net_index + 1 == route_request_count ||
-          net_index % progress_interval == 0) {
-        const RouteRequest& request = metadata.route_requests[net_index];
-        std::cout << "[pathfinder] beginning net " << (net_index + 1)
-                  << "/" << route_request_count
-                  << " name=" << string_at(metadata, request.net_string)
-                  << " sources=" << request.sources.size()
-                  << " sinks=" << request.sinks.size()
-                  << "\n" << std::flush;
-      }
+    for (std::size_t batch_begin = 0; batch_begin < route_request_count;) {
+      const std::size_t batch_end =
+          std::min(route_request_count, batch_begin + options.route_batch_size);
       update_costed_graph_values(base_graph,
                                  result.occupancy,
                                  result.history,
@@ -896,22 +915,50 @@ PathfinderResult run_pathfinder(const HostCsrF32& base_graph,
                                  present_factor,
                                  graph);
       sssp_workspace.update_values(graph.values, stream);
-      RoutedNet net =
-          route_net(graph, sssp_workspace, metadata.route_requests[net_index], options, stream);
-      if (!net.reached_all_sinks) {
-        all_sinks_reached = false;
+
+      const std::size_t batch_result_begin = result.nets.size();
+      for (std::size_t net_index = batch_begin; net_index < batch_end; ++net_index) {
+        if (net_index == 0 || net_index + 1 == route_request_count ||
+            net_index % progress_interval == 0) {
+          const RouteRequest& request = metadata.route_requests[net_index];
+          std::cout << "[pathfinder] beginning net " << (net_index + 1)
+                    << "/" << route_request_count
+                    << " name=" << string_at(metadata, request.net_string)
+                    << " sources=" << request.sources.size()
+                    << " sinks=" << request.sinks.size()
+                    << "\n" << std::flush;
+        }
+        const std::uint32_t tree_stamp =
+            next_tree_stamp(route_tree_seen, &route_tree_stamp);
+        RoutedNet net =
+            route_net(graph,
+                      sssp_workspace,
+                      metadata.route_requests[net_index],
+                      route_tree_seen,
+                      tree_stamp,
+                      options,
+                      stream);
+        if (!net.reached_all_sinks) {
+          all_sinks_reached = false;
+        }
+        result.nets.push_back(std::move(net));
+        if ((net_index + 1) == route_request_count ||
+            (net_index + 1) % progress_interval == 0) {
+          std::cout << "[pathfinder] completed net " << (net_index + 1)
+                    << "/" << route_request_count << "\n";
+          print_pathfinder_progress(iteration + 1,
+                                    options.max_pathfinder_iterations,
+                                    net_index + 1,
+                                    route_request_count);
+        }
       }
-      commit_net_occupancy(net, result.occupancy);
-      result.nets.push_back(std::move(net));
-      if ((net_index + 1) == route_request_count ||
-          (net_index + 1) % progress_interval == 0) {
-        std::cout << "[pathfinder] completed net " << (net_index + 1)
-                  << "/" << route_request_count << "\n";
-        print_pathfinder_progress(iteration + 1,
-                                  options.max_pathfinder_iterations,
-                                  net_index + 1,
-                                  route_request_count);
+
+      for (std::size_t routed_index = batch_result_begin;
+           routed_index < result.nets.size();
+           ++routed_index) {
+        commit_net_occupancy(result.nets[routed_index], result.occupancy);
       }
+      batch_begin = batch_end;
     }
 
     result.iterations_used = iteration + 1;
@@ -1127,6 +1174,9 @@ int main(int argc, char** argv) {
       } else if (option == "--net-limit") {
         options.net_limit =
             routing::parse_size_arg(require_value("--net-limit"), "net-limit");
+      } else if (option == "--route-batch-size") {
+        options.route_batch_size =
+            routing::parse_size_arg(require_value("--route-batch-size"), "route-batch-size");
       } else if (option == "--routes-out") {
         routes_out_path = require_value("--routes-out");
       } else {

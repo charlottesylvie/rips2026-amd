@@ -217,6 +217,25 @@ DeltaSteppingCsrResult DeltaSteppingCsrWorkspace::run(
 }
 
 DeltaSteppingCsrResult DeltaSteppingCsrWorkspace::run(
+    const std::vector<int>& sources,
+    const std::vector<int>& targets,
+    float delta,
+    int max_iters,
+    hipStream_t stream,
+    DeltaSteppingCsrProgressCallback progress_callback,
+    void* progress_user_data) {
+  (void)targets;
+  return delta_stepping_minplus_hip_csr(impl_->graph,
+                                        sources,
+                                        -1,
+                                        delta,
+                                        max_iters,
+                                        stream,
+                                        progress_callback,
+                                        progress_user_data);
+}
+
+DeltaSteppingCsrResult DeltaSteppingCsrWorkspace::run(
     int source,
     int target,
     float delta,
@@ -275,9 +294,14 @@ DeltaSteppingCsrResult delta_stepping_minplus_hip_csr(
   result.pred_node = std::move(cpu_result.pred_node);
   result.pred_edge = std::move(cpu_result.pred_edge);
   result.iterations_used = 1;
-  result.target_distance = result.dist[static_cast<std::size_t>(target)];
-  result.target_reached = std::isfinite(result.target_distance);
-  result.stopped_on_target = result.target_reached;
+  if (target >= 0) {
+    result.target_distance = result.dist[static_cast<std::size_t>(target)];
+    result.target_reached = std::isfinite(result.target_distance);
+    result.stopped_on_target = result.target_reached;
+  } else {
+    result.target_reached = true;
+    result.stopped_on_target = true;
+  }
   result.converged = true;
   return result;
 }
@@ -328,6 +352,7 @@ int main() {
   routing::PathfinderOptions congestion_options;
   congestion_options.max_pathfinder_iterations = 1;
   congestion_options.delta = 1.0f;
+  congestion_options.route_batch_size = 1;
   routing::PathfinderResult congestion_result =
       routing::run_pathfinder(congestion_graph, congestion_metadata, congestion_options, nullptr);
   require(congestion_result.routed,
@@ -366,8 +391,8 @@ int main() {
           "route tree should contain nodes 0,1,2,3");
   require(result.occupancy == std::vector<int>({1, 1, 1, 1}),
           "all route tree nodes should be occupied once");
-  require(g_multisource_delta_calls == 2,
-          "PathFinder should call multi-source delta stepping once per sink");
+  require(g_multisource_delta_calls == 1,
+          "PathFinder should call multi-source delta stepping once per multi-sink net");
 
   const std::filesystem::path routes_path = "/tmp/pathfinder_cpu_stub_routes.jsonl";
   routing::write_routes_jsonl(routes_path, graph, metadata, result);
