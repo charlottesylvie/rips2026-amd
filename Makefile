@@ -34,17 +34,10 @@ JAVA_PROXY=$(if $(HTTPHOST),-Dhttp.proxyHost=$(HTTPHOST) -Dhttp.proxyPort=$(HTTP
 $(if $(HTTPSHOST),-Dhttps.proxyHost=$(HTTPSHOST) -Dhttps.proxyPort=$(HTTPSPORT),)
 
 # Choice of router (default to rwroute)
-# (other supported values: nxroute-poc, PathFinderFile)
+# (other supported values: nxroute-poc)
 ROUTER ?= rwroute
 
-# C++ PathFinder wrapper. The wrapper and its helper binaries are expected to
-# already exist, along with any generated FPGAIF Cap'n Proto C++ files they need.
-# This binary keeps the benchmark-facing interface:
-#   ./PathFinderFile <benchmark>_unrouted.phys <benchmark>_PathFinderFile.phys
-PATHFINDER_ROUTER_BIN ?= ./PathFinderFile
-PATHFINDER_ARGS ?=
-
-# Make /usr/bin/time only print out wall-clock and user time in seconds
+# Make time only print out wall-clock and user time in seconds
 TIME = Wall-clock time (sec): %e
 # Note that User-CPU time is for information purposes only (not used for scoring)
 TIME += \nUser-CPU time (sec): %U
@@ -152,25 +145,27 @@ distclean: clean
 #### BEGIN ROUTER RECIPES
 
 ## RWROUTE
-# /usr/bin/time is used to measure the wall clock time
+# time is used to measure the wall clock time
 # Gradle is used to invoke the PartialRouterPhysNetlist class' main method with arguments
 # $< (%_unrouted.phys) and $@ (%_rwroute.phys), and display/redirect all output into %_rwroute.phys.log
 %_rwroute.phys: %_unrouted.phys | $(JAVA_CLASSPATH_TXT)
-	(/usr/bin/time java -cp $$(cat $(JAVA_CLASSPATH_TXT)) $(JVM_HEAP) com.xilinx.fpga24_routing_contest.PartialRouterPhysNetlist $< $@) $(call log_and_or_display,$@.log)
+	(time java -cp $$(cat $(JAVA_CLASSPATH_TXT)) $(JVM_HEAP) com.xilinx.fpga24_routing_contest.PartialRouterPhysNetlist $< $@) $(call log_and_or_display,$@.log)
 
 
 ## NXROUTE-POC
 %_nxroute-poc.phys: %_unrouted.phys xcvu3p.device | install-python-deps fpga-interchange-schema/interchange/capnp/java.capnp
-	(/usr/bin/time python3 networkx-proof-of-concept-router/nxroute-poc.py $< $@) $(call log_and_or_display,$@.log)
-
-## PATHFINDERFILE
-%_PathFinderFile.phys: %_unrouted.phys %.netlist xcvu3p.device
-	(/usr/bin/time $(PATHFINDER_ROUTER_BIN) $< $@ --logical-netlist $*.netlist --device xcvu3p.device $(PATHFINDER_ARGS)) $(call log_and_or_display,$@.log)
+	(time python3 networkx-proof-of-concept-router/nxroute-poc.py $< $@) $(call log_and_or_display,$@.log)
 
 ## EXAMPLEROUTE
 ## (please only modify '<custom router here>' to ensure that all contest infrastructure remains in place)
 # %_exampleroute.phys: %_unrouted.phys
-# 	(/usr/bin/time <custom router here> $< $@) $(call log_and_or_display,$@.log)
+# 	(time <custom router here> $< $@) $(call log_and_or_display,$@.log)
+
+PATHFINDER_ROUTER_BIN ?= ./PathFinderFile
+PATHFINDER_ARGS ?=
+
+%_PathFinderFile.phys: %_unrouted.phys %.netlist xcvu3p.device
+	(time $(PATHFINDER_ROUTER_BIN) $< $@ --logical-netlist $*.netlist --device xcvu3p.device $(PATHFINDER_ARGS)) $(call log_and_or_display,$@.log)
 
 #### END ROUTER RECIPES
 
@@ -250,3 +245,4 @@ run-opencl-example: opencl_example_container.sif | workdir
 
 # Tell make to not treat routed results as intermediate files (which would get deleted)
 .PRECIOUS: %_$(ROUTER).phys
+
