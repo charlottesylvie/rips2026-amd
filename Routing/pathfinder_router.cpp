@@ -98,13 +98,15 @@ void print_progress(int completed, int total, const std::string& label) {
 
 void run_command(const std::vector<std::string>& argv, const char* label) {
   const std::string command = command_to_string(argv);
-  std::cout << "[pathfinder-router] " << label << ": " << command << "\n";
+  std::cout << "[pathfinder-router] beginning " << label << "\n";
+  std::cout << "[pathfinder-router] command: " << command << "\n" << std::flush;
   const int status = std::system(command.c_str());
   if (status != 0) {
     std::ostringstream out;
     out << label << " failed with status " << status;
     throw std::runtime_error(out.str());
   }
+  std::cout << "[pathfinder-router] completed " << label << "\n" << std::flush;
 }
 
 std::filesystem::path make_work_dir(const Options& options) {
@@ -250,6 +252,15 @@ int main(int argc, char** argv) {
         work_dir / (options.output_phys.stem().string() + ".csrbin.ifmeta.bin");
     const std::filesystem::path routes_path =
         work_dir / (options.output_phys.stem().string() + ".routes.jsonl");
+
+    std::cout << "[pathfinder-router] input_phys: " << options.input_phys << "\n";
+    std::cout << "[pathfinder-router] logical_netlist: " << options.logical_netlist << "\n";
+    std::cout << "[pathfinder-router] device: " << options.device << "\n";
+    std::cout << "[pathfinder-router] output_phys: " << options.output_phys << "\n";
+    std::cout << "[pathfinder-router] work_dir: " << work_dir << "\n";
+    std::cout << "[pathfinder-router] csr_path: " << csr_path << "\n";
+    std::cout << "[pathfinder-router] metadata_path: " << metadata_path << "\n";
+    std::cout << "[pathfinder-router] routes_path: " << routes_path << "\n" << std::flush;
 
     print_progress(0, 3, "starting");
 
