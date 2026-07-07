@@ -86,15 +86,27 @@ std::string command_to_string(const std::vector<std::string>& argv) {
   return out.str();
 }
 
+void print_progress(int completed, int total, const std::string& label) {
+  constexpr int kWidth = 28;
+  const int filled = total == 0 ? kWidth : (completed * kWidth) / total;
+  std::cout << "[pathfinder-router] [";
+  for (int i = 0; i < kWidth; ++i) {
+    std::cout << (i < filled ? '#' : '-');
+  }
+  std::cout << "] " << completed << "/" << total << " " << label << "\n";
+}
+
 void run_command(const std::vector<std::string>& argv, const char* label) {
   const std::string command = command_to_string(argv);
-  std::cout << "[pathfinder-router] " << label << ": " << command << "\n";
+  std::cout << "[pathfinder-router] beginning " << label << "\n";
+  std::cout << "[pathfinder-router] command: " << command << "\n" << std::flush;
   const int status = std::system(command.c_str());
   if (status != 0) {
     std::ostringstream out;
     out << label << " failed with status " << status;
     throw std::runtime_error(out.str());
   }
+  std::cout << "[pathfinder-router] completed " << label << "\n" << std::flush;
 }
 
 std::filesystem::path make_work_dir(const Options& options) {
@@ -241,6 +253,17 @@ int main(int argc, char** argv) {
     const std::filesystem::path routes_path =
         work_dir / (options.output_phys.stem().string() + ".routes.jsonl");
 
+    std::cout << "[pathfinder-router] input_phys: " << options.input_phys << "\n";
+    std::cout << "[pathfinder-router] logical_netlist: " << options.logical_netlist << "\n";
+    std::cout << "[pathfinder-router] device: " << options.device << "\n";
+    std::cout << "[pathfinder-router] output_phys: " << options.output_phys << "\n";
+    std::cout << "[pathfinder-router] work_dir: " << work_dir << "\n";
+    std::cout << "[pathfinder-router] csr_path: " << csr_path << "\n";
+    std::cout << "[pathfinder-router] metadata_path: " << metadata_path << "\n";
+    std::cout << "[pathfinder-router] routes_path: " << routes_path << "\n" << std::flush;
+
+    print_progress(0, 3, "starting");
+
     std::vector<std::string> convert_cmd = {
         options.interchange_to_csr,
         options.input_phys.string(),
@@ -255,6 +278,7 @@ int main(int argc, char** argv) {
                        options.converter_args.begin(),
                        options.converter_args.end());
     run_command(convert_cmd, "convert FPGAIF to CSR");
+    print_progress(1, 3, "CSR conversion complete");
 
     std::vector<std::string> pathfinder_cmd = {
         options.pathfinder,
@@ -267,6 +291,7 @@ int main(int argc, char** argv) {
                           options.pathfinder_args.begin(),
                           options.pathfinder_args.end());
     run_command(pathfinder_cmd, "run PathFinder");
+    print_progress(2, 3, "PathFinder complete");
 
     run_command({options.routes_to_phys,
                  options.input_phys.string(),
@@ -274,6 +299,7 @@ int main(int argc, char** argv) {
                  routes_path.string(),
                  options.output_phys.string()},
                 "reconstruct routed PhysicalNetlist");
+    print_progress(3, 3, "routed PhysicalNetlist written");
 
     if (cleanup_work_dir) {
       std::filesystem::remove_all(work_dir);

@@ -378,6 +378,20 @@ std::uint64_t edge_key(int from, int to) {
          static_cast<std::uint32_t>(to);
 }
 
+void print_pathfinder_progress(int iteration,
+                               int max_iterations,
+                               std::size_t completed_nets,
+                               std::size_t total_nets) {
+  constexpr int kWidth = 30;
+  const int filled =
+      total_nets == 0 ? kWidth : static_cast<int>((completed_nets * kWidth) / total_nets);
+  std::cout << "[pathfinder] iter " << iteration << "/" << max_iterations << " [";
+  for (int i = 0; i < kWidth; ++i) {
+    std::cout << (i < filled ? '#' : '-');
+  }
+  std::cout << "] " << completed_nets << "/" << total_nets << " nets\n" << std::flush;
+}
+
 }  // namespace
 
 std::filesystem::path default_metadata_path(const std::filesystem::path& csr_path) {
@@ -686,6 +700,7 @@ PathfinderResult run_pathfinder(const HostCsrF32& base_graph,
                                 const RoutingMetadata& metadata,
                                 const PathfinderOptions& options,
                                 hipStream_t stream) {
+  std::cout << "[pathfinder] beginning PathFinder setup\n" << std::flush;
   validate_csr(base_graph);
   validate_options(options);
   if (metadata.node_device_ids.size() != static_cast<std::size_t>(base_graph.rows)) {
@@ -704,14 +719,44 @@ PathfinderResult run_pathfinder(const HostCsrF32& base_graph,
           ? metadata.route_requests.size()
           : std::min(options.net_limit, metadata.route_requests.size());
   float present_factor = options.initial_present_factor;
+  std::cout << "[pathfinder] setup complete: rows=" << base_graph.rows
+            << " nnz=" << base_graph.nnz
+            << " route_requests=" << metadata.route_requests.size()
+            << " route_request_count=" << route_request_count
+            << " max_pathfinder_iters=" << options.max_pathfinder_iterations
+            << " delta=" << options.delta
+            << " capacity=" << options.capacity
+            << "\n" << std::flush;
 
   for (int iteration = 0; iteration < options.max_pathfinder_iterations; ++iteration) {
+    std::cout << "[pathfinder] beginning iteration " << (iteration + 1)
+              << "/" << options.max_pathfinder_iterations
+              << " present_factor=" << present_factor
+              << "\n" << std::flush;
     std::fill(result.occupancy.begin(), result.occupancy.end(), 0);
     result.nets.clear();
     result.nets.reserve(route_request_count);
+    const std::size_t progress_interval =
+        std::max<std::size_t>(1, route_request_count / 100);
+    if (route_request_count == 0) {
+      print_pathfinder_progress(iteration + 1,
+                                options.max_pathfinder_iterations,
+                                0,
+                                0);
+    }
 
     bool all_sinks_reached = true;
     for (std::size_t net_index = 0; net_index < route_request_count; ++net_index) {
+      if (net_index == 0 || net_index + 1 == route_request_count ||
+          net_index % progress_interval == 0) {
+        const RouteRequest& request = metadata.route_requests[net_index];
+        std::cout << "[pathfinder] beginning net " << (net_index + 1)
+                  << "/" << route_request_count
+                  << " name=" << string_at(metadata, request.net_string)
+                  << " sources=" << request.sources.size()
+                  << " sinks=" << request.sinks.size()
+                  << "\n" << std::flush;
+      }
       HostCsrF32 graph =
           make_costed_graph(base_graph, result.occupancy, result.history, options, present_factor);
       RoutedNet net =
@@ -721,6 +766,15 @@ PathfinderResult run_pathfinder(const HostCsrF32& base_graph,
       }
       commit_net_occupancy(net, result.occupancy);
       result.nets.push_back(std::move(net));
+      if ((net_index + 1) == route_request_count ||
+          (net_index + 1) % progress_interval == 0) {
+        std::cout << "[pathfinder] completed net " << (net_index + 1)
+                  << "/" << route_request_count << "\n";
+        print_pathfinder_progress(iteration + 1,
+                                  options.max_pathfinder_iterations,
+                                  net_index + 1,
+                                  route_request_count);
+      }
     }
 
     result.iterations_used = iteration + 1;
@@ -730,10 +784,18 @@ PathfinderResult run_pathfinder(const HostCsrF32& base_graph,
                             &result.overused_nodes,
                             &result.max_occupancy);
     result.routed = all_sinks_reached && result.overused_nodes == 0;
+    std::cout << "[pathfinder] iter " << result.iterations_used
+              << " summary: all_sinks_reached="
+              << (result.all_sinks_reached ? "true" : "false")
+              << " overused_nodes=" << result.overused_nodes
+              << " max_occupancy=" << result.max_occupancy
+              << " routed=" << (result.routed ? "true" : "false") << "\n";
     if (result.routed) {
       break;
     }
 
+    std::cout << "[pathfinder] updating historical congestion for iteration "
+              << result.iterations_used << "\n" << std::flush;
     for (std::size_t node = 0; node < result.occupancy.size(); ++node) {
       const int overuse = result.occupancy[node] - options.capacity;
       if (overuse > 0) {
@@ -741,8 +803,11 @@ PathfinderResult run_pathfinder(const HostCsrF32& base_graph,
       }
     }
     present_factor *= options.present_factor_multiplier;
+    std::cout << "[pathfinder] completed historical congestion update; next present_factor="
+              << present_factor << "\n" << std::flush;
   }
 
+  std::cout << "[pathfinder] completed PathFinder loop\n" << std::flush;
   return result;
 }
 
@@ -932,10 +997,23 @@ int main(int argc, char** argv) {
       }
     }
 
+    std::cout << "[pathfinder] beginning CSR load: " << csr_path << "\n" << std::flush;
     HostCsrF32 graph = routing::load_csrbin(csr_path);
+    std::cout << "[pathfinder] completed CSR load: rows=" << graph.rows
+              << " nnz=" << graph.nnz << "\n" << std::flush;
+
+    std::cout << "[pathfinder] beginning metadata load: " << metadata_path << "\n" << std::flush;
     routing::RoutingMetadata metadata = routing::load_interchange_metadata(metadata_path);
+    std::cout << "[pathfinder] completed metadata load: strings=" << metadata.strings.size()
+              << " route_requests=" << metadata.route_requests.size()
+              << " edge_attrs=" << metadata.edge_attrs.size()
+              << " pip_data=" << metadata.pip_data.size()
+              << "\n" << std::flush;
+
+    std::cout << "[pathfinder] beginning routing loop\n" << std::flush;
     routing::PathfinderResult result =
         routing::run_pathfinder(graph, metadata, options, nullptr);
+    std::cout << "[pathfinder] completed routing loop\n" << std::flush;
 
     std::cout << "csr: " << csr_path << "\n";
     std::cout << "metadata: " << metadata_path << "\n";
@@ -954,7 +1032,10 @@ int main(int argc, char** argv) {
         std::cerr << "error: refusing to write routes for an unrouted or congested result\n";
         return 2;
       }
+      std::cout << "[pathfinder] beginning routes JSONL write: " << routes_out_path
+                << "\n" << std::flush;
       routing::write_routes_jsonl(routes_out_path, graph, metadata, result);
+      std::cout << "[pathfinder] completed routes JSONL write\n" << std::flush;
       std::cout << "routes_out: " << routes_out_path << "\n";
     }
 
