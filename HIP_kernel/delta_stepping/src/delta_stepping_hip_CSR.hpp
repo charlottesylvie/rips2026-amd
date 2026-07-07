@@ -4,6 +4,7 @@
 
 #include <hip/hip_runtime.h>
 
+#include <memory>
 #include <vector>
 
 // Delta-Stepping SSSP for nonnegative edge weights over the same incoming-edge
@@ -13,6 +14,44 @@
 using DeltaSteppingCsrProgress = BellmanFordCsrProgress;
 using DeltaSteppingCsrProgressCallback = BellmanFordCsrProgressCallback;
 using DeltaSteppingCsrResult = BellmanFordCsrResult;
+
+class DeltaSteppingCsrWorkspace {
+ public:
+  struct Impl;
+
+  explicit DeltaSteppingCsrWorkspace(const HostCsrF32& adjacency,
+                                     hipStream_t stream = nullptr);
+  ~DeltaSteppingCsrWorkspace();
+
+  DeltaSteppingCsrWorkspace(const DeltaSteppingCsrWorkspace&) = delete;
+  DeltaSteppingCsrWorkspace& operator=(const DeltaSteppingCsrWorkspace&) = delete;
+  DeltaSteppingCsrWorkspace(DeltaSteppingCsrWorkspace&&) noexcept;
+  DeltaSteppingCsrWorkspace& operator=(DeltaSteppingCsrWorkspace&&) noexcept;
+
+  void update_values(const std::vector<float>& values,
+                     hipStream_t stream = nullptr);
+
+  DeltaSteppingCsrResult run(
+      const std::vector<int>& sources,
+      int target,
+      float delta,
+      int max_iters,
+      hipStream_t stream = nullptr,
+      DeltaSteppingCsrProgressCallback progress_callback = nullptr,
+      void* progress_user_data = nullptr);
+
+  DeltaSteppingCsrResult run(
+      int source,
+      int target,
+      float delta,
+      int max_iters,
+      hipStream_t stream = nullptr,
+      DeltaSteppingCsrProgressCallback progress_callback = nullptr,
+      void* progress_user_data = nullptr);
+
+ private:
+  std::unique_ptr<Impl> impl_;
+};
 
 DeltaSteppingCsrResult delta_stepping_minplus_hip_csr(
     const minplus_sparse::DeviceCsrF32& d_adjacency,

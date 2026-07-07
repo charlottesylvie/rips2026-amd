@@ -338,6 +338,7 @@ void update_costed_graph_values(const HostCsrF32& base_graph,
 }
 
 RoutedSink route_sink_from_tree(const HostCsrF32& graph,
+                               DeltaSteppingCsrWorkspace& workspace,
                                const std::vector<int>& source_candidates,
                                const std::vector<std::uint8_t>& tree_seen,
                                int target,
@@ -360,14 +361,13 @@ RoutedSink route_sink_from_tree(const HostCsrF32& graph,
   }
 
   DeltaSteppingCsrResult sssp =
-      delta_stepping_minplus_hip_csr(graph,
-                                     source_candidates,
-                                     target,
-                                     options.delta,
-                                     options.max_sssp_iterations,
-                                     stream,
-                                     nullptr,
-                                     nullptr);
+      workspace.run(source_candidates,
+                    target,
+                    options.delta,
+                    options.max_sssp_iterations,
+                    stream,
+                    nullptr,
+                    nullptr);
   if (!sssp.target_reached ||
       !std::isfinite(sssp.dist[static_cast<std::size_t>(target)])) {
     return routed;
@@ -397,6 +397,7 @@ RoutedSink route_sink_from_tree(const HostCsrF32& graph,
 }
 
 RoutedNet route_net(const HostCsrF32& graph,
+                    DeltaSteppingCsrWorkspace& workspace,
                     const RouteRequest& request,
                     const PathfinderOptions& options,
                     hipStream_t stream) {
@@ -417,7 +418,8 @@ RoutedNet route_net(const HostCsrF32& graph,
   bool reached_all = true;
   for (const SitePinNode& sink : request.sinks) {
     RoutedSink routed_sink =
-        route_sink_from_tree(graph, source_candidates, tree_seen, sink.node, options, stream);
+        route_sink_from_tree(graph, workspace, source_candidates, tree_seen,
+                             sink.node, options, stream);
     if (!routed_sink.reached) {
       reached_all = false;
     } else {
@@ -848,6 +850,7 @@ PathfinderResult run_pathfinder(const HostCsrF32& base_graph,
           : std::min(options.net_limit, metadata.route_requests.size());
   float present_factor = options.initial_present_factor;
   HostCsrF32 graph = base_graph;
+  DeltaSteppingCsrWorkspace sssp_workspace(graph, stream);
   std::cout << "[pathfinder] setup complete: rows=" << base_graph.rows
             << " nnz=" << base_graph.nnz
             << " route_requests=" << metadata.route_requests.size()
@@ -892,8 +895,9 @@ PathfinderResult run_pathfinder(const HostCsrF32& base_graph,
                                  options,
                                  present_factor,
                                  graph);
+      sssp_workspace.update_values(graph.values, stream);
       RoutedNet net =
-          route_net(graph, metadata.route_requests[net_index], options, stream);
+          route_net(graph, sssp_workspace, metadata.route_requests[net_index], options, stream);
       if (!net.reached_all_sinks) {
         all_sinks_reached = false;
       }

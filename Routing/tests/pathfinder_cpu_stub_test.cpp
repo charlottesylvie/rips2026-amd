@@ -175,6 +175,64 @@ routing::RoutingMetadata make_two_net_metadata(const HostCsrF32& graph) {
 
 }  // namespace
 
+struct DeltaSteppingCsrWorkspace::Impl {
+  HostCsrF32 graph;
+};
+
+DeltaSteppingCsrWorkspace::DeltaSteppingCsrWorkspace(const HostCsrF32& adjacency,
+                                                     hipStream_t stream)
+    : impl_(std::make_unique<Impl>()) {
+  (void)stream;
+  impl_->graph = adjacency;
+}
+
+DeltaSteppingCsrWorkspace::~DeltaSteppingCsrWorkspace() = default;
+DeltaSteppingCsrWorkspace::DeltaSteppingCsrWorkspace(
+    DeltaSteppingCsrWorkspace&&) noexcept = default;
+DeltaSteppingCsrWorkspace& DeltaSteppingCsrWorkspace::operator=(
+    DeltaSteppingCsrWorkspace&&) noexcept = default;
+
+void DeltaSteppingCsrWorkspace::update_values(const std::vector<float>& values,
+                                              hipStream_t stream) {
+  (void)stream;
+  impl_->graph.values = values;
+}
+
+DeltaSteppingCsrResult DeltaSteppingCsrWorkspace::run(
+    const std::vector<int>& sources,
+    int target,
+    float delta,
+    int max_iters,
+    hipStream_t stream,
+    DeltaSteppingCsrProgressCallback progress_callback,
+    void* progress_user_data) {
+  return delta_stepping_minplus_hip_csr(impl_->graph,
+                                        sources,
+                                        target,
+                                        delta,
+                                        max_iters,
+                                        stream,
+                                        progress_callback,
+                                        progress_user_data);
+}
+
+DeltaSteppingCsrResult DeltaSteppingCsrWorkspace::run(
+    int source,
+    int target,
+    float delta,
+    int max_iters,
+    hipStream_t stream,
+    DeltaSteppingCsrProgressCallback progress_callback,
+    void* progress_user_data) {
+  return run(std::vector<int>{source},
+             target,
+             delta,
+             max_iters,
+             stream,
+             progress_callback,
+             progress_user_data);
+}
+
 DeltaSteppingCsrResult delta_stepping_minplus_hip_csr(
     const HostCsrF32& adjacency,
     int source,

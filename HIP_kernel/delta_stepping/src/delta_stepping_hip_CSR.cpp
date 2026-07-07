@@ -110,6 +110,7 @@ struct OutgoingCsrOwner {
   DeviceBuffer<Offset> rowptr;
   DeviceBuffer<Index> colind;
   DeviceBuffer<float> values;
+  DeviceBuffer<Offset> incoming_edge;
 
   OutgoingCsrOwner() = default;
   OutgoingCsrOwner(Offset rows_, Offset cols_, Offset nnz_)
@@ -118,7 +119,61 @@ struct OutgoingCsrOwner {
         nnz(nnz_),
         rowptr(static_cast<std::size_t>(rows_) + 1),
         colind(static_cast<std::size_t>(nnz_)),
-        values(static_cast<std::size_t>(nnz_)) {}
+        values(static_cast<std::size_t>(nnz_)),
+        incoming_edge(static_cast<std::size_t>(nnz_)) {}
+};
+
+struct DeltaSteppingScratch {
+  Offset rows = 0;
+  DeviceBuffer<int> sources;
+  DeviceBuffer<float> dist;
+  DeviceBuffer<int> in_current;
+  DeviceBuffer<int> in_pending;
+  DeviceBuffer<int> in_heavy;
+  DeviceBuffer<int> current_queue;
+  DeviceBuffer<int> next_queue;
+  DeviceBuffer<int> pending_a;
+  DeviceBuffer<int> pending_b;
+  DeviceBuffer<int> heavy_queue;
+  DeviceBuffer<int> current_count;
+  DeviceBuffer<int> next_count;
+  DeviceBuffer<int> pending_count;
+  DeviceBuffer<int> new_pending_count;
+  DeviceBuffer<int> heavy_count;
+  DeviceBuffer<int> overflow;
+  DeviceBuffer<int> block_mins;
+  DeviceBuffer<int> pred_node;
+  DeviceBuffer<Offset> pred_edge;
+  std::vector<int> h_block_mins;
+
+  DeltaSteppingScratch() = default;
+  explicit DeltaSteppingScratch(Offset rows_)
+      : rows(rows_),
+        dist(static_cast<std::size_t>(rows_)),
+        in_current(static_cast<std::size_t>(rows_)),
+        in_pending(static_cast<std::size_t>(rows_)),
+        in_heavy(static_cast<std::size_t>(rows_)),
+        current_queue(static_cast<std::size_t>(rows_)),
+        next_queue(static_cast<std::size_t>(rows_)),
+        pending_a(static_cast<std::size_t>(rows_)),
+        pending_b(static_cast<std::size_t>(rows_)),
+        heavy_queue(static_cast<std::size_t>(rows_)),
+        current_count(1),
+        next_count(1),
+        pending_count(1),
+        new_pending_count(1),
+        heavy_count(1),
+        overflow(1),
+        block_mins(static_cast<std::size_t>(
+            (static_cast<int>(rows_) + kBlockSize - 1) / kBlockSize + 1)),
+        pred_node(static_cast<std::size_t>(rows_)),
+        pred_edge(static_cast<std::size_t>(rows_)) {}
+
+  void ensure_source_capacity(std::size_t source_count) {
+    if (sources.size() < source_count) {
+      sources.reset(source_count);
+    }
+  }
 };
 
 inline int grid_for_items(Offset items, int block_size = kBlockSize) {
@@ -379,7 +434,8 @@ __global__ void fill_outgoing_from_incoming_kernel(Offset rows,
                                                    const float* in_values,
                                                    Offset* cursor,
                                                    Index* out_colind,
-                                                   float* out_values) {
+                                                   float* out_values,
+                                                   Offset* out_incoming_edge) {
   // Transpose incoming-edge CSR into outgoing CSR: output row src stores dst.
   for (Offset dst = static_cast<Offset>(blockIdx.x) * blockDim.x + threadIdx.x;
        dst < rows;
@@ -389,7 +445,19 @@ __global__ void fill_outgoing_from_incoming_kernel(Offset rows,
       const Offset pos = atomic_add_offset(&cursor[src], static_cast<Offset>(1));
       out_colind[pos] = static_cast<Index>(dst);
       out_values[pos] = in_values[e];
+      out_incoming_edge[pos] = e;
     }
+  }
+}
+
+__global__ void update_outgoing_values_from_incoming_kernel(Offset nnz,
+                                                            const float* in_values,
+                                                            const Offset* out_incoming_edge,
+                                                            float* out_values) {
+  for (Offset e = static_cast<Offset>(blockIdx.x) * blockDim.x + threadIdx.x;
+       e < nnz;
+       e += static_cast<Offset>(blockDim.x) * gridDim.x) {
+    out_values[e] = in_values[out_incoming_edge[e]];
   }
 }
 
@@ -713,10 +781,25 @@ OutgoingCsrOwner build_outgoing_csr_from_incoming(const minplus_sparse::DeviceCs
 
   if (in.nnz != 0) {
     fill_outgoing_from_incoming_kernel<<<grid_for_items(in.rows), kBlockSize, 0, stream>>>(
-        in.rows, in.rowptr, in.colind, in.values, cursor.get(), out.colind.get(), out.values.get());
+        in.rows, in.rowptr, in.colind, in.values, cursor.get(), out.colind.get(),
+        out.values.get(), out.incoming_edge.get());
     DS_DELTA_HIP_CHECK(hipGetLastError());
   }
   return out;
+}
+
+void update_outgoing_values_from_incoming(OutgoingCsrOwner& outgoing,
+                                          const minplus_sparse::DeviceCsrF32& incoming,
+                                          hipStream_t stream) {
+  if (incoming.nnz == 0) {
+    return;
+  }
+  update_outgoing_values_from_incoming_kernel<<<grid_for_items(incoming.nnz),
+                                                kBlockSize,
+                                                0,
+                                                stream>>>(
+      incoming.nnz, incoming.values, outgoing.incoming_edge.get(), outgoing.values.get());
+  DS_DELTA_HIP_CHECK(hipGetLastError());
 }
 
 std::vector<float> copy_dist_to_host(const float* d_dist, Offset n, hipStream_t stream) {
@@ -735,20 +818,20 @@ float copy_dist_value_to_host(const float* d_dist, int vertex, hipStream_t strea
 void copy_predecessors_to_result(DeltaSteppingCsrResult& result,
                                  const minplus_sparse::DeviceCsrF32& graph,
                                  const float* d_dist,
+                                 int* d_pred_node,
+                                 Offset* d_pred_edge,
                                  hipStream_t stream) {
-  DeviceBuffer<int> d_pred_node(static_cast<std::size_t>(graph.rows));
-  DeviceBuffer<Offset> d_pred_edge(static_cast<std::size_t>(graph.rows));
   compute_predecessors_kernel<<<grid_for_items(graph.rows), kBlockSize, 0, stream>>>(
       graph.rows, graph.rowptr, graph.colind, graph.values, d_dist,
-      d_pred_node.get(), d_pred_edge.get());
+      d_pred_node, d_pred_edge);
   DS_DELTA_HIP_CHECK(hipGetLastError());
 
   result.pred_node.resize(static_cast<std::size_t>(graph.rows));
   result.pred_edge.resize(static_cast<std::size_t>(graph.rows));
-  DS_DELTA_HIP_CHECK(hipMemcpyAsync(result.pred_node.data(), d_pred_node.get(),
+  DS_DELTA_HIP_CHECK(hipMemcpyAsync(result.pred_node.data(), d_pred_node,
                                     static_cast<std::size_t>(graph.rows) * sizeof(int),
                                     hipMemcpyDeviceToHost, stream));
-  DS_DELTA_HIP_CHECK(hipMemcpyAsync(result.pred_edge.data(), d_pred_edge.get(),
+  DS_DELTA_HIP_CHECK(hipMemcpyAsync(result.pred_edge.data(), d_pred_edge,
                                     static_cast<std::size_t>(graph.rows) * sizeof(Offset),
                                     hipMemcpyDeviceToHost, stream));
   DS_DELTA_HIP_CHECK(hipStreamSynchronize(stream));
@@ -784,10 +867,10 @@ int find_min_pending_bucket(const int* d_pending_queue,
   return min_bucket;
 }
 
-}  // namespace ds_delta_detail
-
-DeltaSteppingCsrResult delta_stepping_minplus_hip_csr(
+DeltaSteppingCsrResult run_delta_stepping_impl(
     const minplus_sparse::DeviceCsrF32& d_adjacency,
+    const OutgoingCsrOwner& outgoing,
+    DeltaSteppingScratch& scratch,
     const std::vector<int>& sources,
     int target,
     float delta,
@@ -795,10 +878,6 @@ DeltaSteppingCsrResult delta_stepping_minplus_hip_csr(
     hipStream_t stream,
     DeltaSteppingCsrProgressCallback progress_callback,
     void* progress_user_data) {
-  using namespace ds_delta_detail;
-
-  validate_device_csr_shape(d_adjacency, sources, target, delta);
-  validate_device_csr_contents(d_adjacency, stream);
   if (max_iters < 0) max_iters = std::numeric_limits<int>::max();
 
   const Offset n = d_adjacency.rows;
@@ -809,41 +888,26 @@ DeltaSteppingCsrResult delta_stepping_minplus_hip_csr(
   const bool target_is_source =
       target >= 0 && std::find(sources.begin(), sources.end(), target) != sources.end();
 
-  OutgoingCsrOwner outgoing = build_outgoing_csr_from_incoming(d_adjacency, stream);
-
-  DeviceBuffer<int> d_sources(static_cast<std::size_t>(source_count));
-  DeviceBuffer<float> d_dist(static_cast<std::size_t>(n));
-  DeviceBuffer<int> d_in_current(static_cast<std::size_t>(n));
-  DeviceBuffer<int> d_in_pending(static_cast<std::size_t>(n));
-  DeviceBuffer<int> d_in_heavy(static_cast<std::size_t>(n));
-  DeviceBuffer<int> d_current_queue(static_cast<std::size_t>(n));
-  DeviceBuffer<int> d_next_queue(static_cast<std::size_t>(n));
-  DeviceBuffer<int> d_pending_a(static_cast<std::size_t>(n));
-  DeviceBuffer<int> d_pending_b(static_cast<std::size_t>(n));
-  DeviceBuffer<int> d_heavy_queue(static_cast<std::size_t>(n));
-  DeviceBuffer<int> d_current_count(1), d_next_count(1), d_pending_count(1);
-  DeviceBuffer<int> d_new_pending_count(1), d_heavy_count(1), d_overflow(1);
-  DeviceBuffer<int> d_block_mins(static_cast<std::size_t>((n_int + kBlockSize - 1) / kBlockSize + 1));
-
+  scratch.ensure_source_capacity(static_cast<std::size_t>(source_count));
   initialize_delta_arrays_kernel<<<grid_for_items(n), kBlockSize, 0, stream>>>(
-      n, inf, d_dist.get(), d_in_current.get(), d_in_pending.get(), d_in_heavy.get(),
-      d_current_count.get(), d_next_count.get(), d_pending_count.get(),
-      d_heavy_count.get(), d_overflow.get());
+      n, inf, scratch.dist.get(), scratch.in_current.get(), scratch.in_pending.get(),
+      scratch.in_heavy.get(), scratch.current_count.get(), scratch.next_count.get(),
+      scratch.pending_count.get(), scratch.heavy_count.get(), scratch.overflow.get());
   DS_DELTA_HIP_CHECK(hipGetLastError());
-  DS_DELTA_HIP_CHECK(hipMemcpyAsync(d_sources.get(), sources.data(),
+  DS_DELTA_HIP_CHECK(hipMemcpyAsync(scratch.sources.get(), sources.data(),
                                     static_cast<std::size_t>(source_count) * sizeof(int),
                                     hipMemcpyHostToDevice, stream));
   initialize_delta_sources_kernel<<<grid_for_items(source_count), kBlockSize, 0, stream>>>(
-      d_sources.get(), source_count, d_dist.get(), d_in_current.get(),
-      d_current_queue.get(), d_current_count.get());
+      scratch.sources.get(), source_count, scratch.dist.get(), scratch.in_current.get(),
+      scratch.current_queue.get(), scratch.current_count.get());
   DS_DELTA_HIP_CHECK(hipGetLastError());
 
-  int* current_queue = d_current_queue.get();
-  int* next_queue = d_next_queue.get();
-  int* pending_queue = d_pending_a.get();
-  int* pending_scratch = d_pending_b.get();
+  int* current_queue = scratch.current_queue.get();
+  int* next_queue = scratch.next_queue.get();
+  int* pending_queue = scratch.pending_a.get();
+  int* pending_scratch = scratch.pending_b.get();
   int current_bucket = 0;
-  int current_count = copy_scalar_to_host(d_current_count.get(), stream);
+  int current_count = copy_scalar_to_host(scratch.current_count.get(), stream);
   int pending_count = 0;
   DeltaSteppingCsrResult result;
   result.target = target;
@@ -851,57 +915,54 @@ DeltaSteppingCsrResult delta_stepping_minplus_hip_csr(
     result.target_distance = 0.0f;
     result.target_reached = true;
     result.stopped_on_target = true;
-    copy_predecessors_to_result(result, d_adjacency, d_dist.get(), stream);
-    result.dist = copy_dist_to_host(d_dist.get(), n, stream);
+    copy_predecessors_to_result(result, d_adjacency, scratch.dist.get(),
+                                scratch.pred_node.get(), scratch.pred_edge.get(), stream);
+    result.dist = copy_dist_to_host(scratch.dist.get(), n, stream);
     return result;
   }
-  std::vector<int> h_block_mins;
 
   for (int iter = 0; iter < max_iters; ++iter) {
-    reset_int_zero_async(d_heavy_count.get(), stream);
+    reset_int_zero_async(scratch.heavy_count.get(), stream);
 
     while (current_count > 0) {
-      reset_int_zero_async(d_next_count.get(), stream);
-      reset_int_zero_async(d_overflow.get(), stream);
+      reset_int_zero_async(scratch.next_count.get(), stream);
+      reset_int_zero_async(scratch.overflow.get(), stream);
 
-      // Correctness-critical: clear membership for every vertex in the current
-      // frontier before any block starts relaxing light edges.  The previous
-      // implementation cleared one vertex inside relax_light_edges_kernel;
-      // other blocks could then observe stale in_current[v] == 1 and drop a
-      // required same-bucket re-enqueue, causing premature bucket convergence.
       clear_flags_from_queue_kernel<<<grid_for_items(current_count), kBlockSize, 0, stream>>>(
-          current_queue, current_count, d_in_current.get());
+          current_queue, current_count, scratch.in_current.get());
       DS_DELTA_HIP_CHECK(hipGetLastError());
 
       relax_light_edges_kernel<<<grid_for_frontier(current_count), kBlockSize, 0, stream>>>(
           current_queue, current_count, current_bucket, delta, inv_delta,
-          outgoing.rowptr.get(), outgoing.colind.get(), outgoing.values.get(), d_dist.get(),
-          d_in_current.get(), d_in_pending.get(), d_in_heavy.get(), next_queue, d_next_count.get(),
-          pending_queue, d_pending_count.get(), d_heavy_queue.get(), d_heavy_count.get(),
-          n_int, d_overflow.get());
+          outgoing.rowptr.get(), outgoing.colind.get(), outgoing.values.get(),
+          scratch.dist.get(), scratch.in_current.get(), scratch.in_pending.get(),
+          scratch.in_heavy.get(), next_queue, scratch.next_count.get(),
+          pending_queue, scratch.pending_count.get(), scratch.heavy_queue.get(),
+          scratch.heavy_count.get(), n_int, scratch.overflow.get());
       DS_DELTA_HIP_CHECK(hipGetLastError());
-      throw_if_overflow(d_overflow.get(), stream);
-      current_count = copy_scalar_to_host(d_next_count.get(), stream);
+      throw_if_overflow(scratch.overflow.get(), stream);
+      current_count = copy_scalar_to_host(scratch.next_count.get(), stream);
       std::swap(current_queue, next_queue);
     }
 
-    const int heavy_count = copy_scalar_to_host(d_heavy_count.get(), stream);
+    const int heavy_count = copy_scalar_to_host(scratch.heavy_count.get(), stream);
     if (heavy_count > 0) {
-      reset_int_zero_async(d_overflow.get(), stream);
+      reset_int_zero_async(scratch.overflow.get(), stream);
       relax_heavy_edges_kernel<<<grid_for_frontier(heavy_count), kBlockSize, 0, stream>>>(
-          d_heavy_queue.get(), heavy_count, current_bucket, delta, inv_delta,
-          outgoing.rowptr.get(), outgoing.colind.get(), outgoing.values.get(), d_dist.get(),
-          d_in_pending.get(), pending_queue, d_pending_count.get(), n_int, d_overflow.get());
+          scratch.heavy_queue.get(), heavy_count, current_bucket, delta, inv_delta,
+          outgoing.rowptr.get(), outgoing.colind.get(), outgoing.values.get(),
+          scratch.dist.get(), scratch.in_pending.get(), pending_queue,
+          scratch.pending_count.get(), n_int, scratch.overflow.get());
       DS_DELTA_HIP_CHECK(hipGetLastError());
-      throw_if_overflow(d_overflow.get(), stream);
+      throw_if_overflow(scratch.overflow.get(), stream);
       clear_flags_from_queue_kernel<<<grid_for_items(heavy_count), kBlockSize, 0, stream>>>(
-          d_heavy_queue.get(), heavy_count, d_in_heavy.get());
+          scratch.heavy_queue.get(), heavy_count, scratch.in_heavy.get());
       DS_DELTA_HIP_CHECK(hipGetLastError());
     }
 
     result.iterations_used = iter + 1;
     if (target >= 0) {
-      const float target_distance = copy_dist_value_to_host(d_dist.get(), target, stream);
+      const float target_distance = copy_dist_value_to_host(scratch.dist.get(), target, stream);
       const bool target_settled =
           std::isfinite(target_distance) &&
           bucket_index_host(target_distance, inv_delta) <= current_bucket;
@@ -921,10 +982,11 @@ DeltaSteppingCsrResult delta_stepping_minplus_hip_csr(
       }
     }
 
-    pending_count = copy_scalar_to_host(d_pending_count.get(), stream);
-    const int next_bucket = find_min_pending_bucket(pending_queue, pending_count, current_bucket,
-                                                    inv_delta, d_dist.get(), d_in_pending.get(),
-                                                    d_block_mins.get(), h_block_mins, stream);
+    pending_count = copy_scalar_to_host(scratch.pending_count.get(), stream);
+    const int next_bucket =
+        find_min_pending_bucket(pending_queue, pending_count, current_bucket,
+                                inv_delta, scratch.dist.get(), scratch.in_pending.get(),
+                                scratch.block_mins.get(), scratch.h_block_mins, stream);
     const bool changed = (next_bucket != kNoBucket);
     if (progress_callback) {
       DeltaSteppingCsrProgress progress;
@@ -940,29 +1002,34 @@ DeltaSteppingCsrResult delta_stepping_minplus_hip_csr(
     }
 
     current_bucket = next_bucket;
-    current_queue = d_current_queue.get();
-    next_queue = d_next_queue.get();
-    reset_int_zero_async(d_current_count.get(), stream);
-    reset_int_zero_async(d_new_pending_count.get(), stream);
-    reset_int_zero_async(d_overflow.get(), stream);
+    current_queue = scratch.current_queue.get();
+    next_queue = scratch.next_queue.get();
+    reset_int_zero_async(scratch.current_count.get(), stream);
+    reset_int_zero_async(scratch.new_pending_count.get(), stream);
+    reset_int_zero_async(scratch.overflow.get(), stream);
 
     compact_pending_to_current_bucket_kernel<<<grid_for_items(pending_count), kBlockSize, 0, stream>>>(
-        pending_queue, pending_count, current_bucket, inv_delta, d_dist.get(), d_in_pending.get(),
-        d_in_current.get(), current_queue, d_current_count.get(), pending_scratch,
-        d_new_pending_count.get(), n_int, d_overflow.get());
+        pending_queue, pending_count, current_bucket, inv_delta, scratch.dist.get(),
+        scratch.in_pending.get(), scratch.in_current.get(), current_queue,
+        scratch.current_count.get(), pending_scratch, scratch.new_pending_count.get(),
+        n_int, scratch.overflow.get());
     DS_DELTA_HIP_CHECK(hipGetLastError());
-    throw_if_overflow(d_overflow.get(), stream);
+    throw_if_overflow(scratch.overflow.get(), stream);
 
-    current_count = copy_scalar_to_host(d_current_count.get(), stream);
-    DS_DELTA_HIP_CHECK(hipMemcpyAsync(d_pending_count.get(), d_new_pending_count.get(), sizeof(int),
-                                      hipMemcpyDeviceToDevice, stream));
+    current_count = copy_scalar_to_host(scratch.current_count.get(), stream);
+    DS_DELTA_HIP_CHECK(hipMemcpyAsync(scratch.pending_count.get(),
+                                      scratch.new_pending_count.get(),
+                                      sizeof(int),
+                                      hipMemcpyDeviceToDevice,
+                                      stream));
     std::swap(pending_queue, pending_scratch);
   }
 
   if (target >= 0) {
-    copy_predecessors_to_result(result, d_adjacency, d_dist.get(), stream);
+    copy_predecessors_to_result(result, d_adjacency, scratch.dist.get(),
+                                scratch.pred_node.get(), scratch.pred_edge.get(), stream);
   }
-  result.dist = copy_dist_to_host(d_dist.get(), n, stream);
+  result.dist = copy_dist_to_host(scratch.dist.get(), n, stream);
   if (target >= 0) {
     result.target_distance = result.dist[static_cast<std::size_t>(target)];
     result.target_reached =
@@ -970,6 +1037,121 @@ DeltaSteppingCsrResult delta_stepping_minplus_hip_csr(
         (result.target_reached || result.converged);
   }
   return result;
+}
+
+}  // namespace ds_delta_detail
+
+struct DeltaSteppingCsrWorkspace::Impl {
+  ds_delta_detail::DeviceCsrOwner adjacency;
+  ds_delta_detail::OutgoingCsrOwner outgoing;
+  ds_delta_detail::DeltaSteppingScratch scratch;
+
+  Impl(const HostCsrF32& host, hipStream_t stream)
+      : adjacency(ds_delta_detail::copy_host_csr_to_device(host, stream)),
+        outgoing(ds_delta_detail::build_outgoing_csr_from_incoming(adjacency.view, stream)),
+        scratch(host.rows) {}
+};
+
+DeltaSteppingCsrWorkspace::DeltaSteppingCsrWorkspace(const HostCsrF32& adjacency,
+                                                     hipStream_t stream) {
+  using namespace ds_delta_detail;
+  validate_host_csr_arrays(adjacency);
+  if (adjacency.rows <= 0 || adjacency.rows != adjacency.cols) {
+    throw std::invalid_argument("CSR graph must be nonempty and square");
+  }
+  if (static_cast<unsigned long long>(adjacency.rows) >
+      static_cast<unsigned long long>(std::numeric_limits<int>::max())) {
+    throw std::overflow_error("frontier vertices are stored as int; rows must fit in int");
+  }
+  impl_ = std::make_unique<Impl>(adjacency, stream);
+}
+
+DeltaSteppingCsrWorkspace::~DeltaSteppingCsrWorkspace() = default;
+DeltaSteppingCsrWorkspace::DeltaSteppingCsrWorkspace(
+    DeltaSteppingCsrWorkspace&&) noexcept = default;
+DeltaSteppingCsrWorkspace& DeltaSteppingCsrWorkspace::operator=(
+    DeltaSteppingCsrWorkspace&&) noexcept = default;
+
+void DeltaSteppingCsrWorkspace::update_values(const std::vector<float>& values,
+                                              hipStream_t stream) {
+  using namespace ds_delta_detail;
+  if (!impl_) {
+    throw std::runtime_error("DeltaSteppingCsrWorkspace has no implementation");
+  }
+  if (values.size() != static_cast<std::size_t>(impl_->adjacency.view.nnz)) {
+    throw std::invalid_argument("updated CSR values size does not match workspace nnz");
+  }
+  if (impl_->adjacency.view.nnz == 0) {
+    return;
+  }
+  DS_DELTA_HIP_CHECK(hipMemcpyAsync(impl_->adjacency.values.get(),
+                                    values.data(),
+                                    values.size() * sizeof(float),
+                                    hipMemcpyHostToDevice,
+                                    stream));
+  update_outgoing_values_from_incoming(impl_->outgoing, impl_->adjacency.view, stream);
+}
+
+DeltaSteppingCsrResult DeltaSteppingCsrWorkspace::run(
+    const std::vector<int>& sources,
+    int target,
+    float delta,
+    int max_iters,
+    hipStream_t stream,
+    DeltaSteppingCsrProgressCallback progress_callback,
+    void* progress_user_data) {
+  using namespace ds_delta_detail;
+  if (!impl_) {
+    throw std::runtime_error("DeltaSteppingCsrWorkspace has no implementation");
+  }
+  validate_device_csr_shape(impl_->adjacency.view, sources, target, delta);
+  return run_delta_stepping_impl(impl_->adjacency.view,
+                                 impl_->outgoing,
+                                 impl_->scratch,
+                                 sources,
+                                 target,
+                                 delta,
+                                 max_iters,
+                                 stream,
+                                 progress_callback,
+                                 progress_user_data);
+}
+
+DeltaSteppingCsrResult DeltaSteppingCsrWorkspace::run(
+    int source,
+    int target,
+    float delta,
+    int max_iters,
+    hipStream_t stream,
+    DeltaSteppingCsrProgressCallback progress_callback,
+    void* progress_user_data) {
+  return run(std::vector<int>{source},
+             target,
+             delta,
+             max_iters,
+             stream,
+             progress_callback,
+             progress_user_data);
+}
+
+DeltaSteppingCsrResult delta_stepping_minplus_hip_csr(
+    const minplus_sparse::DeviceCsrF32& d_adjacency,
+    const std::vector<int>& sources,
+    int target,
+    float delta,
+    int max_iters,
+    hipStream_t stream,
+    DeltaSteppingCsrProgressCallback progress_callback,
+    void* progress_user_data) {
+  using namespace ds_delta_detail;
+
+  validate_device_csr_shape(d_adjacency, sources, target, delta);
+  validate_device_csr_contents(d_adjacency, stream);
+  OutgoingCsrOwner outgoing = build_outgoing_csr_from_incoming(d_adjacency, stream);
+  DeltaSteppingScratch scratch(d_adjacency.rows);
+  return run_delta_stepping_impl(d_adjacency, outgoing, scratch, sources, target,
+                                 delta, max_iters, stream, progress_callback,
+                                 progress_user_data);
 }
 
 DeltaSteppingCsrResult delta_stepping_minplus_hip_csr(
