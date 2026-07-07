@@ -143,6 +143,7 @@ void print_usage(const char* program) {
       << "  --delta <float>                Forwarded to pathfinder.\n"
       << "  --max-pathfinder-iters <int>   Forwarded to pathfinder.\n"
       << "  --max-sssp-iters <int>         Forwarded to pathfinder.\n"
+      << "  --net-limit <count>            Forwarded to pathfinder.\n"
       << "  --capacity <int>               Forwarded to pathfinder.\n"
       << "  --present-factor <float>       Forwarded to pathfinder.\n"
       << "  --present-multiplier <float>   Forwarded to pathfinder.\n"
@@ -198,6 +199,7 @@ Options parse_args(int argc, char** argv) {
     } else if (option == "--delta" ||
                option == "--max-pathfinder-iters" ||
                option == "--max-sssp-iters" ||
+               option == "--net-limit" ||
                option == "--capacity" ||
                option == "--present-factor" ||
                option == "--present-multiplier" ||
