@@ -589,6 +589,42 @@ void commit_net_occupancy(const RoutedNet& net, std::vector<int>& occupancy) {
   }
 }
 
+void remove_net_occupancy(const RoutedNet& net, std::vector<int>& occupancy) {
+  if (!net.reached_all_sinks) {
+    return;
+  }
+  for (const int node : net.unique_nodes) {
+    if (node < 0 || static_cast<std::size_t>(node) >= occupancy.size()) {
+      continue;
+    }
+    int& used = occupancy[static_cast<std::size_t>(node)];
+    if (used <= 0) {
+      throw std::runtime_error("incremental rip-up found inconsistent occupancy");
+    }
+    --used;
+  }
+}
+
+bool net_needs_reroute(const RoutedNet& net,
+                       const std::vector<int>& occupancy,
+                       int capacity) {
+  if (!net.reached_all_sinks) {
+    return true;
+  }
+  for (const int node : net.unique_nodes) {
+    if (node >= 0 &&
+        static_cast<std::size_t>(node) < occupancy.size() &&
+        occupancy[static_cast<std::size_t>(node)] > capacity) {
+      return true;
+    }
+  }
+  return false;
+}
+
+std::size_t route_request_weight(const RouteRequest& request) {
+  return request.sources.size() + request.sinks.size();
+}
+
 void update_congestion_stats(const std::vector<int>& occupancy,
                              int capacity,
                              int* overused_nodes,
@@ -997,6 +1033,7 @@ PathfinderResult run_pathfinder(const HostCsrF32& base_graph,
   std::vector<float> vertex_costs(static_cast<std::size_t>(base_graph.rows), 1.0f);
   std::vector<std::uint32_t> route_tree_seen(static_cast<std::size_t>(base_graph.rows), 0);
   std::uint32_t route_tree_stamp = 0;
+  result.nets.resize(route_request_count);
   std::cout << "[pathfinder] setup complete: rows=" << base_graph.rows
             << " nnz=" << base_graph.nnz
             << " route_requests=" << metadata.route_requests.size()
@@ -1012,22 +1049,58 @@ PathfinderResult run_pathfinder(const HostCsrF32& base_graph,
               << "/" << options.max_pathfinder_iterations
               << " present_factor=" << present_factor
               << "\n" << std::flush;
-    std::fill(result.occupancy.begin(), result.occupancy.end(), 0);
-    result.nets.clear();
-    result.nets.reserve(route_request_count);
+
+    std::vector<std::size_t> reroute_indices;
+    reroute_indices.reserve(route_request_count);
+    if (iteration == 0) {
+      std::fill(result.occupancy.begin(), result.occupancy.end(), 0);
+      for (std::size_t net_index = 0; net_index < route_request_count; ++net_index) {
+        reroute_indices.push_back(net_index);
+      }
+    } else {
+      for (std::size_t net_index = 0; net_index < route_request_count; ++net_index) {
+        if (net_needs_reroute(result.nets[net_index],
+                              result.occupancy,
+                              options.capacity)) {
+          reroute_indices.push_back(net_index);
+        }
+      }
+      for (const std::size_t net_index : reroute_indices) {
+        remove_net_occupancy(result.nets[net_index], result.occupancy);
+      }
+    }
+
+    std::stable_sort(
+        reroute_indices.begin(),
+        reroute_indices.end(),
+        [&](std::size_t lhs, std::size_t rhs) {
+          const std::size_t lhs_weight =
+              route_request_weight(metadata.route_requests[lhs]);
+          const std::size_t rhs_weight =
+              route_request_weight(metadata.route_requests[rhs]);
+          if (lhs_weight != rhs_weight) {
+            return lhs_weight > rhs_weight;
+          }
+          return lhs < rhs;
+        });
+
+    std::cout << "[pathfinder] iteration " << (iteration + 1)
+              << " rerouting " << reroute_indices.size()
+              << "/" << route_request_count << " nets\n" << std::flush;
+
+    const std::size_t reroute_count = reroute_indices.size();
     const std::size_t progress_interval =
-        std::max<std::size_t>(1, route_request_count / 100);
-    if (route_request_count == 0) {
+        std::max<std::size_t>(1, reroute_count / 100);
+    if (reroute_count == 0) {
       print_pathfinder_progress(iteration + 1,
                                 options.max_pathfinder_iterations,
                                 0,
                                 0);
     }
 
-    bool all_sinks_reached = true;
-    for (std::size_t batch_begin = 0; batch_begin < route_request_count;) {
+    for (std::size_t batch_begin = 0; batch_begin < reroute_count;) {
       const std::size_t batch_end =
-          std::min(route_request_count, batch_begin + options.route_batch_size);
+          std::min(reroute_count, batch_begin + options.route_batch_size);
       update_vertex_costs(base_graph,
                           result.occupancy,
                           result.history,
@@ -1036,13 +1109,17 @@ PathfinderResult run_pathfinder(const HostCsrF32& base_graph,
                           vertex_costs);
       sssp_workspace.update_vertex_costs(vertex_costs, stream);
 
-      const std::size_t batch_result_begin = result.nets.size();
-      for (std::size_t net_index = batch_begin; net_index < batch_end; ++net_index) {
-        if (net_index == 0 || net_index + 1 == route_request_count ||
-            net_index % progress_interval == 0) {
+      std::vector<std::size_t> batch_routed_indices;
+      batch_routed_indices.reserve(batch_end - batch_begin);
+      for (std::size_t route_pos = batch_begin; route_pos < batch_end; ++route_pos) {
+        const std::size_t net_index = reroute_indices[route_pos];
+        if (route_pos == 0 || route_pos + 1 == reroute_count ||
+            route_pos % progress_interval == 0) {
           const RouteRequest& request = metadata.route_requests[net_index];
           std::cout << "[pathfinder] beginning net " << (net_index + 1)
                     << "/" << route_request_count
+                    << " reroute " << (route_pos + 1)
+                    << "/" << reroute_count
                     << " name=" << string_at(metadata, request.net_string)
                     << " sources=" << request.sources.size()
                     << " sinks=" << request.sinks.size()
@@ -1059,27 +1136,33 @@ PathfinderResult run_pathfinder(const HostCsrF32& base_graph,
                       &vertex_costs,
                       options,
                       stream);
-        if (!net.reached_all_sinks) {
-          all_sinks_reached = false;
-        }
-        result.nets.push_back(std::move(net));
-        if ((net_index + 1) == route_request_count ||
-            (net_index + 1) % progress_interval == 0) {
-          std::cout << "[pathfinder] completed net " << (net_index + 1)
+        result.nets[net_index] = std::move(net);
+        batch_routed_indices.push_back(net_index);
+        if ((route_pos + 1) == reroute_count ||
+            (route_pos + 1) % progress_interval == 0) {
+          std::cout << "[pathfinder] completed reroute " << (route_pos + 1)
+                    << "/" << reroute_count
+                    << " net " << (net_index + 1)
                     << "/" << route_request_count << "\n";
           print_pathfinder_progress(iteration + 1,
                                     options.max_pathfinder_iterations,
-                                    net_index + 1,
-                                    route_request_count);
+                                    route_pos + 1,
+                                    reroute_count);
         }
       }
 
-      for (std::size_t routed_index = batch_result_begin;
-           routed_index < result.nets.size();
-           ++routed_index) {
+      for (const std::size_t routed_index : batch_routed_indices) {
         commit_net_occupancy(result.nets[routed_index], result.occupancy);
       }
       batch_begin = batch_end;
+    }
+
+    bool all_sinks_reached = true;
+    for (std::size_t net_index = 0; net_index < route_request_count; ++net_index) {
+      if (!result.nets[net_index].reached_all_sinks) {
+        all_sinks_reached = false;
+        break;
+      }
     }
 
     result.iterations_used = iteration + 1;

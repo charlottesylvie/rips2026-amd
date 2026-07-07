@@ -121,6 +121,17 @@ HostCsrF32 make_two_net_congestion_graph() {
   return graph;
 }
 
+HostCsrF32 make_incremental_reroute_graph() {
+  HostCsrF32 graph;
+  graph.rows = 8;
+  graph.cols = 8;
+  graph.nnz = 5;
+  graph.rowptr = {0, 0, 0, 2, 2, 3, 4, 4, 5};
+  graph.colind = {0, 1, 2, 2, 6};
+  graph.values = {1.0f, 1.0f, 1.0f, 1.0f, 1.0f};
+  return graph;
+}
+
 routing::RoutingMetadata make_metadata() {
   routing::RoutingMetadata metadata;
   metadata.strings = {"net0",      "SRC_SITE", "SRC_PIN", "SINK_SITE_0",
@@ -147,6 +158,36 @@ routing::RoutingMetadata make_metadata() {
   request.sinks.push_back({2, 3, 4});
   request.sinks.push_back({3, 5, 6});
   metadata.route_requests.push_back(std::move(request));
+  return metadata;
+}
+
+routing::RoutingMetadata make_incremental_reroute_metadata(const HostCsrF32& graph) {
+  routing::RoutingMetadata metadata;
+  metadata.strings = {"net_a", "net_b", "net_c", "SRC_SITE_A", "SRC_SITE_B",
+                      "SRC_SITE_C", "SRC_PIN", "SINK_SITE_A", "SINK_SITE_B",
+                      "SINK_SITE_C", "SINK_PIN", "TILE_A", "WIRE_0", "WIRE_1"};
+  metadata.node_device_ids = {0, 1, 2, 3, 4, 5, 6, 7};
+  metadata.edge_attrs.assign(static_cast<std::size_t>(graph.nnz), {11, 0});
+  metadata.pip_data = {{12, 13, true}};
+
+  routing::RouteRequest net_a;
+  net_a.net_string = 0;
+  net_a.sources.push_back({0, 3, 6});
+  net_a.sinks.push_back({4, 7, 10});
+  metadata.route_requests.push_back(std::move(net_a));
+
+  routing::RouteRequest net_b;
+  net_b.net_string = 1;
+  net_b.sources.push_back({1, 4, 6});
+  net_b.sinks.push_back({5, 8, 10});
+  metadata.route_requests.push_back(std::move(net_b));
+
+  routing::RouteRequest net_c;
+  net_c.net_string = 2;
+  net_c.sources.push_back({6, 5, 6});
+  net_c.sinks.push_back({7, 9, 10});
+  metadata.route_requests.push_back(std::move(net_c));
+
   return metadata;
 }
 
@@ -437,6 +478,28 @@ int main() {
           "first net should use the shared direct path");
   require(congestion_result.nets[1].sinks[0].nodes == std::vector<int>({1, 3, 5}),
           "second net should use the bypass path after node 2 is occupied");
+
+  const HostCsrF32 incremental_graph = make_incremental_reroute_graph();
+  const routing::RoutingMetadata incremental_metadata =
+      make_incremental_reroute_metadata(incremental_graph);
+  routing::PathfinderOptions incremental_options;
+  incremental_options.max_pathfinder_iterations = 2;
+  incremental_options.delta = 1.0f;
+  incremental_options.route_batch_size = 3;
+  g_multisource_delta_calls = 0;
+  routing::PathfinderResult incremental_result =
+      routing::run_pathfinder(incremental_graph,
+                              incremental_metadata,
+                              incremental_options,
+                              nullptr);
+  require(incremental_result.nets.size() == 3,
+          "incremental test should preserve all net result slots");
+  require(incremental_result.overused_nodes == 1,
+          "incremental test should leave the intentionally unavoidable conflict");
+  require(incremental_result.nets[2].sinks[0].nodes == std::vector<int>({6, 7}),
+          "uncongested retained net should keep its previous route");
+  require(g_multisource_delta_calls == 5,
+          "incremental reroute should skip the uncongested third net in iteration 2");
 
   g_multisource_delta_calls = 0;
   routing::PathfinderOptions options;
