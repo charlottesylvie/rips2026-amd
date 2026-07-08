@@ -158,9 +158,8 @@ inline void validate_common_shape(Offset rows, Offset cols, Offset nnz, int sour
   }
 }
 
-inline void validate_host_csr(const HostCsrF32& g, int source, float delta) {
-  validate_common_shape(g.rows, g.cols, g.nnz, source);
-  validate_delta(delta);
+inline void validate_host_csr_context(const HostCsrF32& g) {
+  validate_common_shape(g.rows, g.cols, g.nnz, 0);
   const std::size_t rows = checked_size(g.rows, "rows");
   const std::size_t nnz = checked_size(g.nnz, "nnz");
   if (g.rowptr.size() != rows + 1) throw std::invalid_argument("rowptr.size() must equal rows + 1");
@@ -184,21 +183,49 @@ inline void validate_host_csr(const HostCsrF32& g, int source, float delta) {
   }
 }
 
-inline void validate_device_csr_shape(const minplus_sparse::DeviceCsrF32& g,
-                                      int source,
-                                      float delta) {
+inline void validate_host_csr(const HostCsrF32& g, int source, float delta) {
   validate_common_shape(g.rows, g.cols, g.nnz, source);
   validate_delta(delta);
+  validate_host_csr_context(g);
+}
+
+inline void validate_device_csr_context_shape(const minplus_sparse::DeviceCsrF32& g) {
+  validate_common_shape(g.rows, g.cols, g.nnz, 0);
   if (g.rowptr == nullptr) throw std::invalid_argument("device CSR rowptr is null");
   if (g.nnz > 0 && (g.colind == nullptr || g.values == nullptr)) {
     throw std::invalid_argument("device CSR colind/values are null for a nonempty graph");
   }
 }
 
+inline void validate_device_csr_shape(const minplus_sparse::DeviceCsrF32& g,
+                                      int source,
+                                      float delta) {
+  validate_common_shape(g.rows, g.cols, g.nnz, source);
+  validate_delta(delta);
+  validate_device_csr_context_shape(g);
+}
+
 template <typename T>
 inline T copy_scalar_to_host(const T* d_value, hipStream_t stream) {
   T h{};
   DS_DELTA_HIP_CHECK(hipMemcpyAsync(&h, d_value, sizeof(T), hipMemcpyDeviceToHost, stream));
+  DS_DELTA_HIP_CHECK(hipStreamSynchronize(stream));
+  return h;
+}
+
+struct CountOverflowStatus {
+  int count = 0;
+  int overflow = 0;
+};
+
+inline CountOverflowStatus copy_count_overflow_to_host(const int* d_count,
+                                                       const int* d_overflow,
+                                                       hipStream_t stream) {
+  CountOverflowStatus h{};
+  DS_DELTA_HIP_CHECK(hipMemcpyAsync(&h.count, d_count, sizeof(int),
+                                    hipMemcpyDeviceToHost, stream));
+  DS_DELTA_HIP_CHECK(hipMemcpyAsync(&h.overflow, d_overflow, sizeof(int),
+                                    hipMemcpyDeviceToHost, stream));
   DS_DELTA_HIP_CHECK(hipStreamSynchronize(stream));
   return h;
 }
@@ -643,28 +670,21 @@ int find_min_pending_bucket(const int* d_pending_queue,
   return min_bucket;
 }
 
-}  // namespace ds_delta_detail
-
-DeltaSteppingCsrResult delta_stepping_minplus_hip_csr(
+DeltaSteppingCsrResult run_delta_stepping_prepared(
     const minplus_sparse::DeviceCsrF32& d_adjacency,
+    const OutgoingCsrOwner& outgoing,
     int source,
     float delta,
     int max_iters,
     hipStream_t stream,
     DeltaSteppingCsrProgressCallback progress_callback,
     void* progress_user_data) {
-  using namespace ds_delta_detail;
-
-  validate_device_csr_shape(d_adjacency, source, delta);
-  validate_device_csr_contents(d_adjacency, stream);
   if (max_iters < 0) max_iters = std::numeric_limits<int>::max();
 
   const Offset n = d_adjacency.rows;
   const int n_int = static_cast<int>(n);
   const float inv_delta = 1.0f / delta;
   const float inf = std::numeric_limits<float>::infinity();
-
-  OutgoingCsrOwner outgoing = build_outgoing_csr_from_incoming(d_adjacency, stream);
 
   DeviceBuffer<float> d_dist(static_cast<std::size_t>(n));
   DeviceBuffer<int> d_in_current(static_cast<std::size_t>(n));
@@ -721,8 +741,12 @@ DeltaSteppingCsrResult delta_stepping_minplus_hip_csr(
           pending_queue, d_pending_count.get(), d_heavy_queue.get(), d_heavy_count.get(),
           n_int, d_overflow.get());
       DS_DELTA_HIP_CHECK(hipGetLastError());
-      throw_if_overflow(d_overflow.get(), stream);
-      current_count = copy_scalar_to_host(d_next_count.get(), stream);
+      const CountOverflowStatus next_status =
+          copy_count_overflow_to_host(d_next_count.get(), d_overflow.get(), stream);
+      if (next_status.overflow != 0) {
+        throw std::runtime_error("delta-stepping unique frontier queue overflow");
+      }
+      current_count = next_status.count;
       std::swap(current_queue, next_queue);
     }
 
@@ -771,9 +795,13 @@ DeltaSteppingCsrResult delta_stepping_minplus_hip_csr(
         d_in_current.get(), current_queue, d_current_count.get(), pending_scratch,
         d_new_pending_count.get(), n_int, d_overflow.get());
     DS_DELTA_HIP_CHECK(hipGetLastError());
-    throw_if_overflow(d_overflow.get(), stream);
+    const CountOverflowStatus compact_status =
+        copy_count_overflow_to_host(d_current_count.get(), d_overflow.get(), stream);
+    if (compact_status.overflow != 0) {
+      throw std::runtime_error("delta-stepping unique frontier queue overflow");
+    }
 
-    current_count = copy_scalar_to_host(d_current_count.get(), stream);
+    current_count = compact_status.count;
     DS_DELTA_HIP_CHECK(hipMemcpyAsync(d_pending_count.get(), d_new_pending_count.get(), sizeof(int),
                                       hipMemcpyDeviceToDevice, stream));
     std::swap(pending_queue, pending_scratch);
@@ -781,6 +809,116 @@ DeltaSteppingCsrResult delta_stepping_minplus_hip_csr(
 
   result.dist = copy_dist_to_host(d_dist.get(), n, stream);
   return result;
+}
+
+}  // namespace ds_delta_detail
+
+struct DeltaSteppingGraphContext::Impl {
+  ds_delta_detail::DeviceCsrOwner owned_adjacency;
+  minplus_sparse::DeviceCsrF32 incoming{};
+  ds_delta_detail::OutgoingCsrOwner outgoing;
+
+  Impl(const minplus_sparse::DeviceCsrF32& d_adjacency, hipStream_t stream)
+      : incoming(d_adjacency) {
+    ds_delta_detail::validate_device_csr_context_shape(incoming);
+    ds_delta_detail::validate_device_csr_contents(incoming, stream);
+    outgoing = ds_delta_detail::build_outgoing_csr_from_incoming(incoming, stream);
+    DS_DELTA_HIP_CHECK(hipStreamSynchronize(stream));
+  }
+
+  Impl(const HostCsrF32& adjacency, hipStream_t stream) {
+    ds_delta_detail::validate_host_csr_context(adjacency);
+    owned_adjacency = ds_delta_detail::copy_host_csr_to_device(adjacency, stream);
+    incoming = owned_adjacency.view;
+    outgoing = ds_delta_detail::build_outgoing_csr_from_incoming(incoming, stream);
+    DS_DELTA_HIP_CHECK(hipStreamSynchronize(stream));
+  }
+};
+
+DeltaSteppingGraphContext::DeltaSteppingGraphContext(
+    const minplus_sparse::DeviceCsrF32& d_adjacency,
+    hipStream_t stream)
+    : impl_(std::make_unique<Impl>(d_adjacency, stream)) {}
+
+DeltaSteppingGraphContext::DeltaSteppingGraphContext(const HostCsrF32& adjacency,
+                                                     hipStream_t stream)
+    : impl_(std::make_unique<Impl>(adjacency, stream)) {}
+
+DeltaSteppingGraphContext::~DeltaSteppingGraphContext() = default;
+DeltaSteppingGraphContext::DeltaSteppingGraphContext(DeltaSteppingGraphContext&&) noexcept =
+    default;
+DeltaSteppingGraphContext& DeltaSteppingGraphContext::operator=(
+    DeltaSteppingGraphContext&&) noexcept = default;
+
+minplus_sparse::Offset DeltaSteppingGraphContext::rows() const {
+  return impl_->incoming.rows;
+}
+
+minplus_sparse::Offset DeltaSteppingGraphContext::cols() const {
+  return impl_->incoming.cols;
+}
+
+minplus_sparse::Offset DeltaSteppingGraphContext::nnz() const {
+  return impl_->incoming.nnz;
+}
+
+std::size_t DeltaSteppingGraphContext::frontier_capacity() const {
+  return static_cast<std::size_t>(impl_->incoming.rows);
+}
+
+DeltaSteppingCsrResult DeltaSteppingGraphContext::run(
+    int source,
+    float delta,
+    int max_iters,
+    hipStream_t stream,
+    DeltaSteppingCsrProgressCallback progress_callback,
+    void* progress_user_data) const {
+  ds_delta_detail::validate_device_csr_shape(impl_->incoming, source, delta);
+  return ds_delta_detail::run_delta_stepping_prepared(
+      impl_->incoming, impl_->outgoing, source, delta, max_iters,
+      stream, progress_callback, progress_user_data);
+}
+
+DeltaSteppingCsrResult DeltaSteppingGraphContext::run(int source,
+                                                       float delta,
+                                                       hipStream_t stream) const {
+  return run(source, delta, -1, stream, nullptr, nullptr);
+}
+
+DeltaSteppingCsrResult delta_stepping_minplus_hip_csr(
+    const DeltaSteppingGraphContext& context,
+    int source,
+    float delta,
+    int max_iters,
+    hipStream_t stream,
+    DeltaSteppingCsrProgressCallback progress_callback,
+    void* progress_user_data) {
+  return context.run(source, delta, max_iters, stream, progress_callback, progress_user_data);
+}
+
+DeltaSteppingCsrResult delta_stepping_minplus_hip_csr(
+    const DeltaSteppingGraphContext& context,
+    int source,
+    float delta,
+    hipStream_t stream) {
+  return context.run(source, delta, stream);
+}
+
+DeltaSteppingCsrResult delta_stepping_minplus_hip_csr(
+    const minplus_sparse::DeviceCsrF32& d_adjacency,
+    int source,
+    float delta,
+    int max_iters,
+    hipStream_t stream,
+    DeltaSteppingCsrProgressCallback progress_callback,
+    void* progress_user_data) {
+  using namespace ds_delta_detail;
+
+  validate_device_csr_shape(d_adjacency, source, delta);
+  validate_device_csr_contents(d_adjacency, stream);
+  OutgoingCsrOwner outgoing = build_outgoing_csr_from_incoming(d_adjacency, stream);
+  return run_delta_stepping_prepared(d_adjacency, outgoing, source, delta, max_iters,
+                                     stream, progress_callback, progress_user_data);
 }
 
 DeltaSteppingCsrResult delta_stepping_minplus_hip_csr(

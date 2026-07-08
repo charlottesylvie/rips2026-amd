@@ -348,8 +348,10 @@ int main(int argc, char** argv) {
     int failed_cases = 0;
     int total_bf_mismatches = 0;
     int total_ds_mismatches = 0;
+    int total_ds_context_mismatches = 0;
     float max_bf_abs_diff = 0.0f;
     float max_ds_abs_diff = 0.0f;
+    float max_ds_context_abs_diff = 0.0f;
 
     for (int t = 0; t < test_cases; ++t) {
       const std::uint32_t case_seed = static_cast<std::uint32_t>(seed + t);
@@ -362,6 +364,9 @@ int main(int argc, char** argv) {
           d_graph.view, source, max_iters, stream, nullptr, nullptr);
       DeltaSteppingCsrResult ds = delta_stepping_minplus_hip_csr(
           d_graph.view, source, delta, max_iters, stream, nullptr, nullptr);
+      DeltaSteppingGraphContext delta_context(d_graph.view, stream);
+      DeltaSteppingCsrResult ds_context = delta_context.run(
+          source, delta, max_iters, stream, nullptr, nullptr);
 
       check_hip(hipStreamSynchronize(stream), "sync after algorithms");
 
@@ -371,23 +376,34 @@ int main(int argc, char** argv) {
                 << " | BF converged=" << bf.converged
                 << " iter=" << bf.iterations_used
                 << " | DS converged=" << ds.converged
-                << " iter=" << ds.iterations_used << '\n';
+                << " iter=" << ds.iterations_used
+                << " | DS-ctx converged=" << ds_context.converged
+                << " iter=" << ds_context.iterations_used << '\n';
 
       CompareSummary bf_cmp = compare_to_reference(expected, bf.dist, "Bellman-Ford");
       CompareSummary ds_cmp = compare_to_reference(expected, ds.dist, "Delta-Stepping");
+      CompareSummary ds_context_cmp =
+          compare_to_reference(expected, ds_context.dist, "Delta-Stepping-Context");
 
       total_bf_mismatches += bf_cmp.mismatches;
       total_ds_mismatches += ds_cmp.mismatches;
+      total_ds_context_mismatches += ds_context_cmp.mismatches;
       max_bf_abs_diff = std::max(max_bf_abs_diff, bf_cmp.max_abs_diff);
       max_ds_abs_diff = std::max(max_ds_abs_diff, ds_cmp.max_abs_diff);
+      max_ds_context_abs_diff =
+          std::max(max_ds_context_abs_diff, ds_context_cmp.max_abs_diff);
 
-      const bool ok = bf_cmp.mismatches == 0 && ds_cmp.mismatches == 0;
+      const bool ok = bf_cmp.mismatches == 0 &&
+                      ds_cmp.mismatches == 0 &&
+                      ds_context_cmp.mismatches == 0;
       if (!ok) ++failed_cases;
 
       std::cout << "    BF mismatches=" << bf_cmp.mismatches
                 << " max_abs_diff=" << bf_cmp.max_abs_diff
                 << " | DS mismatches=" << ds_cmp.mismatches
                 << " max_abs_diff=" << ds_cmp.max_abs_diff
+                << " | DS-ctx mismatches=" << ds_context_cmp.mismatches
+                << " max_abs_diff=" << ds_context_cmp.max_abs_diff
                 << " | " << (ok ? "PASS" : "FAIL") << "\n";
     }
 
@@ -395,8 +411,10 @@ int main(int argc, char** argv) {
               << "  failed cases:          " << failed_cases << " / " << test_cases << '\n'
               << "  total BF mismatches:   " << total_bf_mismatches << '\n'
               << "  total DS mismatches:   " << total_ds_mismatches << '\n'
+              << "  total DS-ctx mismatches: " << total_ds_context_mismatches << '\n'
               << "  max BF abs diff:       " << max_bf_abs_diff << '\n'
-              << "  max DS abs diff:       " << max_ds_abs_diff << '\n';
+              << "  max DS abs diff:       " << max_ds_abs_diff << '\n'
+              << "  max DS-ctx abs diff:   " << max_ds_context_abs_diff << '\n';
 
     check_hip(hipStreamDestroy(stream), "destroy stream");
     stream = nullptr;
