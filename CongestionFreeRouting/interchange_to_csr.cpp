@@ -92,6 +92,7 @@ constexpr std::uint64_t kNoLogicalNetIndex = kNoIndex;
 constexpr std::uint64_t kNoStringIndex = kNoIndex;
 
 using NodeId = std::int32_t;
+constexpr NodeId kInvalidRouteNode = -1;
 
 // Controls how the bounded tile box is applied to DeviceResources.nodes.
 // The Python proof of concept uses the first wire of each node as the "base"
@@ -572,6 +573,12 @@ void write_u64(std::ofstream& out, std::uint64_t value, const char* name) {
   if (!out) {
     throw std::runtime_error(std::string("failed while writing ") + name);
   }
+}
+
+void write_route_node(std::ofstream& out, NodeId node, const char* name) {
+  const std::uint64_t encoded =
+      node < 0 ? kNoIndex : static_cast<std::uint64_t>(node);
+  write_u64(out, encoded, name);
 }
 
 // Arrays are written raw after explicit count fields in the header. The file
@@ -1219,45 +1226,48 @@ void parse_physical_netlist(const std::filesystem::path& phys_path,
       // inter-site routing fabric.
       const std::vector<SitePinName> source_pins =
           extract_site_pins(net.getSources(), strings);
+      bool has_valid_source = false;
       for (const SitePinName& source_pin : source_pins) {
-        const std::optional<NodeId> source_node =
-            get_node_from_site_pin(graph, source_pin.site, source_pin.pin);
-        if (!source_node.has_value()) {
-          continue;
-        }
-
         SitePinNode source;
-        source.node = *source_node;
+        source.node = kInvalidRouteNode;
         source.site_string = graph.string_table.intern(source_pin.site);
         source.pin_string = graph.string_table.intern(source_pin.pin);
+
+        const std::optional<NodeId> source_node =
+            get_node_from_site_pin(graph, source_pin.site, source_pin.pin);
+        if (source_node.has_value()) {
+          source.node = *source_node;
+          has_valid_source = true;
+        }
+
         request.sources.push_back(source);
       }
 
-      // Map each sink site pin to a routing node. Sinks become route targets
-      // and get stored as node metadata ("sp") in the sidecar.
+      // Preserve every physical sink stub in the request. If bounds exclude
+      // its routing node, keep the site pin with an invalid node so routing
+      // reports the net as unreached instead of emitting a partial route.
       for (const SitePinName& sink_pin : sink_pins) {
-        const std::optional<NodeId> sink_node =
-            get_node_from_site_pin(graph, sink_pin.site, sink_pin.pin);
-        if (!sink_node.has_value()) {
-          continue;
-        }
-
-        const NodeId node = *sink_node;
-        if (request.sources.empty()) {
-          graph.blocked_node[node] = 1;
-          continue;
-        }
-
         SitePinNode sink;
-        sink.node = node;
+        sink.node = kInvalidRouteNode;
         sink.site_string = graph.string_table.intern(sink_pin.site);
         sink.pin_string = graph.string_table.intern(sink_pin.pin);
+
+        const std::optional<NodeId> sink_node =
+            get_node_from_site_pin(graph, sink_pin.site, sink_pin.pin);
+        if (sink_node.has_value()) {
+          const NodeId node = *sink_node;
+          sink.node = node;
+          if (!has_valid_source) {
+            graph.blocked_node[node] = 1;
+          } else {
+            graph.sink_node_stops[node] = 1;
+            add_site_pin_attr(graph, node, sink.site_string, sink.pin_string);
+          }
+        }
         request.sinks.push_back(sink);
-        graph.sink_node_stops[node] = 1;
-        add_site_pin_attr(graph, node, sink.site_string, sink.pin_string);
       }
 
-      if (!request.sources.empty() && !request.sinks.empty()) {
+      if (!request.sinks.empty()) {
         graph.route_requests.push_back(std::move(request));
       }
       continue;
@@ -1556,8 +1566,7 @@ void write_metadata(const RoutingGraph& graph,
     write_u64(out, static_cast<std::uint64_t>(request.sources.size()),
               "route request source count");
     for (const SitePinNode& source : request.sources) {
-      write_u64(out, static_cast<std::uint64_t>(source.node),
-                "route request source node");
+      write_route_node(out, source.node, "route request source node");
       write_u64(out, source.site_string, "route request source site");
       write_u64(out, source.pin_string, "route request source pin");
     }
@@ -1565,8 +1574,7 @@ void write_metadata(const RoutingGraph& graph,
     write_u64(out, static_cast<std::uint64_t>(request.sinks.size()),
               "route request sink count");
     for (const SitePinNode& sink : request.sinks) {
-      write_u64(out, static_cast<std::uint64_t>(sink.node),
-                "route request sink node");
+      write_route_node(out, sink.node, "route request sink node");
       write_u64(out, sink.site_string, "route request sink site");
       write_u64(out, sink.pin_string, "route request sink pin");
     }

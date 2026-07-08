@@ -45,6 +45,8 @@ namespace {
 constexpr char METADATA_MAGIC[8] = {'R', 'I', 'P', 'S', 'I', 'F', 'M', '1'};
 constexpr std::uint64_t EXPECTED_METADATA_VERSION = 2;
 constexpr std::uint64_t EXPECTED_INCOMING_EDGE_ORIENTATION = 1;
+constexpr std::uint64_t kInvalidRouteNode =
+    std::numeric_limits<std::uint64_t>::max();
 
 struct SitePinKey {
   std::string site;
@@ -308,6 +310,17 @@ std::uint64_t read_u64(std::ifstream& in, const char* name) {
   return value;
 }
 
+int read_route_node(std::ifstream& in, const char* name) {
+  const std::uint64_t raw = read_u64(in, name);
+  if (raw == kInvalidRouteNode) {
+    return -1;
+  }
+  if (raw > static_cast<std::uint64_t>(std::numeric_limits<int>::max())) {
+    throw std::runtime_error(std::string(name) + " exceeds int range");
+  }
+  return static_cast<int>(raw);
+}
+
 void skip_bytes(std::ifstream& in, std::uint64_t count, const char* name) {
   constexpr std::uint64_t kChunk = 1 << 20;
   std::array<char, kChunk> buffer{};
@@ -403,7 +416,7 @@ RoutingMetadataSummary load_metadata_summary(const std::filesystem::path& path) 
     request.sources.reserve(static_cast<std::size_t>(source_count));
     for (std::uint64_t s = 0; s < source_count; ++s) {
       RouteSitePin source;
-      source.node = static_cast<int>(read_u64(in, "source node"));
+      source.node = read_route_node(in, "source node");
       source.site = string_at(metadata, read_u64(in, "source site"));
       source.pin = string_at(metadata, read_u64(in, "source pin"));
       request.sources.push_back(std::move(source));
@@ -413,7 +426,7 @@ RoutingMetadataSummary load_metadata_summary(const std::filesystem::path& path) 
     request.sinks.reserve(static_cast<std::size_t>(sink_count));
     for (std::uint64_t s = 0; s < sink_count; ++s) {
       RouteSitePin sink;
-      sink.node = static_cast<int>(read_u64(in, "sink node"));
+      sink.node = read_route_node(in, "sink node");
       sink.site = string_at(metadata, read_u64(in, "sink site"));
       sink.pin = string_at(metadata, read_u64(in, "sink pin"));
       request.sinks.push_back(std::move(sink));
@@ -470,15 +483,12 @@ NetRoute parse_route_line(const std::string& line) {
   NetRoute route;
   route.net = json_string(object, "net");
   route.routed = json_bool(object, "routed", false);
-  if (!route.routed) {
-    throw std::runtime_error("PathFinder route entry is not routed: " + route.net);
-  }
 
   for (const JsonValue& value : object.at("sources").as_array("sources")) {
     route.sources.push_back(parse_route_site_pin(value, false));
   }
   for (const JsonValue& value : object.at("sinks").as_array("sinks")) {
-    route.sinks.push_back(parse_route_site_pin(value, true));
+    route.sinks.push_back(parse_route_site_pin(value, false));
   }
   for (const JsonValue& value : object.at("edges").as_array("edges")) {
     const auto& edge_object = value.as_object("edge");
@@ -662,12 +672,14 @@ RouteTables build_route_tables(const NetRoute& route) {
     ++tables.edge_count;
   }
   for (const RouteSitePin& source : route.sources) {
+    if (source.node < 0) continue;
     SitePinKey key{source.site, source.pin};
     if (!tables.source_node_by_pin.emplace(key, source.node).second) {
       throw std::runtime_error("duplicate source site pin in route: " + route.net);
     }
   }
   for (const RouteSitePin& sink : route.sinks) {
+    if (!sink.reached || sink.node < 0) continue;
     tables.sinks_by_node[sink.node].push_back({sink.site, sink.pin});
   }
   return tables;
@@ -744,7 +756,8 @@ int insert_route_tree(
 
 void write_routed_phys(const std::filesystem::path& input_phys,
                        const std::filesystem::path& output_phys,
-                       const std::unordered_map<std::string, NetRoute>& routes) {
+                       const std::unordered_map<std::string, NetRoute>& routes,
+                       bool allow_unrouted_stubs) {
   const std::vector<std::uint8_t> bytes = read_gzip_or_plain_file(input_phys);
   std::vector<capnp::word> words = bytes_to_words(bytes);
 
@@ -820,13 +833,27 @@ void write_routed_phys(const std::filesystem::path& input_phys,
           << " but route contains " << tables.edge_count;
       throw std::runtime_error(out.str());
     }
+    std::size_t remaining_stub_count = 0;
     for (const auto& [stub, count] : stub_counts) {
       if (count != 0) {
-        throw std::runtime_error("unrouted stub remains in routed net: " + net_name);
+        if (!allow_unrouted_stubs) {
+          throw std::runtime_error("unrouted stub remains in routed net: " + net_name);
+        }
+        remaining_stub_count += static_cast<std::size_t>(count);
       }
     }
 
-    net.initStubs(0);
+    auto new_stubs = net.initStubs(static_cast<std::uint32_t>(remaining_stub_count));
+    std::uint32_t stub_index = 0;
+    for (const auto& [stub, count] : stub_counts) {
+      for (int i = 0; i < count; ++i) {
+        auto branch = new_stubs[stub_index++];
+        auto site_pin = branch.initRouteSegment().initSitePin();
+        site_pin.setSite(string_index(stub.site, strings, string_to_index));
+        site_pin.setPin(string_index(stub.pin, strings, string_to_index));
+        branch.initBranches(0);
+      }
+    }
     routed_seen.emplace(net_name, true);
     total_pips += emitted_edges;
     ++total_nets;
@@ -849,16 +876,14 @@ void write_routed_phys(const std::filesystem::path& input_phys,
   }
   kj::Array<capnp::word> flat = capnp::messageToFlatArray(builder);
   write_gzip_file(output_phys, flat.asBytes());
-  std::cout << "wrote routed .phys: " << output_phys
-            << " nets=" << total_nets
-            << " pips=" << total_pips << "\n";
 }
 
 void print_usage(const char* program) {
   std::cerr
       << "Usage:\n"
       << "  " << program
-      << " <unrouted.phys> <metadata.ifmeta.bin> <routes.jsonl> <output.phys>\n";
+      << " <unrouted.phys> <metadata.ifmeta.bin> <routes.jsonl> <output.phys> "
+         "[--allow-unrouted-stubs]\n";
 }
 
 }  // namespace
@@ -870,7 +895,10 @@ int main(int argc, char** argv) {
       print_usage(argv[0]);
       return 0;
     }
-    if (argc != 5) {
+    bool allow_unrouted_stubs = false;
+    if (argc == 6 && std::string(argv[5]) == "--allow-unrouted-stubs") {
+      allow_unrouted_stubs = true;
+    } else if (argc != 5) {
       print_usage(argv[0]);
       return 1;
     }
@@ -883,7 +911,7 @@ int main(int argc, char** argv) {
     RoutingMetadataSummary metadata = load_metadata_summary(metadata_path);
     std::unordered_map<std::string, NetRoute> routes = load_routes_jsonl(routes_path);
     validate_routes_against_metadata(routes, metadata);
-    write_routed_phys(input_phys, output_phys, routes);
+    write_routed_phys(input_phys, output_phys, routes, allow_unrouted_stubs);
     return 0;
   } catch (const std::exception& ex) {
     std::cerr << "error: " << ex.what() << "\n";

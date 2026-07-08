@@ -29,6 +29,7 @@
 #include <limits>
 #include <sstream>
 #include <stdexcept>
+#include <unordered_map>
 #include <unordered_set>
 #include <utility>
 
@@ -48,6 +49,17 @@ std::uint64_t read_u64(std::ifstream& in, const char* name) {
     throw std::runtime_error(std::string("failed while reading ") + name);
   }
   return value;
+}
+
+int read_route_node(std::ifstream& in, const char* name) {
+  const std::uint64_t raw = read_u64(in, name);
+  if (raw == kNoIndex) {
+    return -1;
+  }
+  if (raw > static_cast<std::uint64_t>(std::numeric_limits<int>::max())) {
+    throw std::runtime_error(std::string(name) + " exceeds int range");
+  }
+  return static_cast<int>(raw);
 }
 
 template <typename T>
@@ -399,6 +411,21 @@ float effective_edge_cost(const HostCsrF32& graph,
   return base_cost * (*vertex_costs)[static_cast<std::size_t>(dst)];
 }
 
+bool attach_path_if_single_parent_tree(
+    const std::vector<PathEdge>& edges,
+    std::unordered_map<int, int>& parent_by_child) {
+  for (const PathEdge& edge : edges) {
+    const auto parent = parent_by_child.find(edge.to);
+    if (parent != parent_by_child.end() && parent->second != edge.from) {
+      return false;
+    }
+  }
+  for (const PathEdge& edge : edges) {
+    parent_by_child[edge.to] = edge.from;
+  }
+  return true;
+}
+
 RoutedNet route_net(const HostCsrF32& graph,
                     DeltaSteppingCsrWorkspace& workspace,
                     const RouteRequest& request,
@@ -429,6 +456,7 @@ RoutedNet route_net(const HostCsrF32& graph,
   target_sink_indices.reserve(request.sinks.size());
   bool reached_all = true;
   net.sinks.resize(request.sinks.size());
+  std::unordered_map<int, int> parent_by_child;
   for (std::size_t sink_index = 0; sink_index < request.sinks.size(); ++sink_index) {
     const SitePinNode& sink = request.sinks[sink_index];
     net.sinks[sink_index].target = sink.node;
@@ -563,6 +591,12 @@ RoutedNet route_net(const HostCsrF32& graph,
         routed_sink.nodes = nodes_from_path(source, routed_sink.edges);
       }
 
+      if (!attach_path_if_single_parent_tree(routed_sink.edges, parent_by_child)) {
+        reached_all = false;
+        routed_sink.edges.clear();
+        routed_sink.nodes.clear();
+        continue;
+      }
       routed_sink.reached = true;
       for (const int node : routed_sink.nodes) {
         add_unique_node(source_candidates, tree_seen, tree_stamp, node);
@@ -850,6 +884,7 @@ RoutedNet route_net_congestion_free(const HostCsrF32& graph,
   targets.reserve(request.sinks.size());
   net.sinks.resize(request.sinks.size());
   bool reached_all = true;
+  std::unordered_map<int, int> parent_by_child;
   for (std::size_t sink_index = 0; sink_index < request.sinks.size(); ++sink_index) {
     const SitePinNode& sink = request.sinks[sink_index];
     RoutedSink& routed_sink = net.sinks[sink_index];
@@ -935,6 +970,12 @@ RoutedNet route_net_congestion_free(const HostCsrF32& graph,
     const int bfs_distance = workspace.distance_to(target);
     routed_sink.distance =
         bfs_distance >= 0 ? static_cast<float>(bfs_distance) : path_distance;
+    if (!attach_path_if_single_parent_tree(routed_sink.edges, parent_by_child)) {
+      reached_all = false;
+      routed_sink.nodes.clear();
+      routed_sink.edges.clear();
+      continue;
+    }
     routed_sink.reached = true;
     for (const int node : routed_sink.nodes) {
       add_unique_node(source_candidates, tree_seen, tree_stamp, node);
@@ -1072,6 +1113,7 @@ void print_usage(const char* program) {
       << "  --history-factor <float>        Historical congestion increment. Default: 1\n"
       << "  --net-limit <count>             Route only the first count requests.\n"
       << "  --route-batch-size <count>      Nets routed per congestion snapshot. Default: 256\n"
+      << "  --allow-unrouted                Write partial routes even if some sinks are unreached.\n"
       << "  --routes-out <path>             Write routed PIP tree data as JSONL.\n";
 }
 
@@ -1194,7 +1236,7 @@ RoutingMetadata load_interchange_metadata(const std::filesystem::path& path) {
 
   metadata.site_pin_attrs.resize(static_cast<std::size_t>(site_pin_attr_count));
   for (SitePinNode& attr : metadata.site_pin_attrs) {
-    attr.node = static_cast<int>(read_u64(in, "metadata site pin node"));
+    attr.node = read_route_node(in, "metadata site pin node");
     attr.site_string = read_u64(in, "metadata site pin site");
     attr.pin_string = read_u64(in, "metadata site pin pin");
   }
@@ -1207,7 +1249,7 @@ RoutingMetadata load_interchange_metadata(const std::filesystem::path& path) {
     const std::uint64_t source_count = read_u64(in, "metadata source count");
     request.sources.resize(static_cast<std::size_t>(source_count));
     for (SitePinNode& source : request.sources) {
-      source.node = static_cast<int>(read_u64(in, "metadata source node"));
+      source.node = read_route_node(in, "metadata source node");
       source.site_string = read_u64(in, "metadata source site");
       source.pin_string = read_u64(in, "metadata source pin");
     }
@@ -1215,7 +1257,7 @@ RoutingMetadata load_interchange_metadata(const std::filesystem::path& path) {
     const std::uint64_t sink_count = read_u64(in, "metadata sink count");
     request.sinks.resize(static_cast<std::size_t>(sink_count));
     for (SitePinNode& sink : request.sinks) {
-      sink.node = static_cast<int>(read_u64(in, "metadata sink node"));
+      sink.node = read_route_node(in, "metadata sink node");
       sink.site_string = read_u64(in, "metadata sink site");
       sink.pin_string = read_u64(in, "metadata sink pin");
     }
@@ -1327,7 +1369,6 @@ PathfinderResult run_pathfinder(const HostCsrF32& base_graph,
                                 const RoutingMetadata& metadata,
                                 const PathfinderOptions& options,
                                 hipStream_t stream) {
-  std::cout << "[pathfinder] beginning PathFinder setup\n" << std::flush;
   validate_csr(base_graph);
   validate_options(options);
   if (metadata.node_device_ids.size() != static_cast<std::size_t>(base_graph.rows)) {
@@ -1349,27 +1390,11 @@ PathfinderResult run_pathfinder(const HostCsrF32& base_graph,
   std::vector<std::uint32_t> route_tree_seen(static_cast<std::size_t>(base_graph.rows), 0);
   std::uint32_t route_tree_stamp = 0;
   result.nets.resize(route_request_count);
-  std::cout << "[congestion-free-router] setup complete: rows=" << base_graph.rows
-            << " nnz=" << base_graph.nnz
-            << " route_requests=" << metadata.route_requests.size()
-            << " route_request_count=" << route_request_count
-            << " delta=" << options.delta
-            << " engine=gpu-delta"
-            << "\n" << std::flush;
 
   const std::size_t progress_interval =
       std::max<std::size_t>(1, route_request_count / 100);
   for (std::size_t net_index = 0; net_index < route_request_count; ++net_index) {
     const RouteRequest& request = metadata.route_requests[net_index];
-    if (net_index == 0 || net_index + 1 == route_request_count ||
-        net_index % progress_interval == 0) {
-      std::cout << "[congestion-free-router] beginning net " << (net_index + 1)
-                << "/" << route_request_count
-                << " name=" << string_at(metadata, request.net_string)
-                << " sources=" << request.sources.size()
-                << " sinks=" << request.sinks.size()
-                << "\n" << std::flush;
-    }
 
     const std::uint32_t tree_stamp =
         next_tree_stamp(route_tree_seen, &route_tree_stamp);
@@ -1405,14 +1430,6 @@ PathfinderResult run_pathfinder(const HostCsrF32& base_graph,
                           &result.overused_nodes,
                           &result.max_occupancy);
   result.routed = all_sinks_reached;
-  std::cout << "[congestion-free-router] summary: all_sinks_reached="
-            << (result.all_sinks_reached ? "true" : "false")
-            << " overused_nodes=" << result.overused_nodes
-            << " max_occupancy=" << result.max_occupancy
-            << " routed=" << (result.routed ? "true" : "false")
-            << " (overuse is diagnostic only)\n";
-
-  std::cout << "[congestion-free-router] completed routing pass\n" << std::flush;
   return result;
 }
 
@@ -1550,6 +1567,7 @@ int main(int argc, char** argv) {
     std::filesystem::path metadata_path;
     std::filesystem::path routes_out_path;
     routing::PathfinderOptions options;
+    bool allow_unrouted_routes = false;
 
     int arg = 2;
     if (arg < argc && std::string(argv[arg]).rfind("--", 0) != 0) {
@@ -1598,6 +1616,8 @@ int main(int argc, char** argv) {
       } else if (option == "--route-batch-size") {
         options.route_batch_size =
             routing::parse_size_arg(require_value("--route-batch-size"), "route-batch-size");
+      } else if (option == "--allow-unrouted") {
+        allow_unrouted_routes = true;
       } else if (option == "--routes-out") {
         routes_out_path = require_value("--routes-out");
       } else {
@@ -1605,69 +1625,22 @@ int main(int argc, char** argv) {
       }
     }
 
-    std::cout << "[pathfinder] beginning CSR load: " << csr_path << "\n" << std::flush;
     HostCsrF32 graph = routing::load_csrbin(csr_path);
-    std::cout << "[pathfinder] completed CSR load: rows=" << graph.rows
-              << " nnz=" << graph.nnz << "\n" << std::flush;
 
-    std::cout << "[pathfinder] beginning metadata load: " << metadata_path << "\n" << std::flush;
     routing::RoutingMetadata metadata = routing::load_interchange_metadata(metadata_path);
-    std::cout << "[pathfinder] completed metadata load: strings=" << metadata.strings.size()
-              << " route_requests=" << metadata.route_requests.size()
-              << " edge_attrs=" << metadata.edge_attrs.size()
-              << " pip_data=" << metadata.pip_data.size()
-              << "\n" << std::flush;
 
-    std::cout << "[pathfinder] beginning routing loop\n" << std::flush;
     routing::PathfinderResult result =
         routing::run_pathfinder(graph, metadata, options, nullptr);
-    std::cout << "[pathfinder] completed routing loop\n" << std::flush;
-
-    std::cout << "csr: " << csr_path << "\n";
-    std::cout << "metadata: " << metadata_path << "\n";
-    std::cout << "route_requests: " << metadata.route_requests.size() << "\n";
-    if (options.net_limit != 0) {
-      std::cout << "net_limit: " << options.net_limit << "\n";
-    }
-    std::cout << "iterations_used: " << result.iterations_used << "\n";
-    std::cout << "all_sinks_reached: " << (result.all_sinks_reached ? "true" : "false") << "\n";
-    std::cout << "overused_nodes: " << result.overused_nodes << "\n";
-    std::cout << "max_occupancy: " << result.max_occupancy << "\n";
-    std::cout << "routed: " << (result.routed ? "true" : "false") << "\n";
 
     if (!routes_out_path.empty()) {
-      if (!result.routed) {
+      if (!result.routed && !allow_unrouted_routes) {
         std::cerr << "error: refusing to write routes because not all sinks were reached\n";
         return 2;
       }
-      std::cout << "[pathfinder] beginning routes JSONL write: " << routes_out_path
-                << "\n" << std::flush;
       routing::write_routes_jsonl(routes_out_path, graph, metadata, result);
-      std::cout << "[pathfinder] completed routes JSONL write\n" << std::flush;
-      std::cout << "routes_out: " << routes_out_path << "\n";
     }
 
-    const std::size_t printed_nets = std::min<std::size_t>(result.nets.size(), 10);
-    for (std::size_t i = 0; i < printed_nets; ++i) {
-      const routing::RoutedNet& net = result.nets[i];
-      std::size_t reached_sinks = 0;
-      for (const routing::RoutedSink& sink : net.sinks) {
-        if (sink.reached) {
-          ++reached_sinks;
-        }
-      }
-      std::cout << "net[" << i << "]: "
-                << routing::string_at(metadata, net.net_string)
-                << " sinks=" << reached_sinks << "/" << net.sinks.size()
-                << " nodes=" << net.unique_nodes.size()
-                << " reached_all=" << (net.reached_all_sinks ? "true" : "false")
-                << "\n";
-    }
-    if (printed_nets < result.nets.size()) {
-      std::cout << "net_summary_truncated_after: " << printed_nets << "\n";
-    }
-
-    return result.routed ? 0 : 2;
+    return result.routed || allow_unrouted_routes ? 0 : 2;
   } catch (const std::exception& ex) {
     std::cerr << "error: " << ex.what() << "\n";
     if (argc < 2) {

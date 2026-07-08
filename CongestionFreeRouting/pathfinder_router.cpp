@@ -35,6 +35,7 @@ struct Options {
 
   std::vector<std::string> converter_args;
   std::vector<std::string> pathfinder_args;
+  bool allow_unrouted = true;
 };
 
 std::string env_or_default(const char* name, const char* fallback) {
@@ -93,20 +94,18 @@ void print_progress(int completed, int total, const std::string& label) {
   for (int i = 0; i < kWidth; ++i) {
     std::cout << (i < filled ? '#' : '-');
   }
-  std::cout << "] " << completed << "/" << total << " " << label << "\n";
+  std::cout << "] " << completed << "/" << total << " " << label << "\n" << std::flush;
 }
 
 void run_command(const std::vector<std::string>& argv, const char* label) {
   const std::string command = command_to_string(argv);
-  std::cout << "[pathfinder-router] beginning " << label << "\n";
-  std::cout << "[pathfinder-router] command: " << command << "\n" << std::flush;
   const int status = std::system(command.c_str());
   if (status != 0) {
     std::ostringstream out;
-    out << label << " failed with status " << status;
+    out << label << " failed with status " << status
+        << " while running " << command;
     throw std::runtime_error(out.str());
   }
-  std::cout << "[pathfinder-router] completed " << label << "\n" << std::flush;
 }
 
 std::filesystem::path make_work_dir(const Options& options) {
@@ -140,6 +139,7 @@ void print_usage(const char* program) {
       << "  --interchange-to-csr <path>    Converter executable. Env: INTERCHANGE_TO_CSR\n"
       << "  --pathfinder <path>            PathFinder executable. Env: PATHFINDER_BIN\n"
       << "  --routes-to-phys <path>        Route reconstructor. Env: ROUTES_TO_PHYS\n"
+      << "  --strict-routing               Fail instead of writing partial routes.\n"
       << "  --delta <float>                Forwarded to pathfinder.\n"
       << "  --max-pathfinder-iters <int>   Forwarded to pathfinder.\n"
       << "  --max-sssp-iters <int>         Forwarded to pathfinder.\n"
@@ -198,6 +198,8 @@ Options parse_args(int argc, char** argv) {
       options.pathfinder = require_value("--pathfinder");
     } else if (option == "--routes-to-phys") {
       options.routes_to_phys = require_value("--routes-to-phys");
+    } else if (option == "--strict-routing") {
+      options.allow_unrouted = false;
     } else if (option == "--delta" ||
                option == "--max-pathfinder-iters" ||
                option == "--max-sssp-iters" ||
@@ -260,15 +262,6 @@ int main(int argc, char** argv) {
     const std::filesystem::path routes_path =
         work_dir / (options.output_phys.stem().string() + ".routes.jsonl");
 
-    std::cout << "[pathfinder-router] input_phys: " << options.input_phys << "\n";
-    std::cout << "[pathfinder-router] logical_netlist: " << options.logical_netlist << "\n";
-    std::cout << "[pathfinder-router] device: " << options.device << "\n";
-    std::cout << "[pathfinder-router] output_phys: " << options.output_phys << "\n";
-    std::cout << "[pathfinder-router] work_dir: " << work_dir << "\n";
-    std::cout << "[pathfinder-router] csr_path: " << csr_path << "\n";
-    std::cout << "[pathfinder-router] metadata_path: " << metadata_path << "\n";
-    std::cout << "[pathfinder-router] routes_path: " << routes_path << "\n" << std::flush;
-
     print_progress(0, 3, "starting");
 
     std::vector<std::string> convert_cmd = {
@@ -294,18 +287,26 @@ int main(int argc, char** argv) {
         "--routes-out",
         routes_path.string(),
     };
+    if (options.allow_unrouted) {
+      pathfinder_cmd.push_back("--allow-unrouted");
+    }
     pathfinder_cmd.insert(pathfinder_cmd.end(),
                           options.pathfinder_args.begin(),
                           options.pathfinder_args.end());
     run_command(pathfinder_cmd, "run PathFinder");
     print_progress(2, 3, "PathFinder complete");
 
-    run_command({options.routes_to_phys,
-                 options.input_phys.string(),
-                 metadata_path.string(),
-                 routes_path.string(),
-                 options.output_phys.string()},
-                "reconstruct routed PhysicalNetlist");
+    std::vector<std::string> reconstruct_cmd = {
+        options.routes_to_phys,
+        options.input_phys.string(),
+        metadata_path.string(),
+        routes_path.string(),
+        options.output_phys.string(),
+    };
+    if (options.allow_unrouted) {
+      reconstruct_cmd.push_back("--allow-unrouted-stubs");
+    }
+    run_command(reconstruct_cmd, "reconstruct routed PhysicalNetlist");
     print_progress(3, 3, "routed PhysicalNetlist written");
 
     if (cleanup_work_dir) {

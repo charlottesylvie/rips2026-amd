@@ -545,6 +545,19 @@ int main() {
   require(g_multisource_delta_calls == 1,
           "PathFinder should call multi-source delta stepping once per multi-sink net");
 
+  routing::RoutingMetadata invalid_sink_metadata = make_metadata();
+  invalid_sink_metadata.strings.push_back("UNMAPPED_SINK_SITE");
+  invalid_sink_metadata.strings.push_back("UNMAPPED_SINK_PIN");
+  invalid_sink_metadata.route_requests[0].sinks.push_back({-1, 12, 13});
+  routing::PathfinderResult invalid_sink_result =
+      routing::run_pathfinder(graph, invalid_sink_metadata, options, nullptr);
+  require(!invalid_sink_result.routed,
+          "an unmapped physical sink stub should prevent a routed result");
+  require(!invalid_sink_result.all_sinks_reached,
+          "all_sinks_reached must include invalid/unmapped sink stubs");
+  require(!invalid_sink_result.nets[0].sinks.back().reached,
+          "invalid sink should be preserved as an unreached sink result");
+
   const std::filesystem::path routes_path = "/tmp/pathfinder_cpu_stub_routes.jsonl";
   routing::write_routes_jsonl(routes_path, graph, metadata, result);
   std::ifstream routes_file(routes_path);
