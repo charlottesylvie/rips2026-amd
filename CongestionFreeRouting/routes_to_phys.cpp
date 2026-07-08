@@ -573,7 +573,11 @@ std::vector<std::uint8_t> read_gzip_or_plain_file(const std::filesystem::path& p
     const int read_count =
         gzread(file, buffer.data(), static_cast<unsigned int>(buffer.size()));
     if (read_count > 0) {
-      bytes.insert(bytes.end(), buffer.begin(), buffer.begin() + read_count);
+      const std::size_t old_size = bytes.size();
+      bytes.resize(old_size + static_cast<std::size_t>(read_count));
+      std::memcpy(bytes.data() + old_size,
+                  buffer.data(),
+                  static_cast<std::size_t>(read_count));
       continue;
     }
     if (read_count == 0) break;

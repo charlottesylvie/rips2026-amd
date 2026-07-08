@@ -64,7 +64,6 @@
 #include <iostream>
 #include <limits>
 #include <optional>
-#include <regex>
 #include <stdexcept>
 #include <string>
 #include <unordered_map>
@@ -333,6 +332,40 @@ bool has_prefix(const std::string& text, const char* prefix) {
          text.compare(0, prefix_text.size(), prefix_text) == 0;
 }
 
+std::optional<std::pair<int, int>> parse_tile_xy(const std::string& tile_name) {
+  const std::size_t marker = tile_name.rfind("_X");
+  if (marker == std::string::npos) {
+    return std::nullopt;
+  }
+
+  std::size_t pos = marker + 2;
+  if (pos >= tile_name.size() || tile_name[pos] < '0' || tile_name[pos] > '9') {
+    return std::nullopt;
+  }
+
+  int x = 0;
+  while (pos < tile_name.size() && tile_name[pos] >= '0' && tile_name[pos] <= '9') {
+    x = x * 10 + (tile_name[pos] - '0');
+    ++pos;
+  }
+
+  if (pos >= tile_name.size() || tile_name[pos] != 'Y') {
+    return std::nullopt;
+  }
+  ++pos;
+  if (pos >= tile_name.size() || tile_name[pos] < '0' || tile_name[pos] > '9') {
+    return std::nullopt;
+  }
+
+  int y = 0;
+  while (pos < tile_name.size() && tile_name[pos] >= '0' && tile_name[pos] <= '9') {
+    y = y * 10 + (tile_name[pos] - '0');
+    ++pos;
+  }
+
+  return std::make_pair(x, y);
+}
+
 // Print the node-bounds mode in logs so graph size can be interpreted without
 // guessing which subset policy was used.
 const char* node_bounds_mode_name(NodeBoundsMode mode) {
@@ -520,7 +553,11 @@ std::vector<std::uint8_t> read_gzip_or_plain_file(
     const int read_count =
         gzread(file, buffer.data(), static_cast<unsigned int>(buffer.size()));
     if (read_count > 0) {
-      bytes.insert(bytes.end(), buffer.begin(), buffer.begin() + read_count);
+      const std::size_t old_size = bytes.size();
+      bytes.resize(old_size + static_cast<std::size_t>(read_count));
+      std::memcpy(bytes.data() + old_size,
+                  buffer.data(),
+                  static_cast<std::size_t>(read_count));
       continue;
     }
 
@@ -889,21 +926,19 @@ void build_device_routing_graph(const std::filesystem::path& device_path,
   // StringIdx.
   std::unordered_set<std::uint32_t> in_bounds_tile_name_ids;
   std::vector<std::uint32_t> in_bounds_tile_indices;
-  const std::regex tile_xy_regex(R"([A-Z0-9_]+_X([0-9]+)Y([0-9]+))");
 
   for (std::uint32_t tile_index = 0; tile_index < tile_list.size();
        ++tile_index) {
     const auto tile = tile_list[tile_index];
     const std::string& tile_name = strings.get(tile.getName());
 
-    std::smatch match;
-    if (!std::regex_search(tile_name, match, tile_xy_regex) ||
-        match.position() != 0) {
+    const std::optional<std::pair<int, int>> xy = parse_tile_xy(tile_name);
+    if (!xy.has_value()) {
       continue;
     }
 
-    const int x = parse_int_arg(match[1].str().c_str(), "tile X");
-    const int y = parse_int_arg(match[2].str().c_str(), "tile Y");
+    const int x = xy->first;
+    const int y = xy->second;
     if (x < bounds.min_x || x > bounds.max_x || y < bounds.min_y ||
         y > bounds.max_y) {
       continue;
@@ -1344,50 +1379,66 @@ CsrGraph make_incoming_csr(const RoutingGraph& graph) {
   csr.loaded_edges = static_cast<std::uint64_t>(graph.edges.size());
   csr.rowptr.resize(static_cast<std::size_t>(csr.rows) + 1);
 
-  std::vector<std::vector<CsrEntry>> incoming_rows(
-      static_cast<std::size_t>(csr.rows));
-
-  for (const BuildEdge& edge : graph.edges) {
+  auto edge_is_importable = [&](const BuildEdge& edge) {
     if (edge.from < 0 || edge.to < 0 || edge.from >= csr.rows ||
         edge.to >= csr.rows) {
-      continue;
+      return false;
     }
 
     if (graph.blocked_node[edge.from] || graph.blocked_node[edge.to]) {
-      continue;
+      return false;
     }
 
     if (graph.sink_node_stops[edge.from]) {
-      continue;
+      return false;
     }
+    return true;
+  };
 
-    CsrEntry entry;
-    entry.col = edge.from;
-    entry.value = 1.0f;
-    entry.attr = edge.attr;
-    incoming_rows[edge.to].push_back(entry);
+  for (const BuildEdge& edge : graph.edges) {
+    if (edge_is_importable(edge)) {
+      ++csr.rowptr[static_cast<std::size_t>(edge.to) + 1];
+    }
   }
 
   for (std::int64_t row = 0; row < csr.rows; ++row) {
-    auto& entries = incoming_rows[static_cast<std::size_t>(row)];
-    csr.rowptr[static_cast<std::size_t>(row)] =
-        static_cast<std::int64_t>(csr.colind.size());
+    csr.rowptr[static_cast<std::size_t>(row + 1)] +=
+        csr.rowptr[static_cast<std::size_t>(row)];
+  }
 
-    std::sort(entries.begin(),
-              entries.end(),
+  std::vector<CsrEntry> entries(static_cast<std::size_t>(csr.rowptr.back()));
+  std::vector<std::int64_t> cursor = csr.rowptr;
+  for (const BuildEdge& edge : graph.edges) {
+    if (!edge_is_importable(edge)) {
+      continue;
+    }
+
+    const std::size_t row = static_cast<std::size_t>(edge.to);
+    const std::size_t pos = static_cast<std::size_t>(cursor[row]++);
+    entries[pos] = {edge.from, 1.0f, edge.attr};
+  }
+
+  csr.colind.resize(entries.size());
+  csr.values.resize(entries.size());
+  csr.edge_attrs.resize(entries.size());
+  for (std::int64_t row = 0; row < csr.rows; ++row) {
+    const std::size_t begin =
+        static_cast<std::size_t>(csr.rowptr[static_cast<std::size_t>(row)]);
+    const std::size_t end =
+        static_cast<std::size_t>(csr.rowptr[static_cast<std::size_t>(row + 1)]);
+    std::sort(entries.begin() + static_cast<std::ptrdiff_t>(begin),
+              entries.begin() + static_cast<std::ptrdiff_t>(end),
               [](const CsrEntry& lhs, const CsrEntry& rhs) {
                 return lhs.col < rhs.col;
               });
 
-    for (const CsrEntry& entry : entries) {
-      csr.colind.push_back(entry.col);
-      csr.values.push_back(entry.value);
-      csr.edge_attrs.push_back(entry.attr);
+    for (std::size_t index = begin; index < end; ++index) {
+      const CsrEntry& entry = entries[index];
+      csr.colind[index] = entry.col;
+      csr.values[index] = entry.value;
+      csr.edge_attrs[index] = entry.attr;
     }
   }
-
-  csr.rowptr[static_cast<std::size_t>(csr.rows)] =
-      static_cast<std::int64_t>(csr.colind.size());
   return csr;
 }
 

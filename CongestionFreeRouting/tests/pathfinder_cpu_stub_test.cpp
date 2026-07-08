@@ -7,7 +7,7 @@
 
 namespace {
 
-int g_multisource_delta_calls = 0;
+std::atomic<int> g_multisource_delta_calls{0};
 
 struct CpuSsspResult {
   std::vector<float> dist;
@@ -492,6 +492,25 @@ int main() {
           "overlapping route output should still include the second net");
   require(overlap_routes_json.find("\"from\":1,\"to\":2") != std::string::npos,
           "overlapping route output should include the shared shortest path");
+
+  routing::PathfinderOptions parallel_options;
+  parallel_options.max_pathfinder_iterations = 1;
+  parallel_options.delta = 1.0f;
+  parallel_options.parallel_net_workers = 2;
+  g_multisource_delta_calls = 0;
+  routing::PathfinderResult parallel_result =
+      routing::run_pathfinder(congestion_graph,
+                              congestion_metadata,
+                              parallel_options,
+                              nullptr);
+  require(parallel_result.routed,
+          "parallel congestion-free routing should preserve routed status");
+  require(parallel_result.nets[0].sinks[0].nodes == std::vector<int>({0, 2, 4}),
+          "parallel routing should preserve the first net route");
+  require(parallel_result.nets[1].sinks[0].nodes == std::vector<int>({1, 2, 5}),
+          "parallel routing should preserve the second net route");
+  require(g_multisource_delta_calls == 2,
+          "parallel congestion-free routing should call SSSP once per net");
 
   const HostCsrF32 incremental_graph = make_incremental_reroute_graph();
   const routing::RoutingMetadata incremental_metadata =

@@ -15,20 +15,24 @@
 //     -I CongestionFreeRouting/delta_stepping \
 //     CongestionFreeRouting/pathfinder.cpp \
 //     CongestionFreeRouting/delta_stepping/delta_stepping_hip_CSR.cpp \
+//     -pthread \
 //     -o congestion_free_pathfinder
 //
 // Run:
 //   ./congestion_free_pathfinder design.csrbin design.csrbin.ifmeta.bin --net-limit 10
 
 #include <algorithm>
+#include <atomic>
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
 #include <iostream>
 #include <limits>
+#include <mutex>
 #include <sstream>
 #include <stdexcept>
+#include <thread>
 #include <unordered_set>
 #include <utility>
 
@@ -152,6 +156,9 @@ void validate_options(const PathfinderOptions& options) {
   }
   if (options.route_batch_size == 0) {
     throw std::invalid_argument("route_batch_size must be positive");
+  }
+  if (options.parallel_net_workers == 0) {
+    throw std::invalid_argument("parallel_net_workers must be positive");
   }
 }
 
@@ -1085,6 +1092,54 @@ void print_pathfinder_progress(int iteration,
   std::cout << "] " << completed_nets << "/" << total_nets << " nets\n" << std::flush;
 }
 
+hipStream_t create_worker_stream() {
+#if defined(__HIPCC__) || defined(__HIP_PLATFORM_AMD__)
+  hipStream_t stream = nullptr;
+  const hipError_t status = hipStreamCreateWithFlags(&stream, hipStreamNonBlocking);
+  if (status != hipSuccess) {
+    throw std::runtime_error(std::string("hipStreamCreateWithFlags failed: ") +
+                             hipGetErrorString(status));
+  }
+  return stream;
+#else
+  return nullptr;
+#endif
+}
+
+void destroy_worker_stream(hipStream_t stream) {
+#if defined(__HIPCC__) || defined(__HIP_PLATFORM_AMD__)
+  if (stream != nullptr) {
+    (void)hipStreamDestroy(stream);
+  }
+#else
+  (void)stream;
+#endif
+}
+
+struct WorkerStream {
+  explicit WorkerStream(bool create) : owns(create) {
+    if (owns) {
+      stream = create_worker_stream();
+    }
+  }
+
+  WorkerStream(const WorkerStream&) = delete;
+  WorkerStream& operator=(const WorkerStream&) = delete;
+
+  ~WorkerStream() {
+    if (owns) {
+      destroy_worker_stream(stream);
+    }
+  }
+
+  hipStream_t get(hipStream_t fallback) const {
+    return owns ? stream : fallback;
+  }
+
+  hipStream_t stream = nullptr;
+  bool owns = false;
+};
+
 }  // namespace
 
 std::filesystem::path default_metadata_path(const std::filesystem::path& csr_path) {
@@ -1139,6 +1194,7 @@ void print_usage(const char* program) {
       << "  --history-factor <float>        Historical congestion increment. Default: 1\n"
       << "  --net-limit <count>             Route only the first count requests.\n"
       << "  --route-batch-size <count>      Nets routed per congestion snapshot. Default: 256\n"
+      << "  --parallel-net-workers <count>  Independent net workers. Default: 1\n"
       << "  --allow-unrouted                Write partial routes even if some sinks are unreached.\n"
       << "  --routes-out <path>             Write routed PIP tree data as JSONL.\n";
 }
@@ -1412,37 +1468,128 @@ PathfinderResult run_pathfinder(const HostCsrF32& base_graph,
       options.net_limit == 0
           ? metadata.route_requests.size()
           : std::min(options.net_limit, metadata.route_requests.size());
-  DeltaSteppingCsrWorkspace sssp_workspace(base_graph, stream);
-  std::vector<std::uint32_t> route_tree_seen(static_cast<std::size_t>(base_graph.rows), 0);
-  std::vector<int> route_parent_by_child(static_cast<std::size_t>(base_graph.rows), -1);
-  std::vector<std::uint32_t> route_parent_seen(static_cast<std::size_t>(base_graph.rows), 0);
-  std::uint32_t route_tree_stamp = 0;
   result.nets.resize(route_request_count);
 
   const std::size_t progress_interval =
       std::max<std::size_t>(1, route_request_count / 100);
-  for (std::size_t net_index = 0; net_index < route_request_count; ++net_index) {
-    const RouteRequest& request = metadata.route_requests[net_index];
 
-    const std::uint32_t tree_stamp =
-        next_tree_stamp(route_tree_seen, &route_tree_stamp);
-    result.nets[net_index] =
-        route_net(base_graph,
-                  sssp_workspace,
-                  request,
-                  route_tree_seen,
-                  route_parent_by_child,
-                  route_parent_seen,
-                  tree_stamp,
-                  nullptr,
-                  options,
-                  stream);
-    commit_net_occupancy(result.nets[net_index], result.occupancy);
+  std::size_t worker_count =
+      std::min<std::size_t>(options.parallel_net_workers,
+                            std::max<std::size_t>(1, route_request_count));
+  if (stream != nullptr) {
+    worker_count = 1;
+  }
 
-    if ((net_index + 1) == route_request_count ||
-        (net_index + 1) % progress_interval == 0) {
-      print_pathfinder_progress(1, 1, net_index + 1, route_request_count);
+  if (worker_count <= 1 || route_request_count <= 1) {
+    DeltaSteppingCsrWorkspace sssp_workspace(base_graph, stream);
+    std::vector<std::uint32_t> route_tree_seen(static_cast<std::size_t>(base_graph.rows), 0);
+    std::vector<int> route_parent_by_child(static_cast<std::size_t>(base_graph.rows), -1);
+    std::vector<std::uint32_t> route_parent_seen(static_cast<std::size_t>(base_graph.rows), 0);
+    std::uint32_t route_tree_stamp = 0;
+
+    for (std::size_t net_index = 0; net_index < route_request_count; ++net_index) {
+      const RouteRequest& request = metadata.route_requests[net_index];
+
+      const std::uint32_t tree_stamp =
+          next_tree_stamp(route_tree_seen, &route_tree_stamp);
+      result.nets[net_index] =
+          route_net(base_graph,
+                    sssp_workspace,
+                    request,
+                    route_tree_seen,
+                    route_parent_by_child,
+                    route_parent_seen,
+                    tree_stamp,
+                    nullptr,
+                    options,
+                    stream);
+
+      if ((net_index + 1) == route_request_count ||
+          (net_index + 1) % progress_interval == 0) {
+        print_pathfinder_progress(1, 1, net_index + 1, route_request_count);
+      }
     }
+  } else {
+    std::atomic<std::size_t> next_net{0};
+    std::atomic<std::size_t> completed_nets{0};
+    std::atomic<bool> failed{false};
+    std::exception_ptr first_exception;
+    std::mutex exception_mutex;
+    std::mutex progress_mutex;
+    std::size_t last_reported = 0;
+
+    auto report_progress = [&](std::size_t completed) {
+      std::lock_guard<std::mutex> lock(progress_mutex);
+      if (completed == route_request_count ||
+          completed - last_reported >= progress_interval) {
+        last_reported = completed;
+        print_pathfinder_progress(1, 1, completed, route_request_count);
+      }
+    };
+
+    auto worker = [&]() {
+      try {
+        WorkerStream worker_stream(stream == nullptr);
+        hipStream_t local_stream = worker_stream.get(stream);
+        DeltaSteppingCsrWorkspace sssp_workspace(base_graph, local_stream);
+        std::vector<std::uint32_t> route_tree_seen(
+            static_cast<std::size_t>(base_graph.rows), 0);
+        std::vector<int> route_parent_by_child(
+            static_cast<std::size_t>(base_graph.rows), -1);
+        std::vector<std::uint32_t> route_parent_seen(
+            static_cast<std::size_t>(base_graph.rows), 0);
+        std::uint32_t route_tree_stamp = 0;
+
+        while (!failed.load(std::memory_order_relaxed)) {
+          const std::size_t net_index =
+              next_net.fetch_add(1, std::memory_order_relaxed);
+          if (net_index >= route_request_count) {
+            break;
+          }
+
+          const RouteRequest& request = metadata.route_requests[net_index];
+          const std::uint32_t tree_stamp =
+              next_tree_stamp(route_tree_seen, &route_tree_stamp);
+          result.nets[net_index] =
+              route_net(base_graph,
+                        sssp_workspace,
+                        request,
+                        route_tree_seen,
+                        route_parent_by_child,
+                        route_parent_seen,
+                        tree_stamp,
+                        nullptr,
+                        options,
+                        local_stream);
+
+          const std::size_t completed =
+              completed_nets.fetch_add(1, std::memory_order_relaxed) + 1;
+          report_progress(completed);
+        }
+      } catch (...) {
+        failed.store(true, std::memory_order_relaxed);
+        std::lock_guard<std::mutex> lock(exception_mutex);
+        if (!first_exception) {
+          first_exception = std::current_exception();
+        }
+      }
+    };
+
+    std::vector<std::thread> workers;
+    workers.reserve(worker_count);
+    for (std::size_t i = 0; i < worker_count; ++i) {
+      workers.emplace_back(worker);
+    }
+    for (std::thread& thread : workers) {
+      thread.join();
+    }
+    if (first_exception) {
+      std::rethrow_exception(first_exception);
+    }
+  }
+
+  for (const RoutedNet& net : result.nets) {
+    commit_net_occupancy(net, result.occupancy);
   }
 
   bool all_sinks_reached = true;
@@ -1535,7 +1682,12 @@ void write_routes_jsonl(const std::filesystem::path& path,
     }
     out << ']';
 
+    std::size_t route_edge_count = 0;
+    for (const RoutedSink& sink : net.sinks) {
+      route_edge_count += sink.edges.size();
+    }
     std::unordered_set<std::uint64_t> seen_edges;
+    seen_edges.reserve(route_edge_count);
     out << ",\"edges\":[";
     bool first_edge = true;
     for (const RoutedSink& sink : net.sinks) {
@@ -1646,6 +1798,10 @@ int main(int argc, char** argv) {
       } else if (option == "--route-batch-size") {
         options.route_batch_size =
             routing::parse_size_arg(require_value("--route-batch-size"), "route-batch-size");
+      } else if (option == "--parallel-net-workers") {
+        options.parallel_net_workers =
+            routing::parse_size_arg(require_value("--parallel-net-workers"),
+                                    "parallel-net-workers");
       } else if (option == "--allow-unrouted") {
         allow_unrouted_routes = true;
       } else if (option == "--routes-out") {
