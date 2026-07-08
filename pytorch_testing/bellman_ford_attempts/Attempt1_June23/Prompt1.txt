@@ -1,7 +1,0 @@
-Used Claude. 
-
-Prompt: I am doing a project for AMD, which is outlined above. 
-I would like to do the first step, which is to design a Bellman-Ford algorithm using 
-min-plus algebra to accelerate routing on GPUs. Can you please code this for me, as well as a way to test it?
-
-Uploaded with the Long Project Description. 
