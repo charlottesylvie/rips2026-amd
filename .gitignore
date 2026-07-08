@@ -1,1 +1,3 @@
 .DS_Store
+benchmarks/
+HIP_kernel/bellman_ford/data/
