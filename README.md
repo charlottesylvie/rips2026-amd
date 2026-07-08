@@ -36,6 +36,7 @@ The repository Makefile currently defaults to:
 ```make
 ROUTER ?= PathFinderFile
 PATHFINDER_ROUTER_BIN ?= ./PathFinderFile
+PATHFINDER_SSSP_ENGINE ?= unit-bfs
 ```
 
 Run a single benchmark through the contest infrastructure with:
@@ -50,6 +51,16 @@ Forward wrapper or PathFinder tuning options through `PATHFINDER_ARGS`:
 ```bash
 make ROUTER=PathFinderFile BENCHMARKS="boom_med_pb" VERBOSE=1 \
   PATHFINDER_ARGS="--delta 2 --max-pathfinder-iters 20 --keep-work-dir"
+```
+
+Compare the congestion-free unit-BFS backend against delta-stepping while
+keeping the same benchmark, bounds, route writer, and wrapper path:
+
+```bash
+make ROUTER=PathFinderFile BENCHMARKS="boom_med_pb" VERBOSE=1 \
+  PATHFINDER_SSSP_ENGINE=unit-bfs
+make ROUTER=PathFinderFile BENCHMARKS="boom_med_pb" VERBOSE=1 \
+  PATHFINDER_SSSP_ENGINE=delta-step
 ```
 
 The Makefile rule supplies the matching `.netlist` and `xcvu3p.device`:
@@ -146,6 +157,16 @@ hipcc -std=c++17 -O3 -x hip \
   HIP_kernel/delta_stepping/src/delta_stepping_hip_CSR.cpp \
   -o pathfinder
 
+# CongestionFreeRouting variant with unit-BFS and delta-step backends:
+hipcc -std=c++17 -O3 -x hip \
+  -I HIP_kernel/bellman_ford/src \
+  -I CongestionFreeRouting/delta_stepping \
+  -I CongestionFreeRouting/unit_bfs \
+  CongestionFreeRouting/pathfinder.cpp \
+  CongestionFreeRouting/delta_stepping/delta_stepping_hip_CSR.cpp \
+  CongestionFreeRouting/unit_bfs/unit_bfs_hip_CSR.cpp \
+  -pthread -o pathfinder
+
 g++ -std=c++17 -O3 -I"$SCHEMA_DIR" \
   Routing/routes_to_phys.cpp \
   "$SCHEMA_DIR"/PhysicalNetlist.capnp.c++ \
@@ -208,14 +229,17 @@ Tuning options:
 
 | Option | Default | Meaning |
 | --- | --- | --- |
-| `--delta <float>` | `4` | Delta-stepping bucket width. |
+| `--sssp-engine <unit-bfs\|delta-step>` | `unit-bfs` | Shortest-path backend. |
+| `--use-delta-step` | unset | Shorthand for `--sssp-engine delta-step`. |
+| `--delta <float>` | `4` | Delta-stepping bucket width; meaningful for delta-step. |
 | `--max-pathfinder-iters <int>` | `30` | Rip-up/reroute rounds. |
-| `--max-sssp-iters <int>` | `-1` | Delta-stepping bucket rounds; `-1` uses the default. |
+| `--max-sssp-iters <int>` | `-1` | Delta-step bucket rounds or unit-BFS depth cap; `-1` uses the default. |
 | `--capacity <int>` | `1` | Routing-resource capacity. |
 | `--present-factor <float>` | `1` | Initial present congestion factor. |
 | `--present-multiplier <float>` | `2` | Per-iteration present-factor multiplier. |
 | `--history-factor <float>` | `1` | Historical congestion increment. |
 | `--net-limit <count>` | unset | Route only the first `count` requests. |
+| `--parallel-net-workers <count>` | `1` | Independent net workers. |
 | `--routes-out <path>` | unset | Write routed PIP tree data as JSONL. |
 
 ### `routes_to_phys`
@@ -249,7 +273,7 @@ Useful wrapper options:
 | `--interchange-to-csr <path>` | Override converter executable. Env: `INTERCHANGE_TO_CSR`. |
 | `--pathfinder <path>` | Override PathFinder executable. Env: `PATHFINDER_BIN`. |
 | `--routes-to-phys <path>` | Override route reconstructor. Env: `ROUTES_TO_PHYS`. |
-| `--delta`, `--max-pathfinder-iters`, `--max-sssp-iters`, `--capacity`, `--present-factor`, `--present-multiplier`, `--history-factor` | Forwarded to `pathfinder`. |
+| `--sssp-engine`, `--use-delta-step`, `--delta`, `--max-pathfinder-iters`, `--max-sssp-iters`, `--parallel-net-workers`, `--capacity`, `--present-factor`, `--present-multiplier`, `--history-factor` | Forwarded to `pathfinder`. |
 | `--full-device`, `--bounds`, `--node-bounds-mode` | Forwarded to `interchange_to_csr`. |
 
 ## File Formats And Artifacts

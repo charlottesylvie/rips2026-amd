@@ -141,6 +141,9 @@ void print_usage(const char* program) {
       << "  --pathfinder <path>            PathFinder executable. Env: PATHFINDER_BIN\n"
       << "  --routes-to-phys <path>        Route reconstructor. Env: ROUTES_TO_PHYS\n"
       << "  --strict-routing               Fail instead of writing partial routes.\n"
+      << "  --sssp-engine <unit-bfs|delta-step>\n"
+      << "                                 Forwarded to pathfinder. Default: unit-bfs\n"
+      << "  --use-delta-step               Forwarded to pathfinder for comparison.\n"
       << "  --delta <float>                Forwarded to pathfinder.\n"
       << "  --max-pathfinder-iters <int>   Forwarded to pathfinder.\n"
       << "  --max-sssp-iters <int>         Forwarded to pathfinder.\n"
@@ -202,7 +205,10 @@ Options parse_args(int argc, char** argv) {
       options.routes_to_phys = require_value("--routes-to-phys");
     } else if (option == "--strict-routing") {
       options.allow_unrouted = false;
-    } else if (option == "--delta" ||
+    } else if (option == "--use-delta-step") {
+      options.pathfinder_args.push_back(option);
+    } else if (option == "--sssp-engine" ||
+               option == "--delta" ||
                option == "--max-pathfinder-iters" ||
                option == "--max-sssp-iters" ||
                option == "--net-limit" ||

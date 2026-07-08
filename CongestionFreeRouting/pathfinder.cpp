@@ -1,20 +1,23 @@
 #include "pathfinder.hpp"
 
 #include "delta_stepping/delta_stepping_hip_CSR.hpp"
+#include "unit_bfs/unit_bfs_hip_CSR.hpp"
 
 // Congestion-free fork of the repository PathFinder router.
 //
 // This keeps the same benchmark-facing and route JSON APIs, but the routing
 // loop intentionally ignores present/historical congestion.  The default
-// engine keeps using GPU delta-stepping without vertex congestion costs; CPU
-// BFS remains available as an exact unit-cost baseline/fallback.
+// engine uses a unit-weight GPU BFS specialized for the converter's unit
+// routing graph.  GPU delta-stepping remains selectable for comparison.
 //
 // Example GPU build from the repository root:
 //   hipcc -std=c++17 -O3 -x hip \
 //     -I HIP_kernel/bellman_ford/src \
 //     -I CongestionFreeRouting/delta_stepping \
+//     -I CongestionFreeRouting/unit_bfs \
 //     CongestionFreeRouting/pathfinder.cpp \
 //     CongestionFreeRouting/delta_stepping/delta_stepping_hip_CSR.cpp \
+//     CongestionFreeRouting/unit_bfs/unit_bfs_hip_CSR.cpp \
 //     -pthread \
 //     -o congestion_free_pathfinder
 //
@@ -134,7 +137,8 @@ void validate_csr(const HostCsrF32& graph) {
 }
 
 void validate_options(const PathfinderOptions& options) {
-  if (!(options.delta > 0.0f) || !std::isfinite(options.delta)) {
+  if (options.sssp_engine == SsspEngine::kDeltaStep &&
+      (!(options.delta > 0.0f) || !std::isfinite(options.delta))) {
     throw std::invalid_argument("PathFinder delta must be finite and positive");
   }
   if (options.max_pathfinder_iterations <= 0) {
@@ -439,8 +443,9 @@ bool attach_path_if_single_parent_tree(
   return true;
 }
 
+template <typename SsspWorkspace>
 RoutedNet route_net(const HostCsrF32& graph,
-                    DeltaSteppingCsrWorkspace& workspace,
+                    SsspWorkspace& workspace,
                     const RouteRequest& request,
                     std::vector<std::uint32_t>& tree_seen,
                     std::vector<int>& parent_by_child,
@@ -496,14 +501,13 @@ RoutedNet route_net(const HostCsrF32& graph,
   }
 
   if (!targets.empty()) {
-    DeltaSteppingCsrResult sssp =
-        workspace.run(source_candidates,
-                      targets,
-                      options.delta,
-                      options.max_sssp_iterations,
-                      stream,
-                      nullptr,
-                      nullptr);
+    auto sssp = workspace.run(source_candidates,
+                              targets,
+                              options.delta,
+                              options.max_sssp_iterations,
+                              stream,
+                              nullptr,
+                              nullptr);
 
     const bool has_compact_target_paths =
         sssp.target_distances.size() == targets.size() &&
@@ -1140,6 +1144,130 @@ struct WorkerStream {
   bool owns = false;
 };
 
+template <typename SsspWorkspace>
+void route_all_nets_with_workspace(const HostCsrF32& base_graph,
+                                   const RoutingMetadata& metadata,
+                                   const PathfinderOptions& options,
+                                   hipStream_t stream,
+                                   std::size_t route_request_count,
+                                   std::size_t progress_interval,
+                                   std::vector<RoutedNet>& nets) {
+  std::size_t worker_count =
+      std::min<std::size_t>(options.parallel_net_workers,
+                            std::max<std::size_t>(1, route_request_count));
+  if (stream != nullptr) {
+    worker_count = 1;
+  }
+
+  if (worker_count <= 1 || route_request_count <= 1) {
+    SsspWorkspace sssp_workspace(base_graph, stream);
+    std::vector<std::uint32_t> route_tree_seen(static_cast<std::size_t>(base_graph.rows), 0);
+    std::vector<int> route_parent_by_child(static_cast<std::size_t>(base_graph.rows), -1);
+    std::vector<std::uint32_t> route_parent_seen(static_cast<std::size_t>(base_graph.rows), 0);
+    std::uint32_t route_tree_stamp = 0;
+
+    for (std::size_t net_index = 0; net_index < route_request_count; ++net_index) {
+      const RouteRequest& request = metadata.route_requests[net_index];
+      const std::uint32_t tree_stamp =
+          next_tree_stamp(route_tree_seen, &route_tree_stamp);
+      nets[net_index] =
+          route_net(base_graph,
+                    sssp_workspace,
+                    request,
+                    route_tree_seen,
+                    route_parent_by_child,
+                    route_parent_seen,
+                    tree_stamp,
+                    nullptr,
+                    options,
+                    stream);
+
+      if ((net_index + 1) == route_request_count ||
+          (net_index + 1) % progress_interval == 0) {
+        print_pathfinder_progress(1, 1, net_index + 1, route_request_count);
+      }
+    }
+    return;
+  }
+
+  std::atomic<std::size_t> next_net{0};
+  std::atomic<std::size_t> completed_nets{0};
+  std::atomic<bool> failed{false};
+  std::exception_ptr first_exception;
+  std::mutex exception_mutex;
+  std::mutex progress_mutex;
+  std::size_t last_reported = 0;
+
+  auto report_progress = [&](std::size_t completed) {
+    std::lock_guard<std::mutex> lock(progress_mutex);
+    if (completed == route_request_count ||
+        completed - last_reported >= progress_interval) {
+      last_reported = completed;
+      print_pathfinder_progress(1, 1, completed, route_request_count);
+    }
+  };
+
+  auto worker = [&]() {
+    try {
+      WorkerStream worker_stream(stream == nullptr);
+      hipStream_t local_stream = worker_stream.get(stream);
+      SsspWorkspace sssp_workspace(base_graph, local_stream);
+      std::vector<std::uint32_t> route_tree_seen(
+          static_cast<std::size_t>(base_graph.rows), 0);
+      std::vector<int> route_parent_by_child(
+          static_cast<std::size_t>(base_graph.rows), -1);
+      std::vector<std::uint32_t> route_parent_seen(
+          static_cast<std::size_t>(base_graph.rows), 0);
+      std::uint32_t route_tree_stamp = 0;
+
+      while (!failed.load(std::memory_order_relaxed)) {
+        const std::size_t net_index =
+            next_net.fetch_add(1, std::memory_order_relaxed);
+        if (net_index >= route_request_count) {
+          break;
+        }
+
+        const RouteRequest& request = metadata.route_requests[net_index];
+        const std::uint32_t tree_stamp =
+            next_tree_stamp(route_tree_seen, &route_tree_stamp);
+        nets[net_index] =
+            route_net(base_graph,
+                      sssp_workspace,
+                      request,
+                      route_tree_seen,
+                      route_parent_by_child,
+                      route_parent_seen,
+                      tree_stamp,
+                      nullptr,
+                      options,
+                      local_stream);
+
+        const std::size_t completed =
+            completed_nets.fetch_add(1, std::memory_order_relaxed) + 1;
+        report_progress(completed);
+      }
+    } catch (...) {
+      failed.store(true, std::memory_order_relaxed);
+      std::lock_guard<std::mutex> lock(exception_mutex);
+      if (!first_exception) {
+        first_exception = std::current_exception();
+      }
+    }
+  };
+
+  std::vector<std::thread> workers;
+  workers.reserve(worker_count);
+  for (std::size_t i = 0; i < worker_count; ++i) {
+    workers.emplace_back(worker);
+  }
+  for (std::thread& thread : workers) {
+    thread.join();
+  }
+  if (first_exception) {
+    std::rethrow_exception(first_exception);
+  }
+}
+
 }  // namespace
 
 std::filesystem::path default_metadata_path(const std::filesystem::path& csr_path) {
@@ -1180,11 +1308,35 @@ float parse_float_arg(const char* text, const char* name) {
   return value;
 }
 
+SsspEngine parse_sssp_engine_arg(const char* text) {
+  const std::string value(text);
+  if (value == "unit-bfs" || value == "bfs") {
+    return SsspEngine::kUnitBfs;
+  }
+  if (value == "delta-step" || value == "delta-stepping" || value == "delta") {
+    return SsspEngine::kDeltaStep;
+  }
+  throw std::runtime_error("invalid sssp-engine: " + value);
+}
+
+const char* sssp_engine_name(SsspEngine engine) {
+  switch (engine) {
+    case SsspEngine::kUnitBfs:
+      return "unit-bfs";
+    case SsspEngine::kDeltaStep:
+      return "delta-step";
+  }
+  return "unknown";
+}
+
 void print_usage(const char* program) {
   std::cerr
       << "Usage:\n"
       << "  " << program << " <graph.csrbin> [metadata.ifmeta.bin] [options]\n\n"
       << "Options:\n"
+      << "  --sssp-engine <unit-bfs|delta-step>\n"
+      << "                                  Shortest-path backend. Default: unit-bfs\n"
+      << "  --use-delta-step                Use delta-step backend for comparison.\n"
       << "  --delta <float>                 Delta-stepping bucket width. Default: 4\n"
       << "  --max-pathfinder-iters <int>    PathFinder rip-up/reroute rounds. Default: 30\n"
       << "  --max-sssp-iters <int>          Delta-stepping bucket rounds, -1 for default.\n"
@@ -1473,119 +1625,25 @@ PathfinderResult run_pathfinder(const HostCsrF32& base_graph,
   const std::size_t progress_interval =
       std::max<std::size_t>(1, route_request_count / 100);
 
-  std::size_t worker_count =
-      std::min<std::size_t>(options.parallel_net_workers,
-                            std::max<std::size_t>(1, route_request_count));
-  if (stream != nullptr) {
-    worker_count = 1;
-  }
-
-  if (worker_count <= 1 || route_request_count <= 1) {
-    DeltaSteppingCsrWorkspace sssp_workspace(base_graph, stream);
-    std::vector<std::uint32_t> route_tree_seen(static_cast<std::size_t>(base_graph.rows), 0);
-    std::vector<int> route_parent_by_child(static_cast<std::size_t>(base_graph.rows), -1);
-    std::vector<std::uint32_t> route_parent_seen(static_cast<std::size_t>(base_graph.rows), 0);
-    std::uint32_t route_tree_stamp = 0;
-
-    for (std::size_t net_index = 0; net_index < route_request_count; ++net_index) {
-      const RouteRequest& request = metadata.route_requests[net_index];
-
-      const std::uint32_t tree_stamp =
-          next_tree_stamp(route_tree_seen, &route_tree_stamp);
-      result.nets[net_index] =
-          route_net(base_graph,
-                    sssp_workspace,
-                    request,
-                    route_tree_seen,
-                    route_parent_by_child,
-                    route_parent_seen,
-                    tree_stamp,
-                    nullptr,
-                    options,
-                    stream);
-
-      if ((net_index + 1) == route_request_count ||
-          (net_index + 1) % progress_interval == 0) {
-        print_pathfinder_progress(1, 1, net_index + 1, route_request_count);
-      }
-    }
-  } else {
-    std::atomic<std::size_t> next_net{0};
-    std::atomic<std::size_t> completed_nets{0};
-    std::atomic<bool> failed{false};
-    std::exception_ptr first_exception;
-    std::mutex exception_mutex;
-    std::mutex progress_mutex;
-    std::size_t last_reported = 0;
-
-    auto report_progress = [&](std::size_t completed) {
-      std::lock_guard<std::mutex> lock(progress_mutex);
-      if (completed == route_request_count ||
-          completed - last_reported >= progress_interval) {
-        last_reported = completed;
-        print_pathfinder_progress(1, 1, completed, route_request_count);
-      }
-    };
-
-    auto worker = [&]() {
-      try {
-        WorkerStream worker_stream(stream == nullptr);
-        hipStream_t local_stream = worker_stream.get(stream);
-        DeltaSteppingCsrWorkspace sssp_workspace(base_graph, local_stream);
-        std::vector<std::uint32_t> route_tree_seen(
-            static_cast<std::size_t>(base_graph.rows), 0);
-        std::vector<int> route_parent_by_child(
-            static_cast<std::size_t>(base_graph.rows), -1);
-        std::vector<std::uint32_t> route_parent_seen(
-            static_cast<std::size_t>(base_graph.rows), 0);
-        std::uint32_t route_tree_stamp = 0;
-
-        while (!failed.load(std::memory_order_relaxed)) {
-          const std::size_t net_index =
-              next_net.fetch_add(1, std::memory_order_relaxed);
-          if (net_index >= route_request_count) {
-            break;
-          }
-
-          const RouteRequest& request = metadata.route_requests[net_index];
-          const std::uint32_t tree_stamp =
-              next_tree_stamp(route_tree_seen, &route_tree_stamp);
-          result.nets[net_index] =
-              route_net(base_graph,
-                        sssp_workspace,
-                        request,
-                        route_tree_seen,
-                        route_parent_by_child,
-                        route_parent_seen,
-                        tree_stamp,
-                        nullptr,
-                        options,
-                        local_stream);
-
-          const std::size_t completed =
-              completed_nets.fetch_add(1, std::memory_order_relaxed) + 1;
-          report_progress(completed);
-        }
-      } catch (...) {
-        failed.store(true, std::memory_order_relaxed);
-        std::lock_guard<std::mutex> lock(exception_mutex);
-        if (!first_exception) {
-          first_exception = std::current_exception();
-        }
-      }
-    };
-
-    std::vector<std::thread> workers;
-    workers.reserve(worker_count);
-    for (std::size_t i = 0; i < worker_count; ++i) {
-      workers.emplace_back(worker);
-    }
-    for (std::thread& thread : workers) {
-      thread.join();
-    }
-    if (first_exception) {
-      std::rethrow_exception(first_exception);
-    }
+  switch (options.sssp_engine) {
+    case SsspEngine::kUnitBfs:
+      route_all_nets_with_workspace<UnitBfsCsrWorkspace>(base_graph,
+                                                         metadata,
+                                                         options,
+                                                         stream,
+                                                         route_request_count,
+                                                         progress_interval,
+                                                         result.nets);
+      break;
+    case SsspEngine::kDeltaStep:
+      route_all_nets_with_workspace<DeltaSteppingCsrWorkspace>(base_graph,
+                                                               metadata,
+                                                               options,
+                                                               stream,
+                                                               route_request_count,
+                                                               progress_interval,
+                                                               result.nets);
+      break;
   }
 
   for (const RoutedNet& net : result.nets) {
@@ -1771,7 +1829,12 @@ int main(int argc, char** argv) {
         routing::print_usage(argv[0]);
         return 0;
       }
-      if (option == "--delta") {
+      if (option == "--sssp-engine") {
+        options.sssp_engine =
+            routing::parse_sssp_engine_arg(require_value("--sssp-engine"));
+      } else if (option == "--use-delta-step") {
+        options.sssp_engine = routing::SsspEngine::kDeltaStep;
+      } else if (option == "--delta") {
         options.delta = routing::parse_float_arg(require_value("--delta"), "delta");
       } else if (option == "--max-pathfinder-iters") {
         options.max_pathfinder_iterations =

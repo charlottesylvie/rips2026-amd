@@ -77,7 +77,13 @@ struct RoutedNet {
   std::vector<int> unique_nodes;
 };
 
+enum class SsspEngine {
+  kUnitBfs,
+  kDeltaStep,
+};
+
 struct PathfinderOptions {
+  SsspEngine sssp_engine = SsspEngine::kUnitBfs;
   float delta = 4.0f;
   int max_pathfinder_iterations = 30;
   int max_sssp_iterations = -1;

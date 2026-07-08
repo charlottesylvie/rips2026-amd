@@ -162,10 +162,11 @@ distclean: clean
 # 	(time <custom router here> $< $@) $(call log_and_or_display,$@.log)
 
 PATHFINDER_ROUTER_BIN ?= ./PathFinderFile
+PATHFINDER_SSSP_ENGINE ?= unit-bfs
 PATHFINDER_ARGS ?=
 
 %_PathFinderFile.phys: %_unrouted.phys %.netlist xcvu3p.device
-	(time $(PATHFINDER_ROUTER_BIN) $< $@ --logical-netlist $*.netlist --device xcvu3p.device $(PATHFINDER_ARGS)) $(call log_and_or_display,$@.log)
+	(time $(PATHFINDER_ROUTER_BIN) $< $@ --logical-netlist $*.netlist --device xcvu3p.device --sssp-engine $(PATHFINDER_SSSP_ENGINE) $(PATHFINDER_ARGS)) $(call log_and_or_display,$@.log)
 
 #### END ROUTER RECIPES
 

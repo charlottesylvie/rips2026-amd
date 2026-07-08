@@ -8,6 +8,7 @@
 namespace {
 
 std::atomic<int> g_multisource_delta_calls{0};
+std::atomic<int> g_unit_bfs_calls{0};
 
 struct CpuSsspResult {
   std::vector<float> dist;
@@ -69,6 +70,68 @@ CpuSsspResult cpu_dijkstra_incoming_csr_multi(const HostCsrF32& graph,
 std::vector<float> cpu_dijkstra_incoming_csr(const HostCsrF32& graph,
                                              int source) {
   return cpu_dijkstra_incoming_csr_multi(graph, std::vector<int>{source}).dist;
+}
+
+void fill_compact_target_paths(const HostCsrF32& graph,
+                               const std::vector<int>& sources,
+                               const std::vector<int>& targets,
+                               const CpuSsspResult& cpu_result,
+                               BellmanFordCsrResult& result) {
+  result.target_distances.resize(targets.size(), std::numeric_limits<float>::infinity());
+  result.target_sources.resize(targets.size(), -1);
+  result.target_path_offsets.assign(targets.size() + 1, 0);
+  result.target_edge_offsets.assign(targets.size() + 1, 0);
+  result.target_path_nodes.clear();
+  result.target_path_edges.clear();
+  result.target_reached = true;
+
+  for (std::size_t i = 0; i < targets.size(); ++i) {
+    const int target = targets[i];
+    result.target_path_offsets[i] =
+        static_cast<int>(result.target_path_nodes.size());
+    result.target_edge_offsets[i] =
+        static_cast<int>(result.target_path_edges.size());
+    if (target < 0 ||
+        static_cast<std::size_t>(target) >= cpu_result.dist.size() ||
+        !std::isfinite(cpu_result.dist[static_cast<std::size_t>(target)])) {
+      result.target_reached = false;
+      continue;
+    }
+
+    result.target_distances[i] = cpu_result.dist[static_cast<std::size_t>(target)];
+    std::vector<int> reversed_nodes;
+    std::vector<minplus_sparse::Offset> reversed_edges;
+    int current = target;
+    for (int guard = 0; guard < graph.rows; ++guard) {
+      reversed_nodes.push_back(current);
+      if (std::find(sources.begin(), sources.end(), current) != sources.end()) {
+        result.target_sources[i] = current;
+        break;
+      }
+      const int pred = cpu_result.pred_node[static_cast<std::size_t>(current)];
+      if (pred < 0) {
+        break;
+      }
+      reversed_edges.push_back(cpu_result.pred_edge[static_cast<std::size_t>(current)]);
+      current = pred;
+    }
+    if (result.target_sources[i] < 0) {
+      result.target_reached = false;
+      continue;
+    }
+    std::reverse(reversed_nodes.begin(), reversed_nodes.end());
+    std::reverse(reversed_edges.begin(), reversed_edges.end());
+    result.target_path_nodes.insert(result.target_path_nodes.end(),
+                                    reversed_nodes.begin(),
+                                    reversed_nodes.end());
+    result.target_path_edges.insert(result.target_path_edges.end(),
+                                    reversed_edges.begin(),
+                                    reversed_edges.end());
+  }
+  result.target_path_offsets[targets.size()] =
+      static_cast<int>(result.target_path_nodes.size());
+  result.target_edge_offsets[targets.size()] =
+      static_cast<int>(result.target_path_edges.size());
 }
 
 void require(bool condition, const char* message) {
@@ -293,57 +356,11 @@ DeltaSteppingCsrResult DeltaSteppingCsrWorkspace::run(
                                      stream,
                                      progress_callback,
                                      progress_user_data);
-  result.target_distances.resize(targets.size(), std::numeric_limits<float>::infinity());
-  result.target_sources.resize(targets.size(), -1);
-  result.target_path_offsets.assign(targets.size() + 1, 0);
-  result.target_edge_offsets.assign(targets.size() + 1, 0);
-  for (std::size_t i = 0; i < targets.size(); ++i) {
-    const int target = targets[i];
-    result.target_path_offsets[i] =
-        static_cast<int>(result.target_path_nodes.size());
-    result.target_edge_offsets[i] =
-        static_cast<int>(result.target_path_edges.size());
-    if (target < 0 ||
-        static_cast<std::size_t>(target) >= result.dist.size() ||
-        !std::isfinite(result.dist[static_cast<std::size_t>(target)])) {
-      result.target_reached = false;
-      continue;
-    }
-
-    result.target_distances[i] = result.dist[static_cast<std::size_t>(target)];
-    std::vector<int> reversed_nodes;
-    std::vector<minplus_sparse::Offset> reversed_edges;
-    int current = target;
-    for (int guard = 0; guard < impl_->graph.rows; ++guard) {
-      reversed_nodes.push_back(current);
-      if (std::find(sources.begin(), sources.end(), current) != sources.end()) {
-        result.target_sources[i] = current;
-        break;
-      }
-      const int pred = result.pred_node[static_cast<std::size_t>(current)];
-      if (pred < 0) {
-        break;
-      }
-      reversed_edges.push_back(result.pred_edge[static_cast<std::size_t>(current)]);
-      current = pred;
-    }
-    if (result.target_sources[i] < 0) {
-      result.target_reached = false;
-      continue;
-    }
-    std::reverse(reversed_nodes.begin(), reversed_nodes.end());
-    std::reverse(reversed_edges.begin(), reversed_edges.end());
-    result.target_path_nodes.insert(result.target_path_nodes.end(),
-                                    reversed_nodes.begin(),
-                                    reversed_nodes.end());
-    result.target_path_edges.insert(result.target_path_edges.end(),
-                                    reversed_edges.begin(),
-                                    reversed_edges.end());
-  }
-  result.target_path_offsets[targets.size()] =
-      static_cast<int>(result.target_path_nodes.size());
-  result.target_edge_offsets[targets.size()] =
-      static_cast<int>(result.target_path_edges.size());
+  CpuSsspResult cpu_result;
+  cpu_result.dist = result.dist;
+  cpu_result.pred_node = result.pred_node;
+  cpu_result.pred_edge = result.pred_edge;
+  fill_compact_target_paths(impl_->graph, sources, targets, cpu_result, result);
   result.dist.clear();
   result.pred_node.clear();
   result.pred_edge.clear();
@@ -419,6 +436,88 @@ DeltaSteppingCsrResult delta_stepping_minplus_hip_csr(
   }
   result.converged = true;
   return result;
+}
+
+struct UnitBfsCsrWorkspace::Impl {
+  HostCsrF32 graph;
+};
+
+UnitBfsCsrWorkspace::UnitBfsCsrWorkspace(const HostCsrF32& adjacency,
+                                         hipStream_t stream)
+    : impl_(std::make_unique<Impl>()) {
+  (void)stream;
+  impl_->graph = adjacency;
+}
+
+UnitBfsCsrWorkspace::~UnitBfsCsrWorkspace() = default;
+UnitBfsCsrWorkspace::UnitBfsCsrWorkspace(UnitBfsCsrWorkspace&&) noexcept = default;
+UnitBfsCsrWorkspace& UnitBfsCsrWorkspace::operator=(
+    UnitBfsCsrWorkspace&&) noexcept = default;
+
+UnitBfsCsrResult UnitBfsCsrWorkspace::run(
+    const std::vector<int>& sources,
+    const std::vector<int>& targets,
+    float delta,
+    int max_depth,
+    hipStream_t stream,
+    UnitBfsCsrProgressCallback progress_callback,
+    void* progress_user_data) {
+  (void)delta;
+  (void)max_depth;
+  (void)stream;
+  (void)progress_callback;
+  (void)progress_user_data;
+  ++g_unit_bfs_calls;
+
+  UnitBfsCsrResult result;
+  CpuSsspResult cpu_result = cpu_dijkstra_incoming_csr_multi(impl_->graph, sources);
+  fill_compact_target_paths(impl_->graph, sources, targets, cpu_result, result);
+  result.target = -1;
+  result.iterations_used = 1;
+  result.stopped_on_target = result.target_reached;
+  result.converged = true;
+  return result;
+}
+
+UnitBfsCsrResult UnitBfsCsrWorkspace::run(
+    const std::vector<int>& sources,
+    int target,
+    float delta,
+    int max_depth,
+    hipStream_t stream,
+    UnitBfsCsrProgressCallback progress_callback,
+    void* progress_user_data) {
+  UnitBfsCsrResult result = run(sources,
+                                std::vector<int>{target},
+                                delta,
+                                max_depth,
+                                stream,
+                                progress_callback,
+                                progress_user_data);
+  result.target = target;
+  if (!result.target_distances.empty()) {
+    result.target_distance = result.target_distances.front();
+    result.target_reached = std::isfinite(result.target_distance);
+    result.stopped_on_target = result.target_reached;
+  }
+  return result;
+}
+
+UnitBfsCsrResult UnitBfsCsrWorkspace::run(
+    int source,
+    int target,
+    float delta,
+    int max_depth,
+    hipStream_t stream,
+    UnitBfsCsrProgressCallback progress_callback,
+    void* progress_user_data) {
+  return run(std::vector<int>{source},
+             target,
+             delta,
+             max_depth,
+             stream,
+             progress_callback,
+             progress_user_data);
 }
 
 int main() {
@@ -498,6 +597,7 @@ int main() {
   parallel_options.delta = 1.0f;
   parallel_options.parallel_net_workers = 2;
   g_multisource_delta_calls = 0;
+  g_unit_bfs_calls = 0;
   routing::PathfinderResult parallel_result =
       routing::run_pathfinder(congestion_graph,
                               congestion_metadata,
@@ -509,8 +609,10 @@ int main() {
           "parallel routing should preserve the first net route");
   require(parallel_result.nets[1].sinks[0].nodes == std::vector<int>({1, 2, 5}),
           "parallel routing should preserve the second net route");
-  require(g_multisource_delta_calls == 2,
-          "parallel congestion-free routing should call SSSP once per net");
+  require(g_unit_bfs_calls == 2,
+          "parallel congestion-free routing should call unit BFS once per net");
+  require(g_multisource_delta_calls == 0,
+          "parallel default routing should not call delta-step");
 
   const HostCsrF32 incremental_graph = make_incremental_reroute_graph();
   const routing::RoutingMetadata incremental_metadata =
@@ -520,6 +622,7 @@ int main() {
   incremental_options.delta = 1.0f;
   incremental_options.route_batch_size = 3;
   g_multisource_delta_calls = 0;
+  g_unit_bfs_calls = 0;
   routing::PathfinderResult incremental_result =
       routing::run_pathfinder(incremental_graph,
                               incremental_metadata,
@@ -531,17 +634,26 @@ int main() {
           "incremental test should leave the intentionally unavoidable conflict");
   require(incremental_result.nets[2].sinks[0].nodes == std::vector<int>({6, 7}),
           "uncongested retained net should keep its previous route");
-  require(g_multisource_delta_calls == 3,
-          "congestion-free router should call SSSP once per net");
+  require(g_unit_bfs_calls == 3,
+          "congestion-free default router should call unit BFS once per net");
+  require(g_multisource_delta_calls == 0,
+          "congestion-free default router should not call delta-step");
 
   g_multisource_delta_calls = 0;
+  g_unit_bfs_calls = 0;
   routing::PathfinderOptions options;
   options.max_pathfinder_iterations = 1;
   options.delta = 1.0f;
 
-  const routing::RoutingMetadata metadata = make_metadata();
+  HostCsrF32 unit_graph = graph;
+  unit_graph.nnz = 3;
+  unit_graph.rowptr = {0, 0, 1, 2, 3};
+  unit_graph.colind = {0, 1, 1};
+  unit_graph.values = {1.0f, 1.0f, 1.0f};
+  routing::RoutingMetadata metadata = make_metadata();
+  metadata.edge_attrs.resize(static_cast<std::size_t>(unit_graph.nnz));
   routing::PathfinderResult result =
-      routing::run_pathfinder(graph, metadata, options, nullptr);
+      routing::run_pathfinder(unit_graph, metadata, options, nullptr);
   require(result.routed, "PathFinder should route the simple tree graph");
   require(result.all_sinks_reached, "all sinks should be reached");
   require(result.overused_nodes == 0, "simple route should have no overused nodes");
@@ -561,15 +673,34 @@ int main() {
           "route tree should contain nodes 0,1,2,3");
   require(result.occupancy == std::vector<int>({1, 1, 1, 1}),
           "all route tree nodes should be occupied once");
+  require(g_unit_bfs_calls == 1,
+          "PathFinder should call unit BFS once per multi-sink net by default");
+  require(g_multisource_delta_calls == 0,
+          "default unit BFS path should not call delta-step");
+
+  g_multisource_delta_calls = 0;
+  g_unit_bfs_calls = 0;
+  routing::PathfinderOptions delta_options = options;
+  delta_options.sssp_engine = routing::SsspEngine::kDeltaStep;
+  routing::PathfinderResult delta_result =
+      routing::run_pathfinder(unit_graph, metadata, delta_options, nullptr);
+  require(delta_result.routed, "delta-step comparison path should still route");
+  require(delta_result.nets[0].sinks[0].nodes == std::vector<int>({0, 1, 2}),
+          "delta-step comparison path should preserve first sink route");
+  require(delta_result.nets[0].sinks[1].nodes == std::vector<int>({1, 3}),
+          "delta-step comparison path should preserve second sink route");
   require(g_multisource_delta_calls == 1,
-          "PathFinder should call multi-source delta stepping once per multi-sink net");
+          "explicit delta-step comparison path should call delta-step");
+  require(g_unit_bfs_calls == 0,
+          "explicit delta-step comparison path should not call unit BFS");
 
   routing::RoutingMetadata invalid_sink_metadata = make_metadata();
+  invalid_sink_metadata.edge_attrs.resize(static_cast<std::size_t>(unit_graph.nnz));
   invalid_sink_metadata.strings.push_back("UNMAPPED_SINK_SITE");
   invalid_sink_metadata.strings.push_back("UNMAPPED_SINK_PIN");
   invalid_sink_metadata.route_requests[0].sinks.push_back({-1, 12, 13});
   routing::PathfinderResult invalid_sink_result =
-      routing::run_pathfinder(graph, invalid_sink_metadata, options, nullptr);
+      routing::run_pathfinder(unit_graph, invalid_sink_metadata, options, nullptr);
   require(!invalid_sink_result.routed,
           "an unmapped physical sink stub should prevent a routed result");
   require(!invalid_sink_result.all_sinks_reached,
@@ -578,7 +709,7 @@ int main() {
           "invalid sink should be preserved as an unreached sink result");
 
   const std::filesystem::path routes_path = "/tmp/pathfinder_cpu_stub_routes.jsonl";
-  routing::write_routes_jsonl(routes_path, graph, metadata, result);
+  routing::write_routes_jsonl(routes_path, unit_graph, metadata, result);
   std::ifstream routes_file(routes_path);
   const std::string routes_json((std::istreambuf_iterator<char>(routes_file)),
                                 std::istreambuf_iterator<char>());
