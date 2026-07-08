@@ -82,6 +82,41 @@ struct NetRoute {
   std::vector<RouteEdge> edges;
 };
 
+struct StoredRouteBranch {
+  enum class SegmentKind {
+    kBelPin,
+    kSitePin,
+    kPip,
+    kSitePip,
+  };
+
+  SegmentKind kind = SegmentKind::kSitePin;
+  std::string site;
+  std::string bel;
+  std::string pin;
+  std::string tile;
+  std::string wire0;
+  std::string wire1;
+  bool forward = true;
+  bool is_fixed = false;
+  bool has_pip_site = false;
+  bool site_pip_has_is_inverting = false;
+  bool site_pip_is_inverting = false;
+  std::vector<StoredRouteBranch> branches;
+};
+
+struct StoredStubBranch {
+  SitePinKey key;
+  StoredRouteBranch branch;
+  bool consumed = false;
+};
+
+struct StubBranchStore {
+  std::vector<StoredStubBranch> stubs;
+  std::map<SitePinKey, std::vector<std::size_t>> by_key;
+  std::map<SitePinKey, std::size_t> cursor_by_key;
+};
+
 struct MetadataRouteRequest {
   std::string net;
   std::vector<RouteSitePin> sources;
@@ -633,6 +668,157 @@ std::string phys_string_at(const std::vector<std::string>& strings, std::uint32_
   return strings[static_cast<std::size_t>(index)];
 }
 
+StoredRouteBranch snapshot_route_branch(
+    PhysicalNetlist::PhysNetlist::RouteBranch::Builder branch,
+    const std::vector<std::string>& strings) {
+  StoredRouteBranch stored;
+  auto segment = branch.getRouteSegment();
+  if (segment.isBelPin()) {
+    auto bel_pin = segment.getBelPin();
+    stored.kind = StoredRouteBranch::SegmentKind::kBelPin;
+    stored.site = phys_string_at(strings, bel_pin.getSite());
+    stored.bel = phys_string_at(strings, bel_pin.getBel());
+    stored.pin = phys_string_at(strings, bel_pin.getPin());
+  } else if (segment.isSitePin()) {
+    auto site_pin = segment.getSitePin();
+    stored.kind = StoredRouteBranch::SegmentKind::kSitePin;
+    stored.site = phys_string_at(strings, site_pin.getSite());
+    stored.pin = phys_string_at(strings, site_pin.getPin());
+  } else if (segment.isPip()) {
+    auto pip = segment.getPip();
+    stored.kind = StoredRouteBranch::SegmentKind::kPip;
+    stored.tile = phys_string_at(strings, pip.getTile());
+    stored.wire0 = phys_string_at(strings, pip.getWire0());
+    stored.wire1 = phys_string_at(strings, pip.getWire1());
+    stored.forward = pip.getForward();
+    stored.is_fixed = pip.getIsFixed();
+    if (pip.isSite()) {
+      stored.has_pip_site = true;
+      stored.site = phys_string_at(strings, pip.getSite());
+    }
+  } else if (segment.isSitePIP()) {
+    auto site_pip = segment.getSitePIP();
+    stored.kind = StoredRouteBranch::SegmentKind::kSitePip;
+    stored.site = phys_string_at(strings, site_pip.getSite());
+    stored.bel = phys_string_at(strings, site_pip.getBel());
+    stored.pin = phys_string_at(strings, site_pip.getPin());
+    stored.is_fixed = site_pip.getIsFixed();
+    if (site_pip.isIsInverting()) {
+      stored.site_pip_has_is_inverting = true;
+      stored.site_pip_is_inverting = site_pip.getIsInverting();
+    }
+  } else {
+    throw std::runtime_error("unsupported PhysicalNetlist route segment");
+  }
+
+  auto children = branch.getBranches();
+  stored.branches.reserve(children.size());
+  for (std::uint32_t i = 0; i < children.size(); ++i) {
+    stored.branches.push_back(snapshot_route_branch(children[i], strings));
+  }
+  return stored;
+}
+
+void write_stored_route_branch(
+    const StoredRouteBranch& stored,
+    PhysicalNetlist::PhysNetlist::RouteBranch::Builder branch,
+    std::vector<std::string>& strings,
+    std::unordered_map<std::string, std::uint32_t>& string_to_index) {
+  auto segment = branch.initRouteSegment();
+  switch (stored.kind) {
+    case StoredRouteBranch::SegmentKind::kBelPin: {
+      auto bel_pin = segment.initBelPin();
+      bel_pin.setSite(string_index(stored.site, strings, string_to_index));
+      bel_pin.setBel(string_index(stored.bel, strings, string_to_index));
+      bel_pin.setPin(string_index(stored.pin, strings, string_to_index));
+      break;
+    }
+    case StoredRouteBranch::SegmentKind::kSitePin: {
+      auto site_pin = segment.initSitePin();
+      site_pin.setSite(string_index(stored.site, strings, string_to_index));
+      site_pin.setPin(string_index(stored.pin, strings, string_to_index));
+      break;
+    }
+    case StoredRouteBranch::SegmentKind::kPip: {
+      auto pip = segment.initPip();
+      pip.setTile(string_index(stored.tile, strings, string_to_index));
+      pip.setWire0(string_index(stored.wire0, strings, string_to_index));
+      pip.setWire1(string_index(stored.wire1, strings, string_to_index));
+      pip.setForward(stored.forward);
+      pip.setIsFixed(stored.is_fixed);
+      if (stored.has_pip_site) {
+        pip.setSite(string_index(stored.site, strings, string_to_index));
+      } else {
+        pip.setNoSite();
+      }
+      break;
+    }
+    case StoredRouteBranch::SegmentKind::kSitePip: {
+      auto site_pip = segment.initSitePIP();
+      site_pip.setSite(string_index(stored.site, strings, string_to_index));
+      site_pip.setBel(string_index(stored.bel, strings, string_to_index));
+      site_pip.setPin(string_index(stored.pin, strings, string_to_index));
+      site_pip.setIsFixed(stored.is_fixed);
+      if (stored.site_pip_has_is_inverting) {
+        site_pip.setIsInverting(stored.site_pip_is_inverting);
+      } else {
+        site_pip.setInverts();
+      }
+      break;
+    }
+  }
+
+  auto children = branch.initBranches(static_cast<std::uint32_t>(stored.branches.size()));
+  for (std::uint32_t i = 0; i < stored.branches.size(); ++i) {
+    write_stored_route_branch(stored.branches[i],
+                              children[i],
+                              strings,
+                              string_to_index);
+  }
+}
+
+StubBranchStore snapshot_top_level_stubs(
+    capnp::List<PhysicalNetlist::PhysNetlist::RouteBranch>::Builder stubs,
+    const std::vector<std::string>& strings,
+    const std::string& net_name) {
+  StubBranchStore store;
+  store.stubs.reserve(stubs.size());
+  for (std::uint32_t i = 0; i < stubs.size(); ++i) {
+    auto stub = stubs[i];
+    auto segment = stub.getRouteSegment();
+    if (!segment.isSitePin()) {
+      throw std::runtime_error("non-sitePin stub found in net: " + net_name);
+    }
+    auto site_pin = segment.getSitePin();
+    SitePinKey key{phys_string_at(strings, site_pin.getSite()),
+                   phys_string_at(strings, site_pin.getPin())};
+    StoredStubBranch stored;
+    stored.key = key;
+    stored.branch = snapshot_route_branch(stub, strings);
+    const std::size_t index = store.stubs.size();
+    store.stubs.push_back(std::move(stored));
+    store.by_key[key].push_back(index);
+  }
+  return store;
+}
+
+const StoredRouteBranch& consume_stub_branch(StubBranchStore& store,
+                                             const SitePinKey& key,
+                                             const std::string& net_name) {
+  const auto found = store.by_key.find(key);
+  if (found == store.by_key.end()) {
+    throw std::runtime_error("routed sink was not present as a stub in net: " + net_name);
+  }
+
+  std::size_t& cursor = store.cursor_by_key[key];
+  if (cursor >= found->second.size()) {
+    throw std::runtime_error("routed sink used more times than its stubs in net: " + net_name);
+  }
+  const std::size_t stub_index = found->second[cursor++];
+  store.stubs[stub_index].consumed = true;
+  return store.stubs[stub_index].branch;
+}
+
 void collect_site_pin_branches(
     PhysicalNetlist::PhysNetlist::RouteBranch::Builder branch,
     const std::vector<std::string>& strings,
@@ -690,7 +876,7 @@ int insert_route_tree(
     int node,
     const NetRoute& route,
     const RouteTables& tables,
-    std::map<SitePinKey, int>& remaining_stub_counts,
+    StubBranchStore& stub_store,
     std::vector<std::string>& strings,
     std::unordered_map<std::string, std::uint32_t>& string_to_index,
     std::vector<int> ancestors) {
@@ -728,7 +914,7 @@ int insert_route_tree(
                                              edge.to,
                                              route,
                                              tables,
-                                             remaining_stub_counts,
+                                             stub_store,
                                              strings,
                                              string_to_index,
                                              ancestors);
@@ -737,17 +923,11 @@ int insert_route_tree(
 
   if (sinks_it != tables.sinks_by_node.end()) {
     for (const SitePinKey& sink : sinks_it->second) {
-      auto found = remaining_stub_counts.find(sink);
-      if (found == remaining_stub_counts.end() || found->second <= 0) {
-        throw std::runtime_error("routed sink was not present as a stub in net: " + route.net);
-      }
-      --found->second;
-
       auto child = new_branches[out_index++];
-      auto site_pin = child.initRouteSegment().initSitePin();
-      site_pin.setSite(string_index(sink.site, strings, string_to_index));
-      site_pin.setPin(string_index(sink.pin, strings, string_to_index));
-      child.initBranches(0);
+      write_stored_route_branch(consume_stub_branch(stub_store, sink, route.net),
+                                child,
+                                strings,
+                                string_to_index);
     }
   }
 
@@ -789,17 +969,8 @@ void write_routed_phys(const std::filesystem::path& input_phys,
     const NetRoute& route = route_it->second;
     RouteTables tables = build_route_tables(route);
 
-    std::map<SitePinKey, int> stub_counts;
-    auto stubs = net.getStubs();
-    for (std::uint32_t i = 0; i < stubs.size(); ++i) {
-      std::vector<std::pair<SitePinKey, PhysicalNetlist::PhysNetlist::RouteBranch::Builder>>
-          stub_pins;
-      collect_site_pin_branches(stubs[i], strings, stub_pins);
-      for (const auto& [key, branch] : stub_pins) {
-        (void)branch;
-        ++stub_counts[key];
-      }
-    }
+    StubBranchStore stub_store =
+        snapshot_top_level_stubs(net.getStubs(), strings, net_name);
 
     std::vector<std::pair<SitePinKey, PhysicalNetlist::PhysNetlist::RouteBranch::Builder>>
         source_branches;
@@ -821,7 +992,7 @@ void write_routed_phys(const std::filesystem::path& input_phys,
                                          source_node,
                                          route,
                                          tables,
-                                         stub_counts,
+                                         stub_store,
                                          strings,
                                          string_to_index,
                                          {});
@@ -834,25 +1005,23 @@ void write_routed_phys(const std::filesystem::path& input_phys,
       throw std::runtime_error(out.str());
     }
     std::size_t remaining_stub_count = 0;
-    for (const auto& [stub, count] : stub_counts) {
-      if (count != 0) {
+    for (const StoredStubBranch& stub : stub_store.stubs) {
+      if (!stub.consumed) {
         if (!allow_unrouted_stubs) {
           throw std::runtime_error("unrouted stub remains in routed net: " + net_name);
         }
-        remaining_stub_count += static_cast<std::size_t>(count);
+        ++remaining_stub_count;
       }
     }
 
     auto new_stubs = net.initStubs(static_cast<std::uint32_t>(remaining_stub_count));
     std::uint32_t stub_index = 0;
-    for (const auto& [stub, count] : stub_counts) {
-      for (int i = 0; i < count; ++i) {
-        auto branch = new_stubs[stub_index++];
-        auto site_pin = branch.initRouteSegment().initSitePin();
-        site_pin.setSite(string_index(stub.site, strings, string_to_index));
-        site_pin.setPin(string_index(stub.pin, strings, string_to_index));
-        branch.initBranches(0);
-      }
+    for (const StoredStubBranch& stub : stub_store.stubs) {
+      if (stub.consumed) continue;
+      write_stored_route_branch(stub.branch,
+                                new_stubs[stub_index++],
+                                strings,
+                                string_to_index);
     }
     routed_seen.emplace(net_name, true);
     total_pips += emitted_edges;
