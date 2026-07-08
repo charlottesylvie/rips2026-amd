@@ -29,7 +29,6 @@
 #include <limits>
 #include <sstream>
 #include <stdexcept>
-#include <unordered_map>
 #include <unordered_set>
 #include <utility>
 
@@ -413,15 +412,22 @@ float effective_edge_cost(const HostCsrF32& graph,
 
 bool attach_path_if_single_parent_tree(
     const std::vector<PathEdge>& edges,
-    std::unordered_map<int, int>& parent_by_child) {
+    std::vector<int>& parent_by_child,
+    std::vector<std::uint32_t>& parent_seen,
+    std::uint32_t tree_stamp) {
   for (const PathEdge& edge : edges) {
-    const auto parent = parent_by_child.find(edge.to);
-    if (parent != parent_by_child.end() && parent->second != edge.from) {
+    const std::size_t child = static_cast<std::size_t>(edge.to);
+    if (child >= parent_by_child.size()) {
+      return false;
+    }
+    if (parent_seen[child] == tree_stamp && parent_by_child[child] != edge.from) {
       return false;
     }
   }
   for (const PathEdge& edge : edges) {
-    parent_by_child[edge.to] = edge.from;
+    const std::size_t child = static_cast<std::size_t>(edge.to);
+    parent_seen[child] = tree_stamp;
+    parent_by_child[child] = edge.from;
   }
   return true;
 }
@@ -430,6 +436,8 @@ RoutedNet route_net(const HostCsrF32& graph,
                     DeltaSteppingCsrWorkspace& workspace,
                     const RouteRequest& request,
                     std::vector<std::uint32_t>& tree_seen,
+                    std::vector<int>& parent_by_child,
+                    std::vector<std::uint32_t>& parent_seen,
                     std::uint32_t tree_stamp,
                     const std::vector<float>* vertex_costs,
                     const PathfinderOptions& options,
@@ -438,6 +446,10 @@ RoutedNet route_net(const HostCsrF32& graph,
   net.net_string = request.net_string;
   if (tree_seen.size() != static_cast<std::size_t>(graph.rows)) {
     throw std::invalid_argument("route tree scratch size does not match CSR rows");
+  }
+  if (parent_by_child.size() != static_cast<std::size_t>(graph.rows) ||
+      parent_seen.size() != static_cast<std::size_t>(graph.rows)) {
+    throw std::invalid_argument("route parent scratch size does not match CSR rows");
   }
 
   std::vector<int> source_candidates;
@@ -456,7 +468,6 @@ RoutedNet route_net(const HostCsrF32& graph,
   target_sink_indices.reserve(request.sinks.size());
   bool reached_all = true;
   net.sinks.resize(request.sinks.size());
-  std::unordered_map<int, int> parent_by_child;
   for (std::size_t sink_index = 0; sink_index < request.sinks.size(); ++sink_index) {
     const SitePinNode& sink = request.sinks[sink_index];
     net.sinks[sink_index].target = sink.node;
@@ -516,18 +527,26 @@ RoutedNet route_net(const HostCsrF32& graph,
           continue;
         }
 
-        std::vector<int> compact_nodes(sssp.target_path_nodes.begin() + node_begin,
-                                       sssp.target_path_nodes.begin() + node_end);
         std::size_t tree_start = 0;
-        for (std::size_t i = 0; i < compact_nodes.size(); ++i) {
-          if (tree_contains(tree_seen, tree_stamp, compact_nodes[i])) {
-            tree_start = i;
+        for (int node_index = node_begin; node_index < node_end; ++node_index) {
+          const int path_node =
+              sssp.target_path_nodes[static_cast<std::size_t>(node_index)];
+          if (tree_contains(tree_seen, tree_stamp, path_node)) {
+            tree_start = static_cast<std::size_t>(node_index - node_begin);
           }
         }
 
-        routed_sink.source = compact_nodes[tree_start];
-        routed_sink.nodes.assign(compact_nodes.begin() + static_cast<std::ptrdiff_t>(tree_start),
-                                 compact_nodes.end());
+        routed_sink.source =
+            sssp.target_path_nodes[static_cast<std::size_t>(node_begin) + tree_start];
+        routed_sink.nodes.clear();
+        routed_sink.nodes.reserve(static_cast<std::size_t>(node_end - node_begin) -
+                                  tree_start);
+        for (int node_index = node_begin + static_cast<int>(tree_start);
+             node_index < node_end;
+             ++node_index) {
+          routed_sink.nodes.push_back(
+              sssp.target_path_nodes[static_cast<std::size_t>(node_index)]);
+        }
         const int trimmed_edge_begin = edge_begin + static_cast<int>(tree_start);
         if (routed_sink.nodes.empty() ||
             !valid_node(routed_sink.source, graph.rows) ||
@@ -591,7 +610,10 @@ RoutedNet route_net(const HostCsrF32& graph,
         routed_sink.nodes = nodes_from_path(source, routed_sink.edges);
       }
 
-      if (!attach_path_if_single_parent_tree(routed_sink.edges, parent_by_child)) {
+      if (!attach_path_if_single_parent_tree(routed_sink.edges,
+                                             parent_by_child,
+                                             parent_seen,
+                                             tree_stamp)) {
         reached_all = false;
         routed_sink.edges.clear();
         routed_sink.nodes.clear();
@@ -884,7 +906,8 @@ RoutedNet route_net_congestion_free(const HostCsrF32& graph,
   targets.reserve(request.sinks.size());
   net.sinks.resize(request.sinks.size());
   bool reached_all = true;
-  std::unordered_map<int, int> parent_by_child;
+  std::vector<int> parent_by_child(static_cast<std::size_t>(graph.rows), -1);
+  std::vector<std::uint32_t> parent_seen(static_cast<std::size_t>(graph.rows), 0);
   for (std::size_t sink_index = 0; sink_index < request.sinks.size(); ++sink_index) {
     const SitePinNode& sink = request.sinks[sink_index];
     RoutedSink& routed_sink = net.sinks[sink_index];
@@ -970,7 +993,10 @@ RoutedNet route_net_congestion_free(const HostCsrF32& graph,
     const int bfs_distance = workspace.distance_to(target);
     routed_sink.distance =
         bfs_distance >= 0 ? static_cast<float>(bfs_distance) : path_distance;
-    if (!attach_path_if_single_parent_tree(routed_sink.edges, parent_by_child)) {
+    if (!attach_path_if_single_parent_tree(routed_sink.edges,
+                                           parent_by_child,
+                                           parent_seen,
+                                           tree_stamp)) {
       reached_all = false;
       routed_sink.nodes.clear();
       routed_sink.edges.clear();
@@ -1388,6 +1414,8 @@ PathfinderResult run_pathfinder(const HostCsrF32& base_graph,
           : std::min(options.net_limit, metadata.route_requests.size());
   DeltaSteppingCsrWorkspace sssp_workspace(base_graph, stream);
   std::vector<std::uint32_t> route_tree_seen(static_cast<std::size_t>(base_graph.rows), 0);
+  std::vector<int> route_parent_by_child(static_cast<std::size_t>(base_graph.rows), -1);
+  std::vector<std::uint32_t> route_parent_seen(static_cast<std::size_t>(base_graph.rows), 0);
   std::uint32_t route_tree_stamp = 0;
   result.nets.resize(route_request_count);
 
@@ -1403,6 +1431,8 @@ PathfinderResult run_pathfinder(const HostCsrF32& base_graph,
                   sssp_workspace,
                   request,
                   route_tree_seen,
+                  route_parent_by_child,
+                  route_parent_seen,
                   tree_stamp,
                   nullptr,
                   options,
