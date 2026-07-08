@@ -37,10 +37,6 @@ $(if $(HTTPSHOST),-Dhttps.proxyHost=$(HTTPSHOST) -Dhttps.proxyPort=$(HTTPSPORT),
 # (other supported values: nxroute-poc)
 ROUTER ?= rwroute
 
-WIRELENGTH_ANALYZER ?= $(firstword $(wildcard wirelength_analyzer/wa.py fpga24_routing_contest/wirelength_analyzer/wa.py))
-NXROUTE_POC ?= $(firstword $(wildcard networkx-proof-of-concept-router/nxroute-poc.py fpga24_routing_contest/networkx-proof-of-concept-router/nxroute-poc.py))
-NESTED_SCHEMA_JAVA_CAPNP := $(if $(wildcard fpga24_routing_contest/fpga-interchange-schema/interchange/PhysicalNetlist.capnp),fpga24_routing_contest/fpga-interchange-schema/interchange/capnp/java.capnp,)
-
 # Make time only print out wall-clock and user time in seconds
 TIME = Wall-clock time (sec): %e
 # Note that User-CPU time is for information purposes only (not used for scoring)
@@ -112,10 +108,6 @@ fpga-interchange-schema/interchange/capnp/java.capnp:
 	mkdir -p $(@D)
 	wget https://raw.githubusercontent.com/capnproto/capnproto-java/master/compiler/src/main/schema/capnp/java.capnp -O $@
 
-fpga24_routing_contest/fpga-interchange-schema/interchange/capnp/java.capnp: fpga-interchange-schema/interchange/capnp/java.capnp
-	mkdir -p $(@D)
-	cp $< $@
-
 # Gradle is used to invoke the CheckPhysNetlist class' main method with arguments
 # $^ (%.netlist and %_rwroute.phys), and display/redirect all output to $@.log (%_rwroute.check.log).
 # The exit code of Gradle determines if 'PASS' or 'FAIL' is written to $@ (%_rwroute.check)
@@ -127,8 +119,7 @@ fpga24_routing_contest/fpga-interchange-schema/interchange/capnp/java.capnp: fpg
         fi
 
 %_$(ROUTER).wirelength: %_$(ROUTER).phys | setup-wirelength_analyzer
-	@test -n "$(WIRELENGTH_ANALYZER)" || { echo "missing wirelength_analyzer/wa.py; clone fpga24_routing_contest or set WIRELENGTH_ANALYZER" >&2; exit 1; }
-	python3 $(WIRELENGTH_ANALYZER) $< $(call log_and_or_display,$@); \
+	python3 wirelength_analyzer/wa.py $< $(call log_and_or_display,$@); \
 
 .PHONY: score-$(ROUTER)
 score-$(ROUTER): $(foreach b,$(BENCHMARKS),$b_$(ROUTER).wirelength $b_$(ROUTER).check)
@@ -139,7 +130,7 @@ score-$(ROUTER): $(foreach b,$(BENCHMARKS),$b_$(ROUTER).wirelength $b_$(ROUTER).
 	_JAVA_OPTIONS="-Xms14g -Xmx14g" RapidWright/bin/rapidwright DeviceResourcesExample $*
 
 .PHONY: setup-net_printer setup-wirelength_analyzer
-setup-net_printer setup-wirelength_analyzer: | install-python-deps fpga-interchange-schema/interchange/capnp/java.capnp $(NESTED_SCHEMA_JAVA_CAPNP)
+setup-net_printer setup-wirelength_analyzer: | install-python-deps fpga-interchange-schema/interchange/capnp/java.capnp
 
 clean:
 	rm -f *.{check,wirelength,sif}* *_$(ROUTER).phys*
@@ -162,9 +153,8 @@ distclean: clean
 
 
 ## NXROUTE-POC
-%_nxroute-poc.phys: %_unrouted.phys xcvu3p.device | install-python-deps fpga-interchange-schema/interchange/capnp/java.capnp $(NESTED_SCHEMA_JAVA_CAPNP)
-	@test -n "$(NXROUTE_POC)" || { echo "missing networkx-proof-of-concept-router/nxroute-poc.py; clone fpga24_routing_contest or set NXROUTE_POC" >&2; exit 1; }
-	(time python3 $(NXROUTE_POC) $< $@) $(call log_and_or_display,$@.log)
+%_nxroute-poc.phys: %_unrouted.phys xcvu3p.device | install-python-deps fpga-interchange-schema/interchange/capnp/java.capnp
+	(time python3 networkx-proof-of-concept-router/nxroute-poc.py $< $@) $(call log_and_or_display,$@.log)
 
 ## EXAMPLEROUTE
 ## (please only modify '<custom router here>' to ensure that all contest infrastructure remains in place)
