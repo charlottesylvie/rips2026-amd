@@ -93,3 +93,59 @@ Also accepted:
 ```json
 {"type":"path","source":12345,"target":99999,"reached":false,"distance":null,"nodes":[],"csr_edges":[]}
 ```
+
+## Bellman-Ford JSONL Generator
+
+[src/bf_for_validation.cpp](src/bf_for_validation.cpp) reads a `.csrbin` graph
+and its `.csrbin.ifmeta.bin` metadata sidecar, runs HIP Bellman-Ford from the
+route sources listed in metadata, reconstructs paths to the listed sinks, and
+writes JSONL records accepted by `validate_SSSP`.
+
+Build on an AMD ROCm/HIP machine from `rips2026-amd`:
+
+```bash
+hipcc -std=c++17 -O3 -x hip \
+  -I HIP_kernel/bellman_ford/src \
+  -I HIP_kernel/minplus_mm/src \
+  SSSP/src/bf_for_validation.cpp \
+  HIP_kernel/bellman_ford/src/bf_hip_CSR.cpp \
+  HIP_kernel/minplus_mm/src/minplus_sparse_hip.cpp \
+  -o bf_for_validation
+```
+
+Run:
+
+```bash
+./bf_for_validation graph.csrbin graph.csrbin.ifmeta.bin paths.jsonl
+```
+
+Example with smaller limits for a smoke test:
+
+```bash
+./bf_for_validation graph.csrbin graph.csrbin.ifmeta.bin paths.jsonl \
+  --net-limit 10 \
+  --source-limit 5 \
+  --bf-progress-every 100
+```
+
+Then validate the generated paths:
+
+```bash
+./validate_SSSP graph.csrbin paths.jsonl --modes 1,2,3
+```
+
+Generator options:
+
+| Option | Meaning |
+| --- | --- |
+| `--max-iters <n>` | Bellman-Ford relaxation limit; default `-1` means `n - 1`. |
+| `--net-limit <n>` | Use only the first `n` route requests from metadata. |
+| `--source-limit <n>` | Run only the first `n` unique source nodes. |
+| `--query-limit <n>` | Emit at most `n` source-sink path records. |
+| `--bf-progress-every <n>` | Print Bellman-Ford iteration progress every `n` iterations. |
+| `--skip-unreached` | Do not write JSONL records for unreachable sinks. |
+| `--abs-tol <x>` / `--rel-tol <x>` | Path reconstruction tolerances. |
+
+The generator copies the CSR graph to the GPU once, reuses that device graph for
+all unique metadata sources, and copies back one dense distance vector per
+source for CPU-side path reconstruction and JSONL writing.
