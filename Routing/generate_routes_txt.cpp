@@ -57,7 +57,7 @@ struct Metadata {
 void print_usage(const char* program) {
   std::cerr << "Usage:\n"
             << "  " << program
-            << " <graph.csrbin> <graph.ifmeta.bin> <output.routes.txt>\n";
+            << " <graph.csrbin> <graph.ifmeta.bin> <output.routes.json>\n";
 }
 
 Options parse_options(int argc, char** argv) {
@@ -108,6 +108,40 @@ std::string trim(const std::string& text) {
   }
 
   return text.substr(begin, end - begin);
+}
+
+std::string json_escape(const std::string& text) {
+  std::string escaped;
+  escaped.reserve(text.size());
+  for (const unsigned char c : text) {
+    switch (c) {
+      case '\"':
+        escaped += "\\\"";
+        break;
+      case '\\':
+        escaped += "\\\\";
+        break;
+      case '\b':
+        escaped += "\\b";
+        break;
+      case '\f':
+        escaped += "\\f";
+        break;
+      case '\n':
+        escaped += "\\n";
+        break;
+      case '\r':
+        escaped += "\\r";
+        break;
+      case '\t':
+        escaped += "\\t";
+        break;
+      default:
+        escaped.push_back(static_cast<char>(c));
+        break;
+    }
+  }
+  return escaped;
 }
 
 std::uint64_t read_u64(const std::vector<std::uint8_t>& bytes,
@@ -472,7 +506,9 @@ void write_routes(const Metadata& meta,
                              output_path.string());
   }
 
+  out << "{\n  \"routes\": [\n";
   std::size_t routed_paths = 0;
+  bool first_route = true;
   for (const RouteRequest& request : meta.route_requests) {
     if (request.sources.empty()) {
       throw std::runtime_error("route request has no legal source nodes");
@@ -486,21 +522,35 @@ void write_routes(const Metadata& meta,
     for (const SitePinNode& sink : request.sinks) {
       const std::vector<NodeId> path =
           reconstruct_path(predecessor, source, sink.node);
-      out << "net=" << net_name << " source=" << source << " sink=" << sink.node
-          << " path=";
+      if (!first_route) {
+        out << ",\n";
+      }
+      first_route = false;
+
+      out << "    {\n"
+          << "      \"net\": \"" << json_escape(net_name) << "\",\n"
+          << "      \"source\": " << source << ",\n"
+          << "      \"sink\": " << sink.node << ",\n"
+          << "      \"path\": [";
       for (std::size_t i = 0; i < path.size(); ++i) {
         if (i != 0) {
-          out << ",";
+          out << ", ";
         }
         out << path[i];
       }
-      out << "\n";
+      out << "]\n"
+          << "    }";
       if (!out) {
         throw std::runtime_error("failed while writing routes output: " +
                                  output_path.string());
       }
       ++routed_paths;
     }
+  }
+  out << "\n  ]\n}\n";
+  if (!out) {
+    throw std::runtime_error("failed while finalizing routes output: " +
+                             output_path.string());
   }
 
   std::cout << "wrote_routes: " << output_path << "\n";

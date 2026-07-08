@@ -2,16 +2,16 @@
 //   1. a CSR graph (.csrbin),
 //   2. the matching RIPSIFM1 metadata sidecar produced by
 //      Routing/interchange_to_csr.cpp, and
-//   3. a text file describing routed CSR node paths.
+//   3. a JSON file describing routed CSR node paths.
 //
-// The tool expects one routed path per line:
+// The tool expects a top-level object with a "routes" array:
 //
-//   net=<physical-net-name> source=<csr-node> sink=<csr-node> \
-//   path=<n0>,<n1>,...,<nk>
-//
-// Example:
-//
-//   net=net_42 source=101 sink=887 path=101,220,404,700,887
+//   {
+//     "routes": [
+//       {"net": "net_42", "source": 101, "sink": 887,
+//        "path": [101, 220, 404, 700, 887]}
+//     ]
+//   }
 //
 // Each path must begin at the given source node, end at the given sink node,
 // and every consecutive (u, v) pair must exist as a directed routing edge in
@@ -33,7 +33,7 @@
 //   ./csr_to_phys \
 //     HIP_kernel/bellman_ford/data/design.csrbin \
 //     HIP_kernel/bellman_ford/data/design.csrbin.ifmeta.bin \
-//     routes.txt \
+//     routes.json \
 //     design_routed.phys
 
 #include "PhysicalNetlist.capnp.h"
@@ -198,11 +198,11 @@ void print_usage(const char* program) {
   std::cerr
       << "Usage:\n"
       << "  " << program
-      << " <graph.csrbin> <graph.ifmeta.bin> <routes.txt> <output.phys>"
+      << " <graph.csrbin> <graph.ifmeta.bin> <routes.json> <output.phys>"
          " [--gzip-output]\n\n"
-      << "Route file format:\n"
-      << "  net=<name> source=<csr-node> sink=<csr-node>"
-         " path=<n0>,<n1>,...,<nk>\n";
+      << "Route JSON format:\n"
+      << "  {\"routes\":[{\"net\":\"<name>\",\"source\":<csr-node>,"
+         "\"sink\":<csr-node>,\"path\":[<n0>,...,<nk>]}]}\n";
 }
 
 Options parse_options(int argc, char** argv) {
@@ -257,55 +257,6 @@ std::vector<capnp::word> bytes_to_words(const std::vector<std::uint8_t>& bytes) 
     std::memcpy(words.data(), bytes.data(), bytes.size());
   }
   return words;
-}
-
-std::string trim(std::string text) {
-  auto is_space = [](unsigned char c) { return std::isspace(c) != 0; };
-  while (!text.empty() && is_space(static_cast<unsigned char>(text.front()))) {
-    text.erase(text.begin());
-  }
-  while (!text.empty() && is_space(static_cast<unsigned char>(text.back()))) {
-    text.pop_back();
-  }
-  return text;
-}
-
-std::vector<std::string> split_ws(const std::string& text) {
-  std::istringstream in(text);
-  std::vector<std::string> parts;
-  std::string part;
-  while (in >> part) {
-    parts.push_back(part);
-  }
-  return parts;
-}
-
-std::vector<std::string> split(const std::string& text, char delim) {
-  std::vector<std::string> parts;
-  std::string current;
-  std::istringstream in(text);
-  while (std::getline(in, current, delim)) {
-    parts.push_back(current);
-  }
-  return parts;
-}
-
-NodeId parse_node_id(const std::string& text, const char* field_name) {
-  try {
-    std::size_t consumed = 0;
-    const long long value = std::stoll(text, &consumed);
-    if (consumed != text.size()) {
-      throw std::invalid_argument("trailing characters");
-    }
-    if (value < std::numeric_limits<NodeId>::min() ||
-        value > std::numeric_limits<NodeId>::max()) {
-      throw std::out_of_range("node id out of range");
-    }
-    return static_cast<NodeId>(value);
-  } catch (const std::exception&) {
-    throw std::runtime_error(std::string("invalid ") + field_name + ": " +
-                             text);
-  }
 }
 
 std::uint64_t read_u64(const std::vector<std::uint8_t>& bytes, std::size_t& at,
@@ -586,74 +537,263 @@ std::string metadata_string(const Metadata& meta, std::uint64_t index,
   return meta.strings[static_cast<std::size_t>(index)];
 }
 
+class JsonRouteParser {
+ public:
+  explicit JsonRouteParser(std::string input) : input_(std::move(input)) {}
+
+  std::vector<RoutedPath> parse_routes() {
+    skip_ws();
+    expect('{');
+
+    bool found_routes = false;
+    std::vector<RoutedPath> routes;
+    bool first = true;
+    while (true) {
+      skip_ws();
+      if (consume('}')) {
+        break;
+      }
+      if (!first) {
+        expect(',');
+      }
+      first = false;
+
+      const std::string key = parse_string();
+      expect(':');
+      if (key == "routes") {
+        if (found_routes) {
+          fail("duplicate \"routes\" key");
+        }
+        routes = parse_routes_array();
+        found_routes = true;
+      } else {
+        fail("unexpected top-level key: " + key);
+      }
+    }
+
+    skip_ws();
+    if (cursor_ != input_.size()) {
+      fail("trailing data after top-level object");
+    }
+    if (!found_routes) {
+      fail("missing top-level \"routes\" array");
+    }
+    return routes;
+  }
+
+ private:
+  std::string input_;
+  std::size_t cursor_ = 0;
+
+  [[noreturn]] void fail(const std::string& message) const {
+    throw std::runtime_error("invalid routes JSON at byte " +
+                             std::to_string(cursor_) + ": " + message);
+  }
+
+  void skip_ws() {
+    while (cursor_ < input_.size() &&
+           std::isspace(static_cast<unsigned char>(input_[cursor_])) != 0) {
+      ++cursor_;
+    }
+  }
+
+  void expect(char expected) {
+    skip_ws();
+    if (cursor_ >= input_.size() || input_[cursor_] != expected) {
+      fail(std::string("expected '") + expected + "'");
+    }
+    ++cursor_;
+  }
+
+  bool consume(char expected) {
+    skip_ws();
+    if (cursor_ < input_.size() && input_[cursor_] == expected) {
+      ++cursor_;
+      return true;
+    }
+    return false;
+  }
+
+  std::string parse_string() {
+    skip_ws();
+    if (cursor_ >= input_.size() || input_[cursor_] != '"') {
+      fail("expected string");
+    }
+    ++cursor_;
+
+    std::string out;
+    while (cursor_ < input_.size()) {
+      const char c = input_[cursor_++];
+      if (c == '"') {
+        return out;
+      }
+      if (c == '\\') {
+        if (cursor_ >= input_.size()) {
+          fail("unterminated escape sequence");
+        }
+        const char escaped = input_[cursor_++];
+        switch (escaped) {
+          case '"':
+          case '\\':
+          case '/':
+            out.push_back(escaped);
+            break;
+          case 'b':
+            out.push_back('\b');
+            break;
+          case 'f':
+            out.push_back('\f');
+            break;
+          case 'n':
+            out.push_back('\n');
+            break;
+          case 'r':
+            out.push_back('\r');
+            break;
+          case 't':
+            out.push_back('\t');
+            break;
+          default:
+            fail(std::string("unsupported escape sequence \\") + escaped);
+        }
+        continue;
+      }
+      out.push_back(c);
+    }
+    fail("unterminated string");
+  }
+
+  long long parse_integer(const char* field_name) {
+    skip_ws();
+    const std::size_t start = cursor_;
+    if (cursor_ < input_.size() && (input_[cursor_] == '-' || input_[cursor_] == '+')) {
+      ++cursor_;
+    }
+    const std::size_t digits_begin = cursor_;
+    while (cursor_ < input_.size() &&
+           std::isdigit(static_cast<unsigned char>(input_[cursor_])) != 0) {
+      ++cursor_;
+    }
+    if (digits_begin == cursor_) {
+      fail(std::string("expected integer for ") + field_name);
+    }
+    try {
+      return std::stoll(input_.substr(start, cursor_ - start));
+    } catch (const std::exception&) {
+      fail(std::string("invalid integer for ") + field_name);
+    }
+  }
+
+  NodeId parse_node_field(const char* field_name) {
+    const long long value = parse_integer(field_name);
+    if (value < std::numeric_limits<NodeId>::min() ||
+        value > std::numeric_limits<NodeId>::max()) {
+      fail(std::string("node id out of range for ") + field_name);
+    }
+    return static_cast<NodeId>(value);
+  }
+
+  std::vector<NodeId> parse_path_array() {
+    expect('[');
+    std::vector<NodeId> nodes;
+    bool first = true;
+    while (true) {
+      skip_ws();
+      if (consume(']')) {
+        break;
+      }
+      if (!first) {
+        expect(',');
+      }
+      first = false;
+      nodes.push_back(parse_node_field("path node"));
+    }
+    if (nodes.empty()) {
+      fail("path array must not be empty");
+    }
+    return nodes;
+  }
+
+  RoutedPath parse_route_object() {
+    expect('{');
+    RoutedPath route;
+    bool have_net = false;
+    bool have_source = false;
+    bool have_sink = false;
+    bool have_path = false;
+    bool first = true;
+    while (true) {
+      skip_ws();
+      if (consume('}')) {
+        break;
+      }
+      if (!first) {
+        expect(',');
+      }
+      first = false;
+
+      const std::string key = parse_string();
+      expect(':');
+      if (key == "net") {
+        route.net_name = parse_string();
+        have_net = true;
+      } else if (key == "source") {
+        route.source = parse_node_field("source");
+        have_source = true;
+      } else if (key == "sink") {
+        route.sink = parse_node_field("sink");
+        have_sink = true;
+      } else if (key == "path") {
+        route.nodes = parse_path_array();
+        have_path = true;
+      } else {
+        fail("unexpected route key: " + key);
+      }
+    }
+
+    if (!have_net || !have_source || !have_sink || !have_path) {
+      fail("route object is missing one of net/source/sink/path");
+    }
+    if (route.nodes.front() != route.source || route.nodes.back() != route.sink) {
+      fail("path endpoints do not match source/sink");
+    }
+    return route;
+  }
+
+  std::vector<RoutedPath> parse_routes_array() {
+    expect('[');
+    std::vector<RoutedPath> routes;
+    bool first = true;
+    while (true) {
+      skip_ws();
+      if (consume(']')) {
+        break;
+      }
+      if (!first) {
+        expect(',');
+      }
+      first = false;
+      routes.push_back(parse_route_object());
+    }
+    return routes;
+  }
+};
+
 std::vector<RoutedPath> load_routes(const std::filesystem::path& path) {
   std::ifstream in(path);
   if (!in) {
     throw std::runtime_error("could not open routes file: " + path.string());
   }
 
-  std::vector<RoutedPath> routes;
-  std::string line;
-  std::size_t line_number = 0;
-  while (std::getline(in, line)) {
-    ++line_number;
-    const std::string cleaned = trim(line);
-    if (cleaned.empty() || cleaned[0] == '#') {
-      continue;
-    }
-
-    RoutedPath route;
-    bool have_net = false;
-    bool have_source = false;
-    bool have_sink = false;
-    bool have_path = false;
-
-    for (const std::string& token : split_ws(cleaned)) {
-      const std::size_t eq = token.find('=');
-      if (eq == std::string::npos) {
-        throw std::runtime_error("routes line " + std::to_string(line_number) +
-                                 " has malformed token: " + token);
-      }
-      const std::string key = token.substr(0, eq);
-      const std::string value = token.substr(eq + 1);
-      if (key == "net") {
-        route.net_name = value;
-        have_net = true;
-      } else if (key == "source") {
-        route.source = parse_node_id(value, "source");
-        have_source = true;
-      } else if (key == "sink") {
-        route.sink = parse_node_id(value, "sink");
-        have_sink = true;
-      } else if (key == "path") {
-        const std::vector<std::string> nodes = split(value, ',');
-        if (nodes.empty()) {
-          throw std::runtime_error("routes line " + std::to_string(line_number) +
-                                   " has empty path");
-        }
-        route.nodes.reserve(nodes.size());
-        for (const std::string& node_text : nodes) {
-          route.nodes.push_back(parse_node_id(node_text, "path node"));
-        }
-        have_path = true;
-      } else {
-        throw std::runtime_error("routes line " + std::to_string(line_number) +
-                                 " has unknown key: " + key);
-      }
-    }
-
-    if (!have_net || !have_source || !have_sink || !have_path) {
-      throw std::runtime_error("routes line " + std::to_string(line_number) +
-                               " is missing one of net/source/sink/path");
-    }
-    if (route.nodes.front() != route.source || route.nodes.back() != route.sink) {
-      throw std::runtime_error("routes line " + std::to_string(line_number) +
-                               " path endpoints do not match source/sink");
-    }
-    routes.push_back(std::move(route));
+  std::ostringstream buffer;
+  buffer << in.rdbuf();
+  if (!in.good() && !in.eof()) {
+    throw std::runtime_error("failed while reading routes file: " +
+                             path.string());
   }
 
-  return routes;
+  JsonRouteParser parser(buffer.str());
+  return parser.parse_routes();
 }
 
 const SitePinNode* find_site_pin_by_node(const std::vector<SitePinNode>& pins,
