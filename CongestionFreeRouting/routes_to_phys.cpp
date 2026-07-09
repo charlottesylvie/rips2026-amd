@@ -795,6 +795,25 @@ RouteTables build_route_tables(const NetRoute& route) {
   return tables;
 }
 
+bool has_reached_sink(const NetRoute& route) {
+  for (const RouteSitePin& sink : route.sinks) {
+    if (sink.reached) {
+      return true;
+    }
+  }
+  return false;
+}
+
+bool top_level_stubs_are_site_pins(
+    capnp::List<PhysicalNetlist::PhysNetlist::RouteBranch>::Builder stubs) {
+  for (std::uint32_t i = 0; i < stubs.size(); ++i) {
+    if (!stubs[i].getRouteSegment().isSitePin()) {
+      return false;
+    }
+  }
+  return true;
+}
+
 int insert_route_tree(
     PhysicalNetlist::PhysNetlist::RouteBranch::Builder branch,
     int node,
@@ -891,6 +910,25 @@ void write_routed_phys(const std::filesystem::path& input_phys,
     if (route_it == routes.end()) continue;
 
     const NetRoute& route = route_it->second;
+    const bool reached_any_sink = has_reached_sink(route);
+    if (!reached_any_sink) {
+      if (!route.edges.empty()) {
+        throw std::runtime_error("route has PIP edges but no reached sinks: " +
+                                 net_name);
+      }
+      if (!allow_unrouted_stubs) {
+        throw std::runtime_error("unrouted route has no reached sinks: " +
+                                 net_name);
+      }
+      routed_seen.emplace(net_name, true);
+      continue;
+    }
+    if (!route.routed && allow_unrouted_stubs &&
+        !top_level_stubs_are_site_pins(net.getStubs())) {
+      routed_seen.emplace(net_name, true);
+      continue;
+    }
+
     RouteTables tables = build_route_tables(route);
 
     auto old_stubs_orphan = net.disownStubs();
