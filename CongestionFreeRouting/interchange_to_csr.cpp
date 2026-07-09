@@ -51,9 +51,7 @@
 #include "PhysicalNetlist.capnp.h"
 
 #include <capnp/serialize.h>
-#include <capnp/serialize-packed.h>
 #include <kj/array.h>
-#include <kj/io.h>
 #include <zlib.h>
 
 #include <algorithm>
@@ -594,49 +592,19 @@ std::vector<capnp::word> bytes_to_words(
   return words;
 }
 
-capnp::ReaderOptions relaxed_reader_options() {
-  capnp::ReaderOptions reader_options;
-  reader_options.traversalLimitInWords =
-      std::numeric_limits<std::uint64_t>::max();
-  reader_options.nestingLimit = 1 << 20;
-  return reader_options;
-}
-
-std::string kj_exception_description(const kj::Exception& error) {
-  return std::string(error.getDescription().cStr());
-}
-
-template <typename Root, typename Fn>
-void parse_capnp_root(const std::vector<std::uint8_t>& bytes,
-                      const std::filesystem::path& path,
-                      const char* schema_name,
-                      Fn&& fn) {
-  const capnp::ReaderOptions reader_options = relaxed_reader_options();
-  std::vector<capnp::word> words = bytes_to_words(bytes);
-
-  try {
-    capnp::FlatArrayMessageReader reader(
-        kj::arrayPtr(words.data(), words.size()), reader_options);
-    fn(reader.getRoot<Root>());
+void check_device_payload_size(const std::filesystem::path& path,
+                               std::size_t decoded_bytes) {
+  constexpr std::size_t kMinExpectedDeviceBytes = 1 << 20;
+  if (path.filename() != "xcvu3p.device" ||
+      decoded_bytes >= kMinExpectedDeviceBytes) {
     return;
-  } catch (const kj::Exception& flat_error) {
-    const kj::byte* packed_data =
-        reinterpret_cast<const kj::byte*>(bytes.data());
-    kj::ArrayInputStream packed_input(
-        kj::arrayPtr(packed_data, bytes.size()));
-    try {
-      capnp::PackedMessageReader reader(packed_input, reader_options);
-      fn(reader.getRoot<Root>());
-      return;
-    } catch (const kj::Exception& packed_error) {
-      throw std::runtime_error(
-          "failed to parse " + path.string() + " as " + schema_name +
-          " Cap'n Proto (" + std::to_string(bytes.size()) +
-          " decoded bytes): flat reader: " +
-          kj_exception_description(flat_error) +
-          "; packed reader: " + kj_exception_description(packed_error));
-    }
   }
+
+  throw std::runtime_error(
+      "device resources file is suspiciously small: " + path.string() +
+      " has only " + std::to_string(decoded_bytes) +
+      " decoded bytes; regenerate it with `rm -f xcvu3p.device && make "
+      "xcvu3p.device`");
 }
 
 std::uint64_t edge_key(NodeId from, NodeId to) {
@@ -828,20 +796,28 @@ void parse_logical_netlist(const std::filesystem::path& logical_path,
   const std::vector<std::uint8_t> bytes =
       read_gzip_or_plain_file(logical_path);
   graph.logical_netlist_bytes = bytes;
-  parse_capnp_root<Netlist>(
-      bytes, logical_path, "LogicalNetlist::Netlist", [&](auto netlist) {
-        TextCache strings(netlist.getStrList());
+  std::vector<capnp::word> words = bytes_to_words(bytes);
 
-        // Store the top-level logical design name in the shared metadata
-        // string table. This helps a routed-.phys reconstruction tool
-        // sanity-check that it is using metadata from the intended design.
-        graph.logical_design_name_string =
-            graph.string_table.intern(capnp_text_to_string(netlist.getName()));
+  capnp::ReaderOptions reader_options;
+  reader_options.traversalLimitInWords =
+      std::numeric_limits<std::uint64_t>::max();
+  reader_options.nestingLimit = 1 << 20;
 
-        const auto port_list = netlist.getPortList();
-        const auto cell_decls = netlist.getCellDecls();
-        const auto inst_list = netlist.getInstList();
-        const auto cell_list = netlist.getCellList();
+  capnp::FlatArrayMessageReader reader(
+      kj::arrayPtr(words.data(), words.size()), reader_options);
+  const auto netlist = reader.getRoot<Netlist>();
+  TextCache strings(netlist.getStrList());
+
+  // Store the top-level logical design name in the shared metadata string
+  // table. This helps a routed-.phys reconstruction tool sanity-check that it
+  // is using metadata from the intended design.
+  graph.logical_design_name_string =
+      graph.string_table.intern(capnp_text_to_string(netlist.getName()));
+
+  const auto port_list = netlist.getPortList();
+  const auto cell_decls = netlist.getCellDecls();
+  const auto inst_list = netlist.getInstList();
+  const auto cell_list = netlist.getCellList();
 
   // Walk every logical cell. Each cell summary stores a slice into the flat
   // logical_nets array, keeping metadata compact and easy to stream from disk.
@@ -932,7 +908,6 @@ void parse_logical_netlist(const std::filesystem::path& logical_path,
         cell_summary.net_begin;
     graph.logical_cells.push_back(cell_summary);
   }
-      });
 }
 
 void build_device_routing_graph(const std::filesystem::path& device_path,
@@ -943,14 +918,23 @@ void build_device_routing_graph(const std::filesystem::path& device_path,
   // proof of concept. DeviceResources is the fabric database: tiles, wires,
   // routing nodes, tile types, PIPs, site types, and site instances.
   const std::vector<std::uint8_t> bytes = read_gzip_or_plain_file(device_path);
-  parse_capnp_root<DeviceResources::Device>(
-      bytes, device_path, "DeviceResources::Device", [&](auto device) {
-        TextCache strings(device.getStrList());
+  check_device_payload_size(device_path, bytes.size());
+  std::vector<capnp::word> words = bytes_to_words(bytes);
 
-        const auto tile_list = device.getTileList();
-        const auto tile_types = device.getTileTypeList();
-        const auto wires = device.getWires();
-        const auto nodes = device.getNodes();
+  capnp::ReaderOptions reader_options;
+  reader_options.traversalLimitInWords =
+      std::numeric_limits<std::uint64_t>::max();
+  reader_options.nestingLimit = 1 << 20;
+
+  capnp::FlatArrayMessageReader reader(
+      kj::arrayPtr(words.data(), words.size()), reader_options);
+  const auto device = reader.getRoot<DeviceResources::Device>();
+  TextCache strings(device.getStrList());
+
+  const auto tile_list = device.getTileList();
+  const auto tile_types = device.getTileTypeList();
+  const auto wires = device.getWires();
+  const auto nodes = device.getNodes();
 
   // First pass over tileList: keep only tiles whose names carry X/Y coordinates
   // inside the selected bounds. Store the FPGAIF StringIdx values exactly like
@@ -1241,7 +1225,6 @@ void build_device_routing_graph(const std::filesystem::path& device_path,
           std::move(tile_and_types);
     }
   }
-      });
 }
 
 void parse_physical_netlist(const std::filesystem::path& phys_path,
@@ -1254,14 +1237,22 @@ void parse_physical_netlist(const std::filesystem::path& phys_path,
   // pre-routed nets.
   const std::vector<std::uint8_t> bytes = read_gzip_or_plain_file(phys_path);
   graph.physical_netlist_bytes = bytes;
-  parse_capnp_root<PhysNetlist>(
-      bytes, phys_path, "PhysicalNetlist::PhysNetlist", [&](auto netlist) {
-        TextCache strings(netlist.getStrList());
+  std::vector<capnp::word> words = bytes_to_words(bytes);
 
-        const auto phys_nets = netlist.getPhysNets();
-        for (std::uint32_t net_index = 0; net_index < phys_nets.size();
-             ++net_index) {
-          const auto net = phys_nets[net_index];
+  capnp::ReaderOptions reader_options;
+  reader_options.traversalLimitInWords =
+      std::numeric_limits<std::uint64_t>::max();
+  reader_options.nestingLimit = 1 << 20;
+
+  capnp::FlatArrayMessageReader reader(
+      kj::arrayPtr(words.data(), words.size()), reader_options);
+  const auto netlist = reader.getRoot<PhysNetlist>();
+  TextCache strings(netlist.getStrList());
+
+  const auto phys_nets = netlist.getPhysNets();
+  for (std::uint32_t net_index = 0; net_index < phys_nets.size();
+       ++net_index) {
+    const auto net = phys_nets[net_index];
 
     // Signal nets with stubs are the nets still needing routing. Stubs are
     // interpreted as sink site pins; sources are interpreted as start pins.
@@ -1384,7 +1375,6 @@ void parse_physical_netlist(const std::filesystem::path& phys_path,
       }
     }
   }
-      });
 }
 
 struct CsrEntry {

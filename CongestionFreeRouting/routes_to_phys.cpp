@@ -18,9 +18,7 @@
 #include "PhysicalNetlist.capnp.h"
 
 #include <capnp/serialize.h>
-#include <capnp/serialize-packed.h>
 #include <kj/array.h>
-#include <kj/io.h>
 #include <zlib.h>
 
 #include <algorithm>
@@ -603,49 +601,6 @@ std::vector<capnp::word> bytes_to_words(const std::vector<std::uint8_t>& bytes) 
   return words;
 }
 
-capnp::ReaderOptions relaxed_reader_options() {
-  capnp::ReaderOptions reader_options;
-  reader_options.traversalLimitInWords = std::numeric_limits<std::uint64_t>::max();
-  reader_options.nestingLimit = 1 << 20;
-  return reader_options;
-}
-
-std::string kj_exception_description(const kj::Exception& error) {
-  return std::string(error.getDescription().cStr());
-}
-
-template <typename Root, typename Fn>
-void parse_capnp_root(const std::vector<std::uint8_t>& bytes,
-                      const std::filesystem::path& path,
-                      const char* schema_name,
-                      Fn&& fn) {
-  const capnp::ReaderOptions reader_options = relaxed_reader_options();
-  std::vector<capnp::word> words = bytes_to_words(bytes);
-
-  try {
-    capnp::FlatArrayMessageReader reader(kj::arrayPtr(words.data(), words.size()),
-                                         reader_options);
-    fn(reader.getRoot<Root>());
-    return;
-  } catch (const kj::Exception& flat_error) {
-    const kj::byte* packed_data =
-        reinterpret_cast<const kj::byte*>(bytes.data());
-    kj::ArrayInputStream packed_input(kj::arrayPtr(packed_data, bytes.size()));
-    try {
-      capnp::PackedMessageReader reader(packed_input, reader_options);
-      fn(reader.getRoot<Root>());
-      return;
-    } catch (const kj::Exception& packed_error) {
-      throw std::runtime_error(
-          "failed to parse " + path.string() + " as " + schema_name +
-          " Cap'n Proto (" + std::to_string(bytes.size()) +
-          " decoded bytes): flat reader: " +
-          kj_exception_description(flat_error) +
-          "; packed reader: " + kj_exception_description(packed_error));
-    }
-  }
-}
-
 void write_gzip_file(const std::filesystem::path& path,
                      kj::ArrayPtr<const kj::byte> bytes) {
   gzFile file = gzopen(path.string().c_str(), "wb6");
@@ -908,10 +863,16 @@ void write_routed_phys(const std::filesystem::path& input_phys,
                        const std::unordered_map<std::string, NetRoute>& routes,
                        bool allow_unrouted_stubs) {
   const std::vector<std::uint8_t> bytes = read_gzip_or_plain_file(input_phys);
+  std::vector<capnp::word> words = bytes_to_words(bytes);
+
+  capnp::ReaderOptions reader_options;
+  reader_options.traversalLimitInWords = std::numeric_limits<std::uint64_t>::max();
+  reader_options.nestingLimit = 1 << 20;
+  capnp::FlatArrayMessageReader reader(kj::arrayPtr(words.data(), words.size()),
+                                       reader_options);
+
   capnp::MallocMessageBuilder builder;
-  parse_capnp_root<PhysicalNetlist::PhysNetlist>(
-      bytes, input_phys, "PhysicalNetlist::PhysNetlist",
-      [&](auto netlist_reader) { builder.setRoot(netlist_reader); });
+  builder.setRoot(reader.getRoot<PhysicalNetlist::PhysNetlist>());
   auto netlist = builder.getRoot<PhysicalNetlist::PhysNetlist>();
 
   std::unordered_map<std::string, std::uint32_t> string_to_index;
