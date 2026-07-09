@@ -134,18 +134,155 @@ Then validate the generated paths:
 ./validate_SSSP graph.csrbin paths.jsonl --modes 1,2,3
 ```
 
+Batched generator:
+
+[src/bf_batched.cpp](src/bf_batched.cpp) uses the same `.csrbin`,
+`.csrbin.ifmeta.bin`, and JSONL path format as `bf_for_validation`, but runs
+Bellman-Ford for a batch of sources at once. Internally, the distance state is
+an `N x B` sparse matrix, where `N` is the number of graph nodes and `B` is
+`--batch-size`.
+
+Build on an AMD ROCm/HIP machine from `rips2026-amd`:
+
+```bash
+hipcc -std=c++17 -O3 -x hip \
+  -I HIP_kernel/bellman_ford/src \
+  -I HIP_kernel/minplus_mm/src \
+  SSSP/src/bf_batched.cpp \
+  HIP_kernel/minplus_mm/src/minplus_sparse_hip.cpp \
+  -o bf_batched
+```
+
+Run:
+
+```bash
+./bf_batched graph.csrbin graph.csrbin.ifmeta.bin paths.jsonl --batch-size 4
+```
+
+Example smoke test:
+
+```bash
+./bf_batched graph.csrbin graph.csrbin.ifmeta.bin paths.jsonl \
+  --batch-size 4 \
+  --net-limit 10 \
+  --source-limit 8 \
+  --bf-progress-every 100
+```
+
+The batched generator copies the CSR graph to the GPU once, sends only the
+source IDs for each batch, keeps the batched distance matrix on the GPU during
+relaxation, and copies back one dense `N x B` distance block per batch for
+CPU-side path reconstruction and JSONL writing. Start with `--batch-size 2`,
+`4`, or `8`; the dense host copy costs roughly `N * B * 4` bytes per batch.
+
+Warm-started single-source generator:
+
+[src/bf_warm_init.cpp](src/bf_warm_init.cpp) is an experimental variant
+that first finds hop-2 source groups that share a connector node. As a
+preprocessing step, it chooses connector groups, then processes one connector
+and each of its related sources before moving to the next connector. Related
+sources are routed one at a time with their distance vector initialized by
+`edge_weight(source -> connector) + connector_dist[]`.
+Connector paths are not written to JSONL; only source-to-sink path records are
+emitted. Remaining sources are routed cold, one source at a time.
+
+Build on an AMD ROCm/HIP machine from `rips2026-amd`:
+
+```bash
+hipcc -std=c++17 -O3 -x hip \
+  -I HIP_kernel/bellman_ford/src \
+  -I HIP_kernel/minplus_mm/src \
+  SSSP/src/bf_warm_init.cpp \
+  HIP_kernel/minplus_mm/src/minplus_sparse_hip.cpp \
+  -o bf_warm_init
+```
+
+Run:
+
+```bash
+./bf_warm_init data/logicnets_jscl.csrbin data/logicnets_jscl.csrbin.ifmeta.bin paths.jsonl
+```
+
+Only directed edges `source -> connector` are used for warm starts, because
+those produce valid upper bounds. Only one connector distance vector is kept at
+a time.
+
+## Source Proximity Checker
+
+[src/check_sources.cpp](src/check_sources.cpp) checks whether route sources are
+close enough for connector warm-start ordering to be useful. It reads the same
+`.csrbin` and `.csrbin.ifmeta.bin` files, builds outgoing adjacency from the
+incoming-edge CSR, then enumerates exact hop-2
+`source1 - connector - source2` triples. Discovery always treats the two
+source-connector adjacencies as undirected, then classifies the directed
+orientation of the two edges.
+
+Build from `rips2026-amd`:
+
+```bash
+g++ -std=c++17 -O3 \
+  -I SSSP/src \
+  SSSP/src/check_sources.cpp \
+  -o check_sources
+```
+
+Run the exact hop-2 scan:
+
+```bash
+./check_sources graph.csrbin graph.csrbin.ifmeta.bin
+```
+
+Smoke-test options for a large graph:
+
+```bash
+./check_sources graph.csrbin graph.csrbin.ifmeta.bin \
+  --source-limit 100 \
+  --max-sets-print 50
+```
+
+Limit per-set output while still computing full orientation counts:
+
+```bash
+./check_sources graph.csrbin graph.csrbin.ifmeta.bin \
+  --max-sets-print 1
+```
+
+The final summary counts these four source-index-ordered orientations:
+
+```text
+source1 -> connector -> source2
+source1 <- connector -> source2
+source1 -> connector <- source2
+source1 <- connector <- source2
+```
+
+Useful options:
+
+| Option | Meaning |
+| --- | --- |
+| `--source-limit <n>` | Analyze only the first `n` unique sources. |
+| `--net-limit <n>` | Read only the first `n` route requests. |
+| `--max-sets-print <n>` | Print at most `n` orientation lines; `0` means no cap. |
+| `--max-pairs-print <n>` | Alias for `--max-sets-print`. |
+| `--progress-every <n>` | Print relation-scan progress every `n` sources; default `25`. |
+
 Generator options:
 
 | Option | Meaning |
 | --- | --- |
+| `--batch-size <n>` | Batched generator only: sources per GPU Bellman-Ford batch; default `4`, max `64`. |
+| `--no-connector-warm-start` | Warm-started generator only: disable hop-2 shared-connector warm starts. |
+| `--min-connector-sources <n>` | Warm-started generator only: route a connector only if at least `n` sources can warm-start through `source -> connector`; default `2`. |
+| `--max-connector-groups <n>` | Warm-started generator only: cap the number of connector groups; `0` means no cap. |
 | `--max-iters <n>` | Bellman-Ford relaxation limit; default `-1` means `n - 1`. |
 | `--net-limit <n>` | Use only the first `n` route requests from metadata. |
 | `--source-limit <n>` | Run only the first `n` unique source nodes. |
 | `--query-limit <n>` | Emit at most `n` source-sink path records. |
-| `--bf-progress-every <n>` | Print Bellman-Ford iteration progress every `n` iterations. |
+| `--bf-progress-every <n>` | Print Bellman-Ford progress every `n` iterations; generated drivers default to automatic updates at least every 100 iterations. |
+| `--no-bf-progress` | Disable the BF progress bar. |
 | `--skip-unreached` | Do not write JSONL records for unreachable sinks. |
 | `--abs-tol <x>` / `--rel-tol <x>` | Path reconstruction tolerances. |
 
-The generator copies the CSR graph to the GPU once, reuses that device graph for
-all unique metadata sources, and copies back one dense distance vector per
-source for CPU-side path reconstruction and JSONL writing.
+The single-source generator copies the CSR graph to the GPU once, reuses that
+device graph for all unique metadata sources, and copies back one dense
+distance vector per source for CPU-side path reconstruction and JSONL writing.
