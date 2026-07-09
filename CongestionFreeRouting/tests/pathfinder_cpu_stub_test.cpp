@@ -162,17 +162,6 @@ HostCsrF32 make_self_loop_predecessor_graph() {
   return graph;
 }
 
-HostCsrF32 make_two_path_graph() {
-  HostCsrF32 graph;
-  graph.rows = 4;
-  graph.cols = 4;
-  graph.nnz = 4;
-  graph.rowptr = {0, 0, 1, 2, 4};
-  graph.colind = {0, 0, 1, 2};
-  graph.values = {1.0f, 1.0f, 1.0f, 1.0f};
-  return graph;
-}
-
 HostCsrF32 make_two_net_congestion_graph() {
   HostCsrF32 graph;
   graph.rows = 6;
@@ -184,7 +173,7 @@ HostCsrF32 make_two_net_congestion_graph() {
   return graph;
 }
 
-HostCsrF32 make_incremental_reroute_graph() {
+HostCsrF32 make_three_net_overlap_graph() {
   HostCsrF32 graph;
   graph.rows = 8;
   graph.cols = 8;
@@ -224,7 +213,7 @@ routing::RoutingMetadata make_metadata() {
   return metadata;
 }
 
-routing::RoutingMetadata make_incremental_reroute_metadata(const HostCsrF32& graph) {
+routing::RoutingMetadata make_three_net_overlap_metadata(const HostCsrF32& graph) {
   routing::RoutingMetadata metadata;
   metadata.strings = {"net_a", "net_b", "net_c", "SRC_SITE_A", "SRC_SITE_B",
                       "SRC_SITE_C", "SRC_PIN", "SINK_SITE_A", "SINK_SITE_B",
@@ -539,34 +528,11 @@ int main() {
   require(self_loop_path[0].from == 3 && self_loop_path[0].to == 2,
           "reconstruction should ignore no-progress self-loop predecessors");
 
-  const HostCsrF32 two_path_graph = make_two_path_graph();
-  std::vector<int> occupancy = {10, 1, 0, 0};
-  std::vector<float> history = {0.0f, 0.0f, 0.0f, 0.0f};
-  routing::PathfinderOptions cost_options;
-  cost_options.capacity = 1;
-  const HostCsrF32 costed_graph =
-      routing::make_costed_graph(two_path_graph, occupancy, history, cost_options, 5.0f);
-  require(std::fabs(costed_graph.values[0] - 6.0f) < 1e-6f,
-          "entering occupied vertex 1 should receive present congestion cost");
-  require(std::fabs(costed_graph.values[1] - 1.0f) < 1e-6f,
-          "congested source vertex 0 should not inflate outgoing edge 0->2");
-  const std::vector<float> costed_dist =
-      cpu_dijkstra_incoming_csr(costed_graph, 0);
-  const std::vector<routing::PathEdge> costed_path =
-      routing::reconstruct_shortest_path(costed_graph, costed_dist, 0, 3);
-  require(costed_path.size() == 2, "vertex-weighted two-path graph should use two edges");
-  require(costed_path[0].from == 0 && costed_path[0].to == 2,
-          "PathFinder vertex costs should steer away from occupied destination nodes");
-  require(costed_path[1].from == 2 && costed_path[1].to == 3,
-          "PathFinder vertex costs should preserve a valid path to the sink");
-
   const HostCsrF32 congestion_graph = make_two_net_congestion_graph();
   const routing::RoutingMetadata congestion_metadata =
       make_two_net_metadata(congestion_graph);
   routing::PathfinderOptions congestion_options;
-  congestion_options.max_pathfinder_iterations = 1;
   congestion_options.delta = 1.0f;
-  congestion_options.route_batch_size = 1;
   routing::PathfinderResult congestion_result =
       routing::run_pathfinder(congestion_graph, congestion_metadata, congestion_options, nullptr);
   require(congestion_result.routed,
@@ -593,7 +559,6 @@ int main() {
           "overlapping route output should include the shared shortest path");
 
   routing::PathfinderOptions parallel_options;
-  parallel_options.max_pathfinder_iterations = 1;
   parallel_options.delta = 1.0f;
   parallel_options.parallel_net_workers = 2;
   g_multisource_delta_calls = 0;
@@ -614,26 +579,24 @@ int main() {
   require(g_multisource_delta_calls == 0,
           "parallel default routing should not call delta-step");
 
-  const HostCsrF32 incremental_graph = make_incremental_reroute_graph();
-  const routing::RoutingMetadata incremental_metadata =
-      make_incremental_reroute_metadata(incremental_graph);
-  routing::PathfinderOptions incremental_options;
-  incremental_options.max_pathfinder_iterations = 2;
-  incremental_options.delta = 1.0f;
-  incremental_options.route_batch_size = 3;
+  const HostCsrF32 overlap_graph = make_three_net_overlap_graph();
+  const routing::RoutingMetadata overlap_metadata =
+      make_three_net_overlap_metadata(overlap_graph);
+  routing::PathfinderOptions overlap_options;
+  overlap_options.delta = 1.0f;
   g_multisource_delta_calls = 0;
   g_unit_bfs_calls = 0;
-  routing::PathfinderResult incremental_result =
-      routing::run_pathfinder(incremental_graph,
-                              incremental_metadata,
-                              incremental_options,
+  routing::PathfinderResult overlap_result =
+      routing::run_pathfinder(overlap_graph,
+                              overlap_metadata,
+                              overlap_options,
                               nullptr);
-  require(incremental_result.nets.size() == 3,
-          "incremental test should preserve all net result slots");
-  require(incremental_result.overused_nodes == 1,
-          "incremental test should leave the intentionally unavoidable conflict");
-  require(incremental_result.nets[2].sinks[0].nodes == std::vector<int>({6, 7}),
-          "uncongested retained net should keep its previous route");
+  require(overlap_result.nets.size() == 3,
+          "three-net overlap test should preserve all net result slots");
+  require(overlap_result.overused_nodes == 1,
+          "three-net overlap test should leave the intentionally unavoidable conflict");
+  require(overlap_result.nets[2].sinks[0].nodes == std::vector<int>({6, 7}),
+          "independent third net should keep its shortest path");
   require(g_unit_bfs_calls == 3,
           "congestion-free default router should call unit BFS once per net");
   require(g_multisource_delta_calls == 0,
@@ -642,7 +605,6 @@ int main() {
   g_multisource_delta_calls = 0;
   g_unit_bfs_calls = 0;
   routing::PathfinderOptions options;
-  options.max_pathfinder_iterations = 1;
   options.delta = 1.0f;
 
   HostCsrF32 unit_graph = graph;

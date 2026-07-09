@@ -14,12 +14,12 @@ replacing routed stubs with pip routeSegments.
 Example contest Makefile recipe:
 
     %_pathfinder.phys: %_unrouted.phys %.netlist xcvu3p.device
-        (/usr/bin/time python3 Routing/pathfinder_benchmark.py $< $@) \
+        (/usr/bin/time python3 CongestionFreeRouting/pathfinder_benchmark.py $< $@) \
           $(call log_and_or_display,$@.log)
 
 Manual run:
 
-    python3 Routing/pathfinder_benchmark.py vtr_mcml_unrouted.phys \
+    python3 CongestionFreeRouting/pathfinder_benchmark.py vtr_mcml_unrouted.phys \
       vtr_mcml_pathfinder.phys --net-limit 100
 """
 
@@ -112,15 +112,43 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         default=executable_path("pathfinder", "PATHFINDER_BIN"),
         help="PathFinder executable path, or set PATHFINDER_BIN",
     )
-    parser.add_argument("--delta", type=float)
-    parser.add_argument("--max-pathfinder-iters", type=int)
-    parser.add_argument("--max-sssp-iters", type=int)
-    parser.add_argument("--capacity", type=int)
-    parser.add_argument("--present-factor", type=float)
-    parser.add_argument("--present-multiplier", type=float)
-    parser.add_argument("--history-factor", type=float)
+    parser.add_argument("--delta", type=float, help="delta-step bucket width")
+    parser.add_argument(
+        "--max-pathfinder-iters",
+        type=int,
+        help="compatibility-only for the one-shot router; forwarded and ignored",
+    )
+    parser.add_argument(
+        "--max-sssp-iters",
+        type=int,
+        help="delta-step rounds or unit-BFS depth cap",
+    )
+    parser.add_argument(
+        "--capacity",
+        type=int,
+        help="capacity used only for overuse diagnostics",
+    )
+    parser.add_argument(
+        "--present-factor",
+        type=float,
+        help="compatibility-only for the one-shot router; forwarded and ignored",
+    )
+    parser.add_argument(
+        "--present-multiplier",
+        type=float,
+        help="compatibility-only for the one-shot router; forwarded and ignored",
+    )
+    parser.add_argument(
+        "--history-factor",
+        type=float,
+        help="compatibility-only for the one-shot router; forwarded and ignored",
+    )
     parser.add_argument("--net-limit", type=int)
-    parser.add_argument("--route-batch-size", type=int)
+    parser.add_argument(
+        "--route-batch-size",
+        type=int,
+        help="compatibility-only for the one-shot router; forwarded and ignored",
+    )
     parser.add_argument(
         "--keep-work-dir",
         action="store_true",

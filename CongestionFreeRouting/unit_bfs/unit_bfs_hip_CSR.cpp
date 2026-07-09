@@ -124,7 +124,7 @@ struct UnitBfsScratch {
   Offset rows = 0;
   DeviceBuffer<int> sources;
   DeviceBuffer<int> targets;
-  DeviceBuffer<int> target_found;
+  DeviceBuffer<int> target_multiplicity;
   DeviceBuffer<int> level;
   DeviceBuffer<int> pred_node;
   DeviceBuffer<Offset> pred_edge;
@@ -151,6 +151,7 @@ struct UnitBfsScratch {
   UnitBfsScratch() = default;
   explicit UnitBfsScratch(Offset rows_)
       : rows(rows_),
+        target_multiplicity(static_cast<std::size_t>(rows_)),
         level(static_cast<std::size_t>(rows_)),
         pred_node(static_cast<std::size_t>(rows_)),
         pred_edge(static_cast<std::size_t>(rows_)),
@@ -174,7 +175,6 @@ struct UnitBfsScratch {
   void ensure_target_capacity(std::size_t target_count) {
     if (targets.size() < target_count) {
       targets.reset(target_count);
-      target_found.reset(target_count);
       target_distances.reset(target_count);
       target_path_lengths.reset(target_count);
       target_sources.reset(target_count);
@@ -315,6 +315,15 @@ __device__ inline void mark_touched(int v,
   }
 }
 
+__device__ inline void count_target_if_reached(int v,
+                                               const int* target_multiplicity,
+                                               int* found_count) {
+  const int multiplicity = target_multiplicity[v];
+  if (multiplicity > 0) {
+    atomicAdd(found_count, multiplicity);
+  }
+}
+
 __global__ void count_out_degrees_from_incoming_kernel(Offset rows,
                                                        const Offset* in_rowptr,
                                                        const Index* in_colind,
@@ -355,6 +364,7 @@ __global__ void initialize_bfs_arrays_kernel(Offset rows,
                                              int* level,
                                              int* pred_node,
                                              Offset* pred_edge,
+                                             int* target_multiplicity,
                                              int* in_touched,
                                              int* current_count,
                                              int* next_count,
@@ -367,6 +377,7 @@ __global__ void initialize_bfs_arrays_kernel(Offset rows,
     level[v] = kUnvisited;
     pred_node[v] = -1;
     pred_edge[v] = static_cast<Offset>(-1);
+    target_multiplicity[v] = 0;
     in_touched[v] = 0;
   }
   if (blockIdx.x == 0 && threadIdx.x == 0) {
@@ -402,6 +413,8 @@ __global__ void initialize_sources_kernel(const int* sources,
                                           Offset* pred_edge,
                                           int* current_queue,
                                           int* current_count,
+                                          const int* target_multiplicity,
+                                          int* found_count,
                                           int* in_touched,
                                           int* touched_queue,
                                           int* touched_count,
@@ -422,6 +435,7 @@ __global__ void initialize_sources_kernel(const int* sources,
       } else {
         atomicExch(overflow, 1);
       }
+      count_target_if_reached(source, target_multiplicity, found_count);
     }
   }
 }
@@ -437,6 +451,8 @@ __global__ void expand_frontier_kernel(const int* frontier,
                                        Offset* pred_edge,
                                        int* next_frontier,
                                        int* next_count,
+                                       const int* target_multiplicity,
+                                       int* found_count,
                                        int* in_touched,
                                        int* touched_queue,
                                        int* touched_count,
@@ -459,24 +475,29 @@ __global__ void expand_frontier_kernel(const int* frontier,
         } else {
           atomicExch(overflow, 1);
         }
+        count_target_if_reached(v, target_multiplicity, found_count);
       }
     }
   }
 }
 
-__global__ void mark_found_targets_kernel(const int* targets,
-                                          int target_count,
-                                          const int* level,
-                                          int* target_found,
-                                          int* found_count) {
+__global__ void mark_target_multiplicity_kernel(const int* targets,
+                                                int target_count,
+                                                int* target_multiplicity) {
   for (int i = blockIdx.x * blockDim.x + threadIdx.x;
        i < target_count;
        i += blockDim.x * gridDim.x) {
-    if (target_found[i] != 0) continue;
-    const int target = targets[i];
-    if (level[target] != kUnvisited && atomicCAS(&target_found[i], 0, 1) == 0) {
-      atomicAdd(found_count, 1);
-    }
+    atomicAdd(&target_multiplicity[targets[i]], 1);
+  }
+}
+
+__global__ void clear_target_multiplicity_kernel(const int* targets,
+                                                 int target_count,
+                                                 int* target_multiplicity) {
+  for (int i = blockIdx.x * blockDim.x + threadIdx.x;
+       i < target_count;
+       i += blockDim.x * gridDim.x) {
+    target_multiplicity[targets[i]] = 0;
   }
 }
 
@@ -665,6 +686,7 @@ void initialize_scratch_once(UnitBfsScratch& scratch, Offset rows, hipStream_t s
       scratch.level.get(),
       scratch.pred_node.get(),
       scratch.pred_edge.get(),
+      scratch.target_multiplicity.get(),
       scratch.in_touched.get(),
       scratch.current_count.get(),
       scratch.next_count.get(),
@@ -856,10 +878,12 @@ UnitBfsCsrResult run_unit_bfs_impl(const OutgoingCsrOwner& outgoing,
                                     targets.size() * sizeof(int),
                                     hipMemcpyHostToDevice,
                                     stream));
-  UNIT_BFS_HIP_CHECK(hipMemsetAsync(scratch.target_found.get(),
-                                    0,
-                                    targets.size() * sizeof(int),
-                                    stream));
+
+  mark_target_multiplicity_kernel<<<grid_for_items(target_count), kBlockSize, 0, stream>>>(
+      scratch.targets.get(),
+      target_count,
+      scratch.target_multiplicity.get());
+  UNIT_BFS_HIP_CHECK(hipGetLastError());
 
   initialize_sources_kernel<<<grid_for_items(source_count), kBlockSize, 0, stream>>>(
       scratch.sources.get(),
@@ -869,19 +893,13 @@ UnitBfsCsrResult run_unit_bfs_impl(const OutgoingCsrOwner& outgoing,
       scratch.pred_edge.get(),
       scratch.current_queue.get(),
       scratch.current_count.get(),
+      scratch.target_multiplicity.get(),
+      scratch.found_count.get(),
       scratch.in_touched.get(),
       scratch.touched_queue.get(),
       scratch.touched_count.get(),
       n_int,
       scratch.overflow.get());
-  UNIT_BFS_HIP_CHECK(hipGetLastError());
-
-  mark_found_targets_kernel<<<grid_for_items(target_count), kBlockSize, 0, stream>>>(
-      scratch.targets.get(),
-      target_count,
-      scratch.level.get(),
-      scratch.target_found.get(),
-      scratch.found_count.get());
   UNIT_BFS_HIP_CHECK(hipGetLastError());
 
   std::array<int, 3> status =
@@ -914,19 +932,13 @@ UnitBfsCsrResult run_unit_bfs_impl(const OutgoingCsrOwner& outgoing,
         scratch.pred_edge.get(),
         next_queue,
         scratch.next_count.get(),
+        scratch.target_multiplicity.get(),
+        scratch.found_count.get(),
         scratch.in_touched.get(),
         scratch.touched_queue.get(),
         scratch.touched_count.get(),
         n_int,
         scratch.overflow.get());
-    UNIT_BFS_HIP_CHECK(hipGetLastError());
-
-    mark_found_targets_kernel<<<grid_for_items(target_count), kBlockSize, 0, stream>>>(
-        scratch.targets.get(),
-        target_count,
-        scratch.level.get(),
-        scratch.target_found.get(),
-        scratch.found_count.get());
     UNIT_BFS_HIP_CHECK(hipGetLastError());
 
     status = copy_status_to_host(scratch.next_count.get(), scratch, stream);
@@ -950,6 +962,11 @@ UnitBfsCsrResult run_unit_bfs_impl(const OutgoingCsrOwner& outgoing,
   result.converged = current_count == 0 || found_count >= target_count;
   result.stopped_on_target = found_count >= target_count;
   extract_target_paths_to_result(result, scratch, targets, stream);
+  clear_target_multiplicity_kernel<<<grid_for_items(target_count), kBlockSize, 0, stream>>>(
+      scratch.targets.get(),
+      target_count,
+      scratch.target_multiplicity.get());
+  UNIT_BFS_HIP_CHECK(hipGetLastError());
   reset_touched_vertices(scratch, stream);
   return result;
 }

@@ -85,14 +85,9 @@ enum class SsspEngine {
 struct PathfinderOptions {
   SsspEngine sssp_engine = SsspEngine::kUnitBfs;
   float delta = 4.0f;
-  int max_pathfinder_iterations = 30;
   int max_sssp_iterations = -1;
   int capacity = 1;
-  float initial_present_factor = 1.0f;
-  float present_factor_multiplier = 2.0f;
-  float history_factor = 1.0f;
   std::size_t net_limit = 0;
-  std::size_t route_batch_size = 256;
   std::size_t parallel_net_workers = 1;
 };
 
@@ -103,7 +98,6 @@ struct PathfinderResult {
   int overused_nodes = 0;
   int max_occupancy = 0;
   std::vector<int> occupancy;
-  std::vector<float> history;
   std::vector<RoutedNet> nets;
 };
 

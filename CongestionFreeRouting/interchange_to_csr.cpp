@@ -31,7 +31,7 @@
 //
 //   g++ -std=c++17 -O3 \
 //     -I<generated-schema-dir> \
-//     Routing/interchange_to_csr.cpp \
+//     CongestionFreeRouting/interchange_to_csr.cpp \
 //     <generated-schema-dir>/DeviceResources.capnp.c++ \
 //     <generated-schema-dir>/PhysicalNetlist.capnp.c++ \
 //     <generated-schema-dir>/LogicalNetlist.capnp.c++ \

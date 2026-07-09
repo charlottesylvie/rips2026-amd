@@ -1,18 +1,20 @@
 # RIPS AMD 2026
 
 FPGA routing prototype for the FPGA24/RWRoute-style benchmarks, with a
-PathFinder-style router, FPGA Interchange conversion utilities, and HIP kernels
-for shortest-path experiments.
+one-shot shortest-path router, FPGA Interchange conversion utilities, and HIP
+kernels for shortest-path experiments.
 
 The current benchmark-facing flow is the C++ `PathFinderFile` wrapper. It
 converts FPGA Interchange inputs into an internal CSR graph, routes nets with a
-PathFinder-style rip-up/reroute loop, and writes a routed `.phys` file.
+one-shot shortest-path pass, and writes a routed `.phys` file. Overused nodes
+are reported as diagnostics; they do not make the one-shot router fail.
 
 ## Project Status
 
-- Main router path: `Routing/pathfinder_router.cpp`.
-- Main shortest-path engine: targeted Delta Stepping in
-  `HIP_kernel/delta_stepping`.
+- Main router path: `CongestionFreeRouting/pathfinder_router.cpp`.
+- Main shortest-path engine: unit-weight HIP BFS in
+  `CongestionFreeRouting/unit_bfs`; Delta Stepping remains available for
+  comparison.
 - Main interchange flow:
   `interchange_to_csr -> pathfinder -> routes_to_phys`.
 - Local CPU-only tests are available for routing logic, but full router builds
@@ -27,14 +29,14 @@ physical netlist and writes a routed physical netlist:
 ./<router-name> <benchmark>_unrouted.phys <benchmark>_<router-name>.phys
 ```
 
-`Routing/pathfinder_router.cpp` is the C++ wrapper intended to expose that
+`CongestionFreeRouting/pathfinder_router.cpp` is the C++ wrapper intended to expose that
 contest-style interface. The compiled executable name can match whatever router
 name the benchmark Makefile uses, for example `PathFinderFile`.
 
-The repository Makefile currently defaults to:
+Run the contest-provided Makefile path with:
 
 ```make
-ROUTER ?= PathFinderFile
+ROUTER=PathFinderFile
 PATHFINDER_ROUTER_BIN ?= ./PathFinderFile
 PATHFINDER_SSSP_ENGINE ?= unit-bfs
 ```
@@ -96,12 +98,12 @@ the generated `.csrbin`, metadata, and routes files for debugging.
 
 | Path | Purpose |
 | --- | --- |
-| `Routing/interchange_to_csr.cpp` | Converts FPGA Interchange `.phys`, `.netlist`, and `.device` inputs into the router CSR graph and metadata sidecar. |
-| `Routing/pathfinder.cpp` / `Routing/pathfinder.hpp` | Implements the current PathFinder-style rip-up/reroute loop over CSR input. |
-| `Routing/routes_to_phys.cpp` | Reconstructs a routed FPGA Interchange `PhysicalNetlist` from PathFinder JSONL output. |
-| `Routing/pathfinder_router.cpp` | Benchmark-facing C++ wrapper that runs the full conversion, routing, and reconstruction pipeline. |
-| `Routing/pathfinder_benchmark.py` | Older Python wrapper/reference implementation. Useful for reference and writer tests, but not the preferred benchmark-facing router. |
-| `Routing/tests` | CPU-only routing tests and Python writer regression tests. |
+| `CongestionFreeRouting/interchange_to_csr.cpp` | Converts FPGA Interchange `.phys`, `.netlist`, and `.device` inputs into the router CSR graph and metadata sidecar. |
+| `CongestionFreeRouting/pathfinder.cpp` / `CongestionFreeRouting/pathfinder.hpp` | Implements the current one-shot source-to-sink shortest-path router over CSR input. |
+| `CongestionFreeRouting/routes_to_phys.cpp` | Reconstructs a routed FPGA Interchange `PhysicalNetlist` from route JSONL output. |
+| `CongestionFreeRouting/pathfinder_router.cpp` | Benchmark-facing C++ wrapper that runs the full conversion, routing, and reconstruction pipeline. |
+| `CongestionFreeRouting/pathfinder_benchmark.py` | Older Python wrapper/reference implementation. Useful for reference and writer tests, but not the preferred benchmark-facing router. |
+| `CongestionFreeRouting/tests` | CPU-only routing tests. |
 
 ### HIP Kernels
 
@@ -143,21 +145,13 @@ Assuming generated FPGA Interchange C++ schema files are available in
 SCHEMA_DIR=fpga-interchange-schema/interchange
 
 g++ -std=c++17 -O3 -I"$SCHEMA_DIR" \
-  Routing/interchange_to_csr.cpp \
+  CongestionFreeRouting/interchange_to_csr.cpp \
   "$SCHEMA_DIR"/DeviceResources.capnp.c++ \
   "$SCHEMA_DIR"/PhysicalNetlist.capnp.c++ \
   "$SCHEMA_DIR"/LogicalNetlist.capnp.c++ \
   "$SCHEMA_DIR"/References.capnp.c++ \
   -lcapnp -lkj -lz -o interchange_to_csr
 
-hipcc -std=c++17 -O3 -x hip \
-  -I HIP_kernel/bellman_ford/src \
-  -I HIP_kernel/delta_stepping/src \
-  Routing/pathfinder.cpp \
-  HIP_kernel/delta_stepping/src/delta_stepping_hip_CSR.cpp \
-  -o pathfinder
-
-# CongestionFreeRouting variant with unit-BFS and delta-step backends:
 hipcc -std=c++17 -O3 -x hip \
   -I HIP_kernel/bellman_ford/src \
   -I CongestionFreeRouting/delta_stepping \
@@ -168,11 +162,11 @@ hipcc -std=c++17 -O3 -x hip \
   -pthread -o pathfinder
 
 g++ -std=c++17 -O3 -I"$SCHEMA_DIR" \
-  Routing/routes_to_phys.cpp \
+  CongestionFreeRouting/routes_to_phys.cpp \
   "$SCHEMA_DIR"/PhysicalNetlist.capnp.c++ \
   -lcapnp -lkj -lz -o routes_to_phys
 
-g++ -std=c++17 -O2 Routing/pathfinder_router.cpp -o PathFinderFile
+g++ -std=c++17 -O2 CongestionFreeRouting/pathfinder_router.cpp -o PathFinderFile
 ```
 
 If the helper binaries are not in the repository root, point the wrapper at
@@ -232,15 +226,12 @@ Tuning options:
 | `--sssp-engine <unit-bfs\|delta-step>` | `unit-bfs` | Shortest-path backend. |
 | `--use-delta-step` | unset | Shorthand for `--sssp-engine delta-step`. |
 | `--delta <float>` | `4` | Delta-stepping bucket width; meaningful for delta-step. |
-| `--max-pathfinder-iters <int>` | `30` | Rip-up/reroute rounds. |
 | `--max-sssp-iters <int>` | `-1` | Delta-step bucket rounds or unit-BFS depth cap; `-1` uses the default. |
-| `--capacity <int>` | `1` | Routing-resource capacity. |
-| `--present-factor <float>` | `1` | Initial present congestion factor. |
-| `--present-multiplier <float>` | `2` | Per-iteration present-factor multiplier. |
-| `--history-factor <float>` | `1` | Historical congestion increment. |
+| `--capacity <int>` | `1` | Capacity used only for overuse diagnostics. |
 | `--net-limit <count>` | unset | Route only the first `count` requests. |
 | `--parallel-net-workers <count>` | `1` | Independent net workers. |
 | `--routes-out <path>` | unset | Write routed PIP tree data as JSONL. |
+| `--max-pathfinder-iters`, `--present-factor`, `--present-multiplier`, `--history-factor`, `--route-batch-size` | ignored | Compatibility-only options accepted by the one-shot router. |
 
 ### `routes_to_phys`
 
@@ -273,7 +264,8 @@ Useful wrapper options:
 | `--interchange-to-csr <path>` | Override converter executable. Env: `INTERCHANGE_TO_CSR`. |
 | `--pathfinder <path>` | Override PathFinder executable. Env: `PATHFINDER_BIN`. |
 | `--routes-to-phys <path>` | Override route reconstructor. Env: `ROUTES_TO_PHYS`. |
-| `--sssp-engine`, `--use-delta-step`, `--delta`, `--max-pathfinder-iters`, `--max-sssp-iters`, `--parallel-net-workers`, `--capacity`, `--present-factor`, `--present-multiplier`, `--history-factor` | Forwarded to `pathfinder`. |
+| `--sssp-engine`, `--use-delta-step`, `--delta`, `--max-sssp-iters`, `--parallel-net-workers`, `--capacity` | Forwarded to `pathfinder`. |
+| `--max-pathfinder-iters`, `--present-factor`, `--present-multiplier`, `--history-factor`, `--route-batch-size` | Compatibility-only; forwarded to `pathfinder` and ignored. |
 | `--full-device`, `--bounds`, `--node-bounds-mode` | Forwarded to `interchange_to_csr`. |
 
 ## File Formats And Artifacts
@@ -302,11 +294,12 @@ CPU-only PathFinder logic test:
 g++ -std=c++17 -O2 \
   -I Routing/tests/fake_hip \
   -I HIP_kernel/bellman_ford/src \
-  -I HIP_kernel/delta_stepping/src \
-  Routing/tests/pathfinder_cpu_stub_test.cpp \
-  -o /tmp/pathfinder_cpu_stub_test
+  -I CongestionFreeRouting/delta_stepping \
+  -I CongestionFreeRouting/unit_bfs \
+  CongestionFreeRouting/tests/pathfinder_cpu_stub_test.cpp \
+  -o /tmp/congestion_free_pathfinder_cpu_stub_test
 
-/tmp/pathfinder_cpu_stub_test
+/tmp/congestion_free_pathfinder_cpu_stub_test
 ```
 
 Python route-writer regression test:
@@ -352,7 +345,7 @@ output, and computes the benchmark score.
 
 ## Development Notes
 
-- `Routing/pathfinder.cpp` does not directly read or write FPGA Interchange
+- `CongestionFreeRouting/pathfinder.cpp` does not directly read or write FPGA Interchange
   `.phys` files; keep interchange concerns in `interchange_to_csr.cpp` and
   `routes_to_phys.cpp`.
 - PathFinder routes against internal route requests from the metadata sidecar.
