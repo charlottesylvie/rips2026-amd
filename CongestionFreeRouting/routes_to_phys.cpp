@@ -43,8 +43,8 @@
 namespace {
 
 constexpr char METADATA_MAGIC[8] = {'R', 'I', 'P', 'S', 'I', 'F', 'M', '1'};
-constexpr std::uint64_t EXPECTED_METADATA_VERSION = 2;
-constexpr std::uint64_t EXPECTED_INCOMING_EDGE_ORIENTATION = 1;
+constexpr std::uint64_t EXPECTED_METADATA_VERSION = 4;
+constexpr std::uint64_t EXPECTED_OUTGOING_EDGE_ORIENTATION = 2;
 constexpr std::uint64_t kInvalidRouteNode =
     std::numeric_limits<std::uint64_t>::max();
 
@@ -381,7 +381,7 @@ RoutingMetadataSummary load_metadata_summary(const std::filesystem::path& path) 
   if (version != EXPECTED_METADATA_VERSION) {
     throw std::runtime_error("unsupported metadata version");
   }
-  if (orientation != EXPECTED_INCOMING_EDGE_ORIENTATION) {
+  if (orientation != EXPECTED_OUTGOING_EDGE_ORIENTATION) {
     throw std::runtime_error("unsupported metadata orientation");
   }
 
@@ -414,6 +414,12 @@ RoutingMetadataSummary load_metadata_summary(const std::filesystem::path& path) 
   }
 
   skip_bytes(in, node_count * sizeof(std::uint64_t), "node ids");
+  skip_bytes(in, node_count * sizeof(std::int32_t), "node min x coordinates");
+  skip_bytes(in, node_count * sizeof(std::int32_t), "node max x coordinates");
+  skip_bytes(in, node_count * sizeof(std::int32_t), "node min y coordinates");
+  skip_bytes(in, node_count * sizeof(std::int32_t), "node max y coordinates");
+  skip_bytes(in, node_count * sizeof(std::uint64_t), "node tile type strings");
+  skip_bytes(in, node_count * sizeof(std::uint64_t), "node wire type strings");
   skip_bytes(in, edge_attr_count * 2 * sizeof(std::uint64_t), "edge attrs");
   skip_bytes(in, pip_data_count * 3 * sizeof(std::uint64_t), "pip data");
   skip_bytes(in, site_pin_attr_count * 3 * sizeof(std::uint64_t), "site pin attrs");

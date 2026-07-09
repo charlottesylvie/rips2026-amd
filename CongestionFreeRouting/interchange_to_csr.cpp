@@ -1,15 +1,14 @@
 // Converts FPGA Interchange DeviceResources plus a design's PhysicalNetlist
-// and LogicalNetlist into the CSR binary format consumed by
-// HIP_kernel/bellman_ford.
+// and LogicalNetlist into the CSR binary format consumed by the
+// CongestionFreeRouting HIP kernels.
 //
-// The primary output is a RIPSCSR1 .csrbin file with the same layout as
-// HIP_kernel/bellman_ford/src/gr_to_csr.cpp:
+// The primary output is a RIPSCSR1 .csrbin file:
 //
-//   CSR row v, column u = routing edge u -> v, with unit edge weight.
+//   CSR row u, column v = routing edge u -> v, with unit edge weight.
 //
-// This incoming-edge orientation is what the min-plus Bellman-Ford kernels
-// expect. A second sidecar file preserves the FPGA-specific NetworkX-style
-// attributes:
+// This outgoing-edge orientation is emitted directly so the low-level HIP
+// kernels can traverse source frontiers without first transposing the graph.
+// A second sidecar file preserves the FPGA-specific NetworkX-style attributes:
 //
 //   edge attribute "pip" = (tileName, pipDataIndex)
 //   pipData[pipDataIndex] = (wire0Name, wire1Name, forward)
@@ -19,7 +18,7 @@
 // and source site pins, logical net summaries extracted from LogicalNetlist,
 // and the original decompressed .phys/.netlist payloads. That metadata is
 // intentionally CPU-side: the GPU CSR remains compact and compatible with the
-// current Bellman-Ford readers, while later post-processing has enough context
+// routing kernels, while later post-processing has enough context
 // to turn SSSP paths back into PhysPIP route branches in a routed .phys file.
 //
 // Expected generated schema headers:
@@ -73,9 +72,9 @@
 
 namespace {
 
-// Keep the on-disk binary formats explicit. The CSR constants match the
-// existing Bellman-Ford loader; the metadata constants identify the sidecar
-// that stores FPGA-specific information not present in plain CSR.
+// Keep the on-disk binary formats explicit. The CSR constants identify the
+// generic graph payload; the metadata constants identify the sidecar that
+// stores FPGA-specific information not present in plain CSR.
 static_assert(sizeof(std::int64_t) == 8, "int64_t must be 8 bytes");
 static_assert(sizeof(std::int32_t) == 4, "int32_t must be 4 bytes");
 static_assert(sizeof(float) == 4, "float must be 4 bytes");
@@ -83,8 +82,8 @@ static_assert(sizeof(float) == 4, "float must be 4 bytes");
 constexpr char CSR_MAGIC[8] = {'R', 'I', 'P', 'S', 'C', 'S', 'R', '1'};
 constexpr char METADATA_MAGIC[8] = {'R', 'I', 'P', 'S', 'I', 'F', 'M', '1'};
 constexpr std::uint64_t CSR_FORMAT_VERSION = 1;
-constexpr std::uint64_t METADATA_FORMAT_VERSION = 2;
-constexpr std::uint64_t INCOMING_EDGE_ORIENTATION = 1;
+constexpr std::uint64_t METADATA_FORMAT_VERSION = 4;
+constexpr std::uint64_t OUTGOING_EDGE_ORIENTATION = 2;
 constexpr std::uint64_t kNoIndex =
     std::numeric_limits<std::uint64_t>::max();
 constexpr std::uint64_t kNoLogicalNetIndex = kNoIndex;
@@ -205,7 +204,7 @@ struct EdgeAttr {
 };
 
 // Temporary edge representation while building the graph in natural routing
-// direction. The final CSR is written in incoming-edge orientation.
+// direction. The final CSR preserves this outgoing-edge orientation.
 struct BuildEdge {
   NodeId from = 0;
   NodeId to = 0;
@@ -257,8 +256,10 @@ struct LogicalCellSummary {
   std::uint64_t net_count = 0;
 };
 
-// Plain CSR payload consumed by HIP_kernel/bellman_ford. edge_attrs is kept in
+// Plain CSR payload consumed by the HIP routing kernels. edge_attrs is kept in
 // the same order as colind/values so each CSR edge can recover its PIP metadata.
+// values is the separate float edge_weight[]; node coordinate ranges plus
+// tile/wire type metadata stay in the sidecar, not interleaved with edges.
 struct CsrGraph {
   std::int64_t rows = 0;
   std::int64_t cols = 0;
@@ -276,6 +277,12 @@ struct CsrGraph {
 struct RoutingGraph {
   StringTable string_table;
   std::vector<std::uint64_t> node_device_ids;
+  std::vector<std::int32_t> node_min_x;
+  std::vector<std::int32_t> node_max_x;
+  std::vector<std::int32_t> node_min_y;
+  std::vector<std::int32_t> node_max_y;
+  std::vector<std::uint64_t> node_tile_type_strings;
+  std::vector<std::uint64_t> node_wire_type_strings;
   std::vector<BuildEdge> edges;
   std::vector<PipData> pip_data;
   std::uint64_t raw_edges_seen = 0;
@@ -935,6 +942,7 @@ void build_device_routing_graph(const std::filesystem::path& device_path,
   const auto tile_types = device.getTileTypeList();
   const auto wires = device.getWires();
   const auto nodes = device.getNodes();
+  const auto wire_types = device.getWireTypes();
 
   // First pass over tileList: keep only tiles whose names carry X/Y coordinates
   // inside the selected bounds. Store the FPGAIF StringIdx values exactly like
@@ -942,10 +950,13 @@ void build_device_routing_graph(const std::filesystem::path& device_path,
   // StringIdx.
   std::unordered_set<std::uint32_t> in_bounds_tile_name_ids;
   std::vector<std::uint32_t> in_bounds_tile_indices;
+  std::unordered_map<std::uint32_t, std::uint32_t> tile_index_by_name_id;
+  tile_index_by_name_id.reserve(tile_list.size());
 
   for (std::uint32_t tile_index = 0; tile_index < tile_list.size();
        ++tile_index) {
     const auto tile = tile_list[tile_index];
+    tile_index_by_name_id.emplace(tile.getName(), tile_index);
     const std::string& tile_name = strings.get(tile.getName());
 
     const std::optional<std::pair<int, int>> xy = parse_tile_xy(tile_name);
@@ -1017,9 +1028,71 @@ void build_device_routing_graph(const std::filesystem::path& device_path,
       continue;
     }
 
+    std::uint32_t metadata_wire_index = node_wires[0];
+    if (!base_wire_in_bounds) {
+      for (std::uint32_t wire_offset = 0; wire_offset < node_wires.size();
+           ++wire_offset) {
+        const auto wire = wires[node_wires[wire_offset]];
+        if (in_bounds_tile_name_ids.find(wire.getTile()) !=
+            in_bounds_tile_name_ids.end()) {
+          metadata_wire_index = node_wires[wire_offset];
+          break;
+        }
+      }
+    }
+    const auto metadata_wire = wires[metadata_wire_index];
+    std::int32_t node_min_x = std::numeric_limits<std::int32_t>::max();
+    std::int32_t node_max_x = std::numeric_limits<std::int32_t>::min();
+    std::int32_t node_min_y = std::numeric_limits<std::int32_t>::max();
+    std::int32_t node_max_y = std::numeric_limits<std::int32_t>::min();
+    bool has_node_xy = false;
+    for (std::uint32_t wire_offset = 0; wire_offset < node_wires.size();
+         ++wire_offset) {
+      const auto wire = wires[node_wires[wire_offset]];
+      const std::string& tile_name = strings.get(wire.getTile());
+      const std::optional<std::pair<int, int>> xy = parse_tile_xy(tile_name);
+      if (!xy.has_value()) {
+        continue;
+      }
+      has_node_xy = true;
+      node_min_x = std::min(node_min_x, static_cast<std::int32_t>(xy->first));
+      node_max_x = std::max(node_max_x, static_cast<std::int32_t>(xy->first));
+      node_min_y = std::min(node_min_y, static_cast<std::int32_t>(xy->second));
+      node_max_y = std::max(node_max_y, static_cast<std::int32_t>(xy->second));
+    }
+    if (!has_node_xy) {
+      node_min_x = -1;
+      node_max_x = -1;
+      node_min_y = -1;
+      node_max_y = -1;
+    }
+
+    std::uint64_t node_tile_type_string = kNoStringIndex;
+    const auto tile_index_it = tile_index_by_name_id.find(metadata_wire.getTile());
+    if (tile_index_it != tile_index_by_name_id.end()) {
+      const auto tile = tile_list[tile_index_it->second];
+      const std::uint32_t tile_type_index = tile.getType();
+      if (tile_type_index < tile_types.size()) {
+        node_tile_type_string =
+            graph.string_table.intern(strings.get(tile_types[tile_type_index].getName()));
+      }
+    }
+    std::uint64_t node_wire_type_string = kNoStringIndex;
+    const std::uint32_t wire_type_index = metadata_wire.getType();
+    if (wire_type_index < wire_types.size()) {
+      node_wire_type_string =
+          graph.string_table.intern(strings.get(wire_types[wire_type_index].getName()));
+    }
+
     const NodeId compact_node =
         static_cast<NodeId>(graph.node_device_ids.size());
     graph.node_device_ids.push_back(node_index);
+    graph.node_min_x.push_back(node_min_x);
+    graph.node_max_x.push_back(node_max_x);
+    graph.node_min_y.push_back(node_min_y);
+    graph.node_max_y.push_back(node_max_y);
+    graph.node_tile_type_strings.push_back(node_tile_type_string);
+    graph.node_wire_type_strings.push_back(node_wire_type_string);
 
     for (std::uint32_t wire_offset = 0; wire_offset < node_wires.size();
          ++wire_offset) {
@@ -1383,11 +1456,11 @@ struct CsrEntry {
   EdgeAttr attr;
 };
 
-// Convert the natural directed routing graph into Bellman-Ford CSR:
-//   incoming row v contains columns u for every routing edge u -> v.
+// Convert the natural directed routing graph into outgoing CSR:
+//   row u contains columns v for every routing edge u -> v.
 // Blocked nodes and sink-stop source nodes are filtered out here, so the GPU
-// graph never sees those edges.
-CsrGraph make_incoming_csr(const RoutingGraph& graph) {
+// graph never sees those edges or needs an expensive transpose before routing.
+CsrGraph make_outgoing_csr(const RoutingGraph& graph) {
   CsrGraph csr;
   csr.rows = static_cast<std::int64_t>(graph.node_device_ids.size());
   csr.cols = csr.rows;
@@ -1413,7 +1486,7 @@ CsrGraph make_incoming_csr(const RoutingGraph& graph) {
 
   for (const BuildEdge& edge : graph.edges) {
     if (edge_is_importable(edge)) {
-      ++csr.rowptr[static_cast<std::size_t>(edge.to) + 1];
+      ++csr.rowptr[static_cast<std::size_t>(edge.from) + 1];
     }
   }
 
@@ -1429,9 +1502,9 @@ CsrGraph make_incoming_csr(const RoutingGraph& graph) {
       continue;
     }
 
-    const std::size_t row = static_cast<std::size_t>(edge.to);
+    const std::size_t row = static_cast<std::size_t>(edge.from);
     const std::size_t pos = static_cast<std::size_t>(cursor[row]++);
-    entries[pos] = {edge.from, 1.0f, edge.attr};
+    entries[pos] = {edge.to, 1.0f, edge.attr};
   }
 
   csr.colind.resize(entries.size());
@@ -1481,7 +1554,7 @@ void write_csr_graph(const CsrGraph& graph,
 
   const std::uint64_t nnz = static_cast<std::uint64_t>(graph.values.size());
   write_u64(out, CSR_FORMAT_VERSION, "format version");
-  write_u64(out, INCOMING_EDGE_ORIENTATION, "orientation");
+  write_u64(out, OUTGOING_EDGE_ORIENTATION, "orientation");
   write_u64(out, as_u64(graph.rows, "rows"), "row count");
   write_u64(out, as_u64(graph.cols, "cols"), "column count");
   write_u64(out, graph.declared_edges, "declared edge count");
@@ -1514,6 +1587,12 @@ void write_metadata(const RoutingGraph& graph,
   //   u64 logical_design_name_string
   //   repeated strings: u64 byte_length, bytes
   //   u64[node_count] original DeviceResources node ids
+  //   i32[node_count] min X tile coordinate, or -1
+  //   i32[node_count] max X tile coordinate, or -1
+  //   i32[node_count] min Y tile coordinate, or -1
+  //   i32[node_count] max Y tile coordinate, or -1
+  //   u64[node_count] representative tile-type string index, or kNoIndex
+  //   u64[node_count] representative wire-type string index, or kNoIndex
   //   edge_attr_count records: u64 tile_string, u64 pip_data_index
   //   pip_data_count records: u64 wire0_string, u64 wire1_string, u64 forward
   //   site_pin_attr_count records: u64 node, u64 site_string, u64 pin_string
@@ -1524,6 +1603,14 @@ void write_metadata(const RoutingGraph& graph,
   //   logical_netlist_byte_count raw bytes from decompressed .netlist
   if (metadata_path.has_parent_path()) {
     std::filesystem::create_directories(metadata_path.parent_path());
+  }
+  if (graph.node_min_x.size() != graph.node_device_ids.size() ||
+      graph.node_max_x.size() != graph.node_device_ids.size() ||
+      graph.node_min_y.size() != graph.node_device_ids.size() ||
+      graph.node_max_y.size() != graph.node_device_ids.size() ||
+      graph.node_tile_type_strings.size() != graph.node_device_ids.size() ||
+      graph.node_wire_type_strings.size() != graph.node_device_ids.size()) {
+    throw std::runtime_error("node metadata arrays do not match node count");
   }
 
   std::ofstream out(metadata_path, std::ios::binary);
@@ -1552,7 +1639,7 @@ void write_metadata(const RoutingGraph& graph,
   }
 
   write_u64(out, METADATA_FORMAT_VERSION, "metadata format version");
-  write_u64(out, INCOMING_EDGE_ORIENTATION, "metadata orientation");
+  write_u64(out, OUTGOING_EDGE_ORIENTATION, "metadata orientation");
   write_u64(out, static_cast<std::uint64_t>(graph.string_table.strings.size()),
             "string count");
   write_u64(out, static_cast<std::uint64_t>(graph.node_device_ids.size()),
@@ -1594,8 +1681,14 @@ void write_metadata(const RoutingGraph& graph,
   }
 
   // For each compact CSR node, preserve the original DeviceResources node
-  // index. This gives later code a bridge back to FPGAIF device data.
+  // index plus lightweight physical metadata useful to GPU cost models.
   write_array(out, graph.node_device_ids, "device node ids");
+  write_array(out, graph.node_min_x, "node min x coordinates");
+  write_array(out, graph.node_max_x, "node max x coordinates");
+  write_array(out, graph.node_min_y, "node min y coordinates");
+  write_array(out, graph.node_max_y, "node max y coordinates");
+  write_array(out, graph.node_tile_type_strings, "node tile type strings");
+  write_array(out, graph.node_wire_type_strings, "node wire type strings");
 
   // Edge attributes are aligned exactly with CSR colind/values order. For edge
   // k, csr.colind[k], csr.values[k], and edge_attrs[k] describe one PIP edge.
@@ -1622,7 +1715,7 @@ void write_metadata(const RoutingGraph& graph,
   }
 
   // Route requests preserve net -> source nodes and sink nodes. A future
-  // router can run shortest paths/Bellman-Ford over the CSR using these node
+  // router can run shortest paths over the CSR using these node
   // IDs, then recover PIPs through edge_attrs and pip_data. logical_net_index
   // links the physical route request back to LogicalNetlist metadata when a
   // net-name match was available.
@@ -1749,7 +1842,7 @@ int main(int argc, char** argv) {
 
     // CSR is the GPU-facing graph. Metadata is the CPU-facing FPGA context
     // needed to map CSR edges back to tile/wire PIPs and site-pin targets.
-    CsrGraph csr = make_incoming_csr(graph);
+    CsrGraph csr = make_outgoing_csr(graph);
     write_csr_graph(csr, options.output_path);
     write_metadata(graph, csr, options.metadata_path);
 

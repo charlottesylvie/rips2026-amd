@@ -45,8 +45,8 @@ namespace {
 constexpr char CSR_MAGIC[8] = {'R', 'I', 'P', 'S', 'C', 'S', 'R', '1'};
 constexpr char METADATA_MAGIC[8] = {'R', 'I', 'P', 'S', 'I', 'F', 'M', '1'};
 constexpr std::uint64_t EXPECTED_CSR_VERSION = 1;
-constexpr std::uint64_t EXPECTED_METADATA_VERSION = 2;
-constexpr std::uint64_t EXPECTED_INCOMING_EDGE_ORIENTATION = 1;
+constexpr std::uint64_t EXPECTED_METADATA_VERSION = 4;
+constexpr std::uint64_t EXPECTED_OUTGOING_EDGE_ORIENTATION = 2;
 
 std::uint64_t read_u64(std::ifstream& in, const char* name) {
   std::uint64_t value = 0;
@@ -195,6 +195,17 @@ bool tree_contains(const std::vector<std::uint32_t>& tree_seen,
          tree_seen[static_cast<std::size_t>(node)] == tree_stamp;
 }
 
+bool tight_edge(float from_dist, float weight, float to_dist) {
+  if (!std::isfinite(from_dist) || !std::isfinite(to_dist)) {
+    return false;
+  }
+  const float candidate = from_dist + weight;
+  const float error = std::fabs(candidate - to_dist);
+  const float tolerance =
+      1e-3f * std::max({1.0f, std::fabs(candidate), std::fabs(to_dist)});
+  return error <= tolerance;
+}
+
 std::vector<PathEdge> reconstruct_shortest_path_from_tree_dist(
     const HostCsrF32& graph,
     const std::vector<float>& dist,
@@ -215,56 +226,72 @@ std::vector<PathEdge> reconstruct_shortest_path_from_tree_dist(
     return {};
   }
 
-  std::vector<PathEdge> reversed;
-  int current = target;
-  for (minplus_sparse::Offset guard = 0; guard < graph.rows; ++guard) {
-    if (tree_contains(tree_seen, tree_stamp, current)) {
-      *source_out = current;
-      std::reverse(reversed.begin(), reversed.end());
-      return reversed;
+  std::vector<int> parent(static_cast<std::size_t>(graph.rows), -1);
+  std::vector<minplus_sparse::Offset> parent_edge(
+      static_cast<std::size_t>(graph.rows), -1);
+  std::vector<int> queue;
+  queue.reserve(static_cast<std::size_t>(graph.rows));
+  for (int node = 0; node < graph.rows; ++node) {
+    if (!tree_contains(tree_seen, tree_stamp, node) ||
+        !std::isfinite(dist[static_cast<std::size_t>(node)])) {
+      continue;
     }
-
-    const std::size_t row = static_cast<std::size_t>(current);
-    const float current_dist = dist[row];
-    minplus_sparse::Offset best_edge = -1;
-    int best_pred = -1;
-    float best_error = std::numeric_limits<float>::infinity();
-
-    for (minplus_sparse::Offset edge = graph.rowptr[row];
-         edge < graph.rowptr[row + 1];
-         ++edge) {
-      const int pred = graph.colind[static_cast<std::size_t>(edge)];
-      if (pred == current) {
-        continue;
-      }
-      const float pred_dist = dist[static_cast<std::size_t>(pred)];
-      if (!std::isfinite(pred_dist)) {
-        continue;
-      }
-      const float candidate =
-          pred_dist + graph.values[static_cast<std::size_t>(edge)];
-      const float error = std::fabs(candidate - current_dist);
-      const float tolerance =
-          1e-3f * std::max({1.0f, std::fabs(candidate), std::fabs(current_dist)});
-      if (error <= tolerance && error < best_error) {
-        best_error = error;
-        best_edge = edge;
-        best_pred = pred;
-      }
-    }
-
-    if (best_edge < 0) {
-      throw std::runtime_error("could not reconstruct shortest path predecessor");
-    }
-
-    reversed.push_back({best_pred,
-                        current,
-                        best_edge,
-                        graph.values[static_cast<std::size_t>(best_edge)]});
-    current = best_pred;
+    parent[static_cast<std::size_t>(node)] = node;
+    queue.push_back(node);
   }
 
-  throw std::runtime_error("shortest path reconstruction did not reach route tree");
+  for (std::size_t head = 0; head < queue.size(); ++head) {
+    const int u = queue[head];
+    if (u == target) {
+      break;
+    }
+    const float du = dist[static_cast<std::size_t>(u)];
+    for (minplus_sparse::Offset edge = graph.rowptr[static_cast<std::size_t>(u)];
+         edge < graph.rowptr[static_cast<std::size_t>(u + 1)];
+         ++edge) {
+      const int v = graph.colind[static_cast<std::size_t>(edge)];
+      const std::size_t v_index = static_cast<std::size_t>(v);
+      if (parent[v_index] >= 0 || v == u) {
+        continue;
+      }
+      if (!tight_edge(du,
+                      graph.values[static_cast<std::size_t>(edge)],
+                      dist[v_index])) {
+        continue;
+      }
+      parent[v_index] = u;
+      parent_edge[v_index] = edge;
+      queue.push_back(v);
+      if (v == target) {
+        head = queue.size();
+        break;
+      }
+    }
+  }
+
+  if (parent[static_cast<std::size_t>(target)] < 0) {
+    throw std::runtime_error("could not reconstruct shortest path through outgoing CSR");
+  }
+
+  std::vector<PathEdge> reversed;
+  for (int current = target;
+       parent[static_cast<std::size_t>(current)] != current;) {
+    const int pred = parent[static_cast<std::size_t>(current)];
+    const minplus_sparse::Offset edge =
+        parent_edge[static_cast<std::size_t>(current)];
+    if (!valid_node(pred, graph.rows) || edge < 0) {
+      throw std::runtime_error("shortest path reconstruction found an invalid predecessor");
+    }
+    reversed.push_back({pred,
+                        current,
+                        edge,
+                        graph.values[static_cast<std::size_t>(edge)]});
+    current = pred;
+  }
+
+  *source_out = reversed.empty() ? target : reversed.back().from;
+  std::reverse(reversed.begin(), reversed.end());
+  return reversed;
 }
 
 std::vector<PathEdge> reconstruct_shortest_path_from_tree_pred(
@@ -298,9 +325,9 @@ std::vector<PathEdge> reconstruct_shortest_path_from_tree_pred(
     const int pred = sssp.pred_node[current_index];
     const minplus_sparse::Offset edge = sssp.pred_edge[current_index];
     if (!valid_node(pred, graph.rows) ||
-        edge < graph.rowptr[current_index] ||
-        edge >= graph.rowptr[current_index + 1] ||
-        graph.colind[static_cast<std::size_t>(edge)] != pred) {
+        edge < graph.rowptr[static_cast<std::size_t>(pred)] ||
+        edge >= graph.rowptr[static_cast<std::size_t>(pred + 1)] ||
+        graph.colind[static_cast<std::size_t>(edge)] != current) {
       return reconstruct_shortest_path_from_tree_dist(
           graph, sssp.dist, tree_seen, tree_stamp, target, source_out);
     }
@@ -474,9 +501,9 @@ RoutedNet route_net(const HostCsrF32& graph,
               sssp.target_path_edges[static_cast<std::size_t>(edge_index)];
           if (!valid_node(from, graph.rows) ||
               !valid_node(to, graph.rows) ||
-              csr_edge < graph.rowptr[static_cast<std::size_t>(to)] ||
-              csr_edge >= graph.rowptr[static_cast<std::size_t>(to + 1)] ||
-              graph.colind[static_cast<std::size_t>(csr_edge)] != from) {
+              csr_edge < graph.rowptr[static_cast<std::size_t>(from)] ||
+              csr_edge >= graph.rowptr[static_cast<std::size_t>(from + 1)] ||
+              graph.colind[static_cast<std::size_t>(csr_edge)] != to) {
             valid_path = false;
             break;
           }
@@ -903,7 +930,7 @@ HostCsrF32 load_csrbin(const std::filesystem::path& path) {
   if (version != EXPECTED_CSR_VERSION) {
     throw std::runtime_error("unsupported CSR format version");
   }
-  if (orientation != EXPECTED_INCOMING_EDGE_ORIENTATION) {
+  if (orientation != EXPECTED_OUTGOING_EDGE_ORIENTATION) {
     throw std::runtime_error("unsupported CSR orientation");
   }
 
@@ -956,7 +983,7 @@ RoutingMetadata load_interchange_metadata(const std::filesystem::path& path) {
   if (version != EXPECTED_METADATA_VERSION) {
     throw std::runtime_error("unsupported metadata format version");
   }
-  if (orientation != EXPECTED_INCOMING_EDGE_ORIENTATION) {
+  if (orientation != EXPECTED_OUTGOING_EDGE_ORIENTATION) {
     throw std::runtime_error("unsupported metadata orientation");
   }
 
@@ -989,6 +1016,30 @@ RoutingMetadata load_interchange_metadata(const std::filesystem::path& path) {
   }
 
   read_array(in, metadata.node_device_ids, node_count, "metadata device node ids");
+  read_array(in,
+             metadata.node_min_x,
+             node_count,
+             "metadata node min x coordinates");
+  read_array(in,
+             metadata.node_max_x,
+             node_count,
+             "metadata node max x coordinates");
+  read_array(in,
+             metadata.node_min_y,
+             node_count,
+             "metadata node min y coordinates");
+  read_array(in,
+             metadata.node_max_y,
+             node_count,
+             "metadata node max y coordinates");
+  read_array(in,
+             metadata.node_tile_type_strings,
+             node_count,
+             "metadata node tile type strings");
+  read_array(in,
+             metadata.node_wire_type_strings,
+             node_count,
+             "metadata node wire type strings");
 
   metadata.edge_attrs.resize(static_cast<std::size_t>(edge_attr_count));
   for (EdgeAttr& attr : metadata.edge_attrs) {
@@ -1081,55 +1132,55 @@ std::vector<PathEdge> reconstruct_shortest_path(const HostCsrF32& graph,
     return {};
   }
 
-  std::vector<PathEdge> reversed;
-  int current = target;
-  for (minplus_sparse::Offset guard = 0; guard < graph.rows && current != source; ++guard) {
-    const std::size_t row = static_cast<std::size_t>(current);
-    const float current_dist = dist[row];
-    minplus_sparse::Offset best_edge = -1;
-    int best_pred = -1;
-    float best_error = std::numeric_limits<float>::infinity();
+  std::vector<int> parent(static_cast<std::size_t>(graph.rows), -1);
+  std::vector<minplus_sparse::Offset> parent_edge(
+      static_cast<std::size_t>(graph.rows), -1);
+  std::vector<int> queue;
+  queue.reserve(static_cast<std::size_t>(graph.rows));
+  parent[static_cast<std::size_t>(source)] = source;
+  queue.push_back(source);
 
-    for (minplus_sparse::Offset edge = graph.rowptr[row];
-         edge < graph.rowptr[row + 1];
+  for (std::size_t head = 0; head < queue.size(); ++head) {
+    const int u = queue[head];
+    if (u == target) {
+      break;
+    }
+    const float du = dist[static_cast<std::size_t>(u)];
+    for (minplus_sparse::Offset edge = graph.rowptr[static_cast<std::size_t>(u)];
+         edge < graph.rowptr[static_cast<std::size_t>(u + 1)];
          ++edge) {
-      const int pred = graph.colind[static_cast<std::size_t>(edge)];
-      if (pred == current) {
+      const int v = graph.colind[static_cast<std::size_t>(edge)];
+      const std::size_t v_index = static_cast<std::size_t>(v);
+      if (parent[v_index] >= 0 || v == u ||
+          !tight_edge(du, graph.values[static_cast<std::size_t>(edge)], dist[v_index])) {
         continue;
       }
-      const float pred_dist = dist[static_cast<std::size_t>(pred)];
-      if (!std::isfinite(pred_dist)) {
-        continue;
-      }
-      const float candidate =
-          pred_dist + graph.values[static_cast<std::size_t>(edge)];
-      const float error = std::fabs(candidate - current_dist);
-      const float tolerance =
-          1e-3f * std::max({1.0f, std::fabs(candidate), std::fabs(current_dist)});
-      if (error <= tolerance && error < best_error) {
-        best_error = error;
-        best_edge = edge;
-        best_pred = pred;
+      parent[v_index] = u;
+      parent_edge[v_index] = edge;
+      queue.push_back(v);
+      if (v == target) {
+        head = queue.size();
+        break;
       }
     }
-
-    if (best_edge < 0) {
-      throw std::runtime_error("could not reconstruct shortest path predecessor");
-    }
-
-    PathEdge path_edge;
-    path_edge.from = best_pred;
-    path_edge.to = current;
-    path_edge.csr_edge = best_edge;
-    path_edge.cost = graph.values[static_cast<std::size_t>(best_edge)];
-    reversed.push_back(path_edge);
-    current = best_pred;
   }
 
-  if (current != source) {
-    throw std::runtime_error("shortest path reconstruction did not reach source");
+  if (parent[static_cast<std::size_t>(target)] < 0) {
+    throw std::runtime_error("shortest path reconstruction did not reach target");
   }
 
+  std::vector<PathEdge> reversed;
+  for (int current = target;
+       parent[static_cast<std::size_t>(current)] != current;) {
+    const int pred = parent[static_cast<std::size_t>(current)];
+    const minplus_sparse::Offset edge =
+        parent_edge[static_cast<std::size_t>(current)];
+    reversed.push_back({pred,
+                        current,
+                        edge,
+                        graph.values[static_cast<std::size_t>(edge)]});
+    current = pred;
+  }
   std::reverse(reversed.begin(), reversed.end());
   return reversed;
 }
@@ -1142,6 +1193,15 @@ PathfinderResult run_pathfinder(const HostCsrF32& base_graph,
   validate_options(options);
   if (metadata.node_device_ids.size() != static_cast<std::size_t>(base_graph.rows)) {
     throw std::runtime_error("metadata node count does not match CSR row count");
+  }
+  if (metadata.node_min_x.size() != metadata.node_device_ids.size() ||
+      metadata.node_max_x.size() != metadata.node_device_ids.size() ||
+      metadata.node_min_y.size() != metadata.node_device_ids.size() ||
+      metadata.node_max_y.size() != metadata.node_device_ids.size() ||
+      metadata.node_tile_type_strings.size() != metadata.node_device_ids.size() ||
+      metadata.node_wire_type_strings.size() != metadata.node_device_ids.size()) {
+    throw std::runtime_error(
+        "metadata node coordinate range/tile/wire type arrays do not match node count");
   }
   if (metadata.edge_attrs.size() != static_cast<std::size_t>(base_graph.nnz)) {
     throw std::runtime_error("metadata edge attributes do not match CSR nnz");
@@ -1290,7 +1350,10 @@ void write_routes_jsonl(const std::filesystem::path& path,
         if (path_edge.csr_edge < 0 ||
             path_edge.csr_edge >= graph.nnz ||
             !valid_node(path_edge.from, graph.rows) ||
-            !valid_node(path_edge.to, graph.rows)) {
+            !valid_node(path_edge.to, graph.rows) ||
+            path_edge.csr_edge < graph.rowptr[static_cast<std::size_t>(path_edge.from)] ||
+            path_edge.csr_edge >= graph.rowptr[static_cast<std::size_t>(path_edge.from + 1)] ||
+            graph.colind[static_cast<std::size_t>(path_edge.csr_edge)] != path_edge.to) {
           throw std::runtime_error("pathfinder result contains an invalid path edge");
         }
         if (!seen_edges.insert(edge_key(path_edge.from, path_edge.to)).second) {

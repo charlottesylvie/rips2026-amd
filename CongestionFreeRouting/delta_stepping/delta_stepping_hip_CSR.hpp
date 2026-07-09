@@ -7,10 +7,10 @@
 #include <memory>
 #include <vector>
 
-// Delta-Stepping SSSP for nonnegative edge weights over the same incoming-edge
-// CSR convention used by bellman_ford_minplus_hip_csr:
-//   adjacency row v, column u = weight of directed edge u -> v.
-// The implementation internally builds an outgoing CSR transpose on the GPU.
+// Delta-Stepping SSSP for nonnegative edge weights over outgoing-edge CSR:
+//   adjacency row u, column v = weight of directed edge u -> v.
+// The converter emits this orientation directly so the kernel can traverse
+// frontiers without an O(E) GPU transpose.
 using DeltaSteppingCsrProgress = BellmanFordCsrProgress;
 using DeltaSteppingCsrProgressCallback = BellmanFordCsrProgressCallback;
 using DeltaSteppingCsrResult = BellmanFordCsrResult;

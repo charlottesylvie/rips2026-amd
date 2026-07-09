@@ -276,15 +276,15 @@ Useful wrapper options:
 | `<benchmark>.netlist` | Contest setup | Matching logical netlist. |
 | `xcvu3p.device` | RapidWright | FPGA Interchange device resources for the target part. |
 | `.csrbin` | `interchange_to_csr` | Internal CSR routing graph. |
-| `.csrbin.ifmeta.bin` | `interchange_to_csr` | Metadata sidecar with string table, PIP data, site pins, logical summaries, and route requests. |
+| `.csrbin.ifmeta.bin` | `interchange_to_csr` | Metadata sidecar with string table, node coordinate ranges, tile/wire type IDs, PIP data, site pins, logical summaries, and route requests. |
 | `.routes.jsonl` | `pathfinder` | One JSON object per net containing sources, sinks, and selected PIP edges. |
 | `<benchmark>_PathFinderFile.phys` | `routes_to_phys` | Routed physical netlist. |
 | `.check` / `.check.log` | Makefile checker | `PASS` or `FAIL` plus checker output. |
 | `.wirelength` | Makefile wirelength analyzer | Routed design wirelength report. |
 
-CSR orientation is incoming-edge: row `v`, column `u` represents directed edge
-`u -> v`. This convention appears in both the converter and the shortest-path
-kernels.
+CSR orientation is outgoing-edge: row `u`, column `v` represents directed edge
+`u -> v`. Edge weights are stored as a separate `float` array aligned with
+`colind`; node coordinate ranges and tile/wire type metadata stay in the sidecar.
 
 ## Testing
 

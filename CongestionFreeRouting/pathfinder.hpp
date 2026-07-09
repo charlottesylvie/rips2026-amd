@@ -42,6 +42,12 @@ struct RouteRequest {
 struct RoutingMetadata {
   std::vector<std::string> strings;
   std::vector<std::uint64_t> node_device_ids;
+  std::vector<std::int32_t> node_min_x;
+  std::vector<std::int32_t> node_max_x;
+  std::vector<std::int32_t> node_min_y;
+  std::vector<std::int32_t> node_max_y;
+  std::vector<std::uint64_t> node_tile_type_strings;
+  std::vector<std::uint64_t> node_wire_type_strings;
   std::vector<EdgeAttr> edge_attrs;
   std::vector<PipData> pip_data;
   std::vector<SitePinNode> site_pin_attrs;

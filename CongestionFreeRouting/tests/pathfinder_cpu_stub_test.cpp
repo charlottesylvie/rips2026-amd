@@ -16,7 +16,7 @@ struct CpuSsspResult {
   std::vector<minplus_sparse::Offset> pred_edge;
 };
 
-CpuSsspResult cpu_dijkstra_incoming_csr_multi(const HostCsrF32& graph,
+CpuSsspResult cpu_dijkstra_outgoing_csr_multi(const HostCsrF32& graph,
                                               const std::vector<int>& sources) {
   struct OutEdge {
     int to = -1;
@@ -26,11 +26,11 @@ CpuSsspResult cpu_dijkstra_incoming_csr_multi(const HostCsrF32& graph,
 
   std::vector<std::vector<OutEdge>> outgoing(
       static_cast<std::size_t>(graph.rows));
-  for (int dst = 0; dst < graph.rows; ++dst) {
-    for (minplus_sparse::Offset edge = graph.rowptr[static_cast<std::size_t>(dst)];
-         edge < graph.rowptr[static_cast<std::size_t>(dst + 1)];
+  for (int src = 0; src < graph.rows; ++src) {
+    for (minplus_sparse::Offset edge = graph.rowptr[static_cast<std::size_t>(src)];
+         edge < graph.rowptr[static_cast<std::size_t>(src + 1)];
          ++edge) {
-      const int src = graph.colind[static_cast<std::size_t>(edge)];
+      const int dst = graph.colind[static_cast<std::size_t>(edge)];
       const float weight = graph.values[static_cast<std::size_t>(edge)];
       outgoing[static_cast<std::size_t>(src)].push_back({dst, weight, edge});
     }
@@ -67,9 +67,9 @@ CpuSsspResult cpu_dijkstra_incoming_csr_multi(const HostCsrF32& graph,
   return result;
 }
 
-std::vector<float> cpu_dijkstra_incoming_csr(const HostCsrF32& graph,
+std::vector<float> cpu_dijkstra_outgoing_csr(const HostCsrF32& graph,
                                              int source) {
-  return cpu_dijkstra_incoming_csr_multi(graph, std::vector<int>{source}).dist;
+  return cpu_dijkstra_outgoing_csr_multi(graph, std::vector<int>{source}).dist;
 }
 
 void fill_compact_target_paths(const HostCsrF32& graph,
@@ -140,14 +140,24 @@ void require(bool condition, const char* message) {
   }
 }
 
+void add_default_node_metadata(routing::RoutingMetadata& metadata) {
+  const std::size_t node_count = metadata.node_device_ids.size();
+  metadata.node_min_x.assign(node_count, 0);
+  metadata.node_max_x.assign(node_count, 0);
+  metadata.node_min_y.assign(node_count, 0);
+  metadata.node_max_y.assign(node_count, 0);
+  metadata.node_tile_type_strings.assign(node_count, routing::kNoIndex);
+  metadata.node_wire_type_strings.assign(node_count, routing::kNoIndex);
+}
+
 HostCsrF32 make_tree_graph() {
   HostCsrF32 graph;
   graph.rows = 4;
   graph.cols = 4;
   graph.nnz = 4;
-  graph.rowptr = {0, 0, 1, 2, 4};
-  graph.colind = {0, 1, 1, 0};
-  graph.values = {1.0f, 1.0f, 1.0f, 10.0f};
+  graph.rowptr = {0, 2, 4, 4, 4};
+  graph.colind = {1, 3, 2, 3};
+  graph.values = {1.0f, 10.0f, 1.0f, 1.0f};
   return graph;
 }
 
@@ -156,8 +166,8 @@ HostCsrF32 make_self_loop_predecessor_graph() {
   graph.rows = 4;
   graph.cols = 4;
   graph.nnz = 2;
-  graph.rowptr = {0, 0, 0, 2, 2};
-  graph.colind = {2, 3};
+  graph.rowptr = {0, 0, 0, 1, 2};
+  graph.colind = {2, 2};
   graph.values = {0.0f, 1.0f};
   return graph;
 }
@@ -167,8 +177,8 @@ HostCsrF32 make_two_net_congestion_graph() {
   graph.rows = 6;
   graph.cols = 6;
   graph.nnz = 6;
-  graph.rowptr = {0, 0, 0, 2, 3, 4, 6};
-  graph.colind = {0, 1, 1, 2, 2, 3};
+  graph.rowptr = {0, 1, 3, 5, 6, 6, 6};
+  graph.colind = {2, 2, 3, 4, 5, 5};
   graph.values = {1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f};
   return graph;
 }
@@ -178,8 +188,8 @@ HostCsrF32 make_three_net_overlap_graph() {
   graph.rows = 8;
   graph.cols = 8;
   graph.nnz = 5;
-  graph.rowptr = {0, 0, 0, 2, 2, 3, 4, 4, 5};
-  graph.colind = {0, 1, 2, 2, 6};
+  graph.rowptr = {0, 1, 2, 4, 4, 4, 4, 5, 5};
+  graph.colind = {2, 2, 4, 5, 7};
   graph.values = {1.0f, 1.0f, 1.0f, 1.0f, 1.0f};
   return graph;
 }
@@ -191,6 +201,7 @@ routing::RoutingMetadata make_metadata() {
                       "TILE_A",    "WIRE_0",   "WIRE_1", "WIRE_2",
                       "WIRE_3"};
   metadata.node_device_ids = {0, 1, 2, 3};
+  add_default_node_metadata(metadata);
   metadata.edge_attrs = {
       {7, 0},
       {7, 1},
@@ -219,6 +230,7 @@ routing::RoutingMetadata make_three_net_overlap_metadata(const HostCsrF32& graph
                       "SRC_SITE_C", "SRC_PIN", "SINK_SITE_A", "SINK_SITE_B",
                       "SINK_SITE_C", "SINK_PIN", "TILE_A", "WIRE_0", "WIRE_1"};
   metadata.node_device_ids = {0, 1, 2, 3, 4, 5, 6, 7};
+  add_default_node_metadata(metadata);
   metadata.edge_attrs.assign(static_cast<std::size_t>(graph.nnz), {11, 0});
   metadata.pip_data = {{12, 13, true}};
 
@@ -249,6 +261,7 @@ routing::RoutingMetadata make_two_net_metadata(const HostCsrF32& graph) {
                       "SRC_PIN", "SINK_SITE_A", "SINK_SITE_B", "SINK_PIN",
                       "TILE_A", "WIRE_0", "WIRE_1"};
   metadata.node_device_ids = {0, 1, 2, 3, 4, 5};
+  add_default_node_metadata(metadata);
   metadata.edge_attrs.assign(static_cast<std::size_t>(graph.nnz), {8, 0});
   metadata.pip_data = {{9, 10, true}};
 
@@ -299,11 +312,12 @@ void DeltaSteppingCsrWorkspace::update_vertex_costs(
     hipStream_t stream) {
   (void)stream;
   impl_->graph.values.resize(impl_->base_values.size());
-  for (int dst = 0; dst < impl_->graph.rows; ++dst) {
-    const float node_cost = vertex_costs[static_cast<std::size_t>(dst)];
-    for (minplus_sparse::Offset edge = impl_->graph.rowptr[static_cast<std::size_t>(dst)];
-         edge < impl_->graph.rowptr[static_cast<std::size_t>(dst + 1)];
+  for (int src = 0; src < impl_->graph.rows; ++src) {
+    for (minplus_sparse::Offset edge = impl_->graph.rowptr[static_cast<std::size_t>(src)];
+         edge < impl_->graph.rowptr[static_cast<std::size_t>(src + 1)];
          ++edge) {
+      const int dst = impl_->graph.colind[static_cast<std::size_t>(edge)];
+      const float node_cost = vertex_costs[static_cast<std::size_t>(dst)];
       impl_->graph.values[static_cast<std::size_t>(edge)] =
           impl_->base_values[static_cast<std::size_t>(edge)] * node_cost;
     }
@@ -410,7 +424,7 @@ DeltaSteppingCsrResult delta_stepping_minplus_hip_csr(
 
   DeltaSteppingCsrResult result;
   result.target = target;
-  CpuSsspResult cpu_result = cpu_dijkstra_incoming_csr_multi(adjacency, sources);
+  CpuSsspResult cpu_result = cpu_dijkstra_outgoing_csr_multi(adjacency, sources);
   result.dist = std::move(cpu_result.dist);
   result.pred_node = std::move(cpu_result.pred_node);
   result.pred_edge = std::move(cpu_result.pred_edge);
@@ -459,7 +473,7 @@ UnitBfsCsrResult UnitBfsCsrWorkspace::run(
   ++g_unit_bfs_calls;
 
   UnitBfsCsrResult result;
-  CpuSsspResult cpu_result = cpu_dijkstra_incoming_csr_multi(impl_->graph, sources);
+  CpuSsspResult cpu_result = cpu_dijkstra_outgoing_csr_multi(impl_->graph, sources);
   fill_compact_target_paths(impl_->graph, sources, targets, cpu_result, result);
   result.target = -1;
   result.iterations_used = 1;
@@ -511,7 +525,7 @@ UnitBfsCsrResult UnitBfsCsrWorkspace::run(
 
 int main() {
   const HostCsrF32 graph = make_tree_graph();
-  const std::vector<float> dist = cpu_dijkstra_incoming_csr(graph, 0);
+  const std::vector<float> dist = cpu_dijkstra_outgoing_csr(graph, 0);
   const std::vector<routing::PathEdge> path =
       routing::reconstruct_shortest_path(graph, dist, 0, 2);
   require(path.size() == 2, "expected two edges in 0->2 reconstructed path");
@@ -520,7 +534,7 @@ int main() {
 
   const HostCsrF32 self_loop_graph = make_self_loop_predecessor_graph();
   const std::vector<float> self_loop_dist =
-      cpu_dijkstra_incoming_csr(self_loop_graph, 3);
+      cpu_dijkstra_outgoing_csr(self_loop_graph, 3);
   const std::vector<routing::PathEdge> self_loop_path =
       routing::reconstruct_shortest_path(self_loop_graph, self_loop_dist, 3, 2);
   require(self_loop_path.size() == 1,
@@ -609,8 +623,8 @@ int main() {
 
   HostCsrF32 unit_graph = graph;
   unit_graph.nnz = 3;
-  unit_graph.rowptr = {0, 0, 1, 2, 3};
-  unit_graph.colind = {0, 1, 1};
+  unit_graph.rowptr = {0, 1, 3, 3, 3};
+  unit_graph.colind = {1, 2, 3};
   unit_graph.values = {1.0f, 1.0f, 1.0f};
   routing::RoutingMetadata metadata = make_metadata();
   metadata.edge_attrs.resize(static_cast<std::size_t>(unit_graph.nnz));

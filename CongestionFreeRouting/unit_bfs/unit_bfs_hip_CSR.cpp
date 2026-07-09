@@ -1,7 +1,6 @@
 #include "unit_bfs_hip_CSR.hpp"
 
 #include <hip/hip_runtime.h>
-#include <rocprim/rocprim.hpp>
 
 #include <algorithm>
 #include <array>
@@ -86,29 +85,12 @@ class DeviceBuffer {
   std::size_t count_ = 0;
 };
 
-struct IncomingCsrOwner {
-  Offset rows = 0;
-  Offset cols = 0;
-  Offset nnz = 0;
-  DeviceBuffer<Offset> rowptr;
-  DeviceBuffer<Index> colind;
-
-  IncomingCsrOwner() = default;
-  IncomingCsrOwner(Offset rows_, Offset cols_, Offset nnz_)
-      : rows(rows_),
-        cols(cols_),
-        nnz(nnz_),
-        rowptr(static_cast<std::size_t>(rows_) + 1),
-        colind(static_cast<std::size_t>(nnz_)) {}
-};
-
 struct OutgoingCsrOwner {
   Offset rows = 0;
   Offset cols = 0;
   Offset nnz = 0;
   DeviceBuffer<Offset> rowptr;
   DeviceBuffer<Index> colind;
-  DeviceBuffer<Offset> incoming_edge;
 
   OutgoingCsrOwner() = default;
   OutgoingCsrOwner(Offset rows_, Offset cols_, Offset nnz_)
@@ -116,8 +98,7 @@ struct OutgoingCsrOwner {
         cols(cols_),
         nnz(nnz_),
         rowptr(static_cast<std::size_t>(rows_) + 1),
-        colind(static_cast<std::size_t>(nnz_)),
-        incoming_edge(static_cast<std::size_t>(nnz_)) {}
+        colind(static_cast<std::size_t>(nnz_)) {}
 };
 
 struct UnitBfsScratch {
@@ -241,7 +222,7 @@ inline void validate_host_csr_arrays(const HostCsrF32& graph) {
   }
   for (std::size_t edge = 0; edge < nnz; ++edge) {
     if (graph.colind[edge] < 0 || static_cast<Offset>(graph.colind[edge]) >= graph.cols) {
-      throw std::invalid_argument("CSR colind contains an out-of-range source vertex");
+      throw std::invalid_argument("CSR colind contains an out-of-range destination vertex");
     }
     if (!std::isfinite(graph.values[edge]) ||
         std::fabs(graph.values[edge] - 1.0f) > 1e-5f) {
@@ -287,18 +268,6 @@ inline void reset_int_zero_async(int* d_value, hipStream_t stream) {
   UNIT_BFS_HIP_CHECK(hipMemsetAsync(d_value, 0, sizeof(int), stream));
 }
 
-__device__ inline Offset atomic_add_offset(Offset* ptr, Offset value) {
-  static_assert(sizeof(Offset) == 4 || sizeof(Offset) == 8,
-                "Offset must be a 32-bit or 64-bit integer type");
-  if constexpr (sizeof(Offset) == 8) {
-    return static_cast<Offset>(atomicAdd(reinterpret_cast<unsigned long long*>(ptr),
-                                         static_cast<unsigned long long>(value)));
-  } else {
-    return static_cast<Offset>(atomicAdd(reinterpret_cast<unsigned int*>(ptr),
-                                         static_cast<unsigned int>(value)));
-  }
-}
-
 __device__ inline void mark_touched(int v,
                                     int* in_touched,
                                     int* touched_queue,
@@ -321,42 +290,6 @@ __device__ inline void count_target_if_reached(int v,
   const int multiplicity = target_multiplicity[v];
   if (multiplicity > 0) {
     atomicAdd(found_count, multiplicity);
-  }
-}
-
-__global__ void count_out_degrees_from_incoming_kernel(Offset rows,
-                                                       const Offset* in_rowptr,
-                                                       const Index* in_colind,
-                                                       Offset* out_degree) {
-  for (Offset dst = static_cast<Offset>(blockIdx.x) * blockDim.x + threadIdx.x;
-       dst < rows;
-       dst += static_cast<Offset>(blockDim.x) * gridDim.x) {
-    for (Offset edge = in_rowptr[dst]; edge < in_rowptr[dst + 1]; ++edge) {
-      const Offset src = static_cast<Offset>(in_colind[edge]);
-      atomic_add_offset(&out_degree[src], static_cast<Offset>(1));
-    }
-  }
-}
-
-__global__ void set_last_rowptr_kernel(Offset* rowptr, Offset rows, Offset nnz) {
-  if (blockIdx.x == 0 && threadIdx.x == 0) rowptr[rows] = nnz;
-}
-
-__global__ void fill_outgoing_from_incoming_kernel(Offset rows,
-                                                   const Offset* in_rowptr,
-                                                   const Index* in_colind,
-                                                   Offset* cursor,
-                                                   Index* out_colind,
-                                                   Offset* out_incoming_edge) {
-  for (Offset dst = static_cast<Offset>(blockIdx.x) * blockDim.x + threadIdx.x;
-       dst < rows;
-       dst += static_cast<Offset>(blockDim.x) * gridDim.x) {
-    for (Offset edge = in_rowptr[dst]; edge < in_rowptr[dst + 1]; ++edge) {
-      const Offset src = static_cast<Offset>(in_colind[edge]);
-      const Offset pos = atomic_add_offset(&cursor[src], static_cast<Offset>(1));
-      out_colind[pos] = static_cast<Index>(dst);
-      out_incoming_edge[pos] = edge;
-    }
   }
 }
 
@@ -445,7 +378,6 @@ __global__ void expand_frontier_kernel(const int* frontier,
                                        int next_level,
                                        const Offset* out_rowptr,
                                        const Index* out_colind,
-                                       const Offset* out_incoming_edge,
                                        int* level,
                                        int* pred_node,
                                        Offset* pred_edge,
@@ -466,7 +398,7 @@ __global__ void expand_frontier_kernel(const int* frontier,
       const int v = static_cast<int>(out_colind[edge]);
       if (atomicCAS(&level[v], kUnvisited, next_level) == kUnvisited) {
         pred_node[v] = u;
-        pred_edge[v] = out_incoming_edge[edge];
+        pred_edge[v] = edge;
         mark_touched(v, in_touched, touched_queue, touched_count,
                      queue_capacity, overflow);
         const int pos = atomicAdd(next_count, 1);
@@ -589,8 +521,8 @@ __global__ void fill_target_paths_kernel(const int* targets,
   }
 }
 
-IncomingCsrOwner copy_host_csr_to_device(const HostCsrF32& host, hipStream_t stream) {
-  IncomingCsrOwner device(host.rows, host.cols, host.nnz);
+OutgoingCsrOwner copy_host_csr_to_device(const HostCsrF32& host, hipStream_t stream) {
+  OutgoingCsrOwner device(host.rows, host.cols, host.nnz);
   const std::size_t rows = checked_size(host.rows, "rows");
   const std::size_t nnz = checked_size(host.nnz, "nnz");
   UNIT_BFS_HIP_CHECK(hipMemcpyAsync(device.rowptr.get(),
@@ -606,69 +538,6 @@ IncomingCsrOwner copy_host_csr_to_device(const HostCsrF32& host, hipStream_t str
                                       stream));
   }
   return device;
-}
-
-OutgoingCsrOwner build_outgoing_csr_from_incoming(const IncomingCsrOwner& incoming,
-                                                  hipStream_t stream) {
-  OutgoingCsrOwner outgoing(incoming.rows, incoming.cols, incoming.nnz);
-  DeviceBuffer<Offset> degree(static_cast<std::size_t>(incoming.rows));
-  DeviceBuffer<Offset> cursor(static_cast<std::size_t>(incoming.rows));
-
-  UNIT_BFS_HIP_CHECK(hipMemsetAsync(degree.get(),
-                                    0,
-                                    static_cast<std::size_t>(incoming.rows) * sizeof(Offset),
-                                    stream));
-  count_out_degrees_from_incoming_kernel<<<grid_for_items(incoming.rows),
-                                           kBlockSize,
-                                           0,
-                                           stream>>>(
-      incoming.rows, incoming.rowptr.get(), incoming.colind.get(), degree.get());
-  UNIT_BFS_HIP_CHECK(hipGetLastError());
-
-  std::size_t temp_bytes = 0;
-  const std::size_t scan_items = static_cast<std::size_t>(incoming.rows);
-  UNIT_BFS_HIP_CHECK(rocprim::exclusive_scan(nullptr,
-                                             temp_bytes,
-                                             degree.get(),
-                                             outgoing.rowptr.get(),
-                                             static_cast<Offset>(0),
-                                             scan_items,
-                                             rocprim::plus<Offset>(),
-                                             stream));
-  DeviceBuffer<unsigned char> temp(temp_bytes);
-  UNIT_BFS_HIP_CHECK(rocprim::exclusive_scan(temp.get(),
-                                             temp_bytes,
-                                             degree.get(),
-                                             outgoing.rowptr.get(),
-                                             static_cast<Offset>(0),
-                                             scan_items,
-                                             rocprim::plus<Offset>(),
-                                             stream));
-
-  set_last_rowptr_kernel<<<1, 1, 0, stream>>>(outgoing.rowptr.get(),
-                                              incoming.rows,
-                                              incoming.nnz);
-  UNIT_BFS_HIP_CHECK(hipGetLastError());
-  UNIT_BFS_HIP_CHECK(hipMemcpyAsync(cursor.get(),
-                                    outgoing.rowptr.get(),
-                                    static_cast<std::size_t>(incoming.rows) * sizeof(Offset),
-                                    hipMemcpyDeviceToDevice,
-                                    stream));
-
-  if (incoming.nnz != 0) {
-    fill_outgoing_from_incoming_kernel<<<grid_for_items(incoming.rows),
-                                         kBlockSize,
-                                         0,
-                                         stream>>>(
-        incoming.rows,
-        incoming.rowptr.get(),
-        incoming.colind.get(),
-        cursor.get(),
-        outgoing.colind.get(),
-        outgoing.incoming_edge.get());
-    UNIT_BFS_HIP_CHECK(hipGetLastError());
-  }
-  return outgoing;
 }
 
 void initialize_scratch_once(UnitBfsScratch& scratch, Offset rows, hipStream_t stream) {
@@ -926,7 +795,6 @@ UnitBfsCsrResult run_unit_bfs_impl(const OutgoingCsrOwner& outgoing,
         depth + 1,
         outgoing.rowptr.get(),
         outgoing.colind.get(),
-        outgoing.incoming_edge.get(),
         scratch.level.get(),
         scratch.pred_node.get(),
         scratch.pred_edge.get(),
@@ -974,13 +842,11 @@ UnitBfsCsrResult run_unit_bfs_impl(const OutgoingCsrOwner& outgoing,
 }  // namespace unit_bfs_detail
 
 struct UnitBfsCsrWorkspace::Impl {
-  unit_bfs_detail::IncomingCsrOwner incoming;
   unit_bfs_detail::OutgoingCsrOwner outgoing;
   unit_bfs_detail::UnitBfsScratch scratch;
 
   Impl(const HostCsrF32& host, hipStream_t stream)
-      : incoming(unit_bfs_detail::copy_host_csr_to_device(host, stream)),
-        outgoing(unit_bfs_detail::build_outgoing_csr_from_incoming(incoming, stream)),
+      : outgoing(unit_bfs_detail::copy_host_csr_to_device(host, stream)),
         scratch(host.rows) {}
 };
 
