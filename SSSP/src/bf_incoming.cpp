@@ -1,17 +1,18 @@
-// Runs HIP Bellman-Ford from route sources listed in a RIPS interchange
-// metadata sidecar and writes validator-compatible shortest-path JSONL.
+// Runs HIP incoming-scan SSSP from route sources listed in a RIPS
+// interchange metadata sidecar and writes validator-compatible shortest-path
+// JSONL.
 //
 // Build from rips2026-amd on an AMD ROCm/HIP machine:
 //   hipcc -std=c++17 -O3 -x hip \
 //     -I HIP_kernel/bellman_ford/src \
 //     -I HIP_kernel/minplus_mm/src \
-//     SSSP/src/bf_for_validation.cpp \
+//     SSSP/src/bf_incoming.cpp \
 //     HIP_kernel/bellman_ford/src/bf_hip_CSR.cpp \
 //     HIP_kernel/minplus_mm/src/minplus_sparse_hip.cpp \
-//     -o bf_for_validation
+//     -o bf_incoming
 //
 // Run:
-//   ./bf_for_validation graph.csrbin graph.csrbin.ifmeta.bin paths.jsonl
+//   ./bf_incoming data/logicnets_jscl.csrbin data/logicnets_jscl.csrbin.ifmeta.bin paths.jsonl
 
 #include "../../HIP_kernel/bellman_ford/src/bf_hip_CSR.hpp"
 #include "../../HIP_kernel/bellman_ford/src/bf_hip_CSR_device_utils.hpp"
@@ -93,17 +94,10 @@ struct Options {
   std::size_t net_limit = 0;
   std::size_t source_limit = 0;
   std::size_t query_limit = 0;
-  int bf_progress_every = 0;
+  std::size_t source_progress_every = 100;
   double abs_tolerance = 1e-3;
   double rel_tolerance = 1e-5;
   bool include_unreached = true;
-};
-
-struct BfProgressContext {
-  int source = -1;
-  std::size_t source_index = 0;
-  std::size_t source_count = 0;
-  int print_every = 0;
 };
 
 std::uint64_t read_u64(std::ifstream& in, const char* name) {
@@ -471,7 +465,7 @@ void write_metadata_record(std::ostream& out,
                            const HostCsrF32& graph,
                            const RoutingMetadata& metadata) {
   out << "{\"type\":\"metadata\",\"format\":\"rips-sssp-paths-v1\""
-      << ",\"producer\":\"bf_for_validation\""
+      << ",\"producer\":\"bf_incoming\""
       << ",\"node_count\":" << graph.rows
       << ",\"edge_count\":" << graph.nnz
       << ",\"route_request_count\":" << metadata.route_requests.size()
@@ -578,25 +572,41 @@ std::vector<SourceWork> build_source_work(const RoutingMetadata& metadata,
   return work;
 }
 
-void bf_progress_callback(const BellmanFordCsrProgress& progress, void* user_data) {
-  auto* context = static_cast<BfProgressContext*>(user_data);
-  if (context == nullptr || context->print_every <= 0) {
-    return;
-  }
-  const bool should_print =
-      progress.iteration == 1 ||
-      progress.iteration % context->print_every == 0 ||
-      !progress.changed;
-  if (!should_print) {
-    return;
-  }
+std::string progress_bar(std::size_t current, std::size_t total, int width) {
+  if (width <= 0) return "";
+  const double fraction =
+      total <= 0 ? 1.0 : std::min(1.0, static_cast<double>(current) / total);
+  const int filled = static_cast<int>(fraction * width);
 
-  std::cout << "[bf] source " << context->source_index << "/"
-            << context->source_count
-            << " node=" << context->source
-            << " iteration=" << progress.iteration << "/" << progress.max_iters
-            << " changed=" << (progress.changed ? "yes" : "no") << '\n'
+  std::string bar;
+  bar.reserve(static_cast<std::size_t>(width) + 2);
+  bar.push_back('[');
+  for (int i = 0; i < width; ++i) {
+    bar.push_back(i < filled ? '#' : '.');
+  }
+  bar.push_back(']');
+  return bar;
+}
+
+void print_source_progress(std::size_t completed, std::size_t total, bool final_line) {
+  const double percent =
+      total == 0 ? 100.0 : 100.0 * static_cast<double>(completed) /
+                                static_cast<double>(total);
+  std::ostringstream percent_text;
+  percent_text << std::fixed
+               << std::setprecision(percent > 0.0 && percent < 0.1 ? 4 : 1)
+               << std::min(100.0, percent);
+
+  std::cout << '\r'
+            << "[bf_incoming] sources "
+            << progress_bar(completed, total, 30)
+            << ' ' << percent_text.str() << "%"
+            << " " << completed << "/" << total
+            << "        "
             << std::flush;
+  if (final_line) {
+    std::cout << '\n';
+  }
 }
 
 void check_hip(hipError_t status, const char* what) {
@@ -651,7 +661,8 @@ void print_usage(const char* program) {
       << "  --net-limit <n>           Use only the first n route requests.\n"
       << "  --source-limit <n>        Run only the first n unique source nodes.\n"
       << "  --query-limit <n>         Emit at most n source-sink path records.\n"
-      << "  --bf-progress-every <n>   Print Bellman-Ford iteration progress every n iterations.\n"
+      << "  --source-progress-every <n>\n"
+      << "                              Print source summary every n sources. Default: 100.\n"
       << "  --skip-unreached          Do not write JSONL records for unreachable sinks.\n"
       << "  --abs-tol <x>             Path reconstruction absolute tolerance. Default: 1e-3.\n"
       << "  --rel-tol <x>             Path reconstruction relative tolerance. Default: 1e-5.\n"
@@ -680,10 +691,9 @@ Options parse_options(int argc,
     } else if (arg == "--query-limit") {
       options.query_limit =
           parse_size(require_value(&i, argc, argv, "--query-limit"), "--query-limit");
-    } else if (arg == "--bf-progress-every") {
-      options.bf_progress_every =
-          parse_int(require_value(&i, argc, argv, "--bf-progress-every"),
-                    "--bf-progress-every");
+    } else if (arg == "--source-progress-every" || arg == "--bf-progress-every") {
+      options.source_progress_every =
+          parse_size(require_value(&i, argc, argv, arg.c_str()), arg.c_str());
     } else if (arg == "--skip-unreached") {
       options.include_unreached = false;
     } else if (arg == "--abs-tol") {
@@ -711,9 +721,6 @@ Options parse_options(int argc,
   if (options.max_iters < -1) {
     throw std::runtime_error("--max-iters must be -1 or nonnegative");
   }
-  if (options.bf_progress_every < 0) {
-    throw std::runtime_error("--bf-progress-every must be nonnegative");
-  }
   return options;
 }
 
@@ -721,18 +728,19 @@ Options parse_options(int argc,
 
 int main(int argc, char** argv) {
   try {
+    const auto total_begin = std::chrono::steady_clock::now();
     std::filesystem::path csr_path;
     std::filesystem::path metadata_path;
     std::filesystem::path output_path;
     const Options options = parse_options(argc, argv, &csr_path, &metadata_path, &output_path);
 
-    std::cout << "[bf_for_validation] loading CSR: " << csr_path.string() << '\n';
+    std::cout << "[bf_incoming] loading CSR: " << csr_path.string() << '\n';
     HostCsrF32 graph = load_csrbin(csr_path);
-    std::cout << "[bf_for_validation] graph rows=" << graph.rows
+    std::cout << "[bf_incoming] graph rows=" << graph.rows
               << " nnz=" << graph.nnz
               << " orientation=incoming(row v, col u means u -> v)\n";
 
-    std::cout << "[bf_for_validation] loading metadata: " << metadata_path.string() << '\n';
+    std::cout << "[bf_incoming] loading metadata: " << metadata_path.string() << '\n';
     RoutingMetadata metadata = load_interchange_metadata(metadata_path);
     if (metadata.node_device_ids.size() != static_cast<std::size_t>(graph.rows)) {
       throw std::runtime_error("metadata node count does not match CSR rows");
@@ -740,7 +748,7 @@ int main(int argc, char** argv) {
     if (metadata.edge_attr_count != static_cast<std::uint64_t>(graph.nnz)) {
       throw std::runtime_error("metadata edge attribute count does not match CSR nnz");
     }
-    std::cout << "[bf_for_validation] route_requests="
+    std::cout << "[bf_incoming] route_requests="
               << metadata.route_requests.size() << '\n';
 
     std::size_t total_queries = 0;
@@ -750,7 +758,7 @@ int main(int argc, char** argv) {
         options.source_limit == 0
             ? work.size()
             : std::min(options.source_limit, work.size());
-    std::cout << "[bf_for_validation] unique_sources=" << work.size()
+    std::cout << "[bf_incoming] unique_sources=" << work.size()
               << " sources_to_run=" << source_count
               << " source_sink_queries=" << total_queries << '\n';
 
@@ -771,40 +779,26 @@ int main(int argc, char** argv) {
     std::uint64_t unreached_count = 0;
 
     try {
-      std::cout << "[bf_for_validation] copying CSR to GPU once\n";
+      std::cout << "[bf_incoming] copying incoming CSR to GPU once\n";
       bf_csr_detail::DeviceCsrOwner d_graph =
           bf_csr_detail::copy_host_csr_to_device(graph, stream);
 
+      print_source_progress(0, source_count, source_count == 0);
       for (std::size_t source_index = 0; source_index < source_count; ++source_index) {
         const SourceWork& source_work = work[source_index];
         if (source_work.queries.empty()) {
+          print_source_progress(source_index + 1,
+                                source_count,
+                                source_index + 1 == source_count);
           continue;
         }
-        const auto source_begin = std::chrono::steady_clock::now();
-        std::cout << "[bf_for_validation] running Bellman-Ford for source "
-                  << (source_index + 1) << "/" << source_count
-                  << " node=" << source_work.source
-                  << " queries=" << source_work.queries.size() << '\n'
-                  << std::flush;
-
-        BfProgressContext progress_context;
-        progress_context.source = source_work.source;
-        progress_context.source_index = source_index + 1;
-        progress_context.source_count = source_count;
-        progress_context.print_every = options.bf_progress_every;
+        const std::uint64_t paths_before = paths_written;
 
         BellmanFordCsrResult result =
             bellman_ford_minplus_hip_csr(d_graph.view,
                                          source_work.source,
                                          options.max_iters,
-                                         stream,
-                                         bf_progress_callback,
-                                         &progress_context);
-
-        std::cout << "[bf_for_validation] source node=" << source_work.source
-                  << " iterations_used=" << result.iterations_used
-                  << " converged=" << (result.converged ? "yes" : "no")
-                  << "; reconstructing paths\n";
+                                         stream);
 
         for (const Query& query : source_work.queries) {
           const float distance = result.dist[static_cast<std::size_t>(query.target)];
@@ -819,27 +813,50 @@ int main(int argc, char** argv) {
           }
 
           std::vector<PathEdge> edges =
-              reconstruct_shortest_path(graph, result.dist, query.source, query.target, options);
+              reconstruct_shortest_path(graph,
+                                        result.dist,
+                                        query.source,
+                                        query.target,
+                                        options);
           std::vector<int> nodes = nodes_from_edges(query.source, edges);
           write_path_record(out, query, true, distance, nodes, edges);
           ++reached_count;
           ++paths_written;
         }
 
-        const auto source_end = std::chrono::steady_clock::now();
-        const double seconds =
-            std::chrono::duration<double>(source_end - source_begin).count();
-        std::cout << "[bf_for_validation] finished source " << (source_index + 1)
-                  << "/" << source_count
-                  << " elapsed_sec=" << std::fixed << std::setprecision(3) << seconds
-                  << " paths_written=" << paths_written << '\n'
-                  << std::flush;
+        const std::size_t completed = source_index + 1;
+        const bool final_source = completed == source_count;
+        print_source_progress(completed, source_count, final_source);
+
+        const bool should_print_summary =
+            options.source_progress_every > 0 &&
+            (completed % options.source_progress_every == 0 || final_source);
+        if (should_print_summary) {
+          if (!final_source) {
+            std::cout << '\n';
+          }
+          const auto now = std::chrono::steady_clock::now();
+          const double total_seconds_so_far =
+              std::chrono::duration<double>(now - total_begin).count();
+          std::cout << "[bf_incoming] source " << completed
+                    << "/" << source_count
+                    << " node=" << source_work.source
+                    << " queries=" << source_work.queries.size()
+                    << " iterations_used=" << result.iterations_used
+                    << " converged=" << (result.converged ? "yes" : "no")
+                    << " total_elapsed_sec=" << std::fixed << std::setprecision(3)
+                    << total_seconds_so_far
+                    << " source_paths_written="
+                    << (paths_written - paths_before)
+                    << " total_paths_written=" << paths_written << '\n'
+                    << std::flush;
+        }
       }
-      check_hip(hipStreamSynchronize(stream), "sync before freeing device CSR graph");
+      check_hip(hipStreamSynchronize(stream), "sync before freeing incoming CSR graph");
     } catch (...) {
       const hipError_t destroy_status = hipStreamDestroy(stream);
       if (destroy_status != hipSuccess) {
-        std::cerr << "[bf_for_validation] warning: hipStreamDestroy during cleanup failed: "
+        std::cerr << "[bf_incoming] warning: hipStreamDestroy during cleanup failed: "
                   << hipGetErrorString(destroy_status) << '\n';
       }
       throw;
@@ -847,13 +864,18 @@ int main(int argc, char** argv) {
     check_hip(hipStreamSynchronize(stream), "final stream sync");
     check_hip(hipStreamDestroy(stream), "hipStreamDestroy");
 
-    std::cout << "[bf_for_validation] wrote " << paths_written
+    const auto total_end = std::chrono::steady_clock::now();
+    const double total_seconds =
+        std::chrono::duration<double>(total_end - total_begin).count();
+    std::cout << "[bf_incoming] wrote " << paths_written
               << " path records to " << output_path.string()
               << " reached=" << reached_count
-              << " unreached=" << unreached_count << '\n';
+              << " unreached=" << unreached_count
+              << " total_elapsed_sec=" << std::fixed << std::setprecision(3)
+              << total_seconds << '\n';
     return 0;
   } catch (const std::exception& ex) {
-    std::cerr << "[bf_for_validation] ERROR: " << ex.what() << '\n';
+    std::cerr << "[bf_incoming] ERROR: " << ex.what() << '\n';
     return 2;
   }
 }

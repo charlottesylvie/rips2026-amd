@@ -94,12 +94,20 @@ Also accepted:
 {"type":"path","source":12345,"target":99999,"reached":false,"distance":null,"nodes":[],"csr_edges":[]}
 ```
 
-## Bellman-Ford JSONL Generator
+## Outgoing-Frontier JSONL Generator
 
-[src/bf_for_validation.cpp](src/bf_for_validation.cpp) reads a `.csrbin` graph
-and its `.csrbin.ifmeta.bin` metadata sidecar, runs HIP Bellman-Ford from the
-route sources listed in metadata, reconstructs paths to the listed sinks, and
-writes JSONL records accepted by `validate_SSSP`.
+[src/bf_outgoing.cpp](src/bf_outgoing.cpp) reads a `.csrbin` graph
+and its `.csrbin.ifmeta.bin` metadata sidecar, creates or loads a cached outgoing
+CSR under `SSSP/data`, runs HIP frontier SSSP from the route sources listed in
+metadata, reconstructs paths to the listed sinks, and writes JSONL records
+accepted by `validate_SSSP`.
+
+The `.csrbin.ifmeta.bin` file does not change for this flow. It stays tied to
+the original incoming CSR, and `bf_outgoing` writes `csr_edges` using those
+original incoming CSR edge ids. The cached outgoing file is just a runtime
+sidecar named `SSSP/data/<graph>.outgoing.csrbin`. If that sidecar already
+exists, it is loaded and never overwritten automatically; delete it to force a
+rebuild.
 
 Build on an AMD ROCm/HIP machine from `rips2026-amd`:
 
@@ -107,37 +115,61 @@ Build on an AMD ROCm/HIP machine from `rips2026-amd`:
 hipcc -std=c++17 -O3 -x hip \
   -I HIP_kernel/bellman_ford/src \
   -I HIP_kernel/minplus_mm/src \
-  SSSP/src/bf_for_validation.cpp \
-  HIP_kernel/bellman_ford/src/bf_hip_CSR.cpp \
-  HIP_kernel/minplus_mm/src/minplus_sparse_hip.cpp \
-  -o bf_for_validation
+  SSSP/src/bf_outgoing.cpp \
+  -o bf_outgoing
 ```
 
 Run:
 
 ```bash
-./bf_for_validation graph.csrbin graph.csrbin.ifmeta.bin paths.jsonl
+./bf_outgoing data/logicnets_jscl.csrbin data/logicnets_jscl.csrbin.ifmeta.bin outgoing.paths.jsonl
 ```
 
 Example with smaller limits for a smoke test:
 
 ```bash
-./bf_for_validation graph.csrbin graph.csrbin.ifmeta.bin paths.jsonl \
+./bf_outgoing data/logicnets_jscl.csrbin data/logicnets_jscl.csrbin.ifmeta.bin outgoing.paths.jsonl \
   --net-limit 10 \
   --source-limit 5 \
-  --bf-progress-every 100
+  --source-progress-every 100
+```
+
+## Incoming-Scan JSONL Generator
+
+[src/bf_incoming.cpp](src/bf_incoming.cpp) uses the same inputs and output
+format as `bf_outgoing`, but keeps the original incoming CSR orientation and
+runs the fused incoming min-plus scan path from `bf_hip_CSR.cpp`. Use it as the
+scan-side comparison point for frontier-vs-scan experiments.
+
+Build on an AMD ROCm/HIP machine from `rips2026-amd`:
+
+```bash
+hipcc -std=c++17 -O3 -x hip \
+  -I HIP_kernel/bellman_ford/src \
+  -I HIP_kernel/minplus_mm/src \
+  SSSP/src/bf_incoming.cpp \
+  HIP_kernel/bellman_ford/src/bf_hip_CSR.cpp \
+  HIP_kernel/minplus_mm/src/minplus_sparse_hip.cpp \
+  -o bf_incoming
+```
+
+Run:
+
+```bash
+./bf_incoming data/logicnets_jscl.csrbin data/logicnets_jscl.csrbin.ifmeta.bin incoming.paths.jsonl
 ```
 
 Then validate the generated paths:
 
 ```bash
-./validate_SSSP graph.csrbin paths.jsonl --modes 1,2,3
+./validate_SSSP data/logicnets_jscl.csrbin outgoing.paths.jsonl --modes 1,2,3
+./validate_SSSP data/logicnets_jscl.csrbin incoming.paths.jsonl --modes 1,2,3
 ```
 
 Batched generator:
 
 [src/bf_batched.cpp](src/bf_batched.cpp) uses the same `.csrbin`,
-`.csrbin.ifmeta.bin`, and JSONL path format as `bf_for_validation`, but runs
+`.csrbin.ifmeta.bin`, and JSONL path format as `bf_outgoing`, but runs
 Bellman-Ford for a batch of sources at once. Internally, the distance state is
 an `N x B` sparse matrix, where `N` is the number of graph nodes and `B` is
 `--batch-size`.
