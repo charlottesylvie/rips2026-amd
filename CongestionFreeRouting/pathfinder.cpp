@@ -144,9 +144,6 @@ void validate_options(const PathfinderOptions& options) {
   if (options.capacity <= 0) {
     throw std::invalid_argument("capacity must be positive");
   }
-  if (options.parallel_net_workers == 0) {
-    throw std::invalid_argument("parallel_net_workers must be positive");
-  }
 }
 
 bool valid_node(int node, minplus_sparse::Offset rows) {
@@ -707,14 +704,86 @@ struct WorkerStream {
   bool owns = false;
 };
 
-template <typename SsspWorkspace>
+int current_worker_device() {
+#if defined(__HIPCC__) || defined(__HIP_PLATFORM_AMD__)
+  int device = 0;
+  const hipError_t status = hipGetDevice(&device);
+  if (status != hipSuccess) {
+    throw std::runtime_error(std::string("hipGetDevice failed: ") +
+                             hipGetErrorString(status));
+  }
+  return device;
+#else
+  return 0;
+#endif
+}
+
+void select_worker_device(int device) {
+#if defined(__HIPCC__) || defined(__HIP_PLATFORM_AMD__)
+  const hipError_t status = hipSetDevice(device);
+  if (status != hipSuccess) {
+    throw std::runtime_error(std::string("hipSetDevice failed: ") +
+                             hipGetErrorString(status));
+  }
+#else
+  (void)device;
+#endif
+}
+
+std::size_t recommend_unit_bfs_worker_count(minplus_sparse::Offset rows,
+                                            std::size_t route_request_count,
+                                            hipStream_t stream) {
+  if (stream != nullptr || rows <= 0 || route_request_count <= 1) {
+    return 1;
+  }
+
+#if defined(__HIPCC__) || defined(__HIP_PLATFORM_AMD__)
+  std::size_t free_bytes = 0;
+  std::size_t total_bytes = 0;
+  if (hipMemGetInfo(&free_bytes, &total_bytes) != hipSuccess) {
+    return 1;
+  }
+  (void)total_bytes;
+
+  // Current per-worker arrays consume 24 bytes/vertex. Budget 32 bytes per
+  // vertex plus 64 MiB for query/path buffers, and leave 25% of currently free
+  // memory untouched for HIP runtime allocations and unusually large routes.
+  constexpr std::size_t kBytesPerVertexBudget = 32;
+  constexpr std::size_t kPerWorkerReserve = 64ULL * 1024ULL * 1024ULL;
+  constexpr std::size_t kMaxAutoWorkers = 8;
+  const std::size_t row_count = static_cast<std::size_t>(rows);
+  if (row_count >
+      (std::numeric_limits<std::size_t>::max() - kPerWorkerReserve) /
+          kBytesPerVertexBudget) {
+    return 1;
+  }
+  const std::size_t per_worker_bytes =
+      row_count * kBytesPerVertexBudget + kPerWorkerReserve;
+  const std::size_t memory_budget = free_bytes - free_bytes / 4;
+  const std::size_t memory_workers =
+      std::max<std::size_t>(1, memory_budget / per_worker_bytes);
+  const std::size_t cpu_threads =
+      std::max<unsigned int>(1, std::thread::hardware_concurrency());
+  return std::max<std::size_t>(
+      1,
+      std::min({kMaxAutoWorkers,
+                route_request_count,
+                cpu_threads,
+                memory_workers}));
+#else
+  return 1;
+#endif
+}
+
+template <typename WorkspaceFactory>
 void route_all_nets_with_workspace(const HostCsrF32& base_graph,
                                    const RoutingMetadata& metadata,
                                    const PathfinderOptions& options,
                                    hipStream_t stream,
                                    std::size_t route_request_count,
                                    std::size_t progress_interval,
-                                   std::vector<RoutedNet>& nets) {
+                                   std::vector<RoutedNet>& nets,
+                                   WorkspaceFactory workspace_factory) {
   std::size_t worker_count =
       std::min<std::size_t>(options.parallel_net_workers,
                             std::max<std::size_t>(1, route_request_count));
@@ -723,7 +792,7 @@ void route_all_nets_with_workspace(const HostCsrF32& base_graph,
   }
 
   if (worker_count <= 1 || route_request_count <= 1) {
-    SsspWorkspace sssp_workspace(base_graph, stream);
+    auto sssp_workspace = workspace_factory(stream);
     std::vector<std::uint32_t> route_tree_seen(static_cast<std::size_t>(base_graph.rows), 0);
     std::vector<int> route_parent_by_child(static_cast<std::size_t>(base_graph.rows), -1);
     std::vector<std::uint32_t> route_parent_seen(static_cast<std::size_t>(base_graph.rows), 0);
@@ -759,6 +828,7 @@ void route_all_nets_with_workspace(const HostCsrF32& base_graph,
   std::mutex exception_mutex;
   std::mutex progress_mutex;
   std::size_t last_reported = 0;
+  const int worker_device = current_worker_device();
 
   auto report_progress = [&](std::size_t completed) {
     std::lock_guard<std::mutex> lock(progress_mutex);
@@ -771,9 +841,10 @@ void route_all_nets_with_workspace(const HostCsrF32& base_graph,
 
   auto worker = [&]() {
     try {
+      select_worker_device(worker_device);
       WorkerStream worker_stream(stream == nullptr);
       hipStream_t local_stream = worker_stream.get(stream);
-      SsspWorkspace sssp_workspace(base_graph, local_stream);
+      auto sssp_workspace = workspace_factory(local_stream);
       std::vector<std::uint32_t> route_tree_seen(
           static_cast<std::size_t>(base_graph.rows), 0);
       std::vector<int> route_parent_by_child(
@@ -902,7 +973,7 @@ void print_usage(const char* program) {
       << "  --max-sssp-iters <int>          Delta-step rounds or unit-BFS depth cap; -1 for default.\n"
       << "  --capacity <int>                Capacity used only for overuse diagnostics. Default: 1\n"
       << "  --net-limit <count>             Route only the first count requests.\n"
-      << "  --parallel-net-workers <count>  Independent net workers. Default: 1\n"
+      << "  --parallel-net-workers <count>  Independent net workers. Default: 0 (auto-selects up to 8).\n"
       << "  --allow-unrouted                Write partial routes even if some sinks are unreached.\n"
       << "  --routes-out <path>             Write routed PIP tree data as JSONL.\n"
       << "\nCompatibility-only options accepted and ignored by this one-shot router:\n"
@@ -1220,23 +1291,41 @@ PathfinderResult run_pathfinder(const HostCsrF32& base_graph,
       std::max<std::size_t>(1, route_request_count / 100);
 
   switch (options.sssp_engine) {
-    case SsspEngine::kUnitBfs:
-      route_all_nets_with_workspace<UnitBfsCsrWorkspace>(base_graph,
-                                                         metadata,
-                                                         options,
-                                                         stream,
-                                                         route_request_count,
-                                                         progress_interval,
-                                                         result.nets);
+    case SsspEngine::kUnitBfs: {
+      auto shared_graph = std::make_shared<UnitBfsCsrGraph>(base_graph, stream);
+      PathfinderOptions unit_options = options;
+      if (unit_options.parallel_net_workers == 0) {
+        unit_options.parallel_net_workers = recommend_unit_bfs_worker_count(
+            base_graph.rows, route_request_count, stream);
+        std::cout << "[pathfinder] auto-selected "
+                  << unit_options.parallel_net_workers
+                  << " unit-BFS worker(s)\n";
+      }
+      route_all_nets_with_workspace(
+          base_graph,
+          metadata,
+          unit_options,
+          stream,
+          route_request_count,
+          progress_interval,
+          result.nets,
+          [shared_graph](hipStream_t worker_stream) {
+            return UnitBfsCsrWorkspace(shared_graph, worker_stream);
+          });
       break;
+    }
     case SsspEngine::kDeltaStep:
-      route_all_nets_with_workspace<DeltaSteppingCsrWorkspace>(base_graph,
-                                                               metadata,
-                                                               options,
-                                                               stream,
-                                                               route_request_count,
-                                                               progress_interval,
-                                                               result.nets);
+      route_all_nets_with_workspace(
+          base_graph,
+          metadata,
+          options,
+          stream,
+          route_request_count,
+          progress_interval,
+          result.nets,
+          [&base_graph](hipStream_t worker_stream) {
+            return DeltaSteppingCsrWorkspace(base_graph, worker_stream);
+          });
       break;
   }
 

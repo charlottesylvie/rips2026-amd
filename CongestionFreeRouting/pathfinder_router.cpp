@@ -147,7 +147,7 @@ void print_usage(const char* program) {
       << "  --delta <float>                Forwarded to pathfinder.\n"
       << "  --max-sssp-iters <int>         Forwarded to pathfinder.\n"
       << "  --net-limit <count>            Forwarded to pathfinder.\n"
-      << "  --parallel-net-workers <count> Forwarded to pathfinder.\n"
+      << "  --parallel-net-workers <count> Forwarded to pathfinder; 0 enables memory-aware auto-selection.\n"
       << "  --capacity <int>               Forwarded for overuse diagnostics.\n"
       << "  --max-pathfinder-iters <int>   Compatibility-only; accepted by pathfinder and ignored.\n"
       << "  --route-batch-size <count>     Compatibility-only; accepted by pathfinder and ignored.\n"

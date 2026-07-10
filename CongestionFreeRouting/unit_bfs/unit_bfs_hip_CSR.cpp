@@ -766,20 +766,54 @@ UnitBfsCsrResult run_unit_bfs_impl(const OutgoingCsrOwner& outgoing,
 
 }  // namespace unit_bfs_detail
 
-struct UnitBfsCsrWorkspace::Impl {
+struct UnitBfsCsrGraph::Impl {
   unit_bfs_detail::OutgoingCsrOwner outgoing;
-  unit_bfs_detail::UnitBfsScratch scratch;
 
   Impl(const HostCsrF32& host, hipStream_t stream)
-      : outgoing(unit_bfs_detail::copy_host_csr_to_device(host, stream)),
-        scratch(host.rows) {}
+      : outgoing(unit_bfs_detail::copy_host_csr_to_device(host, stream)) {}
+};
+
+UnitBfsCsrGraph::UnitBfsCsrGraph(const HostCsrF32& adjacency,
+                                 hipStream_t stream) {
+  unit_bfs_detail::validate_host_csr_arrays(adjacency);
+  impl_ = std::make_unique<Impl>(adjacency, stream);
+  // The shared graph may be consumed by worker streams created after this
+  // constructor returns.  Complete the one-time upload before publishing it.
+  UNIT_BFS_HIP_CHECK(hipStreamSynchronize(stream));
+}
+
+UnitBfsCsrGraph::~UnitBfsCsrGraph() = default;
+UnitBfsCsrGraph::UnitBfsCsrGraph(UnitBfsCsrGraph&&) noexcept = default;
+UnitBfsCsrGraph& UnitBfsCsrGraph::operator=(UnitBfsCsrGraph&&) noexcept = default;
+
+struct UnitBfsCsrWorkspace::Impl {
+  std::shared_ptr<const UnitBfsCsrGraph> graph;
+  unit_bfs_detail::UnitBfsScratch scratch;
+
+  static minplus_sparse::Offset require_graph_rows(
+      const std::shared_ptr<const UnitBfsCsrGraph>& candidate) {
+    if (!candidate || !candidate->impl_) {
+      throw std::invalid_argument("unit BFS shared graph must not be null");
+    }
+    return candidate->impl_->outgoing.rows;
+  }
+
+  Impl(std::shared_ptr<const UnitBfsCsrGraph> graph_, hipStream_t stream)
+      : graph(std::move(graph_)),
+        scratch(require_graph_rows(graph)) {
+    (void)stream;
+  }
 };
 
 UnitBfsCsrWorkspace::UnitBfsCsrWorkspace(const HostCsrF32& adjacency,
-                                         hipStream_t stream) {
-  unit_bfs_detail::validate_host_csr_arrays(adjacency);
-  impl_ = std::make_unique<Impl>(adjacency, stream);
-}
+                                         hipStream_t stream)
+    : UnitBfsCsrWorkspace(
+          std::make_shared<UnitBfsCsrGraph>(adjacency, stream), stream) {}
+
+UnitBfsCsrWorkspace::UnitBfsCsrWorkspace(
+    std::shared_ptr<const UnitBfsCsrGraph> adjacency,
+    hipStream_t stream)
+    : impl_(std::make_unique<Impl>(std::move(adjacency), stream)) {}
 
 UnitBfsCsrWorkspace::~UnitBfsCsrWorkspace() = default;
 UnitBfsCsrWorkspace::UnitBfsCsrWorkspace(UnitBfsCsrWorkspace&&) noexcept = default;
@@ -800,7 +834,7 @@ UnitBfsCsrResult UnitBfsCsrWorkspace::run(
     throw std::runtime_error("UnitBfsCsrWorkspace has no implementation");
   }
   validate_sources_targets(impl_->scratch.rows, sources, targets);
-  return run_unit_bfs_impl(impl_->outgoing,
+  return run_unit_bfs_impl(impl_->graph->impl_->outgoing,
                            impl_->scratch,
                            sources,
                            targets,

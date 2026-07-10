@@ -11,12 +11,36 @@ using UnitBfsCsrProgress = BellmanFordCsrProgress;
 using UnitBfsCsrProgressCallback = BellmanFordCsrProgressCallback;
 using UnitBfsCsrResult = BellmanFordCsrResult;
 
+// Immutable device CSR that can be shared by independent BFS workspaces.
+// The graph and every workspace using it must remain on the HIP device that
+// was current when the graph was constructed.
+class UnitBfsCsrGraph {
+ public:
+  struct Impl;
+
+  explicit UnitBfsCsrGraph(const HostCsrF32& adjacency,
+                           hipStream_t stream = nullptr);
+  ~UnitBfsCsrGraph();
+
+  UnitBfsCsrGraph(const UnitBfsCsrGraph&) = delete;
+  UnitBfsCsrGraph& operator=(const UnitBfsCsrGraph&) = delete;
+  UnitBfsCsrGraph(UnitBfsCsrGraph&&) noexcept;
+  UnitBfsCsrGraph& operator=(UnitBfsCsrGraph&&) noexcept;
+
+ private:
+  std::unique_ptr<Impl> impl_;
+  friend class UnitBfsCsrWorkspace;
+};
+
 class UnitBfsCsrWorkspace {
  public:
   struct Impl;
 
   explicit UnitBfsCsrWorkspace(const HostCsrF32& adjacency,
                                hipStream_t stream = nullptr);
+  explicit UnitBfsCsrWorkspace(
+      std::shared_ptr<const UnitBfsCsrGraph> adjacency,
+      hipStream_t stream = nullptr);
   ~UnitBfsCsrWorkspace();
 
   UnitBfsCsrWorkspace(const UnitBfsCsrWorkspace&) = delete;

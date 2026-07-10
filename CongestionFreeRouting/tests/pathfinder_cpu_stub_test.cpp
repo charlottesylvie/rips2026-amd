@@ -9,6 +9,7 @@ namespace {
 
 std::atomic<int> g_multisource_delta_calls{0};
 std::atomic<int> g_unit_bfs_calls{0};
+std::atomic<int> g_unit_bfs_graph_uploads{0};
 
 struct CpuSsspResult {
   std::vector<float> dist;
@@ -441,15 +442,40 @@ DeltaSteppingCsrResult delta_stepping_minplus_hip_csr(
   return result;
 }
 
-struct UnitBfsCsrWorkspace::Impl {
+struct UnitBfsCsrGraph::Impl {
   HostCsrF32 graph;
+};
+
+UnitBfsCsrGraph::UnitBfsCsrGraph(const HostCsrF32& adjacency,
+                                 hipStream_t stream)
+    : impl_(std::make_unique<Impl>()) {
+  (void)stream;
+  ++g_unit_bfs_graph_uploads;
+  impl_->graph = adjacency;
+}
+
+UnitBfsCsrGraph::~UnitBfsCsrGraph() = default;
+UnitBfsCsrGraph::UnitBfsCsrGraph(UnitBfsCsrGraph&&) noexcept = default;
+UnitBfsCsrGraph& UnitBfsCsrGraph::operator=(UnitBfsCsrGraph&&) noexcept = default;
+
+struct UnitBfsCsrWorkspace::Impl {
+  std::shared_ptr<const UnitBfsCsrGraph> graph;
 };
 
 UnitBfsCsrWorkspace::UnitBfsCsrWorkspace(const HostCsrF32& adjacency,
                                          hipStream_t stream)
+    : UnitBfsCsrWorkspace(
+          std::make_shared<UnitBfsCsrGraph>(adjacency, stream), stream) {}
+
+UnitBfsCsrWorkspace::UnitBfsCsrWorkspace(
+    std::shared_ptr<const UnitBfsCsrGraph> adjacency,
+    hipStream_t stream)
     : impl_(std::make_unique<Impl>()) {
   (void)stream;
-  impl_->graph = adjacency;
+  if (!adjacency || !adjacency->impl_) {
+    throw std::invalid_argument("unit BFS shared graph must not be null");
+  }
+  impl_->graph = std::move(adjacency);
 }
 
 UnitBfsCsrWorkspace::~UnitBfsCsrWorkspace() = default;
@@ -473,8 +499,9 @@ UnitBfsCsrResult UnitBfsCsrWorkspace::run(
   ++g_unit_bfs_calls;
 
   UnitBfsCsrResult result;
-  CpuSsspResult cpu_result = cpu_dijkstra_outgoing_csr_multi(impl_->graph, sources);
-  fill_compact_target_paths(impl_->graph, sources, targets, cpu_result, result);
+  const HostCsrF32& graph = impl_->graph->impl_->graph;
+  CpuSsspResult cpu_result = cpu_dijkstra_outgoing_csr_multi(graph, sources);
+  fill_compact_target_paths(graph, sources, targets, cpu_result, result);
   result.target = -1;
   result.iterations_used = 1;
   result.stopped_on_target = result.target_reached;
@@ -577,6 +604,7 @@ int main() {
   parallel_options.parallel_net_workers = 2;
   g_multisource_delta_calls = 0;
   g_unit_bfs_calls = 0;
+  g_unit_bfs_graph_uploads = 0;
   routing::PathfinderResult parallel_result =
       routing::run_pathfinder(congestion_graph,
                               congestion_metadata,
@@ -590,8 +618,26 @@ int main() {
           "parallel routing should preserve the second net route");
   require(g_unit_bfs_calls == 2,
           "parallel congestion-free routing should call unit BFS once per net");
+  require(g_unit_bfs_graph_uploads == 1,
+          "parallel unit BFS workers should share one uploaded CSR graph");
   require(g_multisource_delta_calls == 0,
           "parallel default routing should not call delta-step");
+
+  routing::PathfinderOptions auto_worker_options = parallel_options;
+  auto_worker_options.parallel_net_workers = 0;
+  g_unit_bfs_calls = 0;
+  g_unit_bfs_graph_uploads = 0;
+  routing::PathfinderResult auto_worker_result =
+      routing::run_pathfinder(congestion_graph,
+                              congestion_metadata,
+                              auto_worker_options,
+                              nullptr);
+  require(auto_worker_result.routed,
+          "memory-aware unit BFS worker selection should preserve routed status");
+  require(g_unit_bfs_calls == 2,
+          "auto-selected unit BFS workers should still route every net");
+  require(g_unit_bfs_graph_uploads == 1,
+          "auto-selected unit BFS workers should share one uploaded CSR graph");
 
   const HostCsrF32 overlap_graph = make_three_net_overlap_graph();
   const routing::RoutingMetadata overlap_metadata =
