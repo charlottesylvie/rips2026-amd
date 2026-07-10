@@ -302,6 +302,19 @@ g++ -std=c++17 -O2 \
 /tmp/congestion_free_pathfinder_cpu_stub_test
 ```
 
+Unit-BFS compact-offset A/B correctness test (requires an AMD HIP system):
+
+```bash
+hipcc -std=c++17 -O2 -x hip \
+  -I HIP_kernel/bellman_ford/src \
+  -I CongestionFreeRouting/unit_bfs \
+  CongestionFreeRouting/tests/unit_bfs_hip_test.cpp \
+  CongestionFreeRouting/unit_bfs/unit_bfs_hip_CSR.cpp \
+  -o /tmp/unit_bfs_hip_test
+
+/tmp/unit_bfs_hip_test
+```
+
 Python route-writer regression test:
 
 ```bash

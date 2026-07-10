@@ -444,19 +444,42 @@ DeltaSteppingCsrResult delta_stepping_minplus_hip_csr(
 
 struct UnitBfsCsrGraph::Impl {
   HostCsrF32 graph;
+  bool uses_32_bit_offsets = false;
 };
 
 UnitBfsCsrGraph::UnitBfsCsrGraph(const HostCsrF32& adjacency,
                                  hipStream_t stream)
+    : UnitBfsCsrGraph(
+          adjacency, stream, UnitBfsCsrOffsetMode::kAuto) {}
+
+UnitBfsCsrGraph::UnitBfsCsrGraph(const HostCsrF32& adjacency,
+                                 hipStream_t stream,
+                                 UnitBfsCsrOffsetMode offset_mode)
     : impl_(std::make_unique<Impl>()) {
   (void)stream;
   ++g_unit_bfs_graph_uploads;
   impl_->graph = adjacency;
+  switch (offset_mode) {
+    case UnitBfsCsrOffsetMode::kAuto:
+      impl_->uses_32_bit_offsets =
+          adjacency.nnz >= 0 &&
+          adjacency.nnz <= std::numeric_limits<std::int32_t>::max();
+      break;
+    case UnitBfsCsrOffsetMode::kForce64Bit:
+      impl_->uses_32_bit_offsets = false;
+      break;
+    default:
+      throw std::invalid_argument("unknown unit BFS offset mode");
+  }
 }
 
 UnitBfsCsrGraph::~UnitBfsCsrGraph() = default;
 UnitBfsCsrGraph::UnitBfsCsrGraph(UnitBfsCsrGraph&&) noexcept = default;
 UnitBfsCsrGraph& UnitBfsCsrGraph::operator=(UnitBfsCsrGraph&&) noexcept = default;
+
+bool UnitBfsCsrGraph::uses_32_bit_offsets() const noexcept {
+  return impl_ && impl_->uses_32_bit_offsets;
+}
 
 struct UnitBfsCsrWorkspace::Impl {
   std::shared_ptr<const UnitBfsCsrGraph> graph;
@@ -465,7 +488,14 @@ struct UnitBfsCsrWorkspace::Impl {
 UnitBfsCsrWorkspace::UnitBfsCsrWorkspace(const HostCsrF32& adjacency,
                                          hipStream_t stream)
     : UnitBfsCsrWorkspace(
-          std::make_shared<UnitBfsCsrGraph>(adjacency, stream), stream) {}
+          adjacency, stream, UnitBfsCsrOffsetMode::kAuto) {}
+
+UnitBfsCsrWorkspace::UnitBfsCsrWorkspace(const HostCsrF32& adjacency,
+                                         hipStream_t stream,
+                                         UnitBfsCsrOffsetMode offset_mode)
+    : UnitBfsCsrWorkspace(
+          std::make_shared<UnitBfsCsrGraph>(adjacency, stream, offset_mode),
+          stream) {}
 
 UnitBfsCsrWorkspace::UnitBfsCsrWorkspace(
     std::shared_ptr<const UnitBfsCsrGraph> adjacency,

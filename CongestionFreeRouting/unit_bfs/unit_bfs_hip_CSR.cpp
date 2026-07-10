@@ -19,6 +19,13 @@ namespace unit_bfs_detail {
 
 using minplus_sparse::Index;
 using minplus_sparse::Offset;
+using CompactOffset = std::int32_t;
+
+static_assert(sizeof(CompactOffset) == 4,
+              "unit BFS compact offsets must be 32-bit");
+static_assert(std::numeric_limits<CompactOffset>::max() <
+                  std::numeric_limits<Offset>::max(),
+              "unit BFS wide offsets must exceed the compact range");
 
 constexpr int kBlockSize = 256;
 constexpr int kMaxGridX = 65535;
@@ -118,26 +125,39 @@ struct OutgoingCsrOwner {
   Offset rows = 0;
   Offset cols = 0;
   Offset nnz = 0;
-  DeviceBuffer<Offset> rowptr;
+  bool uses_32_bit_offsets = false;
+  DeviceBuffer<CompactOffset> rowptr32;
+  DeviceBuffer<Offset> rowptr64;
   DeviceBuffer<Index> colind;
 
   OutgoingCsrOwner() = default;
-  OutgoingCsrOwner(Offset rows_, Offset cols_, Offset nnz_)
+  OutgoingCsrOwner(Offset rows_,
+                   Offset cols_,
+                   Offset nnz_,
+                   bool uses_32_bit_offsets_)
       : rows(rows_),
         cols(cols_),
         nnz(nnz_),
-        rowptr(static_cast<std::size_t>(rows_) + 1),
+        uses_32_bit_offsets(uses_32_bit_offsets_),
+        rowptr32(uses_32_bit_offsets
+                     ? static_cast<std::size_t>(rows_) + 1
+                     : 0),
+        rowptr64(uses_32_bit_offsets
+                     ? 0
+                     : static_cast<std::size_t>(rows_) + 1),
         colind(static_cast<std::size_t>(nnz_)) {}
 };
 
 struct UnitBfsScratch {
   Offset rows = 0;
+  bool uses_32_bit_offsets = false;
   DeviceBuffer<int> sources;
   DeviceBuffer<int> targets;
   DeviceBuffer<int> target_multiplicity;
   DeviceBuffer<int> level;
   DeviceBuffer<int> pred_node;
-  DeviceBuffer<Offset> pred_edge;
+  DeviceBuffer<CompactOffset> pred_edge32;
+  DeviceBuffer<Offset> pred_edge64;
   // The queue is append-only for one BFS run.  The current frontier is a
   // half-open range within it, and every successfully claimed vertex is also
   // the complete list of levels that must be reset before the next run.
@@ -155,12 +175,18 @@ struct UnitBfsScratch {
   bool initialized = false;
 
   UnitBfsScratch() = default;
-  explicit UnitBfsScratch(Offset rows_)
+  UnitBfsScratch(Offset rows_, bool uses_32_bit_offsets_)
       : rows(rows_),
+        uses_32_bit_offsets(uses_32_bit_offsets_),
         target_multiplicity(static_cast<std::size_t>(rows_)),
         level(static_cast<std::size_t>(rows_)),
         pred_node(static_cast<std::size_t>(rows_)),
-        pred_edge(static_cast<std::size_t>(rows_)),
+        pred_edge32(uses_32_bit_offsets
+                        ? static_cast<std::size_t>(rows_)
+                        : 0),
+        pred_edge64(uses_32_bit_offsets
+                        ? 0
+                        : static_cast<std::size_t>(rows_)),
         frontier_queue(static_cast<std::size_t>(rows_)),
         status(2),
         host_status(2) {}
@@ -322,12 +348,13 @@ __global__ void reset_visited_levels_kernel(const int* frontier_queue,
   }
 }
 
+template <typename EdgeOffset>
 __global__ void initialize_sources_kernel(const int* sources,
                                           int source_count,
                                           int initially_found,
                                           int* level,
                                           int* pred_node,
-                                          Offset* pred_edge,
+                                          EdgeOffset* pred_edge,
                                           int* frontier_queue,
                                           int* status) {
   if (blockIdx.x == 0 && threadIdx.x == 0) {
@@ -342,19 +369,20 @@ __global__ void initialize_sources_kernel(const int* sources,
     // allocation needs a global atomic operation.
     level[source] = 0;
     pred_node[source] = source;
-    pred_edge[source] = static_cast<Offset>(-1);
+    pred_edge[source] = static_cast<EdgeOffset>(-1);
     frontier_queue[i] = source;
   }
 }
 
+template <typename EdgeOffset>
 __global__ void expand_frontier_kernel(int frontier_begin,
                                        int frontier_end,
                                        int next_level,
-                                       const Offset* out_rowptr,
+                                       const EdgeOffset* out_rowptr,
                                        const Index* out_colind,
                                        int* level,
                                        int* pred_node,
-                                       Offset* pred_edge,
+                                       EdgeOffset* pred_edge,
                                        int* frontier_queue,
                                        int* queue_tail,
                                        const int* target_multiplicity,
@@ -363,7 +391,7 @@ __global__ void expand_frontier_kernel(int frontier_begin,
        i < frontier_end;
        i += blockDim.x * gridDim.x) {
     const int u = frontier_queue[i];
-    for (Offset edge = out_rowptr[u]; edge < out_rowptr[u + 1]; ++edge) {
+    for (EdgeOffset edge = out_rowptr[u]; edge < out_rowptr[u + 1]; ++edge) {
       const int v = static_cast<int>(out_colind[edge]);
       // Most examined edges point to a vertex already reached by this BFS.
       // Avoid an atomic read-modify-write for that common case; a stale load is
@@ -433,11 +461,12 @@ __global__ void measure_target_paths_kernel(const int* targets,
   }
 }
 
+template <typename EdgeOffset>
 __global__ void fill_target_paths_kernel(const int* targets,
                                          int target_count,
                                          Offset rows,
                                          const int* pred_node,
-                                         const Offset* pred_edge,
+                                         const EdgeOffset* pred_edge,
                                          const int* path_lengths,
                                          int* path_sources,
                                          const int* node_offsets,
@@ -461,7 +490,8 @@ __global__ void fill_target_paths_kernel(const int* targets,
       if (pred < 0 || static_cast<Offset>(pred) >= rows || pred == current) {
         return;
       }
-      path_edges[edge_begin + j - 1] = pred_edge[current];
+      path_edges[edge_begin + j - 1] =
+          static_cast<Offset>(pred_edge[current]);
       current = pred;
       path_nodes[node_begin + j - 1] = current;
     }
@@ -469,15 +499,42 @@ __global__ void fill_target_paths_kernel(const int* targets,
   }
 }
 
-OutgoingCsrOwner copy_host_csr_to_device(const HostCsrF32& host, hipStream_t stream) {
-  OutgoingCsrOwner device(host.rows, host.cols, host.nnz);
+constexpr bool nnz_fits_32_bit_offsets(Offset nnz) noexcept {
+  return nnz >= 0 &&
+         nnz <= static_cast<Offset>(
+                    std::numeric_limits<CompactOffset>::max());
+}
+
+inline bool select_32_bit_offsets(Offset nnz,
+                                  UnitBfsCsrOffsetMode offset_mode) {
+  switch (offset_mode) {
+    case UnitBfsCsrOffsetMode::kAuto:
+      return nnz_fits_32_bit_offsets(nnz);
+    case UnitBfsCsrOffsetMode::kForce64Bit:
+      return false;
+  }
+  throw std::invalid_argument("unknown unit BFS offset mode");
+}
+
+static_assert(nnz_fits_32_bit_offsets(
+                  static_cast<Offset>(
+                      std::numeric_limits<CompactOffset>::max())),
+              "INT32_MAX edges must use compact offsets");
+static_assert(!nnz_fits_32_bit_offsets(
+                  static_cast<Offset>(
+                      std::numeric_limits<CompactOffset>::max()) + 1),
+              "graphs above INT32_MAX edges must retain wide offsets");
+
+OutgoingCsrOwner copy_host_csr_to_device(
+    const HostCsrF32& host,
+    hipStream_t stream,
+    UnitBfsCsrOffsetMode offset_mode) {
+  const bool uses_32_bit_offsets =
+      select_32_bit_offsets(host.nnz, offset_mode);
+  OutgoingCsrOwner device(
+      host.rows, host.cols, host.nnz, uses_32_bit_offsets);
   const std::size_t rows = checked_size(host.rows, "rows");
   const std::size_t nnz = checked_size(host.nnz, "nnz");
-  UNIT_BFS_HIP_CHECK(hipMemcpyAsync(device.rowptr.get(),
-                                    host.rowptr.data(),
-                                    (rows + 1) * sizeof(Offset),
-                                    hipMemcpyHostToDevice,
-                                    stream));
   if (nnz != 0) {
     UNIT_BFS_HIP_CHECK(hipMemcpyAsync(device.colind.get(),
                                       host.colind.data(),
@@ -485,6 +542,31 @@ OutgoingCsrOwner copy_host_csr_to_device(const HostCsrF32& host, hipStream_t str
                                       hipMemcpyHostToDevice,
                                       stream));
   }
+  std::vector<CompactOffset> compact_rowptr;
+  if (uses_32_bit_offsets) {
+    compact_rowptr.resize(rows + 1);
+    std::transform(host.rowptr.begin(),
+                   host.rowptr.end(),
+                   compact_rowptr.begin(),
+                   [](Offset offset) {
+                     return static_cast<CompactOffset>(offset);
+                   });
+    // This converted host buffer is temporary, so use a blocking copy rather
+    // than relying on pageable-host async-copy behavior for its lifetime.
+    UNIT_BFS_HIP_CHECK(hipMemcpy(device.rowptr32.get(),
+                                 compact_rowptr.data(),
+                                 (rows + 1) * sizeof(CompactOffset),
+                                 hipMemcpyHostToDevice));
+  } else {
+    UNIT_BFS_HIP_CHECK(hipMemcpyAsync(device.rowptr64.get(),
+                                      host.rowptr.data(),
+                                      (rows + 1) * sizeof(Offset),
+                                      hipMemcpyHostToDevice,
+                                      stream));
+  }
+  // Worker streams may consume the graph immediately after construction.
+  // Finish the one-time asynchronous portions before publishing it.
+  UNIT_BFS_HIP_CHECK(hipStreamSynchronize(stream));
   return device;
 }
 
@@ -525,8 +607,10 @@ std::array<int, 2> copy_status_to_host(UnitBfsScratch& scratch,
   return {scratch.host_status.get()[0], scratch.host_status.get()[1]};
 }
 
+template <typename EdgeOffset>
 void extract_target_paths_to_result(UnitBfsCsrResult& result,
                                     UnitBfsScratch& scratch,
+                                    const EdgeOffset* pred_edge,
                                     const std::vector<int>& targets,
                                     int visited_count,
                                     hipStream_t stream) {
@@ -594,18 +678,19 @@ void extract_target_paths_to_result(UnitBfsCsrResult& result,
   result.target_path_edges.resize(total_edges);
   if (total_nodes != 0) {
     scratch.ensure_compact_path_capacity(total_nodes, total_edges);
-    fill_target_paths_kernel<<<grid_for_items(target_count), kBlockSize, 0, stream>>>(
-        scratch.targets.get(),
-        target_count,
-        scratch.rows,
-        scratch.pred_node.get(),
-        scratch.pred_edge.get(),
-        scratch.target_path_lengths.get(),
-        scratch.target_sources.get(),
-        scratch.target_node_offsets.get(),
-        scratch.target_edge_offsets.get(),
-        scratch.compact_path_nodes.get(),
-        scratch.compact_path_edges.get());
+    fill_target_paths_kernel<EdgeOffset>
+        <<<grid_for_items(target_count), kBlockSize, 0, stream>>>(
+            scratch.targets.get(),
+            target_count,
+            scratch.rows,
+            scratch.pred_node.get(),
+            pred_edge,
+            scratch.target_path_lengths.get(),
+            scratch.target_sources.get(),
+            scratch.target_node_offsets.get(),
+            scratch.target_edge_offsets.get(),
+            scratch.compact_path_nodes.get(),
+            scratch.compact_path_edges.get());
     UNIT_BFS_HIP_CHECK(hipGetLastError());
     UNIT_BFS_HIP_CHECK(hipMemcpyAsync(result.target_path_nodes.data(),
                                       scratch.compact_path_nodes.get(),
@@ -632,14 +717,18 @@ void extract_target_paths_to_result(UnitBfsCsrResult& result,
   result.target_reached = all_targets_reached;
 }
 
-UnitBfsCsrResult run_unit_bfs_impl(const OutgoingCsrOwner& outgoing,
-                                   UnitBfsScratch& scratch,
-                                   const std::vector<int>& sources,
-                                   const std::vector<int>& targets,
-                                   int max_depth,
-                                   hipStream_t stream,
-                                   UnitBfsCsrProgressCallback progress_callback,
-                                   void* progress_user_data) {
+template <typename EdgeOffset>
+UnitBfsCsrResult run_unit_bfs_with_offsets(
+    const OutgoingCsrOwner& outgoing,
+    const EdgeOffset* out_rowptr,
+    UnitBfsScratch& scratch,
+    EdgeOffset* pred_edge,
+    const std::vector<int>& sources,
+    const std::vector<int>& targets,
+    int max_depth,
+    hipStream_t stream,
+    UnitBfsCsrProgressCallback progress_callback,
+    void* progress_user_data) {
   if (max_depth < 0) {
     max_depth = static_cast<int>(scratch.rows);
   }
@@ -694,15 +783,16 @@ UnitBfsCsrResult run_unit_bfs_impl(const OutgoingCsrOwner& outgoing,
       scratch.target_multiplicity.get());
   UNIT_BFS_HIP_CHECK(hipGetLastError());
 
-  initialize_sources_kernel<<<grid_for_items(source_count), kBlockSize, 0, stream>>>(
-      scratch.sources.get(),
-      source_count,
-      initially_found,
-      scratch.level.get(),
-      scratch.pred_node.get(),
-      scratch.pred_edge.get(),
-      scratch.frontier_queue.get(),
-      scratch.status.get());
+  initialize_sources_kernel<EdgeOffset>
+      <<<grid_for_items(source_count), kBlockSize, 0, stream>>>(
+          scratch.sources.get(),
+          source_count,
+          initially_found,
+          scratch.level.get(),
+          scratch.pred_node.get(),
+          pred_edge,
+          scratch.frontier_queue.get(),
+          scratch.status.get());
   UNIT_BFS_HIP_CHECK(hipGetLastError());
 
   int frontier_begin = 0;
@@ -717,19 +807,20 @@ UnitBfsCsrResult run_unit_bfs_impl(const OutgoingCsrOwner& outgoing,
   for (int depth = 0;
        current_count > 0 && found_count < target_count && depth < max_depth;
        ++depth) {
-    expand_frontier_kernel<<<grid_for_frontier(current_count), kBlockSize, 0, stream>>>(
-        frontier_begin,
-        frontier_end,
-        depth + 1,
-        outgoing.rowptr.get(),
-        outgoing.colind.get(),
-        scratch.level.get(),
-        scratch.pred_node.get(),
-        scratch.pred_edge.get(),
-        scratch.frontier_queue.get(),
-        scratch.status.get(),
-        scratch.target_multiplicity.get(),
-        scratch.status.get() + 1);
+    expand_frontier_kernel<EdgeOffset>
+        <<<grid_for_frontier(current_count), kBlockSize, 0, stream>>>(
+            frontier_begin,
+            frontier_end,
+            depth + 1,
+            out_rowptr,
+            outgoing.colind.get(),
+            scratch.level.get(),
+            scratch.pred_node.get(),
+            pred_edge,
+            scratch.frontier_queue.get(),
+            scratch.status.get(),
+            scratch.target_multiplicity.get(),
+            scratch.status.get() + 1);
     UNIT_BFS_HIP_CHECK(hipGetLastError());
 
     const std::array<int, 2> status = copy_status_to_host(scratch, stream);
@@ -760,8 +851,46 @@ UnitBfsCsrResult run_unit_bfs_impl(const OutgoingCsrOwner& outgoing,
       target_count,
       scratch.target_multiplicity.get());
   UNIT_BFS_HIP_CHECK(hipGetLastError());
-  extract_target_paths_to_result(result, scratch, targets, queue_tail, stream);
+  extract_target_paths_to_result(
+      result, scratch, pred_edge, targets, queue_tail, stream);
   return result;
+}
+
+UnitBfsCsrResult run_unit_bfs_impl(const OutgoingCsrOwner& outgoing,
+                                   UnitBfsScratch& scratch,
+                                   const std::vector<int>& sources,
+                                   const std::vector<int>& targets,
+                                   int max_depth,
+                                   hipStream_t stream,
+                                   UnitBfsCsrProgressCallback progress_callback,
+                                   void* progress_user_data) {
+  if (scratch.uses_32_bit_offsets != outgoing.uses_32_bit_offsets) {
+    throw std::logic_error(
+        "unit BFS graph and workspace offset representations do not match");
+  }
+  if (outgoing.uses_32_bit_offsets) {
+    return run_unit_bfs_with_offsets(
+        outgoing,
+        outgoing.rowptr32.get(),
+        scratch,
+        scratch.pred_edge32.get(),
+        sources,
+        targets,
+        max_depth,
+        stream,
+        progress_callback,
+        progress_user_data);
+  }
+  return run_unit_bfs_with_offsets(outgoing,
+                                   outgoing.rowptr64.get(),
+                                   scratch,
+                                   scratch.pred_edge64.get(),
+                                   sources,
+                                   targets,
+                                   max_depth,
+                                   stream,
+                                   progress_callback,
+                                   progress_user_data);
 }
 
 }  // namespace unit_bfs_detail
@@ -769,22 +898,32 @@ UnitBfsCsrResult run_unit_bfs_impl(const OutgoingCsrOwner& outgoing,
 struct UnitBfsCsrGraph::Impl {
   unit_bfs_detail::OutgoingCsrOwner outgoing;
 
-  Impl(const HostCsrF32& host, hipStream_t stream)
-      : outgoing(unit_bfs_detail::copy_host_csr_to_device(host, stream)) {}
+  Impl(const HostCsrF32& host,
+       hipStream_t stream,
+       UnitBfsCsrOffsetMode offset_mode)
+      : outgoing(unit_bfs_detail::copy_host_csr_to_device(
+            host, stream, offset_mode)) {}
 };
 
 UnitBfsCsrGraph::UnitBfsCsrGraph(const HostCsrF32& adjacency,
-                                 hipStream_t stream) {
+                                 hipStream_t stream)
+    : UnitBfsCsrGraph(
+          adjacency, stream, UnitBfsCsrOffsetMode::kAuto) {}
+
+UnitBfsCsrGraph::UnitBfsCsrGraph(const HostCsrF32& adjacency,
+                                 hipStream_t stream,
+                                 UnitBfsCsrOffsetMode offset_mode) {
   unit_bfs_detail::validate_host_csr_arrays(adjacency);
-  impl_ = std::make_unique<Impl>(adjacency, stream);
-  // The shared graph may be consumed by worker streams created after this
-  // constructor returns.  Complete the one-time upload before publishing it.
-  UNIT_BFS_HIP_CHECK(hipStreamSynchronize(stream));
+  impl_ = std::make_unique<Impl>(adjacency, stream, offset_mode);
 }
 
 UnitBfsCsrGraph::~UnitBfsCsrGraph() = default;
 UnitBfsCsrGraph::UnitBfsCsrGraph(UnitBfsCsrGraph&&) noexcept = default;
 UnitBfsCsrGraph& UnitBfsCsrGraph::operator=(UnitBfsCsrGraph&&) noexcept = default;
+
+bool UnitBfsCsrGraph::uses_32_bit_offsets() const noexcept {
+  return impl_ && impl_->outgoing.uses_32_bit_offsets;
+}
 
 struct UnitBfsCsrWorkspace::Impl {
   std::shared_ptr<const UnitBfsCsrGraph> graph;
@@ -798,9 +937,18 @@ struct UnitBfsCsrWorkspace::Impl {
     return candidate->impl_->outgoing.rows;
   }
 
+  static bool require_graph_uses_32_bit_offsets(
+      const std::shared_ptr<const UnitBfsCsrGraph>& candidate) {
+    if (!candidate || !candidate->impl_) {
+      throw std::invalid_argument("unit BFS shared graph must not be null");
+    }
+    return candidate->impl_->outgoing.uses_32_bit_offsets;
+  }
+
   Impl(std::shared_ptr<const UnitBfsCsrGraph> graph_, hipStream_t stream)
       : graph(std::move(graph_)),
-        scratch(require_graph_rows(graph)) {
+        scratch(require_graph_rows(graph),
+                require_graph_uses_32_bit_offsets(graph)) {
     (void)stream;
   }
 };
@@ -808,7 +956,14 @@ struct UnitBfsCsrWorkspace::Impl {
 UnitBfsCsrWorkspace::UnitBfsCsrWorkspace(const HostCsrF32& adjacency,
                                          hipStream_t stream)
     : UnitBfsCsrWorkspace(
-          std::make_shared<UnitBfsCsrGraph>(adjacency, stream), stream) {}
+          adjacency, stream, UnitBfsCsrOffsetMode::kAuto) {}
+
+UnitBfsCsrWorkspace::UnitBfsCsrWorkspace(const HostCsrF32& adjacency,
+                                         hipStream_t stream,
+                                         UnitBfsCsrOffsetMode offset_mode)
+    : UnitBfsCsrWorkspace(
+          std::make_shared<UnitBfsCsrGraph>(adjacency, stream, offset_mode),
+          stream) {}
 
 UnitBfsCsrWorkspace::UnitBfsCsrWorkspace(
     std::shared_ptr<const UnitBfsCsrGraph> adjacency,

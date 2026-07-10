@@ -745,9 +745,10 @@ std::size_t recommend_unit_bfs_worker_count(minplus_sparse::Offset rows,
   }
   (void)total_bytes;
 
-  // Current per-worker arrays consume 24 bytes/vertex. Budget 32 bytes per
-  // vertex plus 64 MiB for query/path buffers, and leave 25% of currently free
-  // memory untouched for HIP runtime allocations and unusually large routes.
+  // Per-worker arrays consume 20 bytes/vertex with compact edge offsets and 24
+  // bytes/vertex in the wide fallback. Budget 32 bytes per vertex plus 64 MiB
+  // for query/path buffers, and leave 25% of currently free memory untouched
+  // for HIP runtime allocations and unusually large routes.
   constexpr std::size_t kBytesPerVertexBudget = 32;
   constexpr std::size_t kPerWorkerReserve = 64ULL * 1024ULL * 1024ULL;
   constexpr std::size_t kMaxAutoWorkers = 8;
