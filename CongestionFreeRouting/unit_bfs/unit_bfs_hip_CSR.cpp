@@ -11,6 +11,7 @@
 #include <sstream>
 #include <stdexcept>
 #include <string>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -85,6 +86,34 @@ class DeviceBuffer {
   std::size_t count_ = 0;
 };
 
+template <typename T>
+class PinnedHostBuffer {
+ public:
+  PinnedHostBuffer() = default;
+  explicit PinnedHostBuffer(std::size_t count) {
+    if (count != 0) {
+      UNIT_BFS_HIP_CHECK(
+          hipHostMalloc(reinterpret_cast<void**>(&ptr_),
+                        count * sizeof(T),
+                        hipHostMallocDefault));
+    }
+  }
+
+  ~PinnedHostBuffer() {
+    if (ptr_ != nullptr) {
+      (void)hipHostFree(ptr_);
+    }
+  }
+
+  PinnedHostBuffer(const PinnedHostBuffer&) = delete;
+  PinnedHostBuffer& operator=(const PinnedHostBuffer&) = delete;
+
+  T* get() const { return ptr_; }
+
+ private:
+  T* ptr_ = nullptr;
+};
+
 struct OutgoingCsrOwner {
   Offset rows = 0;
   Offset cols = 0;
@@ -109,20 +138,16 @@ struct UnitBfsScratch {
   DeviceBuffer<int> level;
   DeviceBuffer<int> pred_node;
   DeviceBuffer<Offset> pred_edge;
-  DeviceBuffer<int> current_queue;
-  DeviceBuffer<int> next_queue;
-  DeviceBuffer<int> touched_queue;
-  DeviceBuffer<int> in_touched;
-  DeviceBuffer<int> current_count;
-  DeviceBuffer<int> next_count;
-  DeviceBuffer<int> touched_count;
-  DeviceBuffer<int> found_count;
-  DeviceBuffer<int> overflow;
+  // The queue is append-only for one BFS run.  The current frontier is a
+  // half-open range within it, and every successfully claimed vertex is also
+  // the complete list of levels that must be reset before the next run.
+  DeviceBuffer<int> frontier_queue;
+  // [0] = append position / visited count, [1] = number of targets found.
   DeviceBuffer<int> status;
+  PinnedHostBuffer<int> host_status;
   DeviceBuffer<float> target_distances;
   DeviceBuffer<int> target_path_lengths;
   DeviceBuffer<int> target_sources;
-  DeviceBuffer<int> target_path_status;
   DeviceBuffer<int> target_node_offsets;
   DeviceBuffer<int> target_edge_offsets;
   DeviceBuffer<int> compact_path_nodes;
@@ -136,16 +161,9 @@ struct UnitBfsScratch {
         level(static_cast<std::size_t>(rows_)),
         pred_node(static_cast<std::size_t>(rows_)),
         pred_edge(static_cast<std::size_t>(rows_)),
-        current_queue(static_cast<std::size_t>(rows_)),
-        next_queue(static_cast<std::size_t>(rows_)),
-        touched_queue(static_cast<std::size_t>(rows_)),
-        in_touched(static_cast<std::size_t>(rows_)),
-        current_count(1),
-        next_count(1),
-        touched_count(1),
-        found_count(1),
-        overflow(1),
-        status(3) {}
+        frontier_queue(static_cast<std::size_t>(rows_)),
+        status(2),
+        host_status(2) {}
 
   void ensure_source_capacity(std::size_t source_count) {
     if (sources.size() < source_count) {
@@ -159,7 +177,6 @@ struct UnitBfsScratch {
       target_distances.reset(target_count);
       target_path_lengths.reset(target_count);
       target_sources.reset(target_count);
-      target_path_status.reset(target_count);
       target_node_offsets.reset(target_count + 1);
       target_edge_offsets.reset(target_count + 1);
     }
@@ -256,34 +273,6 @@ inline void validate_sources_targets(Offset rows,
   }
 }
 
-template <typename T>
-inline T copy_scalar_to_host(const T* d_value, hipStream_t stream) {
-  T h{};
-  UNIT_BFS_HIP_CHECK(hipMemcpyAsync(&h, d_value, sizeof(T), hipMemcpyDeviceToHost, stream));
-  UNIT_BFS_HIP_CHECK(hipStreamSynchronize(stream));
-  return h;
-}
-
-inline void reset_int_zero_async(int* d_value, hipStream_t stream) {
-  UNIT_BFS_HIP_CHECK(hipMemsetAsync(d_value, 0, sizeof(int), stream));
-}
-
-__device__ inline void mark_touched(int v,
-                                    int* in_touched,
-                                    int* touched_queue,
-                                    int* touched_count,
-                                    int capacity,
-                                    int* overflow) {
-  if (atomicCAS(&in_touched[v], 0, 1) == 0) {
-    const int pos = atomicAdd(touched_count, 1);
-    if (pos < capacity) {
-      touched_queue[pos] = v;
-    } else {
-      atomicExch(overflow, 1);
-    }
-  }
-}
-
 __device__ inline void count_target_if_reached(int v,
                                                const int* target_multiplicity,
                                                int* found_count) {
@@ -293,120 +282,104 @@ __device__ inline void count_target_if_reached(int v,
   }
 }
 
+__device__ inline int wave_append_position(bool append, int* queue_tail) {
+  const unsigned long long mask = __ballot(append);
+  if (!append) {
+    return -1;
+  }
+
+  const int lane = static_cast<int>(threadIdx.x % warpSize);
+  const int leader = __ffsll(mask) - 1;
+  int base = 0;
+  if (lane == leader) {
+    base = atomicAdd(queue_tail, __popcll(mask));
+  }
+  base = __shfl(base, leader);
+  const unsigned long long lower_lanes =
+      lane == 0 ? 0ULL : mask & ((1ULL << lane) - 1ULL);
+  return base + __popcll(lower_lanes);
+}
+
 __global__ void initialize_bfs_arrays_kernel(Offset rows,
                                              int* level,
-                                             int* pred_node,
-                                             Offset* pred_edge,
-                                             int* target_multiplicity,
-                                             int* in_touched,
-                                             int* current_count,
-                                             int* next_count,
-                                             int* touched_count,
-                                             int* found_count,
-                                             int* overflow) {
+                                             int* target_multiplicity) {
   for (Offset v = static_cast<Offset>(blockIdx.x) * blockDim.x + threadIdx.x;
        v < rows;
        v += static_cast<Offset>(blockDim.x) * gridDim.x) {
     level[v] = kUnvisited;
-    pred_node[v] = -1;
-    pred_edge[v] = static_cast<Offset>(-1);
     target_multiplicity[v] = 0;
-    in_touched[v] = 0;
-  }
-  if (blockIdx.x == 0 && threadIdx.x == 0) {
-    *current_count = 0;
-    *next_count = 0;
-    *touched_count = 0;
-    *found_count = 0;
-    *overflow = 0;
   }
 }
 
-__global__ void reset_touched_vertices_kernel(const int* touched_queue,
-                                              int touched_count,
-                                              int* level,
-                                              int* pred_node,
-                                              Offset* pred_edge,
-                                              int* in_touched) {
+__global__ void reset_visited_levels_kernel(const int* frontier_queue,
+                                            int visited_count,
+                                            int* level) {
   for (int i = blockIdx.x * blockDim.x + threadIdx.x;
-       i < touched_count;
+       i < visited_count;
        i += blockDim.x * gridDim.x) {
-    const int v = touched_queue[i];
+    const int v = frontier_queue[i];
     level[v] = kUnvisited;
-    pred_node[v] = -1;
-    pred_edge[v] = static_cast<Offset>(-1);
-    in_touched[v] = 0;
   }
 }
 
 __global__ void initialize_sources_kernel(const int* sources,
                                           int source_count,
+                                          int initially_found,
                                           int* level,
                                           int* pred_node,
                                           Offset* pred_edge,
-                                          int* current_queue,
-                                          int* current_count,
-                                          const int* target_multiplicity,
-                                          int* found_count,
-                                          int* in_touched,
-                                          int* touched_queue,
-                                          int* touched_count,
-                                          int queue_capacity,
-                                          int* overflow) {
+                                          int* frontier_queue,
+                                          int* status) {
+  if (blockIdx.x == 0 && threadIdx.x == 0) {
+    status[0] = source_count;
+    status[1] = initially_found;
+  }
   for (int i = blockIdx.x * blockDim.x + threadIdx.x;
        i < source_count;
        i += blockDim.x * gridDim.x) {
     const int source = sources[i];
-    if (atomicCAS(&level[source], kUnvisited, 0) == kUnvisited) {
-      pred_node[source] = source;
-      pred_edge[source] = static_cast<Offset>(-1);
-      mark_touched(source, in_touched, touched_queue, touched_count,
-                   queue_capacity, overflow);
-      const int pos = atomicAdd(current_count, 1);
-      if (pos < queue_capacity) {
-        current_queue[pos] = source;
-      } else {
-        atomicExch(overflow, 1);
-      }
-      count_target_if_reached(source, target_multiplicity, found_count);
-    }
+    // Sources are deduplicated on the host, so neither claiming nor queue
+    // allocation needs a global atomic operation.
+    level[source] = 0;
+    pred_node[source] = source;
+    pred_edge[source] = static_cast<Offset>(-1);
+    frontier_queue[i] = source;
   }
 }
 
-__global__ void expand_frontier_kernel(const int* frontier,
-                                       int frontier_count,
+__global__ void expand_frontier_kernel(int frontier_begin,
+                                       int frontier_end,
                                        int next_level,
                                        const Offset* out_rowptr,
                                        const Index* out_colind,
                                        int* level,
                                        int* pred_node,
                                        Offset* pred_edge,
-                                       int* next_frontier,
-                                       int* next_count,
+                                       int* frontier_queue,
+                                       int* queue_tail,
                                        const int* target_multiplicity,
-                                       int* found_count,
-                                       int* in_touched,
-                                       int* touched_queue,
-                                       int* touched_count,
-                                       int queue_capacity,
-                                       int* overflow) {
-  for (int i = blockIdx.x * blockDim.x + threadIdx.x;
-       i < frontier_count;
+                                       int* found_count) {
+  for (int i = frontier_begin + blockIdx.x * blockDim.x + threadIdx.x;
+       i < frontier_end;
        i += blockDim.x * gridDim.x) {
-    const int u = frontier[i];
+    const int u = frontier_queue[i];
     for (Offset edge = out_rowptr[u]; edge < out_rowptr[u + 1]; ++edge) {
       const int v = static_cast<int>(out_colind[edge]);
-      if (atomicCAS(&level[v], kUnvisited, next_level) == kUnvisited) {
+      // Most examined edges point to a vertex already reached by this BFS.
+      // Avoid an atomic read-modify-write for that common case; a stale load is
+      // harmless because the CAS remains the authority for claiming v.
+      const bool claimed =
+          level[v] == kUnvisited &&
+          atomicCAS(&level[v], kUnvisited, next_level) == kUnvisited;
+      if (claimed) {
         pred_node[v] = u;
         pred_edge[v] = edge;
-        mark_touched(v, in_touched, touched_queue, touched_count,
-                     queue_capacity, overflow);
-        const int pos = atomicAdd(next_count, 1);
-        if (pos < queue_capacity) {
-          next_frontier[pos] = v;
-        } else {
-          atomicExch(overflow, 1);
-        }
+      }
+      // Reserve queue positions once per active GPU wave instead of forcing
+      // every discovered vertex through the same global atomic counter.
+      const int pos = wave_append_position(claimed, queue_tail);
+      if (claimed) {
+        frontier_queue[pos] = v;
         count_target_if_reached(v, target_multiplicity, found_count);
       }
     }
@@ -429,30 +402,17 @@ __global__ void clear_target_multiplicity_kernel(const int* targets,
   for (int i = blockIdx.x * blockDim.x + threadIdx.x;
        i < target_count;
        i += blockDim.x * gridDim.x) {
-    target_multiplicity[targets[i]] = 0;
-  }
-}
-
-__global__ void pack_status_kernel(const int* queue_count,
-                                   const int* found_count,
-                                   const int* overflow,
-                                   int* status) {
-  if (blockIdx.x == 0 && threadIdx.x == 0) {
-    status[0] = *queue_count;
-    status[1] = *found_count;
-    status[2] = *overflow;
+    // Duplicate target entries may map several lanes to the same word.
+    atomicExch(&target_multiplicity[targets[i]], 0);
   }
 }
 
 __global__ void measure_target_paths_kernel(const int* targets,
                                             int target_count,
-                                            Offset rows,
                                             const int* level,
-                                            const int* pred_node,
                                             float* target_distances,
                                             int* path_lengths,
-                                            int* path_sources,
-                                            int* path_status) {
+                                            int* path_sources) {
   for (int i = blockIdx.x * blockDim.x + threadIdx.x;
        i < target_count;
        i += blockDim.x * gridDim.x) {
@@ -462,27 +422,14 @@ __global__ void measure_target_paths_kernel(const int* targets,
         target_level == kUnvisited ? INFINITY : static_cast<float>(target_level);
     path_lengths[i] = 0;
     path_sources[i] = -1;
-    path_status[i] = 0;
     if (target_level == kUnvisited) {
       continue;
     }
-
-    int current = target;
-    int length = 1;
-    for (Offset guard = 0; guard < rows; ++guard) {
-      const int pred = pred_node[current];
-      if (pred == current) {
-        path_lengths[i] = length;
-        path_sources[i] = current;
-        path_status[i] = 1;
-        break;
-      }
-      if (pred < 0 || static_cast<Offset>(pred) >= rows) {
-        break;
-      }
-      current = pred;
-      ++length;
-    }
+    // In unit BFS, the level is exactly the edge count.  The previous
+    // implementation walked the predecessor chain here and then walked it a
+    // second time while filling the path.  Derive the size in O(1) and let the
+    // fill pass perform the only pointer chase.
+    path_lengths[i] = target_level + 1;
   }
 }
 
@@ -492,7 +439,7 @@ __global__ void fill_target_paths_kernel(const int* targets,
                                          const int* pred_node,
                                          const Offset* pred_edge,
                                          const int* path_lengths,
-                                         const int* path_status,
+                                         int* path_sources,
                                          const int* node_offsets,
                                          const int* edge_offsets,
                                          int* path_nodes,
@@ -500,7 +447,7 @@ __global__ void fill_target_paths_kernel(const int* targets,
   for (int i = blockIdx.x * blockDim.x + threadIdx.x;
        i < target_count;
        i += blockDim.x * gridDim.x) {
-    if (path_status[i] == 0) {
+    if (path_lengths[i] <= 0) {
       continue;
     }
     const int length = path_lengths[i];
@@ -518,6 +465,7 @@ __global__ void fill_target_paths_kernel(const int* targets,
       current = pred;
       path_nodes[node_begin + j - 1] = current;
     }
+    path_sources[i] = current;
   }
 }
 
@@ -542,109 +490,67 @@ OutgoingCsrOwner copy_host_csr_to_device(const HostCsrF32& host, hipStream_t str
 
 void initialize_scratch_once(UnitBfsScratch& scratch, Offset rows, hipStream_t stream) {
   if (scratch.initialized) {
-    reset_int_zero_async(scratch.current_count.get(), stream);
-    reset_int_zero_async(scratch.next_count.get(), stream);
-    reset_int_zero_async(scratch.touched_count.get(), stream);
-    reset_int_zero_async(scratch.found_count.get(), stream);
-    reset_int_zero_async(scratch.overflow.get(), stream);
     return;
   }
 
   initialize_bfs_arrays_kernel<<<grid_for_items(rows), kBlockSize, 0, stream>>>(
       rows,
       scratch.level.get(),
-      scratch.pred_node.get(),
-      scratch.pred_edge.get(),
-      scratch.target_multiplicity.get(),
-      scratch.in_touched.get(),
-      scratch.current_count.get(),
-      scratch.next_count.get(),
-      scratch.touched_count.get(),
-      scratch.found_count.get(),
-      scratch.overflow.get());
+      scratch.target_multiplicity.get());
   UNIT_BFS_HIP_CHECK(hipGetLastError());
   scratch.initialized = true;
 }
 
-void reset_touched_vertices(UnitBfsScratch& scratch, hipStream_t stream) {
-  const int touched_count = copy_scalar_to_host(scratch.touched_count.get(), stream);
-  if (touched_count > 0) {
-    reset_touched_vertices_kernel<<<grid_for_items(touched_count),
-                                    kBlockSize,
-                                    0,
-                                    stream>>>(
-        scratch.touched_queue.get(),
-        touched_count,
-        scratch.level.get(),
-        scratch.pred_node.get(),
-        scratch.pred_edge.get(),
-        scratch.in_touched.get());
+void reset_visited_levels(UnitBfsScratch& scratch,
+                          int visited_count,
+                          hipStream_t stream) {
+  if (visited_count > 0) {
+    reset_visited_levels_kernel<<<grid_for_items(visited_count),
+                                  kBlockSize,
+                                  0,
+                                  stream>>>(
+        scratch.frontier_queue.get(), visited_count, scratch.level.get());
     UNIT_BFS_HIP_CHECK(hipGetLastError());
   }
-  reset_int_zero_async(scratch.touched_count.get(), stream);
 }
 
-std::array<int, 3> copy_status_to_host(const int* queue_count,
-                                       UnitBfsScratch& scratch,
-                                       hipStream_t stream) {
-  pack_status_kernel<<<1, 1, 0, stream>>>(
-      queue_count, scratch.found_count.get(), scratch.overflow.get(), scratch.status.get());
-  UNIT_BFS_HIP_CHECK(hipGetLastError());
-  std::array<int, 3> status{};
-  UNIT_BFS_HIP_CHECK(hipMemcpyAsync(status.data(),
+std::array<int, 2> copy_status_to_host(UnitBfsScratch& scratch,
+                                      hipStream_t stream) {
+  UNIT_BFS_HIP_CHECK(hipMemcpyAsync(scratch.host_status.get(),
                                     scratch.status.get(),
-                                    status.size() * sizeof(int),
+                                    2 * sizeof(int),
                                     hipMemcpyDeviceToHost,
                                     stream));
   UNIT_BFS_HIP_CHECK(hipStreamSynchronize(stream));
-  return status;
-}
-
-void throw_if_overflow(const std::array<int, 3>& status) {
-  if (status[2] != 0) {
-    throw std::runtime_error("unit BFS frontier/touched queue overflow");
-  }
+  return {scratch.host_status.get()[0], scratch.host_status.get()[1]};
 }
 
 void extract_target_paths_to_result(UnitBfsCsrResult& result,
                                     UnitBfsScratch& scratch,
                                     const std::vector<int>& targets,
+                                    int visited_count,
                                     hipStream_t stream) {
   const int target_count = static_cast<int>(targets.size());
   measure_target_paths_kernel<<<grid_for_items(target_count), kBlockSize, 0, stream>>>(
       scratch.targets.get(),
       target_count,
-      scratch.rows,
       scratch.level.get(),
-      scratch.pred_node.get(),
       scratch.target_distances.get(),
       scratch.target_path_lengths.get(),
-      scratch.target_sources.get(),
-      scratch.target_path_status.get());
+      scratch.target_sources.get());
   UNIT_BFS_HIP_CHECK(hipGetLastError());
 
   result.target_distances.resize(targets.size());
-  result.target_sources.resize(targets.size());
+  result.target_sources.assign(targets.size(), -1);
   std::vector<int> path_lengths(targets.size());
-  std::vector<int> path_status(targets.size());
 
   UNIT_BFS_HIP_CHECK(hipMemcpyAsync(result.target_distances.data(),
                                     scratch.target_distances.get(),
                                     targets.size() * sizeof(float),
                                     hipMemcpyDeviceToHost,
                                     stream));
-  UNIT_BFS_HIP_CHECK(hipMemcpyAsync(result.target_sources.data(),
-                                    scratch.target_sources.get(),
-                                    targets.size() * sizeof(int),
-                                    hipMemcpyDeviceToHost,
-                                    stream));
   UNIT_BFS_HIP_CHECK(hipMemcpyAsync(path_lengths.data(),
                                     scratch.target_path_lengths.get(),
-                                    targets.size() * sizeof(int),
-                                    hipMemcpyDeviceToHost,
-                                    stream));
-  UNIT_BFS_HIP_CHECK(hipMemcpyAsync(path_status.data(),
-                                    scratch.target_path_status.get(),
                                     targets.size() * sizeof(int),
                                     hipMemcpyDeviceToHost,
                                     stream));
@@ -658,7 +564,7 @@ void extract_target_paths_to_result(UnitBfsCsrResult& result,
   for (std::size_t i = 0; i < targets.size(); ++i) {
     result.target_path_offsets[i] = static_cast<int>(total_nodes);
     result.target_edge_offsets[i] = static_cast<int>(total_edges);
-    if (path_status[i] == 0 || path_lengths[i] <= 0 ||
+    if (path_lengths[i] <= 0 ||
         !std::isfinite(result.target_distances[i])) {
       all_targets_reached = false;
       continue;
@@ -695,7 +601,7 @@ void extract_target_paths_to_result(UnitBfsCsrResult& result,
         scratch.pred_node.get(),
         scratch.pred_edge.get(),
         scratch.target_path_lengths.get(),
-        scratch.target_path_status.get(),
+        scratch.target_sources.get(),
         scratch.target_node_offsets.get(),
         scratch.target_edge_offsets.get(),
         scratch.compact_path_nodes.get(),
@@ -706,6 +612,11 @@ void extract_target_paths_to_result(UnitBfsCsrResult& result,
                                       total_nodes * sizeof(int),
                                       hipMemcpyDeviceToHost,
                                       stream));
+    UNIT_BFS_HIP_CHECK(hipMemcpyAsync(result.target_sources.data(),
+                                      scratch.target_sources.get(),
+                                      targets.size() * sizeof(int),
+                                      hipMemcpyDeviceToHost,
+                                      stream));
   }
   if (total_edges != 0) {
     UNIT_BFS_HIP_CHECK(hipMemcpyAsync(result.target_path_edges.data(),
@@ -714,6 +625,9 @@ void extract_target_paths_to_result(UnitBfsCsrResult& result,
                                       hipMemcpyDeviceToHost,
                                       stream));
   }
+  // Reset only the state used to claim a vertex.  Predecessors are overwritten
+  // whenever a future search claims that vertex and never need cleanup.
+  reset_visited_levels(scratch, visited_count, stream);
   UNIT_BFS_HIP_CHECK(hipStreamSynchronize(stream));
   result.target_reached = all_targets_reached;
 }
@@ -731,15 +645,41 @@ UnitBfsCsrResult run_unit_bfs_impl(const OutgoingCsrOwner& outgoing,
   }
 
   const int n_int = static_cast<int>(scratch.rows);
-  const int source_count = static_cast<int>(sources.size());
   const int target_count = static_cast<int>(targets.size());
-  scratch.ensure_source_capacity(sources.size());
+  std::vector<int> deduplicated_sources;
+  const std::vector<int>* effective_sources = &sources;
+  int initially_found = 0;
+  if (sources.size() == 1) {
+    for (const int target : targets) {
+      if (target == sources.front()) {
+        ++initially_found;
+      }
+    }
+  } else {
+    std::unordered_set<int> source_seen;
+    source_seen.reserve(sources.size());
+    deduplicated_sources.reserve(sources.size());
+    for (const int source : sources) {
+      if (source_seen.insert(source).second) {
+        deduplicated_sources.push_back(source);
+      }
+    }
+    effective_sources = &deduplicated_sources;
+    for (const int target : targets) {
+      if (source_seen.find(target) != source_seen.end()) {
+        ++initially_found;
+      }
+    }
+  }
+  const int source_count = static_cast<int>(effective_sources->size());
+
+  scratch.ensure_source_capacity(effective_sources->size());
   scratch.ensure_target_capacity(targets.size());
 
   initialize_scratch_once(scratch, scratch.rows, stream);
   UNIT_BFS_HIP_CHECK(hipMemcpyAsync(scratch.sources.get(),
-                                    sources.data(),
-                                    sources.size() * sizeof(int),
+                                    effective_sources->data(),
+                                    effective_sources->size() * sizeof(int),
                                     hipMemcpyHostToDevice,
                                     stream));
   UNIT_BFS_HIP_CHECK(hipMemcpyAsync(scratch.targets.get(),
@@ -757,28 +697,19 @@ UnitBfsCsrResult run_unit_bfs_impl(const OutgoingCsrOwner& outgoing,
   initialize_sources_kernel<<<grid_for_items(source_count), kBlockSize, 0, stream>>>(
       scratch.sources.get(),
       source_count,
+      initially_found,
       scratch.level.get(),
       scratch.pred_node.get(),
       scratch.pred_edge.get(),
-      scratch.current_queue.get(),
-      scratch.current_count.get(),
-      scratch.target_multiplicity.get(),
-      scratch.found_count.get(),
-      scratch.in_touched.get(),
-      scratch.touched_queue.get(),
-      scratch.touched_count.get(),
-      n_int,
-      scratch.overflow.get());
+      scratch.frontier_queue.get(),
+      scratch.status.get());
   UNIT_BFS_HIP_CHECK(hipGetLastError());
 
-  std::array<int, 3> status =
-      copy_status_to_host(scratch.current_count.get(), scratch, stream);
-  throw_if_overflow(status);
-  int current_count = status[0];
-  int found_count = status[1];
-
-  int* current_queue = scratch.current_queue.get();
-  int* next_queue = scratch.next_queue.get();
+  int frontier_begin = 0;
+  int frontier_end = source_count;
+  int queue_tail = source_count;
+  int current_count = source_count;
+  int found_count = initially_found;
   UnitBfsCsrResult result;
   result.target = -1;
   result.iterations_used = 0;
@@ -786,34 +717,31 @@ UnitBfsCsrResult run_unit_bfs_impl(const OutgoingCsrOwner& outgoing,
   for (int depth = 0;
        current_count > 0 && found_count < target_count && depth < max_depth;
        ++depth) {
-    reset_int_zero_async(scratch.next_count.get(), stream);
-    reset_int_zero_async(scratch.overflow.get(), stream);
-
     expand_frontier_kernel<<<grid_for_frontier(current_count), kBlockSize, 0, stream>>>(
-        current_queue,
-        current_count,
+        frontier_begin,
+        frontier_end,
         depth + 1,
         outgoing.rowptr.get(),
         outgoing.colind.get(),
         scratch.level.get(),
         scratch.pred_node.get(),
         scratch.pred_edge.get(),
-        next_queue,
-        scratch.next_count.get(),
+        scratch.frontier_queue.get(),
+        scratch.status.get(),
         scratch.target_multiplicity.get(),
-        scratch.found_count.get(),
-        scratch.in_touched.get(),
-        scratch.touched_queue.get(),
-        scratch.touched_count.get(),
-        n_int,
-        scratch.overflow.get());
+        scratch.status.get() + 1);
     UNIT_BFS_HIP_CHECK(hipGetLastError());
 
-    status = copy_status_to_host(scratch.next_count.get(), scratch, stream);
-    throw_if_overflow(status);
-    current_count = status[0];
+    const std::array<int, 2> status = copy_status_to_host(scratch, stream);
+    queue_tail = status[0];
+    if (queue_tail < frontier_end || queue_tail > n_int) {
+      throw std::runtime_error("unit BFS append-only frontier queue overflow");
+    }
+    current_count = queue_tail - frontier_end;
     found_count = status[1];
     result.iterations_used = depth + 1;
+    frontier_begin = frontier_end;
+    frontier_end = queue_tail;
 
     if (progress_callback) {
       UnitBfsCsrProgress progress;
@@ -823,19 +751,16 @@ UnitBfsCsrResult run_unit_bfs_impl(const OutgoingCsrOwner& outgoing,
       progress.changed = current_count > 0;
       progress_callback(progress, progress_user_data);
     }
-
-    std::swap(current_queue, next_queue);
   }
 
   result.converged = current_count == 0 || found_count >= target_count;
   result.stopped_on_target = found_count >= target_count;
-  extract_target_paths_to_result(result, scratch, targets, stream);
   clear_target_multiplicity_kernel<<<grid_for_items(target_count), kBlockSize, 0, stream>>>(
       scratch.targets.get(),
       target_count,
       scratch.target_multiplicity.get());
   UNIT_BFS_HIP_CHECK(hipGetLastError());
-  reset_touched_vertices(scratch, stream);
+  extract_target_paths_to_result(result, scratch, targets, queue_tail, stream);
   return result;
 }
 
