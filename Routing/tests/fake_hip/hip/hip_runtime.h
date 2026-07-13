@@ -38,3 +38,7 @@ inline hipError_t hipStreamCreateWithFlags(hipStream_t* stream,
 inline hipError_t hipStreamDestroy(hipStream_t) {
   return hipSuccess;
 }
+
+inline hipError_t hipStreamSynchronize(hipStream_t) {
+  return hipSuccess;
+}

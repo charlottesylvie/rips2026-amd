@@ -229,9 +229,14 @@ Tuning options:
 | `--max-sssp-iters <int>` | `-1` | Delta-step bucket rounds or unit-BFS depth cap; `-1` uses the default. |
 | `--capacity <int>` | `1` | Capacity used only for overuse diagnostics. |
 | `--net-limit <count>` | unset | Route only the first `count` requests. |
-| `--parallel-net-workers <count>` | `0` | Independent net workers sharing one immutable device CSR; `0` auto-selects up to 8 from available GPU memory. |
+| `--parallel-net-workers <count>` | `0` | Independent net workers; `0` auto-selects up to 8 from available GPU memory. Unit-BFS workers share one CSR; delta workers currently own private CSR copies. |
 | `--routes-out <path>` | unset | Write routed PIP tree data as JSONL. |
 | `--max-pathfinder-iters`, `--present-factor`, `--present-multiplier`, `--history-factor`, `--route-batch-size` | ignored | Compatibility-only options accepted by the one-shot router. |
+
+The converter emits exact unit weights. For unlimited multi-target calls with
+no vertex-cost override or progress callback, the delta backend automatically
+uses its equivalent append-only unit-weight specialization; weighted and
+limited-iteration calls retain generic delta-stepping.
 
 ### `routes_to_phys`
 
@@ -315,6 +320,20 @@ hipcc -std=c++17 -O2 -x hip \
 /tmp/unit_bfs_hip_test
 ```
 
+Production outgoing-CSR delta-stepping regression test (requires an AMD HIP
+system):
+
+```bash
+hipcc -std=c++17 -O2 -x hip \
+  -I HIP_kernel/bellman_ford/src \
+  -I CongestionFreeRouting/delta_stepping \
+  CongestionFreeRouting/tests/delta_stepping_hip_test.cpp \
+  CongestionFreeRouting/delta_stepping/delta_stepping_hip_CSR.cpp \
+  -o /tmp/delta_stepping_hip_test
+
+/tmp/delta_stepping_hip_test
+```
+
 Python route-writer regression test:
 
 ```bash
@@ -333,7 +352,9 @@ hipcc -std=c++17 -O3 -x hip \
 ./test_correctness --quick
 ```
 
-Delta Stepping versus Dijkstra verification:
+Legacy incoming-CSR Delta Stepping versus Dijkstra verification (this tests the
+separate implementation under `HIP_kernel/delta_stepping`, not the production
+outgoing-CSR router implementation):
 
 ```bash
 hipcc -std=c++17 -O3 -x hip \

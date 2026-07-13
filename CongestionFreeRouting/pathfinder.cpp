@@ -776,6 +776,65 @@ std::size_t recommend_unit_bfs_worker_count(minplus_sparse::Offset rows,
 #endif
 }
 
+std::size_t recommend_delta_worker_count(minplus_sparse::Offset rows,
+                                         minplus_sparse::Offset nnz,
+                                         std::size_t route_request_count,
+                                         hipStream_t stream) {
+  if (stream != nullptr || rows <= 0 || nnz < 0 || route_request_count <= 1) {
+    return 1;
+  }
+
+#if defined(__HIPCC__) || defined(__HIP_PLATFORM_AMD__)
+  std::size_t free_bytes = 0;
+  std::size_t total_bytes = 0;
+  if (hipMemGetInfo(&free_bytes, &total_bytes) != hipSuccess) {
+    return 1;
+  }
+  (void)total_bytes;
+
+  // Delta workers currently own both CSR and mutable query state. Account for
+  // 72 bytes per vertex (row offsets, distances, flags, queues, race-safe
+  // parents and costs), 8 bytes
+  // per edge (destination, value), and a reserve for target/path buffers.
+  constexpr std::size_t kBytesPerVertexBudget = 72;
+  constexpr std::size_t kBytesPerEdgeBudget = 8;
+  constexpr std::size_t kPerWorkerReserve = 64ULL * 1024ULL * 1024ULL;
+  constexpr std::size_t kMaxAutoWorkers = 8;
+  const std::size_t row_count = static_cast<std::size_t>(rows);
+  const std::size_t edge_count = static_cast<std::size_t>(nnz);
+  if (row_count >
+          (std::numeric_limits<std::size_t>::max() - kPerWorkerReserve) /
+              kBytesPerVertexBudget ||
+      edge_count >
+          (std::numeric_limits<std::size_t>::max() - kPerWorkerReserve) /
+              kBytesPerEdgeBudget) {
+    return 1;
+  }
+  const std::size_t vertex_bytes = row_count * kBytesPerVertexBudget;
+  const std::size_t edge_bytes = edge_count * kBytesPerEdgeBudget;
+  if (vertex_bytes > std::numeric_limits<std::size_t>::max() - edge_bytes ||
+      vertex_bytes + edge_bytes >
+          std::numeric_limits<std::size_t>::max() - kPerWorkerReserve) {
+    return 1;
+  }
+  const std::size_t per_worker_bytes =
+      vertex_bytes + edge_bytes + kPerWorkerReserve;
+  const std::size_t memory_budget = free_bytes - free_bytes / 4;
+  const std::size_t memory_workers =
+      std::max<std::size_t>(1, memory_budget / per_worker_bytes);
+  const std::size_t cpu_threads =
+      std::max<unsigned int>(1, std::thread::hardware_concurrency());
+  return std::max<std::size_t>(
+      1,
+      std::min({kMaxAutoWorkers,
+                route_request_count,
+                cpu_threads,
+                memory_workers}));
+#else
+  return 1;
+#endif
+}
+
 template <typename WorkspaceFactory>
 void route_all_nets_with_workspace(const HostCsrF32& base_graph,
                                    const RoutingMetadata& metadata,
@@ -1315,11 +1374,19 @@ PathfinderResult run_pathfinder(const HostCsrF32& base_graph,
           });
       break;
     }
-    case SsspEngine::kDeltaStep:
+    case SsspEngine::kDeltaStep: {
+      PathfinderOptions delta_options = options;
+      if (delta_options.parallel_net_workers == 0) {
+        delta_options.parallel_net_workers = recommend_delta_worker_count(
+            base_graph.rows, base_graph.nnz, route_request_count, stream);
+        std::cout << "[pathfinder] auto-selected "
+                  << delta_options.parallel_net_workers
+                  << " delta-step worker(s)\n";
+      }
       route_all_nets_with_workspace(
           base_graph,
           metadata,
-          options,
+          delta_options,
           stream,
           route_request_count,
           progress_interval,
@@ -1328,6 +1395,7 @@ PathfinderResult run_pathfinder(const HostCsrF32& base_graph,
             return DeltaSteppingCsrWorkspace(base_graph, worker_stream);
           });
       break;
+    }
   }
 
   for (const RoutedNet& net : result.nets) {

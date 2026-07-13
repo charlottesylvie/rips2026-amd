@@ -11,6 +11,8 @@
 //   adjacency row u, column v = weight of directed edge u -> v.
 // The converter emits this orientation directly so the kernel can traverse
 // frontiers without an O(E) GPU transpose.
+// Unlimited multi-target workspace runs with exact unit weights and no vertex
+// costs use an equivalent append-only traversal specialized for that case.
 using DeltaSteppingCsrProgress = BellmanFordCsrProgress;
 using DeltaSteppingCsrProgressCallback = BellmanFordCsrProgressCallback;
 using DeltaSteppingCsrResult = BellmanFordCsrResult;
@@ -19,6 +21,8 @@ class DeltaSteppingCsrWorkspace {
  public:
   struct Impl;
 
+  // A workspace is stream-affine: construction, updates, and every run must
+  // use the same stream handle. Separate workspaces may use separate streams.
   explicit DeltaSteppingCsrWorkspace(const HostCsrF32& adjacency,
                                      hipStream_t stream = nullptr);
   ~DeltaSteppingCsrWorkspace();
