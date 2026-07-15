@@ -13,10 +13,9 @@
 // the same executable.  The public names are intentionally different from the
 // original implementation to avoid duplicate linker symbols.
 //
-// CSR convention matches bellman_ford_minplus_hip_csr and the original
-// delta-stepping implementation:
-//   adjacency row v, column u = weight of directed edge u -> v.
-// The implementation internally builds an outgoing CSR transpose on the GPU.
+// CSR convention is outgoing:
+//   adjacency row u, column v = weight of directed edge u -> v.
+// This matches the routing graph directly; no CSR transpose is constructed.
 using DeltaSteppingThreadsCsrProgress = BellmanFordCsrProgress;
 using DeltaSteppingThreadsCsrProgressCallback = BellmanFordCsrProgressCallback;
 using DeltaSteppingThreadsCsrResult = BellmanFordCsrResult;

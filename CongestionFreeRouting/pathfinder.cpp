@@ -47,7 +47,6 @@
 #include <sstream>
 #include <stdexcept>
 #include <thread>
-#include <type_traits>
 #include <unordered_set>
 #include <utility>
 
@@ -146,45 +145,6 @@ void validate_csr(const HostCsrF32& graph) {
       throw std::runtime_error("CSR values must be finite nonnegative costs");
     }
   }
-}
-
-HostCsrF32 transpose_outgoing_to_incoming_csr(const HostCsrF32& outgoing) {
-  // The congestion-free router uses outgoing CSR, whereas delta-threading
-  // consumes incoming CSR.  Preserve the edge weights while reversing only
-  // the CSR storage orientation: each original u -> v becomes an entry u in
-  // incoming row v.
-  HostCsrF32 incoming;
-  incoming.rows = outgoing.rows;
-  incoming.cols = outgoing.cols;
-  incoming.nnz = outgoing.nnz;
-  incoming.rowptr.assign(static_cast<std::size_t>(incoming.rows + 1), 0);
-  for (const minplus_sparse::Index destination : outgoing.colind) {
-    ++incoming.rowptr[static_cast<std::size_t>(destination + 1)];
-  }
-  for (minplus_sparse::Offset row = 0; row < incoming.rows; ++row) {
-    incoming.rowptr[static_cast<std::size_t>(row + 1)] +=
-        incoming.rowptr[static_cast<std::size_t>(row)];
-  }
-
-  incoming.colind.resize(static_cast<std::size_t>(incoming.nnz));
-  incoming.values.resize(static_cast<std::size_t>(incoming.nnz));
-  std::vector<minplus_sparse::Offset> next = incoming.rowptr;
-  for (minplus_sparse::Offset source = 0; source < outgoing.rows; ++source) {
-    for (minplus_sparse::Offset edge =
-             outgoing.rowptr[static_cast<std::size_t>(source)];
-         edge < outgoing.rowptr[static_cast<std::size_t>(source + 1)];
-         ++edge) {
-      const minplus_sparse::Index destination =
-          outgoing.colind[static_cast<std::size_t>(edge)];
-      const minplus_sparse::Offset slot =
-          next[static_cast<std::size_t>(destination)]++;
-      incoming.colind[static_cast<std::size_t>(slot)] =
-          static_cast<minplus_sparse::Index>(source);
-      incoming.values[static_cast<std::size_t>(slot)] =
-          outgoing.values[static_cast<std::size_t>(edge)];
-    }
-  }
-  return incoming;
 }
 
 void validate_options(const PathfinderOptions& options) {
@@ -477,21 +437,6 @@ RoutedNet route_net(const HostCsrF32& graph,
                               stream,
                               nullptr,
                               nullptr);
-
-    if constexpr (std::is_same_v<SsspWorkspace, DeltaSteppingThreadsCsrWorkspace>) {
-      // Delta-threading was run on a transposed (incoming) CSR, so its edge
-      // indices cannot be used with this router's outgoing CSR.  Its distance
-      // labels remain valid; force the existing outgoing-CSR reconstruction
-      // fallback to derive the route from those labels.
-      sssp.pred_node.clear();
-      sssp.pred_edge.clear();
-      sssp.target_distances.clear();
-      sssp.target_sources.clear();
-      sssp.target_path_offsets.clear();
-      sssp.target_edge_offsets.clear();
-      sssp.target_path_nodes.clear();
-      sssp.target_path_edges.clear();
-    }
 
     const bool has_compact_target_paths =
         sssp.target_distances.size() == targets.size() &&
@@ -1475,11 +1420,6 @@ PathfinderResult run_pathfinder(const HostCsrF32& base_graph,
       break;
     }
     case SsspEngine::kDeltaThreading: {
-      // Delta-threading consumes incoming CSR.  Keep the router's outgoing
-      // graph for path reconstruction and give each threading workspace the
-      // transposed representation solely for the SSSP calculation.
-      const HostCsrF32 incoming_graph =
-          transpose_outgoing_to_incoming_csr(base_graph);
       PathfinderOptions threading_options = options;
       if (threading_options.parallel_net_workers == 0) {
         // Unlike DeltaSteppingCsrWorkspace, the threading implementation does
@@ -1496,8 +1436,8 @@ PathfinderResult run_pathfinder(const HostCsrF32& base_graph,
           route_request_count,
           progress_interval,
           result.nets,
-          [&incoming_graph](hipStream_t worker_stream) {
-            return DeltaSteppingThreadsCsrWorkspace(incoming_graph, worker_stream);
+          [&base_graph](hipStream_t worker_stream) {
+            return DeltaSteppingThreadsCsrWorkspace(base_graph, worker_stream);
           });
       break;
     }

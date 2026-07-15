@@ -1,5 +1,11 @@
 #include "delta_stepping_hip_CSR.hpp"
+#if __has_include("../../delta_threading/src/delta_stepping_hip_CSR_threads.hpp")
 #include "../../delta_threading/src/delta_stepping_hip_CSR_threads.hpp"
+#elif __has_include("../../delta_threading/delta_threading/src/delta_stepping_hip_CSR_threads.hpp")
+#include "../../delta_threading/delta_threading/src/delta_stepping_hip_CSR_threads.hpp"
+#else
+#error "delta-threading header is required for this comparison"
+#endif
 
 #if __has_include("../../delta_stepping_gpu_opt/src/delta_stepping_hip_CSR.hpp")
 #define SSSP_HAS_DELTA_STEPPING_GPU_OPT 1
@@ -202,6 +208,34 @@ HostCsrF32 make_random_incoming_csr(int n,
   return g;
 }
 
+HostCsrF32 transpose_incoming_to_outgoing_csr(const HostCsrF32& incoming) {
+  HostCsrF32 outgoing;
+  outgoing.rows = incoming.rows;
+  outgoing.cols = incoming.cols;
+  outgoing.nnz = incoming.nnz;
+  outgoing.rowptr.assign(static_cast<std::size_t>(outgoing.rows) + 1, 0);
+  for (const Index source : incoming.colind) {
+    ++outgoing.rowptr[static_cast<std::size_t>(source) + 1];
+  }
+  for (Offset row = 0; row < outgoing.rows; ++row) {
+    outgoing.rowptr[static_cast<std::size_t>(row) + 1] +=
+        outgoing.rowptr[static_cast<std::size_t>(row)];
+  }
+  outgoing.colind.resize(static_cast<std::size_t>(outgoing.nnz));
+  outgoing.values.resize(static_cast<std::size_t>(outgoing.nnz));
+  std::vector<Offset> next = outgoing.rowptr;
+  for (Offset destination = 0; destination < incoming.rows; ++destination) {
+    for (Offset edge = incoming.rowptr[static_cast<std::size_t>(destination)];
+         edge < incoming.rowptr[static_cast<std::size_t>(destination) + 1]; ++edge) {
+      const Index source = incoming.colind[static_cast<std::size_t>(edge)];
+      const Offset slot = next[static_cast<std::size_t>(source)]++;
+      outgoing.colind[static_cast<std::size_t>(slot)] = static_cast<Index>(destination);
+      outgoing.values[static_cast<std::size_t>(slot)] = incoming.values[static_cast<std::size_t>(edge)];
+    }
+  }
+  return outgoing;
+}
+
 struct RunTiming {
   float gpu_ms = 0.0f;   // HIP-event time: queued GPU work on the stream.
   double wall_ms = 0.0;  // End-to-end host wall time for the call.
@@ -327,6 +361,11 @@ int main(int argc, char** argv) {
     HostCsrF32 h_graph = make_random_incoming_csr(n, avg_out_degree, 1.0f, 16.0f,
                                                   static_cast<std::uint32_t>(seed));
     DeviceCsrOwner d_graph = copy_host_csr_to_device(h_graph, stream);
+    // The original delta-stepping implementation uses incoming CSR; the
+    // threaded implementation natively uses outgoing CSR.  Do this setup
+    // conversion once, outside the timed region.
+    HostCsrF32 h_threads_graph = transpose_incoming_to_outgoing_csr(h_graph);
+    DeviceCsrOwner d_threads_graph = copy_host_csr_to_device(h_threads_graph, stream);
 
     std::cout << "Benchmark graph\n"
               << "  vertices:       " << h_graph.rows << '\n'
@@ -348,7 +387,7 @@ int main(int argc, char** argv) {
       last_delta = delta_stepping_minplus_hip_csr(
           d_graph.view, source, delta, max_iters, stream);
       last_threads = delta_stepping_threads_minplus_hip_csr(
-          d_graph.view, source, delta, max_iters, stream);
+          d_threads_graph.view, source, delta, max_iters, stream);
 #if SSSP_HAS_DELTA_STEPPING_GPU_OPT
       last_gpu_opt = delta_stepping_gpu_opt_minplus_hip_csr(
           d_graph.view, source, delta, max_iters, stream);
@@ -377,7 +416,7 @@ int main(int argc, char** argv) {
       });
       auto threads_result = time_call(stream, [&] {
         return delta_stepping_threads_minplus_hip_csr(
-            d_graph.view, source, delta, max_iters, stream);
+            d_threads_graph.view, source, delta, max_iters, stream);
       });
 #if SSSP_HAS_DELTA_STEPPING_GPU_OPT
       auto gpu_opt_result = time_call(stream, [&] {

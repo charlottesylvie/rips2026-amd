@@ -118,6 +118,8 @@ struct DeviceCsrOwner {
   }
 };
 
+// Retained only for the legacy transpose helpers below.  The public threaded
+// solver no longer constructs or uses this representation.
 struct OutgoingCsrOwner {
   Offset rows = 0;
   Offset cols = 0;
@@ -129,9 +131,7 @@ struct OutgoingCsrOwner {
 
   OutgoingCsrOwner() = default;
   OutgoingCsrOwner(Offset rows_, Offset cols_, Offset nnz_)
-      : rows(rows_),
-        cols(cols_),
-        nnz(nnz_),
+      : rows(rows_), cols(cols_), nnz(nnz_),
         rowptr(static_cast<std::size_t>(rows_) + 1),
         colind(static_cast<std::size_t>(nnz_)),
         values(static_cast<std::size_t>(nnz_)),
@@ -733,12 +733,8 @@ __global__ void mark_settled_targets_kernel(const int* targets,
 __global__ void measure_target_paths_kernel(const int* targets,
                                             int target_count,
                                             Offset rows,
-                                            const Offset* rowptr,
-                                            const Index* colind,
-                                            const float* values,
-                                            const float* vertex_costs,
                                             const float* dist,
-                                            int* pred_node,
+                                            const int* pred_node,
                                             float* target_distances,
                                             int* path_lengths,
                                             int* path_sources,
@@ -767,11 +763,8 @@ __global__ void measure_target_paths_kernel(const int* targets,
         break;
       }
 
-      int pred = -1;
-      Offset edge = static_cast<Offset>(-1);
-      if (!find_final_distance_predecessor(rows, rowptr, colind, values,
-                                           vertex_costs, dist, current,
-                                           &pred, &edge)) {
+      const int pred = pred_node[current];
+      if (pred < 0 || pred == current) {
         break;
       }
       (void)edge;
@@ -784,12 +777,8 @@ __global__ void measure_target_paths_kernel(const int* targets,
 __global__ void fill_target_paths_kernel(const int* targets,
                                          int target_count,
                                          Offset rows,
-                                         const Offset* rowptr,
-                                         const Index* colind,
-                                         const float* values,
-                                         const float* vertex_costs,
-                                         const float* dist,
                                          const int* pred_node,
+                                         const Offset* pred_edge,
                                          const int* path_lengths,
                                          const int* path_status,
                                          const int* node_offsets,
@@ -812,11 +801,9 @@ __global__ void fill_target_paths_kernel(const int* targets,
       if (source_marker == current) {
         return;
       }
-      int pred = -1;
-      Offset edge = static_cast<Offset>(-1);
-      if (!find_final_distance_predecessor(rows, rowptr, colind, values,
-                                           vertex_costs, dist, current,
-                                           &pred, &edge)) {
+      const int pred = pred_node[current];
+      const Offset edge = pred_edge[current];
+      if (pred < 0 || pred == current || edge < 0) {
         return;
       }
       path_edges[edge_begin + j - 1] = edge;
@@ -834,7 +821,6 @@ __global__ void relax_light_edges_kernel(const int* frontier,
                                          const Offset* out_rowptr,
                                          const Index* out_colind,
                                          const float* out_values,
-                                         const Offset* out_incoming_edge,
                                          const float* vertex_costs,
                                          float* dist,
                                          int* in_current,
@@ -878,8 +864,13 @@ __global__ void relax_light_edges_kernel(const int* frontier,
       const float nd = du + effective_w;
       const float old = atomic_min_float_nonnegative(&dist[v], nd);
       if (nd < old) {
-        pred_node[v] = u;
-        pred_edge[v] = out_incoming_edge[e];
+        // A later, shorter relaxation may already have won before this
+        // thread records its parent.  Only publish a parent for the distance
+        // that is still current, so compact outgoing paths stay consistent.
+        if (dist[v] == nd) {
+          pred_node[v] = u;
+          pred_edge[v] = e;
+        }
         mark_touched(v, in_touched, touched_queue, touched_count,
                      queue_capacity, overflow);
         const int b = bucket_index(nd, inv_delta);
@@ -917,8 +908,10 @@ __global__ void relax_light_edges_kernel(const int* frontier,
         const float nd = du + effective_w;
         const float old = atomic_min_float_nonnegative(&dist[v], nd);
         if (nd < old) {
-          pred_node[v] = u;
-          pred_edge[v] = out_incoming_edge[e];
+          if (dist[v] == nd) {
+            pred_node[v] = u;
+            pred_edge[v] = e;
+          }
           mark_touched(v, in_touched, touched_queue, touched_count,
                        queue_capacity, overflow);
           const int b = bucket_index(nd, inv_delta);
@@ -944,7 +937,6 @@ __global__ void relax_heavy_edges_kernel(const int* heavy_vertices,
                                          const Offset* out_rowptr,
                                          const Index* out_colind,
                                          const float* out_values,
-                                         const Offset* out_incoming_edge,
                                          const float* vertex_costs,
                                          float* dist,
                                          int* in_heavy,
@@ -977,8 +969,10 @@ __global__ void relax_heavy_edges_kernel(const int* heavy_vertices,
       const float nd = du + effective_w;
       const float old = atomic_min_float_nonnegative(&dist[v], nd);
       if (nd < old) {
-        pred_node[v] = u;
-        pred_edge[v] = out_incoming_edge[e];
+        if (dist[v] == nd) {
+          pred_node[v] = u;
+          pred_edge[v] = e;
+        }
         mark_touched(v, in_touched, touched_queue, touched_count,
                      queue_capacity, overflow);
         const int b = bucket_index(nd, inv_delta);
@@ -1006,8 +1000,10 @@ __global__ void relax_heavy_edges_kernel(const int* heavy_vertices,
         const float nd = du + effective_w;
         const float old = atomic_min_float_nonnegative(&dist[v], nd);
         if (nd < old) {
-          pred_node[v] = u;
-          pred_edge[v] = out_incoming_edge[e];
+          if (dist[v] == nd) {
+            pred_node[v] = u;
+            pred_edge[v] = e;
+          }
           mark_touched(v, in_touched, touched_queue, touched_count,
                        queue_capacity, overflow);
           const int b = bucket_index(nd, inv_delta);
@@ -1255,16 +1251,9 @@ float copy_dist_value_to_host(const float* d_dist, int vertex, hipStream_t strea
 
 void copy_predecessors_to_result(DeltaSteppingThreadsCsrResult& result,
                                  const minplus_sparse::DeviceCsrF32& graph,
-                                 const float* d_dist,
-                                 const float* vertex_costs,
                                  int* d_pred_node,
                                  Offset* d_pred_edge,
                                  hipStream_t stream) {
-  compute_predecessors_kernel<<<grid_for_items(graph.rows), kBlockSize, 0, stream>>>(
-      graph.rows, graph.rowptr, graph.colind, graph.values, vertex_costs, d_dist,
-      d_pred_node, d_pred_edge);
-  DS_DELTA_HIP_CHECK(hipGetLastError());
-
   result.pred_node.resize(static_cast<std::size_t>(graph.rows));
   result.pred_edge.resize(static_cast<std::size_t>(graph.rows));
   DS_DELTA_HIP_CHECK(hipMemcpyAsync(result.pred_node.data(), d_pred_node,
@@ -1280,12 +1269,10 @@ void extract_target_paths_to_result(DeltaSteppingThreadsCsrResult& result,
                                     const minplus_sparse::DeviceCsrF32& graph,
                                     DeltaSteppingScratch& scratch,
                                     const std::vector<int>& targets,
-                                    const float* vertex_costs,
                                     hipStream_t stream) {
   const int target_count = static_cast<int>(targets.size());
   measure_target_paths_kernel<<<grid_for_items(target_count), kBlockSize, 0, stream>>>(
-      scratch.targets.get(), target_count, scratch.rows, graph.rowptr, graph.colind,
-      graph.values, vertex_costs, scratch.dist.get(),
+      scratch.targets.get(), target_count, scratch.rows, scratch.dist.get(),
       scratch.pred_node.get(), scratch.target_distances.get(),
       scratch.target_path_lengths.get(), scratch.target_sources.get(),
       scratch.target_path_status.get());
@@ -1361,8 +1348,8 @@ void extract_target_paths_to_result(DeltaSteppingThreadsCsrResult& result,
   if (total_nodes != 0) {
     scratch.ensure_compact_path_capacity(total_nodes, total_edges);
     fill_target_paths_kernel<<<grid_for_items(target_count), kBlockSize, 0, stream>>>(
-        scratch.targets.get(), target_count, scratch.rows, graph.rowptr, graph.colind,
-        graph.values, vertex_costs, scratch.dist.get(), scratch.pred_node.get(),
+        scratch.targets.get(), target_count, scratch.rows, scratch.pred_node.get(),
+        scratch.pred_edge.get(),
         scratch.target_path_lengths.get(), scratch.target_path_status.get(),
         scratch.target_node_offsets.get(), scratch.target_edge_offsets.get(),
         scratch.compact_path_nodes.get(),
@@ -1430,7 +1417,6 @@ int mark_and_count_settled_targets(DeltaSteppingScratch& scratch,
 
 DeltaSteppingThreadsCsrResult run_delta_stepping_impl(
     const minplus_sparse::DeviceCsrF32& d_adjacency,
-    const OutgoingCsrOwner& outgoing,
     DeltaSteppingScratch& scratch,
     const std::vector<int>& sources,
     int target,
@@ -1492,8 +1478,7 @@ DeltaSteppingThreadsCsrResult run_delta_stepping_impl(
     result.target_distance = 0.0f;
     result.target_reached = true;
     result.stopped_on_target = true;
-    copy_predecessors_to_result(result, d_adjacency, scratch.dist.get(),
-                                vertex_costs, scratch.pred_node.get(),
+    copy_predecessors_to_result(result, d_adjacency, scratch.pred_node.get(),
                                 scratch.pred_edge.get(), stream);
     result.dist = copy_dist_to_host(scratch.dist.get(), n, stream);
     reset_touched_vertices(scratch, inf, stream);
@@ -1514,8 +1499,8 @@ DeltaSteppingThreadsCsrResult run_delta_stepping_impl(
 #endif
       relax_light_edges_kernel<<<light_grid, kBlockSize, 0, stream>>>(
           current_queue, current_count, current_bucket, delta, inv_delta,
-          outgoing.rowptr.get(), outgoing.colind.get(), outgoing.values.get(),
-          outgoing.incoming_edge.get(), vertex_costs, scratch.dist.get(),
+          d_adjacency.rowptr, d_adjacency.colind, d_adjacency.values,
+          vertex_costs, scratch.dist.get(),
           scratch.in_current.get(), scratch.in_pending.get(), scratch.in_heavy.get(),
           scratch.pred_node.get(), scratch.pred_edge.get(),
           scratch.in_touched.get(), scratch.touched_queue.get(), scratch.touched_count.get(),
@@ -1538,8 +1523,8 @@ DeltaSteppingThreadsCsrResult run_delta_stepping_impl(
 #endif
       relax_heavy_edges_kernel<<<heavy_grid, kBlockSize, 0, stream>>>(
           scratch.heavy_queue.get(), heavy_count, current_bucket, delta, inv_delta,
-          outgoing.rowptr.get(), outgoing.colind.get(), outgoing.values.get(),
-          outgoing.incoming_edge.get(), vertex_costs, scratch.dist.get(),
+          d_adjacency.rowptr, d_adjacency.colind, d_adjacency.values,
+          vertex_costs, scratch.dist.get(),
           scratch.in_heavy.get(), scratch.in_pending.get(), scratch.pred_node.get(),
           scratch.pred_edge.get(), scratch.in_touched.get(), scratch.touched_queue.get(),
           scratch.touched_count.get(), pending_queue,
@@ -1631,11 +1616,9 @@ DeltaSteppingThreadsCsrResult run_delta_stepping_impl(
   }
 
   if (use_target_set) {
-    extract_target_paths_to_result(result, d_adjacency, scratch, *targets,
-                                   vertex_costs, stream);
+    extract_target_paths_to_result(result, d_adjacency, scratch, *targets, stream);
   } else if (target >= 0) {
-    copy_predecessors_to_result(result, d_adjacency, scratch.dist.get(),
-                                vertex_costs, scratch.pred_node.get(),
+    copy_predecessors_to_result(result, d_adjacency, scratch.pred_node.get(),
                                 scratch.pred_edge.get(), stream);
   }
   if (use_target_set) {
@@ -1657,14 +1640,12 @@ DeltaSteppingThreadsCsrResult run_delta_stepping_impl(
 
 struct DeltaSteppingThreadsCsrWorkspace::Impl {
   ds_delta_threads_detail::DeviceCsrOwner adjacency;
-  ds_delta_threads_detail::OutgoingCsrOwner outgoing;
   ds_delta_threads_detail::DeltaSteppingScratch scratch;
   ds_delta_threads_detail::DeviceBuffer<float> vertex_costs;
   bool has_vertex_costs = false;
 
   Impl(const HostCsrF32& host, hipStream_t stream)
       : adjacency(ds_delta_threads_detail::copy_host_csr_to_device(host, stream)),
-        outgoing(ds_delta_threads_detail::build_outgoing_csr_from_incoming(adjacency.view, stream)),
         scratch(host.rows),
         vertex_costs(static_cast<std::size_t>(host.rows)) {}
 };
@@ -1706,7 +1687,6 @@ void DeltaSteppingThreadsCsrWorkspace::update_values(const std::vector<float>& v
                                     values.size() * sizeof(float),
                                     hipMemcpyHostToDevice,
                                     stream));
-  update_outgoing_values_from_incoming(impl_->outgoing, impl_->adjacency.view, stream);
 }
 
 void DeltaSteppingThreadsCsrWorkspace::update_vertex_costs(
@@ -1746,7 +1726,6 @@ DeltaSteppingThreadsCsrResult DeltaSteppingThreadsCsrWorkspace::run(
   }
   validate_device_csr_shape(impl_->adjacency.view, sources, target, delta);
   return run_delta_stepping_impl(impl_->adjacency.view,
-                                 impl_->outgoing,
                                  impl_->scratch,
                                  sources,
                                  target,
@@ -1774,7 +1753,6 @@ DeltaSteppingThreadsCsrResult DeltaSteppingThreadsCsrWorkspace::run(
   validate_device_csr_shape(impl_->adjacency.view, sources, -1, delta);
   validate_target_list_common_shape(impl_->adjacency.view.rows, targets);
   return run_delta_stepping_impl(impl_->adjacency.view,
-                                 impl_->outgoing,
                                  impl_->scratch,
                                  sources,
                                  -1,
@@ -1817,9 +1795,8 @@ DeltaSteppingThreadsCsrResult delta_stepping_threads_minplus_hip_csr(
 
   validate_device_csr_shape(d_adjacency, sources, target, delta);
   validate_device_csr_contents(d_adjacency, stream);
-  OutgoingCsrOwner outgoing = build_outgoing_csr_from_incoming(d_adjacency, stream);
   DeltaSteppingScratch scratch(d_adjacency.rows);
-  return run_delta_stepping_impl(d_adjacency, outgoing, scratch, sources, target,
+  return run_delta_stepping_impl(d_adjacency, scratch, sources, target,
                                  nullptr, nullptr, delta, max_iters, stream, progress_callback,
                                  progress_user_data);
 }
