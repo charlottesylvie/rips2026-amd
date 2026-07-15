@@ -165,8 +165,41 @@ PATHFINDER_ROUTER_BIN ?= ./PathFinderFile
 PATHFINDER_SSSP_ENGINE ?= unit-bfs
 PATHFINDER_ARGS ?=
 
-%_PathFinderFile.phys: %_unrouted.phys %.netlist xcvu3p.device
-	(time $(PATHFINDER_ROUTER_BIN) $< $@ --logical-netlist $*.netlist --device xcvu3p.device --sssp-engine $(PATHFINDER_SSSP_ENGINE) $(PATHFINDER_ARGS)) $(call log_and_or_display,$@.log)
+# Optional profiling applies only to the inner GPU PathFinder process. The
+# outer wrapper remains under `time`, so benchmark wall time is still end to
+# end. Each profiled invocation gets a fresh run/benchmark directory and is
+# forced to rerun even when an older routed .phys already exists.
+PATHFINDER_PROFILE ?= none
+PATHFINDER_PROFILE_ROOT ?= pathfinder-profiles
+ifndef PATHFINDER_PROFILE_RUN
+PATHFINDER_PROFILE_RUN := $(shell date +%Y%m%d-%H%M%S)
+endif
+PATHFINDER_PROFILE_ARGS ?=
+PATHFINDER_PROFILE_PREFIX ?=
+PATHFINDER_PROFILE_OUTPUT = $(abspath $(PATHFINDER_PROFILE_ROOT))/$(PATHFINDER_PROFILE_RUN)/$*
+
+ifeq ($(PATHFINDER_PROFILE),none)
+PATHFINDER_PROFILE_COMMAND =
+else ifeq ($(PATHFINDER_PROFILE),rocprofv3)
+PATHFINDER_PROFILE_COMMAND = rocprofv3 --runtime-trace --stats --output-directory $(PATHFINDER_PROFILE_OUTPUT) $(PATHFINDER_PROFILE_ARGS) --
+else ifeq ($(PATHFINDER_PROFILE),rocprof-sys)
+PATHFINDER_PROFILE_COMMAND = env ROCPROFSYS_OUTPUT_PATH=$(PATHFINDER_PROFILE_OUTPUT) ROCPROFSYS_USE_AMD_SMI=ON ROCPROFSYS_USE_SAMPLING=ON ROCPROFSYS_SAMPLING_FREQ=100 ROCPROFSYS_ROCM_DOMAINS=hip_runtime_api,marker_api,kernel_dispatch,memory_copy,scratch_memory rocprof-sys-run --profile --trace $(PATHFINDER_PROFILE_ARGS) --
+else ifeq ($(PATHFINDER_PROFILE),rocprof-compute)
+PATHFINDER_PROFILE_COMMAND = rocprof-compute profile --output-directory $(PATHFINDER_PROFILE_OUTPUT) $(PATHFINDER_PROFILE_ARGS) --
+else ifeq ($(PATHFINDER_PROFILE),custom)
+ifeq ($(strip $(PATHFINDER_PROFILE_PREFIX)),)
+$(error PATHFINDER_PROFILE=custom requires PATHFINDER_PROFILE_PREFIX)
+endif
+PATHFINDER_PROFILE_COMMAND = $(PATHFINDER_PROFILE_PREFIX)
+else
+$(error unsupported PATHFINDER_PROFILE '$(PATHFINDER_PROFILE)'; use none, rocprofv3, rocprof-sys, rocprof-compute, or custom)
+endif
+
+.PHONY: pathfinder-profile-force
+pathfinder-profile-force:
+
+%_PathFinderFile.phys: %_unrouted.phys %.netlist xcvu3p.device $(if $(filter-out none,$(PATHFINDER_PROFILE)),pathfinder-profile-force)
+	(time env PATHFINDER_PROFILE_COMMAND='$(PATHFINDER_PROFILE_COMMAND)' $(PATHFINDER_ROUTER_BIN) $< $@ --logical-netlist $*.netlist --device xcvu3p.device --sssp-engine $(PATHFINDER_SSSP_ENGINE) $(PATHFINDER_ARGS)) $(call log_and_or_display,$@.log)
 
 #### END ROUTER RECIPES
 

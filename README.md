@@ -65,6 +65,11 @@ make ROUTER=PathFinderFile BENCHMARKS="boom_med_pb" VERBOSE=1 \
   PATHFINDER_SSSP_ENGINE=delta-step
 ```
 
+For AMD GPU profiling through the same Makefile path, see
+[`CongestionFreeRouting/GPU_PROFILING.md`](CongestionFreeRouting/GPU_PROFILING.md).
+The integration can wrap only the inner GPU router with `rocprofv3`,
+`rocprof-sys`, or `rocprof-compute` while preserving end-to-end Make timing.
+
 The Makefile rule supplies the matching `.netlist` and `xcvu3p.device`:
 
 ```make
@@ -168,6 +173,9 @@ g++ -std=c++17 -O3 -I"$SCHEMA_DIR" \
 
 g++ -std=c++17 -O2 CongestionFreeRouting/pathfinder_router.cpp -o PathFinderFile
 ```
+
+To include optional ROCTx ranges in profiler traces, add
+`-DPATHFINDER_ENABLE_ROCTX -lrocprofiler-sdk-roctx` to the `hipcc` command.
 
 If the helper binaries are not in the repository root, point the wrapper at
 them with options or environment variables:

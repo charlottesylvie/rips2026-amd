@@ -1,6 +1,7 @@
 #include "pathfinder.hpp"
 
 #include "delta_stepping/delta_stepping_hip_CSR.hpp"
+#include "profiling/roctx_ranges.hpp"
 #include "unit_bfs/unit_bfs_hip_CSR.hpp"
 
 // One-shot shortest-path router for the repository PathFinder flow.
@@ -20,6 +21,7 @@
 //     CongestionFreeRouting/unit_bfs/unit_bfs_hip_CSR.cpp \
 //     -pthread \
 //     -o congestion_free_pathfinder
+// Add -DPATHFINDER_ENABLE_ROCTX -lrocprofiler-sdk-roctx for profiler ranges.
 //
 // Run:
 //   ./congestion_free_pathfinder design.csrbin design.csrbin.ifmeta.bin --net-limit 10
@@ -371,6 +373,7 @@ RoutedNet route_net(const HostCsrF32& graph,
                     std::uint32_t tree_stamp,
                     const PathfinderOptions& options,
                     hipStream_t stream) {
+  PATHFINDER_PROFILE_RANGE("pathfinder.route_net");
   RoutedNet net;
   net.net_string = request.net_string;
   if (tree_seen.size() != static_cast<std::size_t>(graph.rows)) {
@@ -418,13 +421,16 @@ RoutedNet route_net(const HostCsrF32& graph,
   }
 
   if (!targets.empty()) {
-    auto sssp = workspace.run(source_candidates,
-                              targets,
-                              options.delta,
-                              options.max_sssp_iterations,
-                              stream,
-                              nullptr,
-                              nullptr);
+    auto sssp = [&]() {
+      PATHFINDER_PROFILE_RANGE("pathfinder.sssp");
+      return workspace.run(source_candidates,
+                           targets,
+                           options.delta,
+                           options.max_sssp_iterations,
+                           stream,
+                           nullptr,
+                           nullptr);
+    }();
 
     const bool has_compact_target_paths =
         sssp.target_distances.size() == targets.size() &&
@@ -1314,6 +1320,7 @@ PathfinderResult run_pathfinder(const HostCsrF32& base_graph,
                                 const RoutingMetadata& metadata,
                                 const PathfinderOptions& options,
                                 hipStream_t stream) {
+  PATHFINDER_PROFILE_RANGE("pathfinder.run");
   validate_csr(base_graph);
   validate_options(options);
   if (metadata.node_device_ids.size() != static_cast<std::size_t>(base_graph.rows)) {
@@ -1630,9 +1637,15 @@ int main(int argc, char** argv) {
       }
     }
 
-    HostCsrF32 graph = routing::load_csrbin(csr_path);
+    HostCsrF32 graph = [&]() {
+      PATHFINDER_PROFILE_RANGE("pathfinder.load_csr");
+      return routing::load_csrbin(csr_path);
+    }();
 
-    routing::RoutingMetadata metadata = routing::load_interchange_metadata(metadata_path);
+    routing::RoutingMetadata metadata = [&]() {
+      PATHFINDER_PROFILE_RANGE("pathfinder.load_metadata");
+      return routing::load_interchange_metadata(metadata_path);
+    }();
 
     routing::PathfinderResult result =
         routing::run_pathfinder(graph, metadata, options, nullptr);
@@ -1642,7 +1655,10 @@ int main(int argc, char** argv) {
         std::cerr << "error: refusing to write routes because not all sinks were reached\n";
         return 2;
       }
-      routing::write_routes_jsonl(routes_out_path, graph, metadata, result);
+      {
+        PATHFINDER_PROFILE_RANGE("pathfinder.write_routes");
+        routing::write_routes_jsonl(routes_out_path, graph, metadata, result);
+      }
     }
 
     return result.routed || allow_unrouted_routes ? 0 : 2;

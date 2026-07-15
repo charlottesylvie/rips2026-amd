@@ -32,6 +32,7 @@ struct Options {
   std::string interchange_to_csr = "./interchange_to_csr";
   std::string pathfinder = "./pathfinder";
   std::string routes_to_phys = "./routes_to_phys";
+  std::string pathfinder_profile_command;
 
   std::vector<std::string> converter_args;
   std::vector<std::string> pathfinder_args;
@@ -98,8 +99,15 @@ void print_progress(int completed, int total, const std::string& label) {
   std::cout << "] " << completed << "/" << total << " " << label << "\n" << std::flush;
 }
 
-void run_command(const std::vector<std::string>& argv, const char* label) {
-  const std::string command = command_to_string(argv);
+void run_command(const std::vector<std::string>& argv,
+                 const char* label,
+                 const std::string& prefix = {}) {
+  std::string command = command_to_string(argv);
+  if (!prefix.empty()) {
+    command = prefix + " " + command;
+    std::cout << "[pathfinder-router] profiler command: " << command << "\n"
+              << std::flush;
+  }
   const int status = std::system(command.c_str());
   if (status != 0) {
     std::ostringstream out;
@@ -140,6 +148,7 @@ void print_usage(const char* program) {
       << "  --interchange-to-csr <path>    Converter executable. Env: INTERCHANGE_TO_CSR\n"
       << "  --pathfinder <path>            PathFinder executable. Env: PATHFINDER_BIN\n"
       << "  --routes-to-phys <path>        Route reconstructor. Env: ROUTES_TO_PHYS\n"
+      << "  Env PATHFINDER_PROFILE_COMMAND Shell prefix applied only to the inner pathfinder command.\n"
       << "  --strict-routing               Fail instead of writing partial routes.\n"
       << "  --sssp-engine <unit-bfs|delta-step>\n"
       << "                                 Forwarded to pathfinder. Default: unit-bfs\n"
@@ -178,6 +187,8 @@ Options parse_args(int argc, char** argv) {
   options.interchange_to_csr = env_or_default("INTERCHANGE_TO_CSR", "./interchange_to_csr");
   options.pathfinder = env_or_default("PATHFINDER_BIN", "./pathfinder");
   options.routes_to_phys = env_or_default("ROUTES_TO_PHYS", "./routes_to_phys");
+  options.pathfinder_profile_command =
+      env_or_default("PATHFINDER_PROFILE_COMMAND", "");
 
   for (int i = 3; i < argc; ++i) {
     const std::string option = argv[i];
@@ -308,7 +319,9 @@ int main(int argc, char** argv) {
     pathfinder_cmd.insert(pathfinder_cmd.end(),
                           options.pathfinder_args.begin(),
                           options.pathfinder_args.end());
-    run_command(pathfinder_cmd, "run PathFinder");
+    run_command(pathfinder_cmd,
+                "run PathFinder",
+                options.pathfinder_profile_command);
     print_progress(2, 3, "PathFinder complete");
 
     std::vector<std::string> reconstruct_cmd = {

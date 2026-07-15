@@ -1,5 +1,7 @@
 #include "delta_stepping_hip_CSR.hpp"
 
+#include "../profiling/roctx_ranges.hpp"
+
 #include <hip/hip_runtime.h>
 
 #include <algorithm>
@@ -1999,6 +2001,7 @@ struct DeltaSteppingCsrGraph::Impl {
 
 DeltaSteppingCsrGraph::DeltaSteppingCsrGraph(const HostCsrF32& adjacency,
                                              hipStream_t stream) {
+  PATHFINDER_PROFILE_RANGE("delta_step.upload_graph");
   using namespace ds_delta_detail;
   validate_host_csr_arrays(adjacency);
   if (adjacency.rows <= 0 || adjacency.rows != adjacency.cols) {
@@ -2112,6 +2115,7 @@ DeltaSteppingCsrWorkspace& DeltaSteppingCsrWorkspace::operator=(
 
 void DeltaSteppingCsrWorkspace::update_values(const std::vector<float>& values,
                                               hipStream_t stream) {
+  PATHFINDER_PROFILE_RANGE("delta_step.update_edge_weights");
   using namespace ds_delta_detail;
   if (!impl_) {
     throw std::runtime_error("DeltaSteppingCsrWorkspace has no implementation");
@@ -2144,6 +2148,7 @@ void DeltaSteppingCsrWorkspace::update_values(const std::vector<float>& values,
 void DeltaSteppingCsrWorkspace::update_vertex_costs(
     const std::vector<float>& vertex_costs,
     hipStream_t stream) {
+  PATHFINDER_PROFILE_RANGE("delta_step.update_vertex_costs");
   using namespace ds_delta_detail;
   if (!impl_) {
     throw std::runtime_error("DeltaSteppingCsrWorkspace has no implementation");
@@ -2184,6 +2189,7 @@ DeltaSteppingCsrResult DeltaSteppingCsrWorkspace::run(
   impl_->require_stream(stream);
   const DeviceCsrOwner& adjacency = impl_->adjacency();
   validate_device_csr_shape(adjacency.view, sources, target, delta);
+  PATHFINDER_PROFILE_RANGE("delta_step.generic");
   return run_delta_stepping_impl(adjacency.view,
                                  impl_->scratch,
                                  sources,
@@ -2219,6 +2225,7 @@ DeltaSteppingCsrResult DeltaSteppingCsrWorkspace::run(
       adjacency.view.rows <= kMaxUnitSpecializationRows &&
       max_iters < 0 &&
       progress_callback == nullptr) {
+    PATHFINDER_PROFILE_RANGE("delta_step.unit_specialization");
     return run_unit_weight_specialization(adjacency.view,
                                           impl_->scratch,
                                           sources,
@@ -2226,6 +2233,7 @@ DeltaSteppingCsrResult DeltaSteppingCsrWorkspace::run(
                                           delta,
                                           stream);
   }
+  PATHFINDER_PROFILE_RANGE("delta_step.generic");
   return run_delta_stepping_impl(adjacency.view,
                                  impl_->scratch,
                                  sources,
