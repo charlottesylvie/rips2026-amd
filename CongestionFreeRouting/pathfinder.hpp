@@ -86,6 +86,7 @@ struct RoutedNet {
 enum class SsspEngine {
   kUnitBfs,
   kDeltaStep,
+  kDeltaThreading,
 };
 
 struct PathfinderOptions {

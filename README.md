@@ -154,10 +154,12 @@ g++ -std=c++17 -O3 -I"$SCHEMA_DIR" \
 
 hipcc -std=c++17 -O3 -x hip \
   -I HIP_kernel/bellman_ford/src \
+  -I HIP_kernel/delta_threading/src \
   -I CongestionFreeRouting/delta_stepping \
   -I CongestionFreeRouting/unit_bfs \
   CongestionFreeRouting/pathfinder.cpp \
   CongestionFreeRouting/delta_stepping/delta_stepping_hip_CSR.cpp \
+  HIP_kernel/delta_threading/src/delta_stepping_hip_CSR_threads.cpp \
   CongestionFreeRouting/unit_bfs/unit_bfs_hip_CSR.cpp \
   -pthread -o pathfinder
 

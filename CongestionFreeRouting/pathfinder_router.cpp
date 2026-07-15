@@ -141,9 +141,10 @@ void print_usage(const char* program) {
       << "  --pathfinder <path>            PathFinder executable. Env: PATHFINDER_BIN\n"
       << "  --routes-to-phys <path>        Route reconstructor. Env: ROUTES_TO_PHYS\n"
       << "  --strict-routing               Fail instead of writing partial routes.\n"
-      << "  --sssp-engine <unit-bfs|delta-step>\n"
+      << "  --sssp-engine <unit-bfs|delta-step|delta-threading>\n"
       << "                                 Forwarded to pathfinder. Default: unit-bfs\n"
       << "  --use-delta-step               Forwarded to pathfinder for comparison.\n"
+      << "  --use-delta-threading          Forwarded to pathfinder for comparison.\n"
       << "  --delta <float>                Forwarded to pathfinder.\n"
       << "  --max-sssp-iters <int>         Forwarded to pathfinder.\n"
       << "  --net-limit <count>            Forwarded to pathfinder.\n"
@@ -206,6 +207,8 @@ Options parse_args(int argc, char** argv) {
     } else if (option == "--strict-routing") {
       options.allow_unrouted = false;
     } else if (option == "--use-delta-step") {
+      options.pathfinder_args.push_back(option);
+    } else if (option == "--use-delta-threading") {
       options.pathfinder_args.push_back(option);
     } else if (option == "--sssp-engine" ||
                option == "--delta" ||

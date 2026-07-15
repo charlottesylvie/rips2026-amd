@@ -3,20 +3,31 @@
 #include "delta_stepping/delta_stepping_hip_CSR.hpp"
 #include "unit_bfs/unit_bfs_hip_CSR.hpp"
 
+#if __has_include("../HIP_kernel/delta_threading/src/delta_stepping_hip_CSR_threads.hpp")
+#include "../HIP_kernel/delta_threading/src/delta_stepping_hip_CSR_threads.hpp"
+#elif __has_include("../HIP_kernel/delta_threading/delta_threading/src/delta_stepping_hip_CSR_threads.hpp")
+#include "../HIP_kernel/delta_threading/delta_threading/src/delta_stepping_hip_CSR_threads.hpp"
+#else
+#error "delta-threading header is required for the delta-threading PathFinder engine"
+#endif
+
 // One-shot shortest-path router for the repository PathFinder flow.
 //
 // This keeps the same benchmark-facing and route JSON APIs, but the routing
 // pass intentionally ignores present/historical congestion.  The default
 // engine uses a unit-weight GPU BFS specialized for the converter's unit
-// routing graph.  GPU delta-stepping remains selectable for comparison.
+// routing graph.  GPU delta-stepping and delta-threading remain selectable for
+// comparison.
 //
 // Example GPU build from the repository root:
 //   hipcc -std=c++17 -O3 -x hip \
 //     -I HIP_kernel/bellman_ford/src \
+//     -I HIP_kernel/delta_threading/src \
 //     -I CongestionFreeRouting/delta_stepping \
 //     -I CongestionFreeRouting/unit_bfs \
 //     CongestionFreeRouting/pathfinder.cpp \
 //     CongestionFreeRouting/delta_stepping/delta_stepping_hip_CSR.cpp \
+//     HIP_kernel/delta_threading/src/delta_stepping_hip_CSR_threads.cpp \
 //     CongestionFreeRouting/unit_bfs/unit_bfs_hip_CSR.cpp \
 //     -pthread \
 //     -o congestion_free_pathfinder
@@ -36,6 +47,7 @@
 #include <sstream>
 #include <stdexcept>
 #include <thread>
+#include <type_traits>
 #include <unordered_set>
 #include <utility>
 
@@ -136,8 +148,48 @@ void validate_csr(const HostCsrF32& graph) {
   }
 }
 
+HostCsrF32 transpose_outgoing_to_incoming_csr(const HostCsrF32& outgoing) {
+  // The congestion-free router uses outgoing CSR, whereas delta-threading
+  // consumes incoming CSR.  Preserve the edge weights while reversing only
+  // the CSR storage orientation: each original u -> v becomes an entry u in
+  // incoming row v.
+  HostCsrF32 incoming;
+  incoming.rows = outgoing.rows;
+  incoming.cols = outgoing.cols;
+  incoming.nnz = outgoing.nnz;
+  incoming.rowptr.assign(static_cast<std::size_t>(incoming.rows + 1), 0);
+  for (const minplus_sparse::Index destination : outgoing.colind) {
+    ++incoming.rowptr[static_cast<std::size_t>(destination + 1)];
+  }
+  for (minplus_sparse::Offset row = 0; row < incoming.rows; ++row) {
+    incoming.rowptr[static_cast<std::size_t>(row + 1)] +=
+        incoming.rowptr[static_cast<std::size_t>(row)];
+  }
+
+  incoming.colind.resize(static_cast<std::size_t>(incoming.nnz));
+  incoming.values.resize(static_cast<std::size_t>(incoming.nnz));
+  std::vector<minplus_sparse::Offset> next = incoming.rowptr;
+  for (minplus_sparse::Offset source = 0; source < outgoing.rows; ++source) {
+    for (minplus_sparse::Offset edge =
+             outgoing.rowptr[static_cast<std::size_t>(source)];
+         edge < outgoing.rowptr[static_cast<std::size_t>(source + 1)];
+         ++edge) {
+      const minplus_sparse::Index destination =
+          outgoing.colind[static_cast<std::size_t>(edge)];
+      const minplus_sparse::Offset slot =
+          next[static_cast<std::size_t>(destination)]++;
+      incoming.colind[static_cast<std::size_t>(slot)] =
+          static_cast<minplus_sparse::Index>(source);
+      incoming.values[static_cast<std::size_t>(slot)] =
+          outgoing.values[static_cast<std::size_t>(edge)];
+    }
+  }
+  return incoming;
+}
+
 void validate_options(const PathfinderOptions& options) {
-  if (options.sssp_engine == SsspEngine::kDeltaStep &&
+  if ((options.sssp_engine == SsspEngine::kDeltaStep ||
+       options.sssp_engine == SsspEngine::kDeltaThreading) &&
       (!(options.delta > 0.0f) || !std::isfinite(options.delta))) {
     throw std::invalid_argument("PathFinder delta must be finite and positive");
   }
@@ -425,6 +477,21 @@ RoutedNet route_net(const HostCsrF32& graph,
                               stream,
                               nullptr,
                               nullptr);
+
+    if constexpr (std::is_same_v<SsspWorkspace, DeltaSteppingThreadsCsrWorkspace>) {
+      // Delta-threading was run on a transposed (incoming) CSR, so its edge
+      // indices cannot be used with this router's outgoing CSR.  Its distance
+      // labels remain valid; force the existing outgoing-CSR reconstruction
+      // fallback to derive the route from those labels.
+      sssp.pred_node.clear();
+      sssp.pred_edge.clear();
+      sssp.target_distances.clear();
+      sssp.target_sources.clear();
+      sssp.target_path_offsets.clear();
+      sssp.target_edge_offsets.clear();
+      sssp.target_path_nodes.clear();
+      sssp.target_path_edges.clear();
+    }
 
     const bool has_compact_target_paths =
         sssp.target_distances.size() == targets.size() &&
@@ -1002,6 +1069,9 @@ SsspEngine parse_sssp_engine_arg(const char* text) {
   if (value == "delta-step" || value == "delta-stepping" || value == "delta") {
     return SsspEngine::kDeltaStep;
   }
+  if (value == "delta-threading" || value == "delta-thread") {
+    return SsspEngine::kDeltaThreading;
+  }
   throw std::runtime_error("invalid sssp-engine: " + value);
 }
 
@@ -1011,6 +1081,8 @@ const char* sssp_engine_name(SsspEngine engine) {
       return "unit-bfs";
     case SsspEngine::kDeltaStep:
       return "delta-step";
+    case SsspEngine::kDeltaThreading:
+      return "delta-threading";
   }
   return "unknown";
 }
@@ -1020,9 +1092,10 @@ void print_usage(const char* program) {
       << "Usage:\n"
       << "  " << program << " <graph.csrbin> [metadata.ifmeta.bin] [options]\n\n"
       << "Options:\n"
-      << "  --sssp-engine <unit-bfs|delta-step>\n"
+      << "  --sssp-engine <unit-bfs|delta-step|delta-threading>\n"
       << "                                  Shortest-path backend. Default: unit-bfs\n"
       << "  --use-delta-step                Use delta-step backend for comparison.\n"
+      << "  --use-delta-threading           Use delta-threading backend for comparison.\n"
       << "  --delta <float>                 Delta-stepping bucket width. Default: 4\n"
       << "  --max-sssp-iters <int>          Delta-step rounds or unit-BFS depth cap; -1 for default.\n"
       << "  --capacity <int>                Capacity used only for overuse diagnostics. Default: 1\n"
@@ -1398,6 +1471,33 @@ PathfinderResult run_pathfinder(const HostCsrF32& base_graph,
           result.nets,
           [shared_graph](hipStream_t worker_stream) {
             return DeltaSteppingCsrWorkspace(shared_graph, worker_stream);
+      });
+      break;
+    }
+    case SsspEngine::kDeltaThreading: {
+      // Delta-threading consumes incoming CSR.  Keep the router's outgoing
+      // graph for path reconstruction and give each threading workspace the
+      // transposed representation solely for the SSSP calculation.
+      const HostCsrF32 incoming_graph =
+          transpose_outgoing_to_incoming_csr(base_graph);
+      PathfinderOptions threading_options = options;
+      if (threading_options.parallel_net_workers == 0) {
+        // Unlike DeltaSteppingCsrWorkspace, the threading implementation does
+        // not yet expose immutable graph sharing across workspaces.  One
+        // worker avoids making a full device copy of the graph per worker.
+        threading_options.parallel_net_workers = 1;
+        std::cout << "[pathfinder] auto-selected 1 delta-threading worker\n";
+      }
+      route_all_nets_with_workspace(
+          base_graph,
+          metadata,
+          threading_options,
+          stream,
+          route_request_count,
+          progress_interval,
+          result.nets,
+          [&incoming_graph](hipStream_t worker_stream) {
+            return DeltaSteppingThreadsCsrWorkspace(incoming_graph, worker_stream);
           });
       break;
     }
@@ -1594,6 +1694,8 @@ int main(int argc, char** argv) {
             routing::parse_sssp_engine_arg(require_value("--sssp-engine"));
       } else if (option == "--use-delta-step") {
         options.sssp_engine = routing::SsspEngine::kDeltaStep;
+      } else if (option == "--use-delta-threading") {
+        options.sssp_engine = routing::SsspEngine::kDeltaThreading;
       } else if (option == "--delta") {
         options.delta = routing::parse_float_arg(require_value("--delta"), "delta");
       } else if (option == "--max-pathfinder-iters") {
