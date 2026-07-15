@@ -777,10 +777,10 @@ std::size_t recommend_unit_bfs_worker_count(minplus_sparse::Offset rows,
 }
 
 std::size_t recommend_delta_worker_count(minplus_sparse::Offset rows,
-                                         minplus_sparse::Offset nnz,
                                          std::size_t route_request_count,
+                                         bool unit_specialization,
                                          hipStream_t stream) {
-  if (stream != nullptr || rows <= 0 || nnz < 0 || route_request_count <= 1) {
+  if (stream != nullptr || rows <= 0 || route_request_count <= 1) {
     return 1;
   }
 
@@ -792,33 +792,27 @@ std::size_t recommend_delta_worker_count(minplus_sparse::Offset rows,
   }
   (void)total_bytes;
 
-  // Delta workers currently own both CSR and mutable query state. Account for
-  // 72 bytes per vertex (row offsets, distances, flags, queues, race-safe
-  // parents and costs), 8 bytes
-  // per edge (destination, value), and a reserve for target/path buffers.
-  constexpr std::size_t kBytesPerVertexBudget = 72;
-  constexpr std::size_t kBytesPerEdgeBudget = 8;
+  // The immutable CSR has already been uploaded once and is reflected in
+  // free_bytes. Exact-unit PathFinder queries allocate only their 24-byte per
+  // vertex append-only traversal state. Generic weighted fallback lazily adds
+  // membership flags, bucket queues, touched state, and race-safe parent keys,
+  // reaching 60 bytes per vertex. Vertex costs are also lazy and PathFinder
+  // never installs them. Leave a reserve for query and compact path buffers.
+  const std::size_t bytes_per_vertex_budget = unit_specialization ? 24 : 60;
   constexpr std::size_t kPerWorkerReserve = 64ULL * 1024ULL * 1024ULL;
   constexpr std::size_t kMaxAutoWorkers = 8;
   const std::size_t row_count = static_cast<std::size_t>(rows);
-  const std::size_t edge_count = static_cast<std::size_t>(nnz);
   if (row_count >
           (std::numeric_limits<std::size_t>::max() - kPerWorkerReserve) /
-              kBytesPerVertexBudget ||
-      edge_count >
-          (std::numeric_limits<std::size_t>::max() - kPerWorkerReserve) /
-              kBytesPerEdgeBudget) {
+              bytes_per_vertex_budget) {
     return 1;
   }
-  const std::size_t vertex_bytes = row_count * kBytesPerVertexBudget;
-  const std::size_t edge_bytes = edge_count * kBytesPerEdgeBudget;
-  if (vertex_bytes > std::numeric_limits<std::size_t>::max() - edge_bytes ||
-      vertex_bytes + edge_bytes >
-          std::numeric_limits<std::size_t>::max() - kPerWorkerReserve) {
+  const std::size_t vertex_bytes = row_count * bytes_per_vertex_budget;
+  if (vertex_bytes >
+      std::numeric_limits<std::size_t>::max() - kPerWorkerReserve) {
     return 1;
   }
-  const std::size_t per_worker_bytes =
-      vertex_bytes + edge_bytes + kPerWorkerReserve;
+  const std::size_t per_worker_bytes = vertex_bytes + kPerWorkerReserve;
   const std::size_t memory_budget = free_bytes - free_bytes / 4;
   const std::size_t memory_workers =
       std::max<std::size_t>(1, memory_budget / per_worker_bytes);
@@ -1375,10 +1369,21 @@ PathfinderResult run_pathfinder(const HostCsrF32& base_graph,
       break;
     }
     case SsspEngine::kDeltaStep: {
+      auto shared_graph =
+          std::make_shared<DeltaSteppingCsrGraph>(base_graph, stream);
       PathfinderOptions delta_options = options;
       if (delta_options.parallel_net_workers == 0) {
+        const bool uses_unit_specialization =
+            delta_options.max_sssp_iterations < 0 &&
+            base_graph.rows <=
+                (static_cast<minplus_sparse::Offset>(1) <<
+                 std::numeric_limits<float>::digits) &&
+            std::all_of(base_graph.values.begin(),
+                        base_graph.values.end(),
+                        [](float value) { return value == 1.0f; });
         delta_options.parallel_net_workers = recommend_delta_worker_count(
-            base_graph.rows, base_graph.nnz, route_request_count, stream);
+            base_graph.rows, route_request_count, uses_unit_specialization,
+            stream);
         std::cout << "[pathfinder] auto-selected "
                   << delta_options.parallel_net_workers
                   << " delta-step worker(s)\n";
@@ -1391,8 +1396,8 @@ PathfinderResult run_pathfinder(const HostCsrF32& base_graph,
           route_request_count,
           progress_interval,
           result.nets,
-          [&base_graph](hipStream_t worker_stream) {
-            return DeltaSteppingCsrWorkspace(base_graph, worker_stream);
+          [shared_graph](hipStream_t worker_stream) {
+            return DeltaSteppingCsrWorkspace(shared_graph, worker_stream);
           });
       break;
     }

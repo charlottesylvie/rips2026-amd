@@ -1,4 +1,5 @@
 #define ROUTING_PATHFINDER_NO_MAIN
+#define __HIP_PLATFORM_AMD__ 1
 
 #include "../pathfinder.cpp"
 
@@ -8,6 +9,7 @@
 namespace {
 
 std::atomic<int> g_multisource_delta_calls{0};
+std::atomic<int> g_delta_graph_uploads{0};
 std::atomic<int> g_unit_bfs_calls{0};
 std::atomic<int> g_unit_bfs_graph_uploads{0};
 
@@ -282,6 +284,25 @@ routing::RoutingMetadata make_two_net_metadata(const HostCsrF32& graph) {
 
 }  // namespace
 
+struct DeltaSteppingCsrGraph::Impl {
+  explicit Impl(const HostCsrF32& adjacency) : graph(adjacency) {}
+
+  HostCsrF32 graph;
+};
+
+DeltaSteppingCsrGraph::DeltaSteppingCsrGraph(const HostCsrF32& adjacency,
+                                             hipStream_t stream)
+    : impl_(std::make_shared<Impl>(adjacency)) {
+  (void)stream;
+  ++g_delta_graph_uploads;
+}
+
+DeltaSteppingCsrGraph::~DeltaSteppingCsrGraph() = default;
+DeltaSteppingCsrGraph::DeltaSteppingCsrGraph(
+    DeltaSteppingCsrGraph&&) noexcept = default;
+DeltaSteppingCsrGraph& DeltaSteppingCsrGraph::operator=(
+    DeltaSteppingCsrGraph&&) noexcept = default;
+
 struct DeltaSteppingCsrWorkspace::Impl {
   HostCsrF32 graph;
   std::vector<float> base_values;
@@ -293,6 +314,19 @@ DeltaSteppingCsrWorkspace::DeltaSteppingCsrWorkspace(const HostCsrF32& adjacency
   (void)stream;
   impl_->graph = adjacency;
   impl_->base_values = adjacency.values;
+}
+
+DeltaSteppingCsrWorkspace::DeltaSteppingCsrWorkspace(
+    std::shared_ptr<const DeltaSteppingCsrGraph> adjacency,
+    hipStream_t stream)
+    : impl_(std::make_unique<Impl>()) {
+  (void)stream;
+  if (!adjacency || !adjacency->impl_) {
+    throw std::invalid_argument(
+        "delta-stepping shared graph must not be null");
+  }
+  impl_->graph = adjacency->impl_->graph;
+  impl_->base_values = impl_->graph.values;
 }
 
 DeltaSteppingCsrWorkspace::~DeltaSteppingCsrWorkspace() = default;
@@ -629,6 +663,24 @@ int main() {
   require(overlap_routes_json.find("\"from\":1,\"to\":2") != std::string::npos,
           "overlapping route output should include the shared shortest path");
 
+  auto movable_delta_graph =
+      std::make_shared<DeltaSteppingCsrGraph>(congestion_graph, nullptr);
+  DeltaSteppingCsrWorkspace retained_delta_workspace(
+      movable_delta_graph, nullptr);
+  *movable_delta_graph = DeltaSteppingCsrGraph(self_loop_graph, nullptr);
+  const DeltaSteppingCsrResult retained_delta_result =
+      retained_delta_workspace.run(std::vector<int>{0},
+                                   std::vector<int>{4},
+                                   1.0f,
+                                   -1,
+                                   nullptr,
+                                   nullptr,
+                                   nullptr);
+  require(retained_delta_result.target_path_nodes ==
+              std::vector<int>({0, 2, 4}),
+          "shared delta workspace should retain its graph after wrapper move "
+          "assignment");
+
   routing::PathfinderOptions parallel_options;
   parallel_options.delta = 1.0f;
   parallel_options.parallel_net_workers = 2;
@@ -653,6 +705,25 @@ int main() {
   require(g_multisource_delta_calls == 0,
           "parallel default routing should not call delta-step");
 
+  routing::PathfinderOptions parallel_delta_options = parallel_options;
+  parallel_delta_options.sssp_engine = routing::SsspEngine::kDeltaStep;
+  g_multisource_delta_calls = 0;
+  g_unit_bfs_calls = 0;
+  g_delta_graph_uploads = 0;
+  routing::PathfinderResult parallel_delta_result =
+      routing::run_pathfinder(congestion_graph,
+                              congestion_metadata,
+                              parallel_delta_options,
+                              nullptr);
+  require(parallel_delta_result.routed,
+          "parallel delta-step routing should preserve routed status");
+  require(g_multisource_delta_calls == 2,
+          "parallel delta-step routing should call delta once per net");
+  require(g_delta_graph_uploads == 1,
+          "parallel delta workers should share one uploaded CSR graph");
+  require(g_unit_bfs_calls == 0,
+          "parallel explicit delta routing should not call unit BFS");
+
   routing::PathfinderOptions auto_worker_options = parallel_options;
   auto_worker_options.parallel_net_workers = 0;
   g_unit_bfs_calls = 0;
@@ -668,6 +739,30 @@ int main() {
           "auto-selected unit BFS workers should still route every net");
   require(g_unit_bfs_graph_uploads == 1,
           "auto-selected unit BFS workers should share one uploaded CSR graph");
+
+  for (const bool weighted_fallback : {false, true}) {
+    HostCsrF32 auto_delta_graph = congestion_graph;
+    if (weighted_fallback) {
+      std::fill(auto_delta_graph.values.begin(),
+                auto_delta_graph.values.end(),
+                2.0f);
+    }
+    routing::PathfinderOptions auto_delta_options = parallel_delta_options;
+    auto_delta_options.parallel_net_workers = 0;
+    g_multisource_delta_calls = 0;
+    g_delta_graph_uploads = 0;
+    routing::PathfinderResult auto_delta_result =
+        routing::run_pathfinder(auto_delta_graph,
+                                congestion_metadata,
+                                auto_delta_options,
+                                nullptr);
+    require(auto_delta_result.routed,
+            "auto-selected delta workers should preserve routed status");
+    require(g_multisource_delta_calls == 2,
+            "auto-selected delta workers should route every net");
+    require(g_delta_graph_uploads == 1,
+            "auto-selected delta workers should share one uploaded CSR graph");
+  }
 
   const HostCsrF32 overlap_graph = make_three_net_overlap_graph();
   const routing::RoutingMetadata overlap_metadata =

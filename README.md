@@ -229,7 +229,7 @@ Tuning options:
 | `--max-sssp-iters <int>` | `-1` | Delta-step bucket rounds or unit-BFS depth cap; `-1` uses the default. |
 | `--capacity <int>` | `1` | Capacity used only for overuse diagnostics. |
 | `--net-limit <count>` | unset | Route only the first `count` requests. |
-| `--parallel-net-workers <count>` | `0` | Independent net workers; `0` auto-selects up to 8 from available GPU memory. Unit-BFS workers share one CSR; delta workers currently own private CSR copies. |
+| `--parallel-net-workers <count>` | `0` | Independent net workers; `0` auto-selects up to 8 from available GPU memory. Both engines share one immutable CSR across worker-private search state. |
 | `--routes-out <path>` | unset | Write routed PIP tree data as JSONL. |
 | `--max-pathfinder-iters`, `--present-factor`, `--present-multiplier`, `--history-factor`, `--route-batch-size` | ignored | Compatibility-only options accepted by the one-shot router. |
 
@@ -296,7 +296,7 @@ CSR orientation is outgoing-edge: row `u`, column `v` represents directed edge
 CPU-only PathFinder logic test:
 
 ```bash
-g++ -std=c++17 -O2 \
+g++ -std=c++17 -O2 -pthread \
   -I Routing/tests/fake_hip \
   -I HIP_kernel/bellman_ford/src \
   -I CongestionFreeRouting/delta_stepping \
@@ -324,7 +324,7 @@ Production outgoing-CSR delta-stepping regression test (requires an AMD HIP
 system):
 
 ```bash
-hipcc -std=c++17 -O2 -x hip \
+hipcc -std=c++17 -O2 -pthread -x hip \
   -I HIP_kernel/bellman_ford/src \
   -I CongestionFreeRouting/delta_stepping \
   CongestionFreeRouting/tests/delta_stepping_hip_test.cpp \

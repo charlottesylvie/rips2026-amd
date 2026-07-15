@@ -17,6 +17,29 @@ using DeltaSteppingCsrProgress = BellmanFordCsrProgress;
 using DeltaSteppingCsrProgressCallback = BellmanFordCsrProgressCallback;
 using DeltaSteppingCsrResult = BellmanFordCsrResult;
 
+// Immutable device CSR that can be shared by independent Delta-Stepping
+// workspaces. The graph and every workspace using it must remain on the HIP
+// device that was current when the graph was constructed.
+class DeltaSteppingCsrGraph {
+ public:
+  struct Impl;
+
+  explicit DeltaSteppingCsrGraph(const HostCsrF32& adjacency,
+                                 hipStream_t stream = nullptr);
+  ~DeltaSteppingCsrGraph();
+
+  DeltaSteppingCsrGraph(const DeltaSteppingCsrGraph&) = delete;
+  DeltaSteppingCsrGraph& operator=(const DeltaSteppingCsrGraph&) = delete;
+  DeltaSteppingCsrGraph(DeltaSteppingCsrGraph&&) noexcept;
+  DeltaSteppingCsrGraph& operator=(DeltaSteppingCsrGraph&&) noexcept;
+
+ private:
+  // Workspaces retain this immutable backing allocation directly, so moving
+  // or replacing the public graph wrapper cannot invalidate live workspaces.
+  std::shared_ptr<const Impl> impl_;
+  friend class DeltaSteppingCsrWorkspace;
+};
+
 class DeltaSteppingCsrWorkspace {
  public:
   struct Impl;
@@ -25,6 +48,12 @@ class DeltaSteppingCsrWorkspace {
   // use the same stream handle. Separate workspaces may use separate streams.
   explicit DeltaSteppingCsrWorkspace(const HostCsrF32& adjacency,
                                      hipStream_t stream = nullptr);
+  // Shared-graph workspaces keep private mutable search state but reuse the
+  // immutable CSR. update_values() is intentionally unavailable for this form;
+  // update_vertex_costs() remains workspace-local and is supported.
+  explicit DeltaSteppingCsrWorkspace(
+      std::shared_ptr<const DeltaSteppingCsrGraph> adjacency,
+      hipStream_t stream = nullptr);
   ~DeltaSteppingCsrWorkspace();
 
   DeltaSteppingCsrWorkspace(const DeltaSteppingCsrWorkspace&) = delete;

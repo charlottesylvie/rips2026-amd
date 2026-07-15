@@ -1,7 +1,7 @@
 #include "../delta_stepping/delta_stepping_hip_CSR.hpp"
 
 // AMD build/run from the repository root:
-//   hipcc -std=c++17 -O2 -x hip \
+//   hipcc -std=c++17 -O2 -pthread -x hip \
 //     -I HIP_kernel/bellman_ford/src \
 //     -I CongestionFreeRouting/delta_stepping \
 //     CongestionFreeRouting/tests/delta_stepping_hip_test.cpp \
@@ -14,6 +14,7 @@
 #include <cmath>
 #include <cstdint>
 #include <functional>
+#include <future>
 #include <iostream>
 #include <limits>
 #include <queue>
@@ -40,6 +41,13 @@ void require(bool condition, const std::string& message) {
   if (!condition) {
     fail(message);
   }
+}
+
+void record_progress(const DeltaSteppingCsrProgress& progress,
+                     void* user_data) {
+  auto* records =
+      static_cast<std::vector<DeltaSteppingCsrProgress>*>(user_data);
+  records->push_back(progress);
 }
 
 void check_hip(hipError_t status, const char* operation) {
@@ -415,6 +423,17 @@ void run_full_and_target_checks(
                                 expected,
                                 targeted,
                                 vertex_costs);
+  const bool all_targets_reachable =
+      std::all_of(targets.begin(), targets.end(), [&](int target) {
+        return std::isfinite(expected[static_cast<std::size_t>(target)]);
+      });
+  if (all_targets_reachable) {
+    require(targeted.stopped_on_target && !targeted.converged,
+            label + ": reachable target set did not stop early");
+  } else {
+    require(targeted.converged && !targeted.stopped_on_target,
+            label + ": unreachable target set did not exhaust the graph");
+  }
 
   if (rerun_full_after_targets) {
     const DeltaSteppingCsrResult repeated =
@@ -491,9 +510,23 @@ void test_unit_weight_specialization(hipStream_t stream) {
        {7, 7, 1.0f},
        {8, 6, 1.0f}});
   DeltaSteppingCsrWorkspace workspace(graph, stream);
+  const std::vector<float> unit_expected =
+      cpu_dijkstra_outgoing_multi_source(graph, {0, 8, 0});
+  const std::vector<int> lazy_unit_targets = {4, 7, 7};
+  const DeltaSteppingCsrResult lazy_unit_first = workspace.run(
+      {0, 8, 0}, lazy_unit_targets, 4.0f, -1, stream, nullptr, nullptr);
+  validate_compact_target_paths("fresh lazy unit specialization",
+                                graph,
+                                {0, 8, 0},
+                                lazy_unit_targets,
+                                unit_expected,
+                                lazy_unit_first);
+  require(lazy_unit_first.stopped_on_target && !lazy_unit_first.converged,
+          "fresh lazy unit specialization did not stop on its targets");
   // Unlimited multi-target runs on exact unit weights take the append-only
   // specialization. Duplicates, source targets, an unreachable target, and a
-  // subsequent generic full-distance run exercise all reset invariants.
+  // subsequent generic full-distance run exercise unit-to-generic allocation
+  // and all reset invariants.
   run_full_and_target_checks("exact unit-weight specialization",
                              workspace,
                              graph,
@@ -505,8 +538,6 @@ void test_unit_weight_specialization(hipStream_t stream) {
                              true);
 
   const std::vector<int> reachable_targets = {4, 7, 7};
-  const std::vector<float> unit_expected =
-      cpu_dijkstra_outgoing_multi_source(graph, {0, 8, 0});
   const DeltaSteppingCsrResult early_stop = workspace.run(
       {0, 8, 0}, reachable_targets, 4.0f, -1, stream, nullptr, nullptr);
   validate_compact_target_paths("unit specialization reachable early stop",
@@ -567,6 +598,360 @@ void test_zero_weight_scc_predecessors(hipStream_t stream) {
                              stream,
                              nullptr,
                              true);
+}
+
+void test_float_bucket_boundaries_and_saturation(hipStream_t stream) {
+  {
+    const float delta = 0.1f;
+    const float nominally_heavy =
+        std::nextafter(delta, std::numeric_limits<float>::infinity());
+    const HostCsrF32 graph = make_outgoing_csr(
+        4,
+        {{0, 1, 2.3f},
+         {1, 2, nominally_heavy},
+         {2, 3, 0.0f}});
+    DeltaSteppingCsrWorkspace workspace(graph, stream);
+    // Float addition places the nominally-heavy 1->2 relaxation in the same
+    // bucket as vertex 1. It must re-enter closure so vertex 3 is reached.
+    run_full_and_target_checks("same-bucket nominally-heavy edge",
+                               workspace,
+                               graph,
+                               {0},
+                               {1, 2, 3},
+                               delta,
+                               stream,
+                               nullptr,
+                               true);
+  }
+  {
+    const HostCsrF32 graph = make_outgoing_csr(
+        4,
+        {{0, 1, 1.1e9f},
+         {1, 2, 2.0f},
+         {2, 3, 0.0f}});
+    DeltaSteppingCsrWorkspace workspace(graph, stream);
+    // All three finite distances clamp to the terminal representable bucket.
+    // Terminal-bucket processing must close over every outgoing edge.
+    run_full_and_target_checks("terminal bucket saturation",
+                               workspace,
+                               graph,
+                               {0},
+                               {1, 2, 3},
+                               1.0f,
+                               stream,
+                               nullptr,
+                               true);
+  }
+  {
+    const HostCsrF32 graph = make_outgoing_csr(
+        4,
+        {{0, 1, 1.0f},
+         {1, 2, 1.0f},
+         {2, 3, 1.0f}});
+    DeltaSteppingCsrWorkspace workspace(graph, stream);
+    const std::vector<int> sources = {0};
+    const std::vector<int> targets = {3};
+    const std::vector<float> expected =
+        cpu_dijkstra_outgoing_multi_source(graph, sources);
+    constexpr float kSaturatingDelta = 1.0e-10f;
+
+    const DeltaSteppingCsrResult specialized = workspace.run(
+        sources, targets, kSaturatingDelta, -1, stream, nullptr, nullptr);
+    validate_compact_target_paths("unit terminal-bucket specialization",
+                                  graph,
+                                  sources,
+                                  targets,
+                                  expected,
+                                  specialized);
+
+    std::vector<DeltaSteppingCsrProgress> progress;
+    const DeltaSteppingCsrResult generic = workspace.run(
+        sources, targets, kSaturatingDelta, -1, stream,
+        record_progress, &progress);
+    validate_compact_target_paths("unit terminal-bucket generic fallback",
+                                  graph,
+                                  sources,
+                                  targets,
+                                  expected,
+                                  generic);
+    require(specialized.iterations_used == 2,
+            "unit terminal-bucket specialization counted BFS depths instead "
+            "of distinct buckets");
+    require(generic.iterations_used == specialized.iterations_used,
+            "unit terminal-bucket specialization disagrees with generic "
+            "bucket rounds");
+  }
+}
+
+void test_batched_closure_and_iteration_fallback(hipStream_t stream) {
+  for (const int edge_count : {1, 2, 3, 4, 5, 12}) {
+    std::vector<EdgeSpec> edges;
+    for (int vertex = 0; vertex < edge_count; ++vertex) {
+      edges.push_back({vertex, vertex + 1, 0.0f});
+    }
+    const HostCsrF32 graph = make_outgoing_csr(edge_count + 1, edges);
+    DeltaSteppingCsrWorkspace workspace(graph, stream);
+    // After the immediate source round, edge counts 1..4 empty on each
+    // possible speculative batch round, 5 crosses the boundary, and 12 spans
+    // several batches. Repeating checks both ping-pong count parities.
+    std::ostringstream label;
+    label << "batched zero-weight closure length " << edge_count;
+    run_full_and_target_checks(label.str(),
+                               workspace,
+                               graph,
+                               {0},
+                               {edge_count},
+                               1.0f,
+                               stream,
+                               nullptr,
+                               true);
+  }
+  {
+    const HostCsrF32 graph = make_outgoing_csr(
+        4,
+        {{0, 1, 1.0f}, {1, 2, 1.0f}, {2, 3, 1.0f}});
+    DeltaSteppingCsrWorkspace workspace(graph, stream);
+    const DeltaSteppingCsrResult zero_iterations = workspace.run(
+        std::vector<int>{0}, std::vector<int>{3},
+        1.0f, 0, stream, nullptr, nullptr);
+    require(zero_iterations.iterations_used == 0 &&
+                !zero_iterations.converged &&
+                !zero_iterations.target_reached,
+            "zero-iteration generic fallback did not preserve its cap");
+    const DeltaSteppingCsrResult limited = workspace.run(
+        std::vector<int>{0}, std::vector<int>{3},
+        1.0f, 1, stream, nullptr, nullptr);
+    require(limited.iterations_used == 1,
+            "limited generic run did not stop at one bucket iteration");
+    require(!limited.target_reached && !limited.stopped_on_target,
+            "limited generic run reached a target beyond its iteration cap");
+    require(!limited.converged,
+            "limited generic run incorrectly reported full convergence");
+
+    std::vector<DeltaSteppingCsrProgress> progress;
+    const DeltaSteppingCsrResult callback_result = workspace.run(
+        std::vector<int>{0}, std::vector<int>{3},
+        1.0f, -1, stream, record_progress, &progress);
+    const std::vector<float> expected =
+        cpu_dijkstra_outgoing_multi_source(graph, {0});
+    validate_compact_target_paths("generic callback fallback",
+                                  graph,
+                                  {0},
+                                  {3},
+                                  expected,
+                                  callback_result);
+    require(!progress.empty(),
+            "generic callback fallback did not report bucket progress");
+    for (std::size_t i = 0; i < progress.size(); ++i) {
+      require(progress[i].iteration == static_cast<int>(i + 1),
+              "generic callback iteration sequence is not contiguous");
+      require(progress[i].convergence_checked,
+              "generic callback did not report a convergence check");
+      require(progress[i].max_iters == std::numeric_limits<int>::max(),
+              "generic callback reported the wrong unlimited iteration cap");
+    }
+    require(callback_result.stopped_on_target && !callback_result.converged,
+            "unit-graph callback fallback did not stop on its target");
+  }
+}
+
+void test_wave_boundary_contention(hipStream_t stream) {
+  constexpr int kFrontierSize = 257;
+  {
+    std::vector<int> sources;
+    std::vector<EdgeSpec> edges;
+    sources.reserve(kFrontierSize);
+    edges.reserve(kFrontierSize);
+    for (int source = 0; source < kFrontierSize; ++source) {
+      const int child = kFrontierSize + source;
+      sources.push_back(source);
+      edges.push_back({source, child, 0.0f});
+    }
+    const HostCsrF32 graph =
+        make_outgoing_csr(kFrontierSize * 2, edges);
+    DeltaSteppingCsrWorkspace workspace(graph, stream);
+    // 257 frontier threads discover distinct children together, exercising
+    // full- and partial-wave coalesced reservations. Every vertex is touched.
+    run_full_and_target_checks("wave-coalesced distinct appends",
+                               workspace,
+                               graph,
+                               sources,
+                               {kFrontierSize * 2 - 1},
+                               1.0f,
+                               stream,
+                               nullptr,
+                               true);
+  }
+  {
+    constexpr int kSink = kFrontierSize + 1;
+    std::vector<EdgeSpec> edges;
+    edges.reserve(static_cast<std::size_t>(kFrontierSize) * 2);
+    for (int vertex = 1; vertex <= kFrontierSize; ++vertex) {
+      edges.push_back({0, vertex, 0.0f});
+      edges.push_back({vertex, kSink, 0.0f});
+    }
+    const HostCsrF32 graph = make_outgoing_csr(kSink + 1, edges);
+    DeltaSteppingCsrWorkspace workspace(graph, stream);
+    // One 257-thread frontier contends to claim a single sink, stressing CAS
+    // authority and sparse successful appends across two blocks.
+    run_full_and_target_checks("wave-boundary high-fan-in contention",
+                               workspace,
+                               graph,
+                               {0},
+                               {kSink, 256, kSink},
+                               1.0f,
+                               stream,
+                               nullptr,
+                               true);
+  }
+}
+
+void test_shared_graph_workspaces(hipStream_t construction_stream) {
+  const HostCsrF32 graph = make_weighted_corner_graph();
+  auto shared_graph =
+      std::make_shared<DeltaSteppingCsrGraph>(graph, construction_stream);
+  HipStream other_stream;
+  DeltaSteppingCsrWorkspace first(shared_graph, construction_stream);
+  DeltaSteppingCsrWorkspace second(shared_graph, other_stream.get());
+
+  const std::vector<int> first_sources = {0, 8};
+  const std::vector<int> first_targets = {4, 7, 9, 11};
+  const std::vector<int> second_sources = {10};
+  const std::vector<int> second_targets = {11, 10, 0, 9};
+  const std::vector<float> first_expected =
+      cpu_dijkstra_outgoing_multi_source(graph, first_sources);
+  const std::vector<float> second_expected =
+      cpu_dijkstra_outgoing_multi_source(graph, second_sources);
+
+  auto first_run = std::async(std::launch::async, [&]() {
+    return first.run(first_sources,
+                     first_targets,
+                     1.25f,
+                     -1,
+                     construction_stream,
+                     nullptr,
+                     nullptr);
+  });
+  auto second_run = std::async(std::launch::async, [&]() {
+    return second.run(second_sources,
+                      second_targets,
+                      2.5f,
+                      -1,
+                      other_stream.get(),
+                      nullptr,
+                      nullptr);
+  });
+  const DeltaSteppingCsrResult first_result = first_run.get();
+  const DeltaSteppingCsrResult second_result = second_run.get();
+  validate_compact_target_paths("shared graph first stream",
+                                graph,
+                                first_sources,
+                                first_targets,
+                                first_expected,
+                                first_result);
+  validate_compact_target_paths("shared graph second stream",
+                                graph,
+                                second_sources,
+                                second_targets,
+                                second_expected,
+                                second_result);
+  require(first_result.converged && !first_result.stopped_on_target &&
+              second_result.converged && !second_result.stopped_on_target,
+          "shared-graph unreachable target runs did not exhaust their graphs");
+
+  bool rejected_update = false;
+  try {
+    first.update_values(graph.values, construction_stream);
+  } catch (const std::logic_error&) {
+    rejected_update = true;
+  }
+  require(rejected_update,
+          "immutable shared delta graph accepted an edge-value update");
+
+  std::vector<float> shared_vertex_costs(
+      static_cast<std::size_t>(graph.rows), 1.0f);
+  shared_vertex_costs[2] = 0.5f;
+  shared_vertex_costs[4] = 1.75f;
+  first.update_vertex_costs(shared_vertex_costs, construction_stream);
+  const std::vector<int> cost_targets = {4, 7};
+  const DeltaSteppingCsrResult cost_result = first.run(
+      first_sources, cost_targets, 1.5f, -1,
+      construction_stream, nullptr, nullptr);
+  validate_compact_target_paths(
+      "shared graph workspace-local vertex costs",
+      graph,
+      first_sources,
+      cost_targets,
+      cpu_dijkstra_outgoing_multi_source(graph, first_sources,
+                                         &shared_vertex_costs),
+      cost_result,
+      &shared_vertex_costs);
+  require(cost_result.stopped_on_target && !cost_result.converged,
+          "shared vertex-cost run did not stop on reachable targets");
+
+  const HostCsrF32 unit_graph = make_outgoing_csr(
+      6,
+      {{0, 1, 1.0f},
+       {1, 2, 1.0f},
+       {2, 3, 1.0f},
+       {4, 2, 1.0f}});
+  auto shared_unit_graph =
+      std::make_shared<DeltaSteppingCsrGraph>(unit_graph,
+                                              construction_stream);
+  DeltaSteppingCsrWorkspace unit_first(shared_unit_graph,
+                                       construction_stream);
+  DeltaSteppingCsrWorkspace unit_second(shared_unit_graph,
+                                        other_stream.get());
+  auto unit_first_run = std::async(std::launch::async, [&]() {
+    return unit_first.run({0}, std::vector<int>{3}, 2.0f, -1,
+                          construction_stream, nullptr, nullptr);
+  });
+  auto unit_second_run = std::async(std::launch::async, [&]() {
+    return unit_second.run({4}, std::vector<int>{2, 3}, 2.0f, -1,
+                           other_stream.get(), nullptr, nullptr);
+  });
+  const DeltaSteppingCsrResult unit_first_result = unit_first_run.get();
+  const DeltaSteppingCsrResult unit_second_result = unit_second_run.get();
+  validate_compact_target_paths(
+      "shared graph lazy unit first stream",
+      unit_graph,
+      {0},
+      {3},
+      cpu_dijkstra_outgoing_multi_source(unit_graph, {0}),
+      unit_first_result);
+  validate_compact_target_paths(
+      "shared graph lazy unit second stream",
+      unit_graph,
+      {4},
+      {2, 3},
+      cpu_dijkstra_outgoing_multi_source(unit_graph, {4}),
+      unit_second_result);
+  require(unit_first_result.stopped_on_target &&
+              unit_second_result.stopped_on_target &&
+              !unit_first_result.converged &&
+              !unit_second_result.converged,
+          "shared lazy unit workspaces did not stop on reachable targets");
+
+  // A workspace retains the immutable allocation it was constructed from,
+  // even if the caller later replaces the movable public graph wrapper.
+  const HostCsrF32 replacement_unit_graph = make_outgoing_csr(
+      6,
+      {{0, 5, 1.0f}});
+  *shared_unit_graph =
+      DeltaSteppingCsrGraph(replacement_unit_graph, construction_stream);
+  const DeltaSteppingCsrResult retained_graph_result = unit_first.run(
+      {0}, std::vector<int>{3}, 2.0f, -1,
+      construction_stream, nullptr, nullptr);
+  validate_compact_target_paths(
+      "shared graph survives wrapper move assignment",
+      unit_graph,
+      {0},
+      {3},
+      cpu_dijkstra_outgoing_multi_source(unit_graph, {0}),
+      retained_graph_result);
+  require(retained_graph_result.stopped_on_target &&
+              !retained_graph_result.converged,
+          "shared workspace followed a replacement graph wrapper");
 }
 
 void test_stream_affinity(hipStream_t construction_stream) {
@@ -749,6 +1134,10 @@ int main() {
     test_empty_and_singleton_graphs(stream.get());
     test_unit_weight_specialization(stream.get());
     test_zero_weight_scc_predecessors(stream.get());
+    test_float_bucket_boundaries_and_saturation(stream.get());
+    test_batched_closure_and_iteration_fallback(stream.get());
+    test_wave_boundary_contention(stream.get());
+    test_shared_graph_workspaces(stream.get());
     test_workspace_reuse_and_updates(stream.get());
     test_seeded_random_graphs(stream.get());
     test_stream_affinity(stream.get());
