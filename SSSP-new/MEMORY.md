@@ -1,0 +1,369 @@
+# SSSP-new Memory
+
+## Format Contract
+
+- `SSSP-new` uses outgoing CSR throughout: row `u` stores directed routing edges `u -> v`.
+- `RIPSOCS1` CSR version 3 has orientation `2` for outgoing edges.
+- `RIPSIFM1` metadata version 3 also has orientation `2`; `edge_attrs[k]` describes the same outgoing CSR edge index `k`.
+- Packed `best_state` keeps the existing 64-bit layout: high 32 bits are float distance bits, low 32 bits are the predecessor outgoing CSR `edge_id`.
+- The old `incoming_edge` wording is stale for `SSSP-new`; current code should use `edge_id` or predecessor outgoing edge id language.
+
+## Optimization Summary
+
+- `src/mp_csr.cpp`: Support module extracted from `SSSP/src/bf_original.cpp`. Implements reusable dense outgoing Bellman-Ford relaxation for callers such as `bf1.cpp` and `bf2.cpp`.
+- `src/bf1.cpp`: Bare-bones dense outgoing driver. Runs one SSSP per unique valid source, writes optional summary CSV, and does not reconstruct paths.
+- `src/bf2.cpp`: Path-outputting dense outgoing driver. Preserves `bf1.cpp` progress behavior and adds JSONL source-to-sink paths by copying the full `best_state` vector back after each source.
+- `src/bf3.cpp`: Minimal active-frontier version of `bf2.cpp`. It relaxes only vertices in the current frontier and stops when the frontier is empty. JSONL path output is optional and disabled by default. It intentionally does not add jump propagation, local multi-hop propagation, priority queues, target early stopping, sparse path-state gather, batching, or warm starts.
+- `src/bf4.cpp`: Experimental bounded jump-frontier version of `bf3.cpp`. Default `--jump-k 1` matches one-hop active-frontier behavior; larger values run multiple synchronized GPU frontier micro-steps per outer iteration. JSONL path output remains optional and disabled by default.
+- `src/bf5.cpp`: Target-aware early-stopping version of `bf3.cpp`. It builds a reverse CSR once, marks the per-source set of nodes that can reach requested sinks, and stops a source run only when the next frontier has no target-reachable vertex. JSONL path output remains optional and disabled by default.
+- `src/bf6.cpp`: Distance-bound early-stopping version of `bf3.cpp`. It keeps the active-frontier kernels, tracks the minimum distance in the just-built next frontier and the maximum reached target distance, and stops once nonnegative weights prove no queried sink can improve. JSONL path output remains optional and disabled by default. Optional `--print-frontiers` copies and prints the per-iteration active frontier for detailed source progress lines only. Optional `--print-jsonl-entry-ids` prints the corresponding JSONL path record ids and line numbers for detailed source progress lines.
+- `src/bf7.cpp`: Copied from `bf6.cpp` and keeps the same distance-bound active-frontier behavior, while making three small CPU/GPU handoff and atomic optimizations: a reusable pinned host status handoff that also replaces the tiny reset kernel launch, removal of the immediate post-initialization stream sync, and CAS-based next-frontier marking to avoid repeated atomic exchanges for already queued destinations.
+- `test/check_SSSP.cpp`: Standalone C++17 validator for `SSSP-new` outgoing CSR, outgoing metadata, and paths JSONL. It has toggleable continuity, targeted shortest-path, and completeness checks.
+- `tools/rocprof_runtime_split.py`: Wrapper/analyzer for rocprofv3 trace CSVs. Runs `rocprofv3 --runtime-trace --rccl-trace`, then writes `runtime_split.csv`, `cpu_gpu_overlap.csv`, `trace_audit.csv`, and `runtime_split.json`. The runtime split has trace-based buckets for compute, RAM copies, explicit vRAM copies, networking, and unattributed host/idle time. The CPU/GPU overlap file reports wall time with no traced GPU command active, traced GPU-only command time, and overlap between traced GPU commands and traced HIP/RCCL API calls. It summarizes flushed CSVs after normal exit or interrupt, but cannot guarantee output after SIGKILL or node failure.
+- `docs/rocprof-runtime-split.md`: Usage notes for profiling `bf1`, `bf2`, and `bf3` with `tools/rocprof_runtime_split.py`, including `trace_audit.csv` for diagnosing all-zero summaries and the limitation that rocprof tracing cannot split in-kernel arithmetic time from in-kernel vRAM stall time without a separate hardware-counter pass.
+
+## Files
+
+### `src/mp_csr.cpp`
+
+- Purpose: Reusable outgoing-CSR min-plus matrix-vector relaxation for single-source shortest paths.
+- Inputs:
+  - GPU-resident outgoing CSR graph in `DeviceOutgoingCsrF32`.
+  - `rowptr`: length `rows + 1`; row `u` stores outgoing edges `u -> v`.
+  - `degree`: length `rows`; cached outgoing degree for each row.
+  - `to`: length `nnz`; destination vertex for each outgoing edge.
+  - `values`: length `nnz`; nonnegative edge weights.
+  - `edge_id`: length `nnz`; outgoing CSR edge id. The expected identity mapping is `edge_id[k] == k`.
+  - `DeviceSsspWorkspace` with GPU-resident packed `best_state`, dense changed/status flags, and optional gather scratch.
+  - Source vertex for initialization, or an already initialized workspace for one-step relaxation.
+- Outputs:
+  - Updated GPU-resident `best_state`, where high 32 bits store float distance bits and low 32 bits store predecessor outgoing CSR edge id.
+  - `run_outgoing_dense_relaxation_iteration` returns whether one dense relaxation step changed any vertex.
+  - `run_outgoing_dense_sssp` returns `OutgoingSsspResult {iterations_used, converged}` and leaves final packed states in the workspace.
+  - `gather_best_states` writes selected packed states to a caller-provided GPU output buffer.
+- Compilation:
+  - From `rips2026-amd`: `hipcc -std=c++17 -O3 -x hip -c SSSP-new/src/mp_csr.cpp -o mp_csr.o`
+- Semantics:
+  - Dense outgoing relaxation scans all graph rows each iteration.
+  - Skips vertices with infinite/non-finite current distance.
+  - Uses packed 64-bit state and `atomicCAS` to atomically keep the minimum distance/predecessor pair.
+  - Does not parse route metadata, write JSONL, reconstruct paths, or implement generic SpGEMM.
+
+### `src/bf1.cpp`
+
+- Purpose: Bare-bones executable that runs dense outgoing-CSR SSSP once for each unique valid source found in `SSSP-new` metadata.
+- Inputs:
+  - Required outgoing CSR file in `RIPSOCS1` format.
+  - Required metadata `.ifmeta.bin` file in `RIPSIFM1` version 3, orientation 2, outgoing-edge-aligned format.
+  - Optional summary CSV output path.
+  - CLI options: `--max-iters <n>` with default `-1` meaning `rows - 1`; `--source-progress-every <n>` with default `100`; `--source-limit <n>` with default `0` meaning all unique valid sources.
+- Outputs:
+  - Console progress bar and detailed source progress reporting.
+  - Optional summary CSV with `source,iterations_used,converged`.
+- Compilation:
+  - From `rips2026-amd`: `hipcc -std=c++17 -O3 -x hip SSSP-new/src/bf1.cpp SSSP-new/src/mp_csr.cpp -o bf1`
+- What it does:
+  - Loads outgoing CSR and metadata on the CPU once.
+  - Extracts first-seen unique valid source nodes from metadata route requests.
+  - Copies outgoing CSR arrays to the GPU once.
+  - Reuses one `DeviceSsspWorkspace`.
+  - Calls `run_outgoing_dense_sssp` from `mp_csr.cpp` per source.
+  - Does not copy full distance vectors back and does not reconstruct paths.
+
+### `src/bf2.cpp`
+
+- Purpose: Path-outputting executable built from `bf1.cpp` behavior plus JSONL source-to-sink path emission.
+- Inputs:
+  - Required outgoing `RIPSOCS1` CSR.
+  - Required outgoing-aligned `RIPSIFM1` metadata version 3, orientation 2.
+  - Optional summary CSV output path.
+  - CLI options: same as `bf1.cpp`, plus `--paths-output <path>`.
+- Default path output:
+  - `SSSP-new/paths/bf2.<csr-stem>.paths.jsonl`.
+- JSONL output:
+  - First line is `{"type":"metadata","format":"rips-sssp-paths-v1",...,"edge_orientation":"outgoing"}`.
+  - Path lines include `net`, `net_index`, `logical_net_index`, `source`, `target`, `reached`, `distance`, `nodes`, and `csr_edges`.
+  - `csr_edges` are outgoing CSR edge ids in source-to-target order.
+- Compilation:
+  - From `rips2026-amd`: `hipcc -std=c++17 -O3 -x hip SSSP-new/src/bf2.cpp SSSP-new/src/mp_csr.cpp -o bf2`
+- What it does:
+  - Reads full route requests, not only unique source ids.
+  - Groups all source-sink queries by unique source.
+  - Runs dense outgoing Bellman-Ford via `mp_csr.cpp`.
+  - Copies the full packed `best_state` vector back after each source.
+  - Reconstructs each reached path by walking predecessor outgoing edge ids backward and validating `to[edge_id] == current_node`.
+- What it does not do:
+  - No frontiers, jump propagation, local multi-hop propagation, priority queue, target early stopping, sparse path-state gather, batching, or warm starts.
+
+### `src/bf3.cpp`
+
+- Purpose: Minimal active-frontier Bellman-Ford version of `bf2.cpp`.
+- Inputs:
+  - Same CLI shape as `bf2.cpp`: `<outgoing.csrbin> <metadata.ifmeta.bin> [summary.csv] [options]`.
+  - Required outgoing `RIPSOCS1` CSR.
+  - Required outgoing-aligned `RIPSIFM1` metadata version 3, orientation 2.
+  - CLI options: `--max-iters <n>`, `--paths-output <path>`, `--source-progress-every <n>`, `--source-limit <n>`, and `--help`.
+- Path output:
+  - Disabled by default.
+  - Enabled only when the user passes `--paths-output <path>`.
+  - Recommended filename pattern remains `SSSP-new/paths/bf3.<csr-stem>.paths.jsonl`.
+- Output format:
+  - Same compact JSONL path schema as `bf2.cpp`.
+  - `csr_edges` remain outgoing CSR edge ids.
+  - Path reconstruction still validates `to[edge_id] == current_node`.
+  - Optional summary CSV remains `source,iterations_used,converged`.
+- Frontier behavior:
+  - Local HIP kernels and workspace helpers live inside `bf3.cpp`; `mp_csr.cpp` is not modified or linked for this version.
+  - Initialization sets `best_state[source] = 0`, all other distances to infinity, and current frontier to `{source}`.
+  - Each iteration launches over the current frontier count, not over all graph rows.
+  - For each active vertex `u`, the kernel scans outgoing CSR row `u` and relaxes edges `u -> v`.
+  - On a successful improvement, `v` is placed into `next_frontier` once using `next_marks`.
+  - Current and next frontiers are swapped after each iteration.
+  - The run terminates when the next frontier is empty or `--max-iters` is reached.
+- What changed from `bf2.cpp`:
+  - Dense all-row relaxation is replaced by active-frontier relaxation.
+  - `bf3.cpp` owns its frontier-specific kernels, workspace allocation, and status handling locally.
+- What did not change from `bf2.cpp`:
+  - Outgoing CSR loader.
+  - Outgoing metadata expectations.
+  - Progress bars and detailed source progress reporting.
+  - Summary CSV support.
+  - Full `best_state` copyback per source only when `--paths-output` is enabled.
+  - JSONL path schema when path output is enabled.
+- What is intentionally not implemented:
+  - No jump propagation from the JFR paper.
+  - No local multi-hop propagation.
+  - No priority queue.
+  - No negative-cycle detection, because project graphs are assumed to have no negative weights or negative cycles.
+  - No target early stopping, sparse path-state gather, batching, or warm starts.
+- Compilation:
+  - From `rips2026-amd`: `hipcc -std=c++17 -O3 -x hip SSSP-new/src/bf3.cpp -o bf3`
+
+### `src/bf4.cpp`
+
+- Purpose: Experimental bounded jump-frontier Bellman-Ford version of `bf3.cpp`.
+- Inputs:
+  - Same CLI shape as `bf3.cpp`: `<outgoing.csrbin> <metadata.ifmeta.bin> [summary.csv] [options]`.
+  - Required outgoing `RIPSOCS1` CSR.
+  - Required outgoing-aligned `RIPSIFM1` metadata version 3, orientation 2.
+  - CLI options: `--max-iters <n>`, `--jump-k <n>`, `--paths-output <path>`, `--source-progress-every <n>`, `--source-limit <n>`, and `--help`.
+- Path output:
+  - Disabled by default.
+  - Enabled only when the user passes `--paths-output <path>`.
+  - Recommended filename pattern is `SSSP-new/paths/bf4.<csr-stem>.paths.jsonl`.
+- Output format:
+  - Same compact JSONL path schema as `bf3.cpp` when path output is enabled.
+  - `csr_edges` remain outgoing CSR edge ids.
+  - Path reconstruction still validates `to[edge_id] == current_node`.
+  - Optional summary CSV remains `source,iterations_used,converged`.
+- Jump-frontier semantics:
+  - `--jump-k 1` is the default and performs one frontier micro-step per outer iteration, matching `bf3.cpp` behavior.
+  - `--jump-k 2` relaxes the current frontier, then relaxes the newly improved micro-frontier once more before ending the outer iteration.
+  - In general, `jump_k` is the maximum number of frontier micro-steps per outer iteration.
+  - Outer `iterations_used` still counts outer iterations, not individual jump micro-steps.
+  - The outer run terminates when the active frontier becomes empty or `--max-iters` is reached.
+- GPU synchronization and atomics:
+  - Each jump depth is one separate HIP kernel launch over the active frontier count, not all graph rows.
+  - The host-side status copy and stream synchronization after each micro-step provide the global synchronization point before launching the next depth.
+  - Concurrent improvements to the same destination still use packed-state `atomicCAS` through `atomic_relax_state`.
+  - The low 32 bits of `best_state[v]` still store the predecessor outgoing CSR edge id.
+  - `next_marks` de-duplicates improved vertices once per micro-step.
+- What changed from `bf3.cpp`:
+  - Added `--jump-k`.
+  - Replaced the single-step runner with `run_outgoing_jump_frontier_sssp`, which performs up to `jump_k` synchronized frontier micro-steps per outer iteration.
+  - Added mark-token wrap handling by clearing `next_marks` if the integer token would overflow.
+- What did not change from `bf3.cpp`:
+  - Outgoing CSR loader.
+  - Outgoing metadata expectations.
+  - Progress bars and detailed source progress reporting.
+  - Summary CSV support.
+  - JSONL path output remains optional and disabled by default.
+  - Full `best_state` copyback per source only when `--paths-output` is enabled.
+  - JSONL path schema when path output is enabled.
+- What is intentionally not implemented:
+  - No priority queue, heap, radix heap, or bucket queue.
+  - No target early stopping.
+  - No sparse path-state gather.
+  - No batching.
+  - No warm starts.
+  - No graph partitioning or cache scheduling.
+  - No negative-cycle detection, because project graphs are assumed to have no negative weights or negative cycles.
+- Compilation:
+  - From `rips2026-amd`: `hipcc -std=c++17 -O3 -x hip SSSP-new/src/bf4.cpp -o bf4`
+
+### `src/bf5.cpp`
+
+- Purpose: Early-stopping active-frontier Bellman-Ford version of `bf3.cpp`.
+- Inputs:
+  - Same CLI shape as `bf3.cpp`: `<outgoing.csrbin> <metadata.ifmeta.bin> [summary.csv] [options]`.
+  - Required outgoing `RIPSOCS1` CSR.
+  - Required outgoing-aligned `RIPSIFM1` metadata version 3, orientation 2.
+  - CLI options: `--max-iters <n>`, `--no-target-early-stop`, `--paths-output <path>`, `--source-progress-every <n>`, `--source-limit <n>`, and `--help`.
+- Path output:
+  - Disabled by default.
+  - Enabled only when the user passes `--paths-output <path>`.
+  - Recommended filename pattern is `SSSP-new/paths/bf5.<csr-stem>.paths.jsonl`.
+- Output format:
+  - Same compact JSONL path schema as `bf3.cpp` when path output is enabled.
+  - `csr_edges` remain outgoing CSR edge ids.
+  - Path reconstruction still validates `to[edge_id] == current_node`.
+  - Optional summary CSV remains `source,iterations_used,converged`.
+- Target early-stopping semantics:
+  - Enabled by default.
+  - `--no-target-early-stop` disables it and runs the full active-frontier search with `bf5` logs.
+  - For each source, `bf5.cpp` collects that source's queried target sinks.
+  - It computes `can_reach_target[u]` by reverse traversal from those sinks.
+  - During relaxation, a device flag is set only when an improved next-frontier vertex can reach a queried target.
+  - The runner stops early only if the just-produced next frontier is nonempty and has no target-reachable vertex.
+  - It never stops merely because a target sink is absent from the current frontier.
+  - `converged=yes` still means full graph frontier convergence; target early stopping is logged separately as `termination=early_target_unreachable`.
+- Memory and transfer behavior:
+  - Reverse CSR is built once after loading the outgoing graph.
+  - Host reachability mask, queue, and touched-node buffers are reused per source.
+  - The per-source reachability mask is copied to GPU once per source when early stopping is enabled.
+  - Per iteration, the host copies back only normal status plus one target-relevance flag.
+  - Full `best_state` copyback still happens only when `--paths-output` is enabled.
+- What changed from `bf3.cpp`:
+  - Added `--no-target-early-stop`.
+  - Added reverse CSR construction and per-source target-cone marking.
+  - Added device target-reachability mask and target-relevant flag.
+  - Added `run_outgoing_frontier_sssp_target_early_stop`.
+  - Detailed source progress now includes `termination=full_convergence`, `termination=early_target_unreachable`, or `termination=max_iters`.
+- What did not change from `bf3.cpp`:
+  - Outgoing CSR loader.
+  - Outgoing metadata expectations.
+  - Progress bars and detailed source progress reporting.
+  - Summary CSV schema.
+  - JSONL path output remains optional and disabled by default.
+  - Full `best_state` copyback still happens only when `--paths-output` is enabled.
+  - JSONL path schema when path output is enabled.
+- What is intentionally not implemented:
+  - No jump propagation.
+  - No priority queue, heap, radix heap, or bucket queue.
+  - No target-distance pruning.
+  - No sparse path-state gather.
+  - No batching.
+  - No warm starts.
+  - No negative-cycle detection, because project graphs are assumed to have no negative weights or negative cycles.
+- Compilation:
+  - From `rips2026-amd`: `hipcc -std=c++17 -O3 -x hip SSSP-new/src/bf5.cpp -o bf5`
+
+### `src/bf6.cpp`
+
+- Purpose: Distance-bound early-stopping active-frontier Bellman-Ford version of `bf3.cpp`.
+- Inputs:
+  - Same CLI shape as `bf3.cpp`: `<outgoing.csrbin> <metadata.ifmeta.bin> [summary.csv] [options]`.
+  - Required outgoing `RIPSOCS1` CSR.
+  - Required outgoing-aligned `RIPSIFM1` metadata version 3, orientation 2.
+  - CLI options: `--max-iters <n>`, `--no-distance-early-stop`, `--paths-output <path>`, `--print-frontiers`, `--print-jsonl-entry-ids`, `--source-progress-every <n>`, `--source-limit <n>`, and `--help`.
+- Path output:
+  - Disabled by default.
+  - Enabled only when the user passes `--paths-output <path>`.
+  - Recommended filename pattern is `SSSP-new/paths/bf6.<csr-stem>.paths.jsonl`.
+- Output format:
+  - Same compact JSONL path schema as `bf3.cpp` when path output is enabled.
+  - `csr_edges` remain outgoing CSR edge ids.
+  - Path reconstruction still validates `to[edge_id] == current_node`.
+  - Optional summary CSV remains `source,iterations_used,converged`.
+- Distance-bound early-stopping semantics:
+  - Enabled by default.
+  - `--no-distance-early-stop` disables it and runs the full active-frontier search with `bf6` logs.
+  - For each source, `bf6.cpp` collects that source's unique queried target sinks and copies that compact list to the GPU once.
+  - Each relaxation iteration tracks `min_next_frontier_dist_bits`, the smallest improved distance among vertices placed in the next frontier.
+  - A target-status kernel scans only the source's target list and tracks how many targets are currently reached plus `max_target_dist_bits`, the largest reached target distance.
+  - The runner stops early only when the just-produced next frontier is nonempty, every queried target is reached, and `min_next_frontier_dist_bits > max_target_dist_bits`.
+  - This relies on the project assumption that edge weights are nonnegative: future paths from the next frontier cannot produce a target distance smaller than the next-frontier distance lower bound.
+  - `converged=yes` still means full graph frontier convergence; distance-bound early stopping is logged separately as `termination=early_distance_bound`.
+  - `iterations_used` is counted on the CPU as the number of relaxation iterations launched for the source. It is assigned from a host-side `launched_iterations` counter after each synchronized status copy, not from a GPU atomic or device memory counter.
+- Optional frontier printing:
+  - Disabled by default.
+  - Enabled with `--print-frontiers`.
+  - Prints only for the same sources that receive detailed source progress lines from `--source-progress-every`; use `--source-progress-every 1 --print-frontiers` to print every source.
+  - The output line is `frontier_trace ... frontiers=[[...],[...]]`, where each inner list is the active frontier vertex ids used by one relaxation iteration.
+  - The trace copies the current device frontier to the CPU before launching that iteration's relaxation kernel and sorts the host copy for stable printing. It does not feed the copied data back into the algorithm.
+- Optional JSONL entry-id printing:
+  - Disabled by default.
+  - Enabled with `--print-jsonl-entry-ids`.
+  - The old `--print-jsonl-records` spelling is accepted as an alias, but it now prints ids only.
+  - Prints only for the same sources that receive detailed source progress lines from `--source-progress-every`; use `--source-progress-every 1 --print-jsonl-entry-ids` to print every source's ids.
+  - The diagnostic line starts with `jsonl_entry_ids ...` and prints `jsonl_entry_ids=[...]` plus `jsonl_line_numbers=[...]`.
+  - `jsonl_entry_ids` are zero-based JSONL entry indexes including the metadata record as entry 0, so the first path record is entry id 1.
+  - `jsonl_line_numbers` are one-based physical line numbers in the JSONL file, so the first path record is line 2.
+  - Actual ids are available only when `--paths-output` is enabled. Without `--paths-output`, the diagnostic reports `unavailable_no_paths_output=yes`.
+- Memory and transfer behavior:
+  - No reverse CSR or `can_reach_target` mask is built.
+  - GPU target storage is sized to the maximum unique sink count among selected sources, not to the full graph row count.
+  - Per source, only the unique target node list is copied to the GPU for early stopping.
+  - Per iteration, the host copies back only the small `IterationStatus` struct.
+  - With `--print-frontiers`, printed sources also copy one current-frontier array per launched iteration for diagnostics; unprinted sources do not pay this transfer cost.
+  - Full `best_state` copyback happens for every source when `--paths-output` is enabled.
+  - `--print-jsonl-entry-ids` does not add `best_state` copyback by itself; it reports ids for records already being written by `--paths-output`.
+- What changed from `bf3.cpp`:
+  - Added `--no-distance-early-stop`.
+  - Added target-list helpers, `update_target_status_kernel`, and `run_outgoing_frontier_sssp_distance_early_stop`.
+  - Added per-source termination counters and detailed progress labels: `termination=full_convergence`, `termination=early_distance_bound`, or `termination=max_iters`.
+  - Added `--print-frontiers`, `copy_current_frontier_to_host`, and `write_frontier_trace` for optional per-iteration frontier diagnostics.
+  - Added `--print-jsonl-entry-ids` and `write_u64_list` for optional terminal inspection of JSONL path record ids associated with detailed source progress lines.
+- What did not change from `bf3.cpp`:
+  - Outgoing CSR loader.
+  - Outgoing metadata expectations.
+  - Progress bars and detailed source progress reporting.
+  - Summary CSV schema.
+  - JSONL path output remains optional and disabled by default.
+  - Full `best_state` copyback remains tied to path-record needs rather than normal summary-only runs.
+  - JSONL path schema when path output is enabled.
+- What is intentionally not implemented:
+  - No jump propagation.
+  - No reverse-CSR target-cone stopping.
+  - No priority queue, heap, radix heap, or bucket queue.
+  - No sparse path-state gather.
+  - No batching.
+  - No warm starts.
+  - No negative-cycle detection, because project graphs are assumed to have no negative weights or negative cycles.
+- Compilation:
+  - From `rips2026-amd`: `hipcc -std=c++17 -O3 -x hip SSSP-new/src/bf6.cpp -o bf6`
+
+### `src/bf7.cpp`
+
+- Purpose: Conservative transfer/synchronization optimization of `bf6.cpp` for the same outgoing-CSR, distance-bound active-frontier SSSP workflow.
+- Inputs:
+  - Same CLI shape as `bf6.cpp`: `<outgoing.csrbin> <metadata.ifmeta.bin> [summary.csv] [options]`.
+  - Required outgoing `RIPSOCS1` CSR.
+  - Required outgoing-aligned `RIPSIFM1` metadata version 3, orientation 2.
+  - CLI options remain `--max-iters <n>`, `--no-distance-early-stop`, `--paths-output <path>`, `--print-frontiers`, `--source-progress-every <n>`, `--source-limit <n>`, and `--help`.
+- Behavior preserved from `bf6.cpp`:
+  - One active-frontier SSSP run per unique valid source.
+  - Distance-bound early stopping remains enabled by default and uses the same `min_next_frontier_dist_bits > max_target_dist_bits` proof for nonnegative weights.
+  - JSONL path output remains optional and disabled by default.
+  - Full `best_state` copyback still happens only when `--paths-output` is enabled.
+  - Optional `--print-frontiers` still copies current frontiers to host only for detailed diagnostic progress lines.
+- Memory, synchronization, and atomic changes from `bf6.cpp`:
+  - `DeviceSsspWorkspace` now owns and documents one pinned host `IterationStatus` slot reused for per-iteration status reset and status readback.
+  - Per-iteration status reset uses a small pinned host-to-device copy instead of launching `reset_iteration_status_kernel`.
+  - `initialize_outgoing_sssp_state` no longer synchronizes immediately after the init kernel; later same-stream work and the existing iteration status sync preserve ordering.
+  - Next-frontier marking uses a load plus `atomicCAS` helper so vertices already queued for the current iteration skip the unconditional `atomicExch`.
+- What is intentionally not changed:
+  - No new algorithmic strategy, batching, queue type, path reconstruction format, or target stopping rule.
+  - No changes to `bf6.cpp`.
+- Compilation:
+  - From `rips2026-amd`: `hipcc -std=c++17 -O3 -x hip SSSP-new/src/bf7.cpp -o bf7`
+
+### `test/check_SSSP.cpp`
+
+- Purpose: Standalone validator for `SSSP-new` path JSONL against outgoing CSR and outgoing metadata.
+- Inputs:
+  - Required outgoing `RIPSOCS1` CSR.
+  - Required outgoing-aligned `RIPSIFM1` metadata version 3, orientation 2.
+  - Required paths JSONL using `format:"rips-sssp-paths-v1"` and `edge_orientation:"outgoing"`.
+  - CLI shape: `<outgoing.csrbin> <metadata.ifmeta.bin> <paths.jsonl> [options]`.
+- Validation modes:
+  - `--check-continuity`: reached paths must start at `source`, end at `target`, use valid outgoing CSR edge ids, have `from[edge_id] == nodes[i]`, `to[edge_id] == nodes[i + 1]`, and have JSON distance matching the summed edge weights. Unreached paths must have `distance:null`, `nodes:[]`, and `csr_edges:[]`.
+  - `--check-shortest`: groups JSONL records by source and runs targeted Dijkstra over outgoing CSR only for that source's requested targets. This is exact for nonnegative weights and is not an all-pairs/global comparison.
+  - `--check-completeness`: every valid metadata source-sink query must have exactly one matching JSONL record, and extra or duplicate records are reported.
+  - `--all` enables all checks; if no mode is provided, all checks are enabled by default.
+  - `--shortest-source-limit <n>` limits only the Dijkstra/shortest check to the first `n` unique JSONL sources; `0` means all sources. Continuity and completeness remain full-file checks.
+- Output:
+  - Prints CSR, metadata, JSONL, enabled-mode, and per-check pass/fail summaries.
+  - Exits `0` on pass, `2` on validation failures, and `1` on parsing/input errors.
+- Compilation:
+  - From `rips2026-amd`: `g++ -std=c++17 -O2 SSSP-new/test/check_SSSP.cpp -o check_SSSP`
