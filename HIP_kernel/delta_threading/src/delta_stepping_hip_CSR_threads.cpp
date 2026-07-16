@@ -767,7 +767,6 @@ __global__ void measure_target_paths_kernel(const int* targets,
       if (pred < 0 || pred == current) {
         break;
       }
-      (void)edge;
       current = pred;
       ++length;
     }
