@@ -1,7 +1,6 @@
 #include "delta_stepping_hip_CSR.hpp"
 
 #include <hip/hip_runtime.h>
-#include <rocprim/rocprim.hpp>
 
 #include <algorithm>
 #include <cmath>
@@ -10,6 +9,7 @@
 #include <sstream>
 #include <stdexcept>
 #include <string>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -21,6 +21,10 @@ using minplus_sparse::Offset;
 constexpr int kBlockSize = 256;
 constexpr int kMaxGridX = 65535;
 constexpr int kNoBucket = 0x3fffffff;
+constexpr Offset kMaxUnitSpecializationRows =
+    static_cast<Offset>(1) << std::numeric_limits<float>::digits;
+constexpr unsigned long long kNoParentKey =
+    std::numeric_limits<unsigned long long>::max();
 
 inline void hip_check(hipError_t status, const char* expr, const char* file, int line) {
   if (status != hipSuccess) {
@@ -84,6 +88,34 @@ class DeviceBuffer {
   std::size_t count_ = 0;
 };
 
+template <typename T>
+class PinnedHostBuffer {
+ public:
+  PinnedHostBuffer() = default;
+  explicit PinnedHostBuffer(std::size_t count) {
+    if (count != 0) {
+      DS_DELTA_HIP_CHECK(
+          hipHostMalloc(reinterpret_cast<void**>(&ptr_),
+                        count * sizeof(T),
+                        hipHostMallocDefault));
+    }
+  }
+
+  ~PinnedHostBuffer() {
+    if (ptr_ != nullptr) {
+      (void)hipHostFree(ptr_);
+    }
+  }
+
+  PinnedHostBuffer(const PinnedHostBuffer&) = delete;
+  PinnedHostBuffer& operator=(const PinnedHostBuffer&) = delete;
+
+  T* get() const { return ptr_; }
+
+ private:
+  T* ptr_ = nullptr;
+};
+
 struct DeviceCsrOwner {
   DeviceBuffer<Offset> rowptr;
   DeviceBuffer<Index> colind;
@@ -104,26 +136,6 @@ struct DeviceCsrOwner {
   }
 };
 
-struct OutgoingCsrOwner {
-  Offset rows = 0;
-  Offset cols = 0;
-  Offset nnz = 0;
-  DeviceBuffer<Offset> rowptr;
-  DeviceBuffer<Index> colind;
-  DeviceBuffer<float> values;
-  DeviceBuffer<Offset> incoming_edge;
-
-  OutgoingCsrOwner() = default;
-  OutgoingCsrOwner(Offset rows_, Offset cols_, Offset nnz_)
-      : rows(rows_),
-        cols(cols_),
-        nnz(nnz_),
-        rowptr(static_cast<std::size_t>(rows_) + 1),
-        colind(static_cast<std::size_t>(nnz_)),
-        values(static_cast<std::size_t>(nnz_)),
-        incoming_edge(static_cast<std::size_t>(nnz_)) {}
-};
-
 struct DeltaSteppingScratch {
   Offset rows = 0;
   DeviceBuffer<int> sources;
@@ -133,7 +145,6 @@ struct DeltaSteppingScratch {
   DeviceBuffer<int> in_current;
   DeviceBuffer<int> in_pending;
   DeviceBuffer<int> in_heavy;
-  DeviceBuffer<int> in_touched;
   DeviceBuffer<int> current_queue;
   DeviceBuffer<int> next_queue;
   DeviceBuffer<int> pending_a;
@@ -146,11 +157,15 @@ struct DeltaSteppingScratch {
   DeviceBuffer<int> new_pending_count;
   DeviceBuffer<int> heavy_count;
   DeviceBuffer<int> touched_count;
-  DeviceBuffer<int> overflow;
   DeviceBuffer<int> settled_target_count;
-  DeviceBuffer<int> block_mins;
+  DeviceBuffer<int> min_pending_bucket;
+  // Unit-weight specialization status: append tail, targets reached, frontier
+  // begin/end, next depth, whether the last expansion was active, last
+  // discovered bucket, and distinct bucket rounds.
+  DeviceBuffer<int> unit_status;
   DeviceBuffer<int> pred_node;
   DeviceBuffer<Offset> pred_edge;
+  DeviceBuffer<unsigned long long> parent_key;
   DeviceBuffer<float> target_distances;
   DeviceBuffer<int> target_path_lengths;
   DeviceBuffer<int> target_sources;
@@ -159,63 +174,92 @@ struct DeltaSteppingScratch {
   DeviceBuffer<int> target_edge_offsets;
   DeviceBuffer<int> compact_path_nodes;
   DeviceBuffer<Offset> compact_path_edges;
-  std::vector<int> h_block_mins;
-  bool initialized = false;
+  PinnedHostBuffer<int> host_scalar;
+  PinnedHostBuffer<int> host_unit_status;
+  bool unit_initialized = false;
+  bool generic_initialized = false;
 
   DeltaSteppingScratch() = default;
   explicit DeltaSteppingScratch(Offset rows_)
       : rows(rows_),
         dist(static_cast<std::size_t>(rows_)),
-        in_current(static_cast<std::size_t>(rows_)),
         in_pending(static_cast<std::size_t>(rows_)),
-        in_heavy(static_cast<std::size_t>(rows_)),
-        in_touched(static_cast<std::size_t>(rows_)),
         current_queue(static_cast<std::size_t>(rows_)),
-        next_queue(static_cast<std::size_t>(rows_)),
-        pending_a(static_cast<std::size_t>(rows_)),
-        pending_b(static_cast<std::size_t>(rows_)),
-        touched_queue(static_cast<std::size_t>(rows_)),
-        heavy_queue(static_cast<std::size_t>(rows_)),
-        current_count(1),
-        next_count(1),
-        pending_count(1),
-        new_pending_count(1),
-        heavy_count(1),
-        touched_count(1),
-        overflow(1),
-        settled_target_count(1),
-        block_mins(static_cast<std::size_t>(
-            (static_cast<int>(rows_) + kBlockSize - 1) / kBlockSize + 1)),
+        unit_status(8),
         pred_node(static_cast<std::size_t>(rows_)),
-        pred_edge(static_cast<std::size_t>(rows_)) {}
+        pred_edge(static_cast<std::size_t>(rows_)),
+        host_scalar(1),
+        host_unit_status(8) {}
+
+  void ensure_generic_storage() {
+    const std::size_t vertex_count = static_cast<std::size_t>(rows);
+    auto ensure_vertices = [vertex_count](auto& buffer) {
+      if (buffer.size() < vertex_count) buffer.reset(vertex_count);
+    };
+    auto ensure_scalar = [](auto& buffer) {
+      if (buffer.size() == 0) buffer.reset(1);
+    };
+    ensure_vertices(in_current);
+    ensure_vertices(in_heavy);
+    ensure_vertices(next_queue);
+    ensure_vertices(pending_a);
+    ensure_vertices(pending_b);
+    ensure_vertices(touched_queue);
+    ensure_vertices(heavy_queue);
+    ensure_vertices(parent_key);
+    ensure_scalar(current_count);
+    ensure_scalar(next_count);
+    ensure_scalar(pending_count);
+    ensure_scalar(new_pending_count);
+    ensure_scalar(heavy_count);
+    ensure_scalar(touched_count);
+    ensure_scalar(settled_target_count);
+    ensure_scalar(min_pending_bucket);
+  }
 
   void ensure_source_capacity(std::size_t source_count) {
     if (sources.size() < source_count) {
-      sources.reset(source_count);
+      sources.reset(grown_capacity(sources.size(), source_count));
     }
   }
 
   void ensure_target_capacity(std::size_t target_count) {
     if (targets.size() < target_count) {
-      targets.reset(target_count);
-      target_settled.reset(target_count);
-      target_distances.reset(target_count);
-      target_path_lengths.reset(target_count);
-      target_sources.reset(target_count);
-      target_path_status.reset(target_count);
-      target_node_offsets.reset(target_count + 1);
-      target_edge_offsets.reset(target_count + 1);
+      const std::size_t capacity =
+          grown_capacity(targets.size(), target_count);
+      targets.reset(capacity);
+      target_settled.reset(capacity);
+      target_distances.reset(capacity);
+      target_path_lengths.reset(capacity);
+      target_sources.reset(capacity);
+      target_path_status.reset(capacity);
+      target_node_offsets.reset(capacity + 1);
+      target_edge_offsets.reset(capacity + 1);
     }
   }
 
   void ensure_compact_path_capacity(std::size_t node_count,
                                     std::size_t edge_count) {
     if (compact_path_nodes.size() < node_count) {
-      compact_path_nodes.reset(node_count);
+      compact_path_nodes.reset(
+          grown_capacity(compact_path_nodes.size(), node_count));
     }
     if (compact_path_edges.size() < edge_count) {
-      compact_path_edges.reset(edge_count);
+      compact_path_edges.reset(
+          grown_capacity(compact_path_edges.size(), edge_count));
     }
+  }
+
+ private:
+  static std::size_t grown_capacity(std::size_t current,
+                                    std::size_t required) {
+    if (current >= required) return current;
+    if (current == 0) return required;
+    const std::size_t growth = current / 2 + 1;
+    if (current > std::numeric_limits<std::size_t>::max() - growth) {
+      return required;
+    }
+    return std::max(required, current + growth);
   }
 };
 
@@ -227,7 +271,10 @@ inline int grid_for_items(Offset items, int block_size = kBlockSize) {
 
 inline int grid_for_frontier(int items) {
   if (items <= 0) return 1;
-  return std::min(kMaxGridX, items);
+  const long long blocks =
+      (static_cast<long long>(items) + kBlockSize - 1) / kBlockSize;
+  return static_cast<int>(
+      std::min<long long>(kMaxGridX, std::max<long long>(1, blocks)));
 }
 
 inline std::size_t checked_size(Offset x, const char* name) {
@@ -324,12 +371,26 @@ inline void validate_host_csr_arrays(const HostCsrF32& g) {
   }
   for (std::size_t e = 0; e < nnz; ++e) {
     if (g.colind[e] < 0 || static_cast<Offset>(g.colind[e]) >= g.cols) {
-      throw std::invalid_argument("CSR colind contains an out-of-range source vertex");
+      throw std::invalid_argument("CSR colind contains an out-of-range destination vertex");
     }
     if (!std::isfinite(g.values[e]) || g.values[e] < 0.0f) {
       throw std::invalid_argument("delta-stepping requires finite nonnegative edge weights");
     }
   }
+}
+
+inline float max_edge_value(const std::vector<float>& values) {
+  float max_value = 0.0f;
+  for (const float value : values) {
+    max_value = std::max(max_value, value);
+  }
+  return max_value;
+}
+
+inline bool has_exact_unit_edge_values(const std::vector<float>& values) {
+  return std::all_of(values.begin(), values.end(), [](float value) {
+    return value == 1.0f;
+  });
 }
 
 inline void validate_host_csr(const HostCsrF32& g, int source, int target, float delta) {
@@ -372,27 +433,22 @@ inline void validate_device_csr_shape(const minplus_sparse::DeviceCsrF32& g,
 }
 
 template <typename T>
-inline T copy_scalar_to_host(const T* d_value, hipStream_t stream) {
-  T h{};
-  DS_DELTA_HIP_CHECK(hipMemcpyAsync(&h, d_value, sizeof(T), hipMemcpyDeviceToHost, stream));
+inline T copy_scalar_to_host(const T* d_value,
+                             hipStream_t stream,
+                             T* host_staging = nullptr) {
+  T pageable_value{};
+  T* const destination = host_staging == nullptr ? &pageable_value : host_staging;
+  DS_DELTA_HIP_CHECK(hipMemcpyAsync(destination,
+                                    d_value,
+                                    sizeof(T),
+                                    hipMemcpyDeviceToHost,
+                                    stream));
   DS_DELTA_HIP_CHECK(hipStreamSynchronize(stream));
-  return h;
+  return *destination;
 }
 
 inline void reset_int_zero_async(int* d_value, hipStream_t stream) {
   DS_DELTA_HIP_CHECK(hipMemsetAsync(d_value, 0, sizeof(int), stream));
-}
-
-__device__ inline Offset atomic_add_offset(Offset* ptr, Offset value) {
-  static_assert(sizeof(Offset) == 4 || sizeof(Offset) == 8,
-                "Offset must be a 32-bit or 64-bit integer type");
-  if constexpr (sizeof(Offset) == 8) {
-    return static_cast<Offset>(atomicAdd(reinterpret_cast<unsigned long long*>(ptr),
-                                         static_cast<unsigned long long>(value)));
-  } else {
-    return static_cast<Offset>(atomicAdd(reinterpret_cast<unsigned int*>(ptr),
-                                         static_cast<unsigned int>(value)));
-  }
 }
 
 __device__ inline float atomic_min_float_nonnegative(float* addr, float value) {
@@ -406,53 +462,63 @@ __device__ inline float atomic_min_float_nonnegative(float* addr, float value) {
   return __uint_as_float(old);
 }
 
-inline int bucket_index_host(float distance, float inv_delta) {
+__device__ inline bool finite_float(float value) {
+  return (__float_as_uint(value) & 0x7f800000U) != 0x7f800000U;
+}
+
+__device__ inline bool infinite_float(float value) {
+  return (__float_as_uint(value) & 0x7fffffffU) == 0x7f800000U;
+}
+
+__device__ inline void publish_parent_candidate(
+    unsigned long long* parent_key,
+    int predecessor,
+    float candidate_distance) {
+  const unsigned long long candidate_key =
+      (static_cast<unsigned long long>(__float_as_uint(candidate_distance)) << 32) |
+      static_cast<unsigned int>(predecessor);
+  unsigned long long old = *parent_key;
+  while (candidate_key < old) {
+    const unsigned long long assumed = old;
+    old = atomicCAS(parent_key, assumed, candidate_key);
+    if (old == assumed) break;
+  }
+}
+
+inline int bucket_index_host(float distance, float delta) {
   if (!std::isfinite(distance)) return kNoBucket;
-  const float bucket_f = std::floor(distance * inv_delta);
+  const float bucket_f = distance / delta;
+  if (bucket_f < 0.0f) return 0;
+  if (bucket_f >= static_cast<float>(kNoBucket)) return kNoBucket - 1;
+  // Distances are nonnegative, so integer truncation is floor without an
+  // additional libm operation.
+  return static_cast<int>(bucket_f);
+}
+
+__device__ inline int bucket_index(float distance, float delta) {
+  if (!finite_float(distance)) return kNoBucket;
+  const float bucket_f = distance / delta;
   if (bucket_f < 0.0f) return 0;
   if (bucket_f >= static_cast<float>(kNoBucket)) return kNoBucket - 1;
   return static_cast<int>(bucket_f);
 }
 
-__device__ inline int bucket_index(float distance, float inv_delta) {
-  if (!isfinite(distance)) return kNoBucket;
-  const float bucket_f = floorf(distance * inv_delta);
-  if (bucket_f < 0.0f) return 0;
-  if (bucket_f >= static_cast<float>(kNoBucket)) return kNoBucket - 1;
-  return static_cast<int>(bucket_f);
-}
-
-__device__ inline void enqueue_unique(int v,
-                                      int* flags,
-                                      int* queue,
-                                      int* count,
-                                      int capacity,
-                                      int* overflow) {
-  if (atomicCAS(&flags[v], 0, 1) == 0) {
-    const int pos = atomicAdd(count, 1);
-    if (pos < capacity) {
-      queue[pos] = v;
-    } else {
-      atomicExch(overflow, 1);
-      atomicExch(&flags[v], 0);
-    }
+__device__ inline int wave_append_position(bool append, int* queue_tail) {
+  const unsigned long long mask = __ballot(append);
+  if (!append) {
+    return -1;
   }
-}
 
-__device__ inline void mark_touched(int v,
-                                    int* in_touched,
-                                    int* touched_queue,
-                                    int* touched_count,
-                                    int capacity,
-                                    int* overflow) {
-  if (atomicCAS(&in_touched[v], 0, 1) == 0) {
-    const int pos = atomicAdd(touched_count, 1);
-    if (pos < capacity) {
-      touched_queue[pos] = v;
-    } else {
-      atomicExch(overflow, 1);
-    }
+  const int lane = static_cast<int>(threadIdx.x % warpSize);
+  const int leader = __ffsll(mask) - 1;
+  int base = 0;
+  if (lane == leader) {
+    base = atomicAdd(queue_tail, __popcll(mask));
   }
+  base = __shfl(base, leader);
+  const unsigned long long lower_lanes =
+      lane == 0 ? 0ULL : mask & ((1ULL << lane) - 1ULL);
+  return base + __popcll(lower_lanes);
 }
 
 __global__ void validate_device_csr_kernel(Offset rows,
@@ -475,64 +541,13 @@ __global__ void validate_device_csr_kernel(Offset rows,
       continue;
     }
     for (Offset e = begin; e < end; ++e) {
-      const Index src = colind[e];
+      const Index dst = colind[e];
       const float w = values[e];
-      if (src < 0 || static_cast<Offset>(src) >= cols || !isfinite(w) || w < 0.0f) {
+      if (dst < 0 || static_cast<Offset>(dst) >= cols ||
+          !finite_float(w) || w < 0.0f) {
         atomicExch(invalid, 1);
       }
     }
-  }
-}
-
-__global__ void count_out_degrees_from_incoming_kernel(Offset rows,
-                                                       const Offset* in_rowptr,
-                                                       const Index* in_colind,
-                                                       Offset* out_degree) {
-  // Public CSR row dst enumerates incoming edges src -> dst. Count by src.
-  for (Offset dst = static_cast<Offset>(blockIdx.x) * blockDim.x + threadIdx.x;
-       dst < rows;
-       dst += static_cast<Offset>(blockDim.x) * gridDim.x) {
-    for (Offset e = in_rowptr[dst]; e < in_rowptr[dst + 1]; ++e) {
-      const Offset src = static_cast<Offset>(in_colind[e]);
-      atomic_add_offset(&out_degree[src], static_cast<Offset>(1));
-    }
-  }
-}
-
-__global__ void set_last_rowptr_kernel(Offset* rowptr, Offset rows, Offset nnz) {
-  if (blockIdx.x == 0 && threadIdx.x == 0) rowptr[rows] = nnz;
-}
-
-__global__ void fill_outgoing_from_incoming_kernel(Offset rows,
-                                                   const Offset* in_rowptr,
-                                                   const Index* in_colind,
-                                                   const float* in_values,
-                                                   Offset* cursor,
-                                                   Index* out_colind,
-                                                   float* out_values,
-                                                   Offset* out_incoming_edge) {
-  // Transpose incoming-edge CSR into outgoing CSR: output row src stores dst.
-  for (Offset dst = static_cast<Offset>(blockIdx.x) * blockDim.x + threadIdx.x;
-       dst < rows;
-       dst += static_cast<Offset>(blockDim.x) * gridDim.x) {
-    for (Offset e = in_rowptr[dst]; e < in_rowptr[dst + 1]; ++e) {
-      const Offset src = static_cast<Offset>(in_colind[e]);
-      const Offset pos = atomic_add_offset(&cursor[src], static_cast<Offset>(1));
-      out_colind[pos] = static_cast<Index>(dst);
-      out_values[pos] = in_values[e];
-      out_incoming_edge[pos] = e;
-    }
-  }
-}
-
-__global__ void update_outgoing_values_from_incoming_kernel(Offset nnz,
-                                                            const float* in_values,
-                                                            const Offset* out_incoming_edge,
-                                                            float* out_values) {
-  for (Offset e = static_cast<Offset>(blockIdx.x) * blockDim.x + threadIdx.x;
-       e < nnz;
-       e += static_cast<Offset>(blockDim.x) * gridDim.x) {
-    out_values[e] = in_values[out_incoming_edge[e]];
   }
 }
 
@@ -546,10 +561,9 @@ __global__ void initialize_delta_arrays_kernel(Offset n,
                                                 int* next_count,
                                                 int* pending_count,
                                                 int* heavy_count,
-                                                int* overflow,
                                                 int* pred_node,
                                                 Offset* pred_edge,
-                                                int* in_touched,
+                                                unsigned long long* parent_key,
                                                 int* touched_count) {
   for (Offset v = static_cast<Offset>(blockIdx.x) * blockDim.x + threadIdx.x;
        v < n;
@@ -560,15 +574,30 @@ __global__ void initialize_delta_arrays_kernel(Offset n,
     in_heavy[v] = 0;
     pred_node[v] = -1;
     pred_edge[v] = static_cast<Offset>(-1);
-    in_touched[v] = 0;
+    parent_key[v] = kNoParentKey;
   }
   if (blockIdx.x == 0 && threadIdx.x == 0) {
     *current_count = 0;
     *next_count = 0;
     *pending_count = 0;
     *heavy_count = 0;
-    *overflow = 0;
     *touched_count = 0;
+  }
+}
+
+__global__ void initialize_unit_arrays_kernel(Offset n,
+                                              float inf,
+                                              float* dist,
+                                              int* target_multiplicity,
+                                              int* pred_node,
+                                              Offset* pred_edge) {
+  for (Offset v = static_cast<Offset>(blockIdx.x) * blockDim.x + threadIdx.x;
+       v < n;
+       v += static_cast<Offset>(blockDim.x) * gridDim.x) {
+    dist[v] = inf;
+    target_multiplicity[v] = 0;
+    pred_node[v] = -1;
+    pred_edge[v] = static_cast<Offset>(-1);
   }
 }
 
@@ -580,11 +609,66 @@ __global__ void initialize_delta_sources_kernel(const int* sources,
                                                 int* current_count,
                                                 int* pred_node,
                                                 Offset* pred_edge,
-                                                int* in_touched,
                                                 int* touched_queue,
-                                                int* touched_count,
-                                                int queue_capacity,
-                                                int* overflow) {
+                                                int* touched_count) {
+  if (blockIdx.x == 0 && threadIdx.x == 0) {
+    *current_count = source_count;
+    *touched_count = source_count;
+  }
+  for (int i = blockIdx.x * blockDim.x + threadIdx.x;
+       i < source_count;
+       i += blockDim.x * gridDim.x) {
+    const int source = sources[i];
+    dist[source] = 0.0f;
+    in_current[source] = 1;
+    pred_node[source] = source;
+    pred_edge[source] = static_cast<Offset>(-1);
+    current_queue[i] = source;
+    touched_queue[i] = source;
+  }
+}
+
+__global__ void mark_unit_target_multiplicity_kernel(
+    const int* targets,
+    int target_count,
+    int* target_multiplicity) {
+  for (int i = blockIdx.x * blockDim.x + threadIdx.x;
+       i < target_count;
+       i += blockDim.x * gridDim.x) {
+    atomicAdd(&target_multiplicity[targets[i]], 1);
+  }
+}
+
+__global__ void clear_unit_target_multiplicity_kernel(
+    const int* targets,
+    int target_count,
+    int* target_multiplicity) {
+  for (int i = blockIdx.x * blockDim.x + threadIdx.x;
+       i < target_count;
+       i += blockDim.x * gridDim.x) {
+    // Duplicate target entries may map several lanes to the same word.
+    atomicExch(&target_multiplicity[targets[i]], 0);
+  }
+}
+
+__global__ void initialize_unit_sources_kernel(const int* sources,
+                                               int source_count,
+                                               int initially_found,
+                                               float* dist,
+                                               int* pred_node,
+                                               Offset* pred_edge,
+                                               int* frontier_queue,
+                                               int* status) {
+  if (blockIdx.x == 0 && threadIdx.x == 0) {
+    status[0] = source_count;
+    status[1] = initially_found;
+    status[2] = 0;
+    status[3] = source_count;
+    status[4] = 0;
+    status[5] = 0;
+    status[6] = 0;
+    status[7] = 1;
+  }
   for (int i = blockIdx.x * blockDim.x + threadIdx.x;
        i < source_count;
        i += blockDim.x * gridDim.x) {
@@ -592,106 +676,123 @@ __global__ void initialize_delta_sources_kernel(const int* sources,
     dist[source] = 0.0f;
     pred_node[source] = source;
     pred_edge[source] = static_cast<Offset>(-1);
-    mark_touched(source, in_touched, touched_queue, touched_count,
-                 queue_capacity, overflow);
-    if (atomicCAS(&in_current[source], 0, 1) == 0) {
-      const int pos = atomicAdd(current_count, 1);
-      current_queue[pos] = source;
-    }
+    frontier_queue[i] = source;
   }
 }
 
-__global__ void compute_predecessors_kernel(Offset rows,
-                                            const Offset* rowptr,
-                                            const Index* colind,
-                                            const float* values,
-                                            const float* vertex_costs,
-                                            const float* dist,
+__global__ void expand_unit_frontier_kernel(const Offset* out_rowptr,
+                                            const Index* out_colind,
+                                            float* dist,
                                             int* pred_node,
-                                            Offset* pred_edge) {
-  for (Offset v = static_cast<Offset>(blockIdx.x) * blockDim.x + threadIdx.x;
-       v < rows;
-       v += static_cast<Offset>(blockDim.x) * gridDim.x) {
-    const float current_dist = dist[v];
-    int best_pred = -1;
-    Offset best_edge = static_cast<Offset>(-1);
-    float best_error = INFINITY;
+                                            Offset* pred_edge,
+                                            int* frontier_queue,
+                                            int* status,
+                                            const int* target_multiplicity,
+                                            int target_count,
+                                            int max_depth) {
+  const int frontier_begin = status[2];
+  const int frontier_end = status[3];
+  const int depth = status[4];
+  const bool active = frontier_begin < frontier_end &&
+                      status[1] < target_count && depth < max_depth;
+  if (blockIdx.x == 0 && threadIdx.x == 0) {
+    status[5] = active ? 1 : 0;
+  }
+  if (!active) return;
 
-    if (isfinite(current_dist)) {
-      for (Offset edge = rowptr[v]; edge < rowptr[v + 1]; ++edge) {
-        const int pred = static_cast<int>(colind[edge]);
-        if (pred == static_cast<int>(v)) continue;
-        const float pred_dist = dist[pred];
-        if (!isfinite(pred_dist)) continue;
-        const float edge_cost =
-            values[edge] * (vertex_costs == nullptr ? 1.0f : vertex_costs[v]);
-        const float candidate = pred_dist + edge_cost;
-        const float error = fabsf(candidate - current_dist);
-        const float tolerance =
-            1e-3f * fmaxf(1.0f, fmaxf(fabsf(candidate), fabsf(current_dist)));
-        if (error <= tolerance &&
-            (error < best_error ||
-             (error == best_error && (best_pred < 0 || pred < best_pred)))) {
-          best_error = error;
-          best_pred = pred;
-          best_edge = edge;
+  const float next_distance = static_cast<float>(depth + 1);
+  const unsigned int infinity_bits = __float_as_uint(INFINITY);
+  const unsigned int next_distance_bits = __float_as_uint(next_distance);
+  for (int i = frontier_begin + blockIdx.x * blockDim.x + threadIdx.x;
+       i < frontier_end;
+       i += blockDim.x * gridDim.x) {
+    const int u = frontier_queue[i];
+    for (Offset edge = out_rowptr[u]; edge < out_rowptr[u + 1]; ++edge) {
+      const int v = static_cast<int>(out_colind[edge]);
+      auto* const distance_bits =
+          reinterpret_cast<unsigned int*>(&dist[v]);
+      const bool claimed =
+          *distance_bits == infinity_bits &&
+          atomicCAS(distance_bits, infinity_bits, next_distance_bits) ==
+              infinity_bits;
+      if (claimed) {
+        pred_node[v] = u;
+        pred_edge[v] = edge;
+      }
+      const int pos = wave_append_position(claimed, status);
+      if (claimed) {
+        frontier_queue[pos] = v;
+        const int multiplicity = target_multiplicity[v];
+        if (multiplicity > 0) {
+          atomicAdd(status + 1, multiplicity);
         }
       }
     }
-
-    pred_node[v] = best_pred;
-    pred_edge[v] = best_edge;
   }
 }
 
-__device__ inline bool find_final_distance_predecessor(Offset rows,
-                                                       const Offset* rowptr,
-                                                       const Index* colind,
-                                                       const float* values,
-                                                       const float* vertex_costs,
-                                                       const float* dist,
-                                                       int current,
-                                                       int* pred_out,
-                                                       Offset* edge_out) {
-  const float current_dist = dist[current];
-  int best_pred = -1;
-  Offset best_edge = static_cast<Offset>(-1);
-  float best_error = INFINITY;
-
-  if (!isfinite(current_dist)) {
-    return false;
+__global__ void advance_unit_frontier_kernel(int* status, float delta) {
+  if (blockIdx.x == 0 && threadIdx.x == 0 && status[5] != 0) {
+    if (status[0] > status[3]) {
+      const int discovered_depth = status[4] + 1;
+      const int discovered_bucket =
+          bucket_index(static_cast<float>(discovered_depth), delta);
+      if (discovered_bucket != status[6]) {
+        status[6] = discovered_bucket;
+        ++status[7];
+      }
+    }
+    status[2] = status[3];
+    status[3] = status[0];
+    ++status[4];
+    status[5] = 0;
   }
-  for (Offset edge = rowptr[current]; edge < rowptr[current + 1]; ++edge) {
-    const int pred = static_cast<int>(colind[edge]);
-    if (pred == current) continue;
-    const float pred_dist = dist[pred];
-    if (!isfinite(pred_dist)) continue;
-    const float edge_cost =
-        values[edge] * (vertex_costs == nullptr ? 1.0f : vertex_costs[current]);
-    const float candidate = pred_dist + edge_cost;
-    const float error = fabsf(candidate - current_dist);
-    const float tolerance =
-        1e-3f * fmaxf(1.0f, fmaxf(fabsf(candidate), fabsf(current_dist)));
-    if (error <= tolerance &&
-        (error < best_error ||
-         (error == best_error && (best_pred < 0 || pred < best_pred)))) {
-      best_error = error;
-      best_pred = pred;
-      best_edge = edge;
+}
+
+__global__ void materialize_predecessors_kernel(
+    const int* touched_vertices,
+    int touched_count,
+    const Offset* rowptr,
+    const Index* colind,
+    const float* values,
+    const float* vertex_costs,
+    const float* dist,
+    const unsigned long long* parent_key,
+    int* pred_node,
+    Offset* pred_edge) {
+  for (int i = blockIdx.x * blockDim.x + threadIdx.x;
+       i < touched_count;
+       i += blockDim.x * gridDim.x) {
+    const int v = touched_vertices[i];
+    if (pred_node[v] == v) {
+      // Sources are marked directly and have no predecessor edge.
+      continue;
+    }
+    const unsigned long long key = parent_key[v];
+    if (key == kNoParentKey) continue;
+    const int u = static_cast<int>(static_cast<unsigned int>(key));
+    const float du = dist[u];
+    const float dv = dist[v];
+    if (!finite_float(du) || !finite_float(dv)) continue;
+
+    for (Offset edge = rowptr[u]; edge < rowptr[u + 1]; ++edge) {
+      if (static_cast<int>(colind[edge]) != v) continue;
+      const float edge_cost =
+          values[edge] * (vertex_costs == nullptr ? 1.0f : vertex_costs[v]);
+      const float candidate = du + edge_cost;
+      if (__float_as_uint(candidate) == __float_as_uint(dv)) {
+        pred_node[v] = u;
+        pred_edge[v] = edge;
+        break;
+      }
     }
   }
-  if (best_pred < 0) {
-    return false;
-  }
-  *pred_out = best_pred;
-  *edge_out = best_edge;
-  return true;
 }
 
 __global__ void mark_settled_targets_kernel(const int* targets,
                                             int target_count,
                                             int current_bucket,
-                                            float inv_delta,
+                                            float delta,
                                             const float* dist,
                                             int* target_settled,
                                             int* settled_count) {
@@ -701,8 +802,8 @@ __global__ void mark_settled_targets_kernel(const int* targets,
     if (target_settled[i] != 0) continue;
     const int target = targets[i];
     const float target_distance = dist[target];
-    if (isfinite(target_distance) &&
-        bucket_index(target_distance, inv_delta) <= current_bucket &&
+    if (finite_float(target_distance) &&
+        bucket_index(target_distance, delta) <= current_bucket &&
         atomicCAS(&target_settled[i], 0, 1) == 0) {
       atomicAdd(settled_count, 1);
     }
@@ -712,12 +813,8 @@ __global__ void mark_settled_targets_kernel(const int* targets,
 __global__ void measure_target_paths_kernel(const int* targets,
                                             int target_count,
                                             Offset rows,
-                                            const Offset* rowptr,
-                                            const Index* colind,
-                                            const float* values,
-                                            const float* vertex_costs,
                                             const float* dist,
-                                            int* pred_node,
+                                            const int* pred_node,
                                             float* target_distances,
                                             int* path_lengths,
                                             int* path_sources,
@@ -731,7 +828,7 @@ __global__ void measure_target_paths_kernel(const int* targets,
     path_lengths[i] = 0;
     path_sources[i] = -1;
     path_status[i] = 0;
-    if (!isfinite(target_distance)) {
+    if (!finite_float(target_distance)) {
       continue;
     }
 
@@ -746,31 +843,48 @@ __global__ void measure_target_paths_kernel(const int* targets,
         break;
       }
 
-      int pred = -1;
-      Offset edge = static_cast<Offset>(-1);
-      if (!find_final_distance_predecessor(rows, rowptr, colind, values,
-                                           vertex_costs, dist, current,
-                                           &pred, &edge)) {
+      const int pred = pred_node[current];
+      if (pred < 0 || static_cast<Offset>(pred) >= rows) {
         break;
       }
-      (void)edge;
       current = pred;
       ++length;
     }
   }
 }
 
+__global__ void measure_unit_target_paths_kernel(const int* targets,
+                                                 int target_count,
+                                                 const float* dist,
+                                                 float* target_distances,
+                                                 int* path_lengths,
+                                                 int* path_sources,
+                                                 int* path_status) {
+  for (int i = blockIdx.x * blockDim.x + threadIdx.x;
+       i < target_count;
+       i += blockDim.x * gridDim.x) {
+    const float target_distance = dist[targets[i]];
+    target_distances[i] = target_distance;
+    path_sources[i] = -1;
+    if (!finite_float(target_distance)) {
+      path_lengths[i] = 0;
+      path_status[i] = 0;
+      continue;
+    }
+    // In the unit specialization, distance is exactly the BFS edge depth.
+    path_lengths[i] = static_cast<int>(target_distance) + 1;
+    path_status[i] = 1;
+  }
+}
+
 __global__ void fill_target_paths_kernel(const int* targets,
                                          int target_count,
                                          Offset rows,
-                                         const Offset* rowptr,
-                                         const Index* colind,
-                                         const float* values,
-                                         const float* vertex_costs,
-                                         const float* dist,
                                          const int* pred_node,
+                                         const Offset* pred_edge,
                                          const int* path_lengths,
                                          const int* path_status,
+                                         int* path_sources,
                                          const int* node_offsets,
                                          const int* edge_offsets,
                                          int* path_nodes,
@@ -785,43 +899,43 @@ __global__ void fill_target_paths_kernel(const int* targets,
     int current = targets[i];
     const int node_begin = node_offsets[i];
     const int edge_begin = edge_offsets[i];
+    bool path_valid = true;
     path_nodes[node_begin + length - 1] = current;
     for (int j = length - 1; j > 0; --j) {
       const int source_marker = pred_node[current];
       if (source_marker == current) {
-        return;
+        path_valid = false;
+        break;
       }
-      int pred = -1;
-      Offset edge = static_cast<Offset>(-1);
-      if (!find_final_distance_predecessor(rows, rowptr, colind, values,
-                                           vertex_costs, dist, current,
-                                           &pred, &edge)) {
-        return;
+      const int pred = source_marker;
+      if (pred < 0 || static_cast<Offset>(pred) >= rows) {
+        path_valid = false;
+        break;
       }
-      path_edges[edge_begin + j - 1] = edge;
+      path_edges[edge_begin + j - 1] = pred_edge[current];
       current = pred;
       path_nodes[node_begin + j - 1] = current;
+    }
+    if (path_valid) {
+      path_sources[i] = current;
     }
   }
 }
 
+template <bool HasVertexCosts, bool CollectHeavy, bool AllEdgesLight>
 __global__ void relax_light_edges_kernel(const int* frontier,
-                                         int frontier_count,
+                                         const int* frontier_count_ptr,
                                          int current_bucket,
                                          float delta,
-                                         float inv_delta,
                                          const Offset* out_rowptr,
                                          const Index* out_colind,
                                          const float* out_values,
-                                         const Offset* out_incoming_edge,
                                          const float* vertex_costs,
                                          float* dist,
+                                         unsigned long long* parent_key,
                                          int* in_current,
                                          int* in_pending,
                                          int* in_heavy,
-                                         int* pred_node,
-                                         Offset* pred_edge,
-                                         int* in_touched,
                                          int* touched_queue,
                                          int* touched_count,
                                          int* next_frontier,
@@ -829,103 +943,198 @@ __global__ void relax_light_edges_kernel(const int* frontier,
                                          int* pending_queue,
                                          int* pending_count,
                                          int* heavy_queue,
-                                         int* heavy_count,
-                                         int queue_capacity,
-                                         int* overflow) {
-  // One block cooperates on one active vertex at a time; grid-stride over frontier.
-  for (int fi = blockIdx.x; fi < frontier_count; fi += gridDim.x) {
+                                         int* heavy_count) {
+  // FPGA routing graphs have short outgoing rows.  Assign one active vertex to
+  // each thread so a 256-thread block can process up to 256 rows concurrently,
+  // matching the unit-BFS traversal instead of idling most of a block per row.
+  const int frontier_count = *frontier_count_ptr;
+  for (int fi = blockIdx.x * blockDim.x + threadIdx.x;
+       fi < frontier_count;
+       fi += blockDim.x * gridDim.x) {
     const int u = frontier[fi];
     // The in_current flags for this whole frontier are cleared by a separate
     // kernel before relaxation starts.  Do not clear them here: doing so races
     // with other blocks that may need to re-enqueue this vertex after a same-
     // bucket distance decrease.
     const float du = dist[u];
-    const bool active = isfinite(du) && bucket_index(du, inv_delta) == current_bucket;
-    if (active) {
-      if (threadIdx.x == 0) {
-        enqueue_unique(u, in_heavy, heavy_queue, heavy_count, queue_capacity, overflow);
+    const bool active =
+        finite_float(du) && bucket_index(du, delta) == current_bucket;
+    if constexpr (CollectHeavy) {
+      const bool append_heavy =
+          active && atomicCAS(&in_heavy[u], 0, 1) == 0;
+      const int heavy_pos = wave_append_position(append_heavy, heavy_count);
+      if (append_heavy) {
+        heavy_queue[heavy_pos] = u;
       }
-      for (Offset e = out_rowptr[u] + threadIdx.x; e < out_rowptr[u + 1]; e += blockDim.x) {
+    }
+    if (active) {
+      for (Offset e = out_rowptr[u]; e < out_rowptr[u + 1]; ++e) {
         const float w = out_values[e];
         const int v = static_cast<int>(out_colind[e]);
         const float effective_w =
-            vertex_costs == nullptr ? w : w * vertex_costs[v];
-        if (effective_w > delta) continue;
-        const float nd = du + effective_w;
-        const float old = atomic_min_float_nonnegative(&dist[v], nd);
-        if (nd < old) {
-          pred_node[v] = u;
-          pred_edge[v] = out_incoming_edge[e];
-          mark_touched(v, in_touched, touched_queue, touched_count,
-                       queue_capacity, overflow);
-          const int b = bucket_index(nd, inv_delta);
+            HasVertexCosts ? w * vertex_costs[v] : w;
+        const float candidate = du + effective_w;
+        int candidate_bucket = kNoBucket;
+        // Float addition can place a nominally heavy edge in the current
+        // bucket (and all very large distances share the terminal bucket).
+        // Such work belongs to light closure or its descendants can be lost.
+        bool light = true;
+        if constexpr (!AllEdgesLight) {
+          candidate_bucket = bucket_index(candidate, delta);
+          light = effective_w <= delta ||
+                  candidate_bucket == current_bucket;
+        }
+        const float nd = light ? candidate : INFINITY;
+        const float old =
+            light ? atomic_min_float_nonnegative(&dist[v], nd) : INFINITY;
+        const bool decreased = light && nd < old;
+        const bool append_touched = decreased && infinite_float(old);
+        bool append_current = false;
+        bool append_pending = false;
+        if (decreased) {
+          if constexpr (AllEdgesLight) {
+            candidate_bucket = bucket_index(nd, delta);
+          }
+          publish_parent_candidate(&parent_key[v], u, nd);
+          const int b = candidate_bucket;
           if (b == current_bucket) {
             // If v had previously been discovered in a later bucket, the new
             // distance has moved it back into the current bucket.  Clear the
             // pending flag so stale pending-queue entries cannot affect later
             // bucket selection.
             atomicExch(&in_pending[v], 0);
-            enqueue_unique(v, in_current, next_frontier, next_count, queue_capacity, overflow);
+            append_current = atomicCAS(&in_current[v], 0, 1) == 0;
           } else if (b > current_bucket && b < kNoBucket) {
-            enqueue_unique(v, in_pending, pending_queue, pending_count, queue_capacity, overflow);
+            append_pending = atomicCAS(&in_pending[v], 0, 1) == 0;
           }
         }
+        const int touched_pos =
+            wave_append_position(append_touched, touched_count);
+        const int current_pos =
+            wave_append_position(append_current, next_count);
+        const int pending_pos =
+            wave_append_position(append_pending, pending_count);
+        if (append_touched) touched_queue[touched_pos] = v;
+        if (append_current) next_frontier[current_pos] = v;
+        if (append_pending) pending_queue[pending_pos] = v;
       }
     }
-    __syncthreads();
   }
 }
 
+template <bool HasVertexCosts>
 __global__ void relax_heavy_edges_kernel(const int* heavy_vertices,
-                                         int heavy_count_value,
+                                         const int* heavy_count_ptr,
                                          int current_bucket,
                                          float delta,
-                                         float inv_delta,
                                          const Offset* out_rowptr,
                                          const Index* out_colind,
                                          const float* out_values,
-                                         const Offset* out_incoming_edge,
                                          const float* vertex_costs,
                                          float* dist,
+                                         unsigned long long* parent_key,
                                          int* in_pending,
-                                         int* pred_node,
-                                         Offset* pred_edge,
-                                         int* in_touched,
                                          int* touched_queue,
                                          int* touched_count,
                                          int* pending_queue,
                                          int* pending_count,
-                                         int queue_capacity,
-                                         int* overflow) {
-  for (int fi = blockIdx.x; fi < heavy_count_value; fi += gridDim.x) {
+                                         int* in_heavy) {
+  const int heavy_count_value = *heavy_count_ptr;
+  for (int fi = blockIdx.x * blockDim.x + threadIdx.x;
+       fi < heavy_count_value;
+       fi += blockDim.x * gridDim.x) {
     const int u = heavy_vertices[fi];
     const float du = dist[u];
-    if (isfinite(du)) {
-      for (Offset e = out_rowptr[u] + threadIdx.x; e < out_rowptr[u + 1]; e += blockDim.x) {
+    if (finite_float(du)) {
+      for (Offset e = out_rowptr[u]; e < out_rowptr[u + 1]; ++e) {
         const float w = out_values[e];
         const int v = static_cast<int>(out_colind[e]);
         const float effective_w =
-            vertex_costs == nullptr ? w : w * vertex_costs[v];
-        if (effective_w <= delta) continue;
-        const float nd = du + effective_w;
-        const float old = atomic_min_float_nonnegative(&dist[v], nd);
-        if (nd < old) {
-          pred_node[v] = u;
-          pred_edge[v] = out_incoming_edge[e];
-          mark_touched(v, in_touched, touched_queue, touched_count,
-                       queue_capacity, overflow);
-          const int b = bucket_index(nd, inv_delta);
+            HasVertexCosts ? w * vertex_costs[v] : w;
+        const float candidate = du + effective_w;
+        const int candidate_bucket = bucket_index(candidate, delta);
+        // Same-bucket nominally-heavy edges were already processed by the
+        // light-closure kernel. Only future-bucket candidates belong here.
+        const bool heavy = effective_w > delta &&
+                           candidate_bucket > current_bucket &&
+                           candidate_bucket < kNoBucket;
+        const float nd = heavy ? candidate : INFINITY;
+        const float old =
+            heavy ? atomic_min_float_nonnegative(&dist[v], nd) : INFINITY;
+        const bool decreased = heavy && nd < old;
+        const bool append_touched = decreased && infinite_float(old);
+        bool append_pending = false;
+        if (decreased) {
+          publish_parent_candidate(&parent_key[v], u, nd);
+          const int b = candidate_bucket;
           if (b > current_bucket && b < kNoBucket) {
-            enqueue_unique(v, in_pending, pending_queue, pending_count, queue_capacity, overflow);
+            append_pending = atomicCAS(&in_pending[v], 0, 1) == 0;
           }
         }
+        const int touched_pos =
+            wave_append_position(append_touched, touched_count);
+        const int pending_pos =
+            wave_append_position(append_pending, pending_count);
+        if (append_touched) touched_queue[touched_pos] = v;
+        if (append_pending) pending_queue[pending_pos] = v;
       }
     }
-    __syncthreads();
+    in_heavy[u] = 0;
   }
 }
 
-__global__ void clear_flags_from_queue_kernel(const int* vertices, int count, int* flags) {
+template <bool HasVertexCosts, bool CollectHeavy, bool AllEdgesLight>
+void launch_relax_light_edges(
+    const minplus_sparse::DeviceCsrF32& graph,
+    DeltaSteppingScratch& scratch,
+    const float* vertex_costs,
+    const int* current_queue,
+    const int* current_count,
+    int launch_blocks,
+    int current_bucket,
+    float delta,
+    int* next_queue,
+    int* next_count,
+    int* pending_queue,
+    hipStream_t stream) {
+  relax_light_edges_kernel<HasVertexCosts, CollectHeavy, AllEdgesLight>
+      <<<launch_blocks, kBlockSize, 0, stream>>>(
+          current_queue, current_count, current_bucket, delta,
+          graph.rowptr, graph.colind, graph.values, vertex_costs,
+          scratch.dist.get(), scratch.parent_key.get(),
+          scratch.in_current.get(), scratch.in_pending.get(),
+          scratch.in_heavy.get(), scratch.touched_queue.get(),
+          scratch.touched_count.get(), next_queue, next_count,
+          pending_queue, scratch.pending_count.get(), scratch.heavy_queue.get(),
+          scratch.heavy_count.get());
+  DS_DELTA_HIP_CHECK(hipGetLastError());
+}
+
+template <bool HasVertexCosts>
+void launch_relax_heavy_edges(
+    const minplus_sparse::DeviceCsrF32& graph,
+    DeltaSteppingScratch& scratch,
+    const float* vertex_costs,
+    int launch_blocks,
+    int current_bucket,
+    float delta,
+    int* pending_queue,
+    hipStream_t stream) {
+  relax_heavy_edges_kernel<HasVertexCosts>
+      <<<launch_blocks, kBlockSize, 0, stream>>>(
+          scratch.heavy_queue.get(), scratch.heavy_count.get(),
+          current_bucket, delta,
+          graph.rowptr, graph.colind, graph.values, vertex_costs,
+          scratch.dist.get(), scratch.parent_key.get(), scratch.in_pending.get(),
+          scratch.touched_queue.get(), scratch.touched_count.get(),
+          pending_queue, scratch.pending_count.get(), scratch.in_heavy.get());
+  DS_DELTA_HIP_CHECK(hipGetLastError());
+}
+
+__global__ void clear_flags_from_queue_kernel(const int* vertices,
+                                              const int* count_ptr,
+                                              int* flags) {
+  const int count = *count_ptr;
   for (int i = blockIdx.x * blockDim.x + threadIdx.x;
        i < count;
        i += blockDim.x * gridDim.x) {
@@ -940,9 +1149,9 @@ __global__ void reset_touched_vertices_kernel(const int* touched_queue,
                                               int* in_current,
                                               int* in_pending,
                                               int* in_heavy,
-                                              int* in_touched,
                                               int* pred_node,
-                                              Offset* pred_edge) {
+                                              Offset* pred_edge,
+                                              unsigned long long* parent_key) {
   for (int i = blockIdx.x * blockDim.x + threadIdx.x;
        i < touched_count;
        i += blockDim.x * gridDim.x) {
@@ -951,28 +1160,45 @@ __global__ void reset_touched_vertices_kernel(const int* touched_queue,
     in_current[v] = 0;
     in_pending[v] = 0;
     in_heavy[v] = 0;
-    in_touched[v] = 0;
+    pred_node[v] = -1;
+    pred_edge[v] = static_cast<Offset>(-1);
+    parent_key[v] = kNoParentKey;
+  }
+}
+
+__global__ void reset_unit_visited_kernel(const int* visited_queue,
+                                          int visited_count,
+                                          float inf,
+                                          float* dist,
+                                          int* pred_node,
+                                          Offset* pred_edge) {
+  for (int i = blockIdx.x * blockDim.x + threadIdx.x;
+       i < visited_count;
+       i += blockDim.x * gridDim.x) {
+    const int v = visited_queue[i];
+    dist[v] = inf;
     pred_node[v] = -1;
     pred_edge[v] = static_cast<Offset>(-1);
   }
 }
 
 __global__ void reduce_min_pending_bucket_kernel(const int* pending_queue,
-                                                 int pending_count,
+                                                 const int* pending_count_ptr,
                                                  int previous_bucket,
-                                                 float inv_delta,
+                                                 float delta,
                                                  const float* dist,
                                                  const int* in_pending,
-                                                 int* block_mins) {
+                                                 int* global_min) {
   __shared__ int s_min[kBlockSize];
   const int tid = threadIdx.x;
+  const int pending_count = *pending_count_ptr;
   int local_min = kNoBucket;
   for (int i = blockIdx.x * blockDim.x + tid;
        i < pending_count;
        i += blockDim.x * gridDim.x) {
     const int v = pending_queue[i];
     if (in_pending[v]) {
-      const int b = bucket_index(dist[v], inv_delta);
+      const int b = bucket_index(dist[v], delta);
       if (b > previous_bucket && b < local_min) local_min = b;
     }
   }
@@ -984,38 +1210,43 @@ __global__ void reduce_min_pending_bucket_kernel(const int* pending_queue,
     }
     __syncthreads();
   }
-  if (tid == 0) block_mins[blockIdx.x] = s_min[0];
+  if (tid == 0 && s_min[0] < kNoBucket) {
+    atomicMin(global_min, s_min[0]);
+  }
 }
 
 __global__ void compact_pending_to_current_bucket_kernel(const int* pending_in,
-                                                         int pending_count,
+                                                         const int* pending_count_ptr,
                                                          int selected_bucket,
-                                                         float inv_delta,
+                                                         float delta,
                                                          const float* dist,
                                                          int* in_pending,
                                                          int* in_current,
                                                          int* current_queue,
                                                          int* current_count,
                                                          int* pending_out,
-                                                         int* new_pending_count,
-                                                         int queue_capacity,
-                                                         int* overflow) {
+                                                         int* new_pending_count) {
+  const int pending_count = *pending_count_ptr;
   for (int i = blockIdx.x * blockDim.x + threadIdx.x;
        i < pending_count;
        i += blockDim.x * gridDim.x) {
     const int v = pending_in[i];
-    if (!in_pending[v]) continue;
-    const int b = bucket_index(dist[v], inv_delta);
-    if (b == selected_bucket) {
+    const bool active = in_pending[v] != 0;
+    const int b = active ? bucket_index(dist[v], delta) : kNoBucket;
+    bool append_current = false;
+    const bool keep_pending = active && b > selected_bucket && b < kNoBucket;
+    if (active && b == selected_bucket) {
       atomicExch(&in_pending[v], 0);
-      enqueue_unique(v, in_current, current_queue, current_count, queue_capacity, overflow);
-    } else if (b > selected_bucket && b < kNoBucket) {
-      const int pos = atomicAdd(new_pending_count, 1);
-      if (pos < queue_capacity) pending_out[pos] = v;
-      else atomicExch(overflow, 1);
-    } else {
+      append_current = atomicCAS(&in_current[v], 0, 1) == 0;
+    } else if (active && !keep_pending) {
       atomicExch(&in_pending[v], 0);
     }
+    const int current_pos =
+        wave_append_position(append_current, current_count);
+    const int pending_pos =
+        wave_append_position(keep_pending, new_pending_count);
+    if (append_current) current_queue[current_pos] = v;
+    if (keep_pending) pending_out[pending_pos] = v;
   }
 }
 
@@ -1031,6 +1262,9 @@ DeviceCsrOwner copy_host_csr_to_device(const HostCsrF32& h, hipStream_t stream) 
     DS_DELTA_HIP_CHECK(hipMemcpyAsync(d.values.get(), h.values.data(),
                                       nnz * sizeof(float), hipMemcpyHostToDevice, stream));
   }
+  // The host vectors may be temporary, and PathFinder worker streams consume
+  // the graph immediately after construction. Publish only a completed upload.
+  DS_DELTA_HIP_CHECK(hipStreamSynchronize(stream));
   return d;
 }
 
@@ -1046,104 +1280,67 @@ void validate_device_csr_contents(const minplus_sparse::DeviceCsrF32& g, hipStre
   }
 }
 
-OutgoingCsrOwner build_outgoing_csr_from_incoming(const minplus_sparse::DeviceCsrF32& in,
-                                                  hipStream_t stream) {
-  OutgoingCsrOwner out(in.rows, in.cols, in.nnz);
-  DeviceBuffer<Offset> degree(static_cast<std::size_t>(in.rows));
-  DeviceBuffer<Offset> cursor(static_cast<std::size_t>(in.rows));
-
-  DS_DELTA_HIP_CHECK(hipMemsetAsync(degree.get(), 0,
-                                    static_cast<std::size_t>(in.rows) * sizeof(Offset), stream));
-  count_out_degrees_from_incoming_kernel<<<grid_for_items(in.rows), kBlockSize, 0, stream>>>(
-      in.rows, in.rowptr, in.colind, degree.get());
-  DS_DELTA_HIP_CHECK(hipGetLastError());
-
-  std::size_t temp_bytes = 0;
-  const std::size_t scan_items = static_cast<std::size_t>(in.rows);
-
-  // Same rocPRIM argument order used by bf_hip_CSR_device_utils.hpp:
-  //   input, output, initial_value, size, scan_op, stream.
-  DS_DELTA_HIP_CHECK(rocprim::exclusive_scan(nullptr,
-                                             temp_bytes,
-                                             degree.get(),
-                                             out.rowptr.get(),
-                                             static_cast<Offset>(0),
-                                             scan_items,
-                                             rocprim::plus<Offset>(),
-                                             stream));
-  DeviceBuffer<unsigned char> temp(temp_bytes);
-  DS_DELTA_HIP_CHECK(rocprim::exclusive_scan(temp.get(),
-                                             temp_bytes,
-                                             degree.get(),
-                                             out.rowptr.get(),
-                                             static_cast<Offset>(0),
-                                             scan_items,
-                                             rocprim::plus<Offset>(),
-                                             stream));
-
-  set_last_rowptr_kernel<<<1, 1, 0, stream>>>(out.rowptr.get(), in.rows, in.nnz);
-  DS_DELTA_HIP_CHECK(hipGetLastError());
-  DS_DELTA_HIP_CHECK(hipMemcpyAsync(cursor.get(), out.rowptr.get(),
-                                    static_cast<std::size_t>(in.rows) * sizeof(Offset),
-                                    hipMemcpyDeviceToDevice, stream));
-
-  if (in.nnz != 0) {
-    fill_outgoing_from_incoming_kernel<<<grid_for_items(in.rows), kBlockSize, 0, stream>>>(
-        in.rows, in.rowptr, in.colind, in.values, cursor.get(), out.colind.get(),
-        out.values.get(), out.incoming_edge.get());
-    DS_DELTA_HIP_CHECK(hipGetLastError());
-  }
-  return out;
-}
-
-void update_outgoing_values_from_incoming(OutgoingCsrOwner& outgoing,
-                                          const minplus_sparse::DeviceCsrF32& incoming,
-                                          hipStream_t stream) {
-  if (incoming.nnz == 0) {
-    return;
-  }
-  update_outgoing_values_from_incoming_kernel<<<grid_for_items(incoming.nnz),
-                                                kBlockSize,
-                                                0,
-                                                stream>>>(
-      incoming.nnz, incoming.values, outgoing.incoming_edge.get(), outgoing.values.get());
-  DS_DELTA_HIP_CHECK(hipGetLastError());
-}
-
-void initialize_scratch_once(DeltaSteppingScratch& scratch,
-                             Offset n,
-                             float inf,
-                             hipStream_t stream) {
-  if (scratch.initialized) {
-    reset_int_zero_async(scratch.current_count.get(), stream);
-    reset_int_zero_async(scratch.next_count.get(), stream);
-    reset_int_zero_async(scratch.pending_count.get(), stream);
-    reset_int_zero_async(scratch.new_pending_count.get(), stream);
-    reset_int_zero_async(scratch.heavy_count.get(), stream);
-    reset_int_zero_async(scratch.touched_count.get(), stream);
-    reset_int_zero_async(scratch.overflow.get(), stream);
-    return;
-  }
-
+void initialize_scratch_storage_once(DeltaSteppingScratch& scratch,
+                                     Offset n,
+                                     float inf,
+                                     hipStream_t stream) {
+  scratch.ensure_generic_storage();
+  if (scratch.generic_initialized) return;
   initialize_delta_arrays_kernel<<<grid_for_items(n), kBlockSize, 0, stream>>>(
       n, inf, scratch.dist.get(), scratch.in_current.get(), scratch.in_pending.get(),
       scratch.in_heavy.get(), scratch.current_count.get(), scratch.next_count.get(),
-      scratch.pending_count.get(), scratch.heavy_count.get(), scratch.overflow.get(),
-      scratch.pred_node.get(), scratch.pred_edge.get(), scratch.in_touched.get(),
+      scratch.pending_count.get(), scratch.heavy_count.get(),
+      scratch.pred_node.get(), scratch.pred_edge.get(), scratch.parent_key.get(),
       scratch.touched_count.get());
   DS_DELTA_HIP_CHECK(hipGetLastError());
-  scratch.initialized = true;
+  scratch.generic_initialized = true;
+  scratch.unit_initialized = true;
+}
+
+void initialize_unit_scratch_storage_once(DeltaSteppingScratch& scratch,
+                                          Offset n,
+                                          float inf,
+                                          hipStream_t stream) {
+  if (scratch.unit_initialized) return;
+  initialize_unit_arrays_kernel<<<grid_for_items(n), kBlockSize, 0, stream>>>(
+      n, inf, scratch.dist.get(), scratch.in_pending.get(),
+      scratch.pred_node.get(), scratch.pred_edge.get());
+  DS_DELTA_HIP_CHECK(hipGetLastError());
+  scratch.unit_initialized = true;
+}
+
+void prepare_delta_scratch(DeltaSteppingScratch& scratch,
+                           Offset n,
+                           float inf,
+                           hipStream_t stream) {
+  scratch.ensure_generic_storage();
+  if (!scratch.generic_initialized) {
+    initialize_scratch_storage_once(scratch, n, inf, stream);
+    return;
+  }
+  reset_int_zero_async(scratch.current_count.get(), stream);
+  reset_int_zero_async(scratch.next_count.get(), stream);
+  reset_int_zero_async(scratch.pending_count.get(), stream);
+  reset_int_zero_async(scratch.new_pending_count.get(), stream);
+  reset_int_zero_async(scratch.heavy_count.get(), stream);
+  reset_int_zero_async(scratch.touched_count.get(), stream);
 }
 
 void reset_touched_vertices(DeltaSteppingScratch& scratch,
                             float inf,
-                            hipStream_t stream) {
-  const int touched_count = copy_scalar_to_host(scratch.touched_count.get(), stream);
+                            hipStream_t stream,
+                            int known_touched_count = -1) {
+  const int touched_count =
+      known_touched_count >= 0
+          ? known_touched_count
+          : copy_scalar_to_host(scratch.touched_count.get(),
+                                stream,
+                                scratch.host_scalar.get());
   if (touched_count > 0) {
     reset_touched_vertices_kernel<<<grid_for_items(touched_count), kBlockSize, 0, stream>>>(
         scratch.touched_queue.get(), touched_count, inf, scratch.dist.get(),
         scratch.in_current.get(), scratch.in_pending.get(), scratch.in_heavy.get(),
-        scratch.in_touched.get(), scratch.pred_node.get(), scratch.pred_edge.get());
+        scratch.pred_node.get(), scratch.pred_edge.get(), scratch.parent_key.get());
     DS_DELTA_HIP_CHECK(hipGetLastError());
   }
   reset_int_zero_async(scratch.touched_count.get(), stream);
@@ -1164,16 +1361,9 @@ float copy_dist_value_to_host(const float* d_dist, int vertex, hipStream_t strea
 
 void copy_predecessors_to_result(DeltaSteppingCsrResult& result,
                                  const minplus_sparse::DeviceCsrF32& graph,
-                                 const float* d_dist,
-                                 const float* vertex_costs,
                                  int* d_pred_node,
                                  Offset* d_pred_edge,
                                  hipStream_t stream) {
-  compute_predecessors_kernel<<<grid_for_items(graph.rows), kBlockSize, 0, stream>>>(
-      graph.rows, graph.rowptr, graph.colind, graph.values, vertex_costs, d_dist,
-      d_pred_node, d_pred_edge);
-  DS_DELTA_HIP_CHECK(hipGetLastError());
-
   result.pred_node.resize(static_cast<std::size_t>(graph.rows));
   result.pred_edge.resize(static_cast<std::size_t>(graph.rows));
   DS_DELTA_HIP_CHECK(hipMemcpyAsync(result.pred_node.data(), d_pred_node,
@@ -1185,19 +1375,49 @@ void copy_predecessors_to_result(DeltaSteppingCsrResult& result,
   DS_DELTA_HIP_CHECK(hipStreamSynchronize(stream));
 }
 
+int materialize_predecessors_from_keys(
+    const minplus_sparse::DeviceCsrF32& graph,
+    DeltaSteppingScratch& scratch,
+    const float* vertex_costs,
+    hipStream_t stream) {
+  // Relaxation atomically keeps the predecessor associated with the smallest
+  // winning distance. Materialize only touched vertices and recover the exact
+  // original CSR edge from the winning predecessor's normally short row.
+  const int touched_count = copy_scalar_to_host(
+      scratch.touched_count.get(), stream, scratch.host_scalar.get());
+  if (touched_count == 0) {
+    return touched_count;
+  }
+  materialize_predecessors_kernel
+      <<<grid_for_items(touched_count), kBlockSize, 0, stream>>>(
+          scratch.touched_queue.get(), touched_count, graph.rowptr,
+          graph.colind, graph.values, vertex_costs, scratch.dist.get(),
+          scratch.parent_key.get(), scratch.pred_node.get(),
+          scratch.pred_edge.get());
+  DS_DELTA_HIP_CHECK(hipGetLastError());
+  return touched_count;
+}
+
 void extract_target_paths_to_result(DeltaSteppingCsrResult& result,
-                                    const minplus_sparse::DeviceCsrF32& graph,
                                     DeltaSteppingScratch& scratch,
                                     const std::vector<int>& targets,
-                                    const float* vertex_costs,
-                                    hipStream_t stream) {
+                                    hipStream_t stream,
+                                    bool unit_weight_specialization = false) {
   const int target_count = static_cast<int>(targets.size());
-  measure_target_paths_kernel<<<grid_for_items(target_count), kBlockSize, 0, stream>>>(
-      scratch.targets.get(), target_count, scratch.rows, graph.rowptr, graph.colind,
-      graph.values, vertex_costs, scratch.dist.get(),
-      scratch.pred_node.get(), scratch.target_distances.get(),
-      scratch.target_path_lengths.get(), scratch.target_sources.get(),
-      scratch.target_path_status.get());
+  if (unit_weight_specialization) {
+    measure_unit_target_paths_kernel
+        <<<grid_for_items(target_count), kBlockSize, 0, stream>>>(
+            scratch.targets.get(), target_count, scratch.dist.get(),
+            scratch.target_distances.get(), scratch.target_path_lengths.get(),
+            scratch.target_sources.get(), scratch.target_path_status.get());
+  } else {
+    measure_target_paths_kernel
+        <<<grid_for_items(target_count), kBlockSize, 0, stream>>>(
+            scratch.targets.get(), target_count, scratch.rows,
+            scratch.dist.get(), scratch.pred_node.get(),
+            scratch.target_distances.get(), scratch.target_path_lengths.get(),
+            scratch.target_sources.get(), scratch.target_path_status.get());
+  }
   DS_DELTA_HIP_CHECK(hipGetLastError());
 
   result.target_distances.resize(targets.size());
@@ -1207,11 +1427,6 @@ void extract_target_paths_to_result(DeltaSteppingCsrResult& result,
   DS_DELTA_HIP_CHECK(hipMemcpyAsync(result.target_distances.data(),
                                     scratch.target_distances.get(),
                                     targets.size() * sizeof(float),
-                                    hipMemcpyDeviceToHost,
-                                    stream));
-  DS_DELTA_HIP_CHECK(hipMemcpyAsync(result.target_sources.data(),
-                                    scratch.target_sources.get(),
-                                    targets.size() * sizeof(int),
                                     hipMemcpyDeviceToHost,
                                     stream));
   DS_DELTA_HIP_CHECK(hipMemcpyAsync(path_lengths.data(),
@@ -1270,9 +1485,10 @@ void extract_target_paths_to_result(DeltaSteppingCsrResult& result,
   if (total_nodes != 0) {
     scratch.ensure_compact_path_capacity(total_nodes, total_edges);
     fill_target_paths_kernel<<<grid_for_items(target_count), kBlockSize, 0, stream>>>(
-        scratch.targets.get(), target_count, scratch.rows, graph.rowptr, graph.colind,
-        graph.values, vertex_costs, scratch.dist.get(), scratch.pred_node.get(),
+        scratch.targets.get(), target_count, scratch.rows, scratch.pred_node.get(),
+        scratch.pred_edge.get(),
         scratch.target_path_lengths.get(), scratch.target_path_status.get(),
+        scratch.target_sources.get(),
         scratch.target_node_offsets.get(), scratch.target_edge_offsets.get(),
         scratch.compact_path_nodes.get(),
         scratch.compact_path_edges.get());
@@ -1290,61 +1506,221 @@ void extract_target_paths_to_result(DeltaSteppingCsrResult& result,
                                       hipMemcpyDeviceToHost,
                                       stream));
   }
+  DS_DELTA_HIP_CHECK(hipMemcpyAsync(result.target_sources.data(),
+                                    scratch.target_sources.get(),
+                                    targets.size() * sizeof(int),
+                                    hipMemcpyDeviceToHost,
+                                    stream));
   DS_DELTA_HIP_CHECK(hipStreamSynchronize(stream));
   result.target_reached = all_targets_reached;
 }
 
-void throw_if_overflow(const int* d_overflow, hipStream_t stream) {
-  if (copy_scalar_to_host(d_overflow, stream) != 0) {
-    throw std::runtime_error("delta-stepping unique frontier queue overflow");
+DeltaSteppingCsrResult run_unit_weight_specialization(
+    const minplus_sparse::DeviceCsrF32& graph,
+    DeltaSteppingScratch& scratch,
+    const std::vector<int>& sources,
+    const std::vector<int>& targets,
+    float delta,
+    hipStream_t stream) {
+  // With identical positive edge weights, delta-stepping and multi-source BFS
+  // have the same shortest paths.  The routing converter emits exactly this
+  // case, so use an append-only frontier and claim each vertex once.  This
+  // removes bucket scans, light-closure bookkeeping, and the O(E) predecessor
+  // rebuild while preserving original CSR edge IDs.
+  std::vector<int> deduplicated_sources;
+  const std::vector<int>* effective_sources = &sources;
+  int initially_found = 0;
+  if (sources.size() == 1) {
+    for (const int target : targets) {
+      if (target == sources.front()) {
+        ++initially_found;
+      }
+    }
+  } else {
+    std::unordered_set<int> source_set;
+    source_set.reserve(sources.size());
+    deduplicated_sources.reserve(sources.size());
+    for (const int source : sources) {
+      if (source_set.insert(source).second) {
+        deduplicated_sources.push_back(source);
+      }
+    }
+    effective_sources = &deduplicated_sources;
+    for (const int target : targets) {
+      if (source_set.find(target) != source_set.end()) {
+        ++initially_found;
+      }
+    }
   }
+
+  const int source_count = static_cast<int>(effective_sources->size());
+  const int target_count = static_cast<int>(targets.size());
+  const int vertex_count = static_cast<int>(graph.rows);
+  const float inf = std::numeric_limits<float>::infinity();
+  scratch.ensure_source_capacity(effective_sources->size());
+  scratch.ensure_target_capacity(targets.size());
+  initialize_unit_scratch_storage_once(scratch, graph.rows, inf, stream);
+
+  DS_DELTA_HIP_CHECK(hipMemcpyAsync(scratch.sources.get(),
+                                    effective_sources->data(),
+                                    effective_sources->size() * sizeof(int),
+                                    hipMemcpyHostToDevice,
+                                    stream));
+  DS_DELTA_HIP_CHECK(hipMemcpyAsync(scratch.targets.get(),
+                                    targets.data(),
+                                    targets.size() * sizeof(int),
+                                    hipMemcpyHostToDevice,
+                                    stream));
+  mark_unit_target_multiplicity_kernel
+      <<<grid_for_items(target_count), kBlockSize, 0, stream>>>(
+          scratch.targets.get(),
+          target_count,
+          scratch.in_pending.get());
+  DS_DELTA_HIP_CHECK(hipGetLastError());
+  initialize_unit_sources_kernel
+      <<<grid_for_items(source_count), kBlockSize, 0, stream>>>(
+          scratch.sources.get(),
+          source_count,
+          initially_found,
+          scratch.dist.get(),
+          scratch.pred_node.get(),
+          scratch.pred_edge.get(),
+          scratch.current_queue.get(),
+          scratch.unit_status.get());
+  DS_DELTA_HIP_CHECK(hipGetLastError());
+
+  int queue_tail = source_count;
+  int current_count = source_count;
+  int found_count = initially_found;
+  int bucket_rounds = 1;
+  DeltaSteppingCsrResult result;
+  result.target = -1;
+
+  while (current_count > 0 && found_count < target_count &&
+         result.iterations_used < vertex_count) {
+    // As with weighted closure, check the first expansion immediately, then
+    // amortize status synchronization across groups of four device-controlled
+    // BFS levels. Later launches become no-ops after target discovery or an
+    // empty frontier.
+    const int rounds_to_enqueue = result.iterations_used == 0 ? 1 : 4;
+    const int launch_blocks =
+        rounds_to_enqueue == 1
+            ? grid_for_frontier(current_count)
+            : std::min(grid_for_items(graph.rows),
+                       std::max(grid_for_frontier(current_count), 32));
+    for (int round = 0; round < rounds_to_enqueue; ++round) {
+      expand_unit_frontier_kernel
+          <<<launch_blocks, kBlockSize, 0, stream>>>(
+              graph.rowptr,
+              graph.colind,
+              scratch.dist.get(),
+              scratch.pred_node.get(),
+              scratch.pred_edge.get(),
+              scratch.current_queue.get(),
+              scratch.unit_status.get(),
+              scratch.in_pending.get(),
+              target_count,
+              vertex_count);
+      DS_DELTA_HIP_CHECK(hipGetLastError());
+      advance_unit_frontier_kernel<<<1, 1, 0, stream>>>(
+          scratch.unit_status.get(), delta);
+      DS_DELTA_HIP_CHECK(hipGetLastError());
+    }
+    DS_DELTA_HIP_CHECK(hipMemcpyAsync(scratch.host_unit_status.get(),
+                                      scratch.unit_status.get(),
+                                      8 * sizeof(int),
+                                      hipMemcpyDeviceToHost,
+                                      stream));
+    DS_DELTA_HIP_CHECK(hipStreamSynchronize(stream));
+    queue_tail = scratch.host_unit_status.get()[0];
+    found_count = scratch.host_unit_status.get()[1];
+    const int frontier_begin = scratch.host_unit_status.get()[2];
+    const int frontier_end = scratch.host_unit_status.get()[3];
+    if (queue_tail < frontier_end || queue_tail > vertex_count ||
+        frontier_begin < 0 || frontier_end < frontier_begin) {
+      throw std::runtime_error(
+          "delta unit-weight append-only frontier queue overflow");
+    }
+    current_count = frontier_end - frontier_begin;
+    result.iterations_used = scratch.host_unit_status.get()[4];
+    bucket_rounds = scratch.host_unit_status.get()[7];
+  }
+
+  result.stopped_on_target = found_count >= target_count;
+  result.converged = !result.stopped_on_target && current_count == 0;
+  clear_unit_target_multiplicity_kernel
+      <<<grid_for_items(target_count), kBlockSize, 0, stream>>>(
+          scratch.targets.get(),
+          target_count,
+          scratch.in_pending.get());
+  DS_DELTA_HIP_CHECK(hipGetLastError());
+  extract_target_paths_to_result(result, scratch, targets, stream, true);
+
+  // Report distinct nonempty delta buckets rather than BFS expansion depth.
+  // Tracking transitions on the device also handles float bucket collisions
+  // and the shared terminal bucket after index saturation.
+  result.iterations_used = bucket_rounds;
+
+  if (queue_tail > 0) {
+    reset_unit_visited_kernel
+        <<<grid_for_items(queue_tail), kBlockSize, 0, stream>>>(
+            scratch.current_queue.get(),
+            queue_tail,
+            inf,
+            scratch.dist.get(),
+            scratch.pred_node.get(),
+            scratch.pred_edge.get());
+    DS_DELTA_HIP_CHECK(hipGetLastError());
+  }
+  return result;
 }
 
 int find_min_pending_bucket(const int* d_pending_queue,
-                            int pending_count,
+                            const int* d_pending_count,
+                            int launch_blocks,
                             int current_bucket,
-                            float inv_delta,
+                            float delta,
                             const float* d_dist,
                             const int* d_in_pending,
-                            int* d_block_mins,
-                            std::vector<int>& h_block_mins,
+                            int* d_min_bucket,
+                            int* h_min_bucket,
                             hipStream_t stream) {
-  if (pending_count <= 0) return kNoBucket;
-  const int blocks = std::min(kMaxGridX, std::max(1, (pending_count + kBlockSize - 1) / kBlockSize));
-  reduce_min_pending_bucket_kernel<<<blocks, kBlockSize, 0, stream>>>(
-      d_pending_queue, pending_count, current_bucket, inv_delta, d_dist, d_in_pending, d_block_mins);
+  const int initial_min = kNoBucket;
+  DS_DELTA_HIP_CHECK(hipMemcpyAsync(d_min_bucket,
+                                    &initial_min,
+                                    sizeof(int),
+                                    hipMemcpyHostToDevice,
+                                    stream));
+  reduce_min_pending_bucket_kernel<<<launch_blocks, kBlockSize, 0, stream>>>(
+      d_pending_queue, d_pending_count, current_bucket, delta, d_dist,
+      d_in_pending, d_min_bucket);
   DS_DELTA_HIP_CHECK(hipGetLastError());
-  h_block_mins.resize(static_cast<std::size_t>(blocks));
-  DS_DELTA_HIP_CHECK(hipMemcpyAsync(h_block_mins.data(), d_block_mins,
-                                    static_cast<std::size_t>(blocks) * sizeof(int),
-                                    hipMemcpyDeviceToHost, stream));
-  DS_DELTA_HIP_CHECK(hipStreamSynchronize(stream));
-  int min_bucket = kNoBucket;
-  for (int b : h_block_mins) min_bucket = std::min(min_bucket, b);
-  return min_bucket;
+  return copy_scalar_to_host(d_min_bucket, stream, h_min_bucket);
 }
 
 int mark_and_count_settled_targets(DeltaSteppingScratch& scratch,
                                    int target_count,
                                    int current_bucket,
-                                   float inv_delta,
+                                   float delta,
                                    hipStream_t stream) {
   mark_settled_targets_kernel<<<grid_for_items(target_count), kBlockSize, 0, stream>>>(
-      scratch.targets.get(), target_count, current_bucket, inv_delta,
+      scratch.targets.get(), target_count, current_bucket, delta,
       scratch.dist.get(), scratch.target_settled.get(),
       scratch.settled_target_count.get());
   DS_DELTA_HIP_CHECK(hipGetLastError());
-  return copy_scalar_to_host(scratch.settled_target_count.get(), stream);
+  return copy_scalar_to_host(scratch.settled_target_count.get(),
+                             stream,
+                             scratch.host_scalar.get());
 }
 
 DeltaSteppingCsrResult run_delta_stepping_impl(
     const minplus_sparse::DeviceCsrF32& d_adjacency,
-    const OutgoingCsrOwner& outgoing,
     DeltaSteppingScratch& scratch,
     const std::vector<int>& sources,
     int target,
     const std::vector<int>* targets,
     const float* vertex_costs,
+    bool skip_heavy_edges,
     float delta,
     int max_iters,
     hipStream_t stream,
@@ -1353,17 +1729,31 @@ DeltaSteppingCsrResult run_delta_stepping_impl(
   if (max_iters < 0) max_iters = std::numeric_limits<int>::max();
 
   const Offset n = d_adjacency.rows;
-  const int n_int = static_cast<int>(n);
-  const int source_count = static_cast<int>(sources.size());
+  std::vector<int> deduplicated_sources;
+  const std::vector<int>* effective_sources = &sources;
+  if (sources.size() > 1) {
+    std::unordered_set<int> seen;
+    seen.reserve(sources.size());
+    deduplicated_sources.reserve(sources.size());
+    for (const int source : sources) {
+      if (seen.insert(source).second) {
+        deduplicated_sources.push_back(source);
+      }
+    }
+    effective_sources = &deduplicated_sources;
+  }
+  const int source_count = static_cast<int>(effective_sources->size());
   const bool use_target_set = targets != nullptr;
   const int target_count = use_target_set ? static_cast<int>(targets->size()) : 0;
-  const float inv_delta = 1.0f / delta;
   const float inf = std::numeric_limits<float>::infinity();
   const bool target_is_source =
       !use_target_set &&
       target >= 0 && std::find(sources.begin(), sources.end(), target) != sources.end();
 
-  scratch.ensure_source_capacity(static_cast<std::size_t>(source_count));
+  scratch.ensure_source_capacity(effective_sources->size());
+  // Generic state is lazy because exact-unit workers never need it. Allocate
+  // and initialize its scalars before target setup touches settled_count.
+  prepare_delta_scratch(scratch, n, inf, stream);
   if (use_target_set) {
     scratch.ensure_target_capacity(static_cast<std::size_t>(target_count));
     DS_DELTA_HIP_CHECK(hipMemcpyAsync(scratch.targets.get(), targets->data(),
@@ -1375,34 +1765,36 @@ DeltaSteppingCsrResult run_delta_stepping_impl(
                                       stream));
     reset_int_zero_async(scratch.settled_target_count.get(), stream);
   }
-  initialize_scratch_once(scratch, n, inf, stream);
-  DS_DELTA_HIP_CHECK(hipMemcpyAsync(scratch.sources.get(), sources.data(),
+  DS_DELTA_HIP_CHECK(hipMemcpyAsync(scratch.sources.get(), effective_sources->data(),
                                     static_cast<std::size_t>(source_count) * sizeof(int),
                                     hipMemcpyHostToDevice, stream));
   initialize_delta_sources_kernel<<<grid_for_items(source_count), kBlockSize, 0, stream>>>(
       scratch.sources.get(), source_count, scratch.dist.get(), scratch.in_current.get(),
       scratch.current_queue.get(), scratch.current_count.get(),
       scratch.pred_node.get(), scratch.pred_edge.get(),
-      scratch.in_touched.get(), scratch.touched_queue.get(), scratch.touched_count.get(),
-      n_int, scratch.overflow.get());
+      scratch.touched_queue.get(), scratch.touched_count.get());
   DS_DELTA_HIP_CHECK(hipGetLastError());
-  throw_if_overflow(scratch.overflow.get(), stream);
 
   int* current_queue = scratch.current_queue.get();
   int* next_queue = scratch.next_queue.get();
+  int* current_count_device = scratch.current_count.get();
+  int* next_count_device = scratch.next_count.get();
   int* pending_queue = scratch.pending_a.get();
   int* pending_scratch = scratch.pending_b.get();
   int current_bucket = 0;
-  int current_count = copy_scalar_to_host(scratch.current_count.get(), stream);
-  int pending_count = 0;
+  // Sources are deduplicated on the host and initialization writes exactly
+  // this many queue entries, so no device round trip is needed here.
+  int current_count = source_count;
+  // Device-counted heavy/pending kernels need a host-independent launch size.
+  // Cap it to avoid pathological grids; tune 32--256 on the target GPU.
+  const int device_count_blocks = std::min(grid_for_items(n), 256);
   DeltaSteppingCsrResult result;
   result.target = target;
   if (target_is_source) {
     result.target_distance = 0.0f;
     result.target_reached = true;
     result.stopped_on_target = true;
-    copy_predecessors_to_result(result, d_adjacency, scratch.dist.get(),
-                                vertex_costs, scratch.pred_node.get(),
+    copy_predecessors_to_result(result, d_adjacency, scratch.pred_node.get(),
                                 scratch.pred_edge.get(), stream);
     result.dist = copy_dist_to_host(scratch.dist.get(), n, stream);
     reset_touched_vertices(scratch, inf, stream);
@@ -1412,53 +1804,76 @@ DeltaSteppingCsrResult run_delta_stepping_impl(
   for (int iter = 0; iter < max_iters; ++iter) {
     reset_int_zero_async(scratch.heavy_count.get(), stream);
 
+    int light_rounds = 0;
     while (current_count > 0) {
-      reset_int_zero_async(scratch.next_count.get(), stream);
-      reset_int_zero_async(scratch.overflow.get(), stream);
+      // Check the first round immediately so shallow buckets pay no speculative
+      // launch cost. Once closure proves nontrivial, enqueue four device-counted
+      // ping-pong rounds before the next host synchronization.
+      const bool batch_rounds =
+          progress_callback == nullptr && light_rounds > 0;
+      const int rounds_to_enqueue = batch_rounds ? 4 : 1;
+      const int graph_blocks = grid_for_items(n);
+      const int launch_blocks =
+          batch_rounds
+              ? std::min(graph_blocks,
+                         std::max(grid_for_frontier(current_count), 32))
+              : grid_for_frontier(current_count);
 
-      clear_flags_from_queue_kernel<<<grid_for_items(current_count), kBlockSize, 0, stream>>>(
-          current_queue, current_count, scratch.in_current.get());
-      DS_DELTA_HIP_CHECK(hipGetLastError());
+      for (int round = 0; round < rounds_to_enqueue; ++round) {
+        reset_int_zero_async(next_count_device, stream);
+        clear_flags_from_queue_kernel
+            <<<launch_blocks, kBlockSize, 0, stream>>>(
+                current_queue, current_count_device,
+                scratch.in_current.get());
+        DS_DELTA_HIP_CHECK(hipGetLastError());
 
-      relax_light_edges_kernel<<<grid_for_frontier(current_count), kBlockSize, 0, stream>>>(
-          current_queue, current_count, current_bucket, delta, inv_delta,
-          outgoing.rowptr.get(), outgoing.colind.get(), outgoing.values.get(),
-          outgoing.incoming_edge.get(), vertex_costs, scratch.dist.get(),
-          scratch.in_current.get(), scratch.in_pending.get(), scratch.in_heavy.get(),
-          scratch.pred_node.get(), scratch.pred_edge.get(),
-          scratch.in_touched.get(), scratch.touched_queue.get(), scratch.touched_count.get(),
-          next_queue, scratch.next_count.get(),
-          pending_queue, scratch.pending_count.get(), scratch.heavy_queue.get(),
-          scratch.heavy_count.get(), n_int, scratch.overflow.get());
-      DS_DELTA_HIP_CHECK(hipGetLastError());
-      throw_if_overflow(scratch.overflow.get(), stream);
-      current_count = copy_scalar_to_host(scratch.next_count.get(), stream);
-      std::swap(current_queue, next_queue);
+        const bool terminal_bucket = current_bucket == kNoBucket - 1;
+        if (terminal_bucket && vertex_costs != nullptr) {
+          launch_relax_light_edges<true, false, true>(
+              d_adjacency, scratch, vertex_costs, current_queue,
+              current_count_device, launch_blocks, current_bucket, delta,
+              next_queue, next_count_device, pending_queue, stream);
+        } else if (terminal_bucket || skip_heavy_edges) {
+          launch_relax_light_edges<false, false, true>(
+              d_adjacency, scratch, nullptr, current_queue,
+              current_count_device, launch_blocks, current_bucket, delta,
+              next_queue, next_count_device, pending_queue, stream);
+        } else if (vertex_costs != nullptr) {
+          launch_relax_light_edges<true, true, false>(
+              d_adjacency, scratch, vertex_costs, current_queue,
+              current_count_device, launch_blocks, current_bucket, delta,
+              next_queue, next_count_device, pending_queue, stream);
+        } else {
+          launch_relax_light_edges<false, true, false>(
+              d_adjacency, scratch, nullptr, current_queue,
+              current_count_device, launch_blocks, current_bucket, delta,
+              next_queue, next_count_device, pending_queue, stream);
+        }
+        std::swap(current_queue, next_queue);
+        std::swap(current_count_device, next_count_device);
+        ++light_rounds;
+      }
+      current_count = copy_scalar_to_host(
+          current_count_device, stream, scratch.host_scalar.get());
     }
 
-    const int heavy_count = copy_scalar_to_host(scratch.heavy_count.get(), stream);
-    if (heavy_count > 0) {
-      reset_int_zero_async(scratch.overflow.get(), stream);
-      relax_heavy_edges_kernel<<<grid_for_frontier(heavy_count), kBlockSize, 0, stream>>>(
-          scratch.heavy_queue.get(), heavy_count, current_bucket, delta, inv_delta,
-          outgoing.rowptr.get(), outgoing.colind.get(), outgoing.values.get(),
-          outgoing.incoming_edge.get(), vertex_costs, scratch.dist.get(),
-          scratch.in_pending.get(), scratch.pred_node.get(), scratch.pred_edge.get(),
-          scratch.in_touched.get(), scratch.touched_queue.get(), scratch.touched_count.get(),
-          pending_queue,
-          scratch.pending_count.get(), n_int, scratch.overflow.get());
-      DS_DELTA_HIP_CHECK(hipGetLastError());
-      throw_if_overflow(scratch.overflow.get(), stream);
-      clear_flags_from_queue_kernel<<<grid_for_items(heavy_count), kBlockSize, 0, stream>>>(
-          scratch.heavy_queue.get(), heavy_count, scratch.in_heavy.get());
-      DS_DELTA_HIP_CHECK(hipGetLastError());
+    if (!skip_heavy_edges && current_bucket != kNoBucket - 1) {
+      if (vertex_costs != nullptr) {
+        launch_relax_heavy_edges<true>(
+            d_adjacency, scratch, vertex_costs, device_count_blocks,
+            current_bucket, delta, pending_queue, stream);
+      } else {
+        launch_relax_heavy_edges<false>(
+            d_adjacency, scratch, nullptr, device_count_blocks,
+            current_bucket, delta, pending_queue, stream);
+      }
     }
 
     result.iterations_used = iter + 1;
     if (use_target_set) {
       const int settled_count =
           mark_and_count_settled_targets(scratch, target_count, current_bucket,
-                                         inv_delta, stream);
+                                         delta, stream);
       if (settled_count >= target_count) {
         result.target_reached = true;
         result.stopped_on_target = true;
@@ -1476,7 +1891,7 @@ DeltaSteppingCsrResult run_delta_stepping_impl(
       const float target_distance = copy_dist_value_to_host(scratch.dist.get(), target, stream);
       const bool target_settled =
           std::isfinite(target_distance) &&
-          bucket_index_host(target_distance, inv_delta) <= current_bucket;
+          bucket_index_host(target_distance, delta) <= current_bucket;
       if (target_settled) {
         result.target_distance = target_distance;
         result.target_reached = true;
@@ -1493,11 +1908,12 @@ DeltaSteppingCsrResult run_delta_stepping_impl(
       }
     }
 
-    pending_count = copy_scalar_to_host(scratch.pending_count.get(), stream);
     const int next_bucket =
-        find_min_pending_bucket(pending_queue, pending_count, current_bucket,
-                                inv_delta, scratch.dist.get(), scratch.in_pending.get(),
-                                scratch.block_mins.get(), scratch.h_block_mins, stream);
+        find_min_pending_bucket(pending_queue, scratch.pending_count.get(),
+                                device_count_blocks, current_bucket, delta,
+                                scratch.dist.get(), scratch.in_pending.get(),
+                                scratch.min_pending_bucket.get(),
+                                scratch.host_scalar.get(), stream);
     const bool changed = (next_bucket != kNoBucket);
     if (progress_callback) {
       DeltaSteppingCsrProgress progress;
@@ -1515,19 +1931,20 @@ DeltaSteppingCsrResult run_delta_stepping_impl(
     current_bucket = next_bucket;
     current_queue = scratch.current_queue.get();
     next_queue = scratch.next_queue.get();
+    current_count_device = scratch.current_count.get();
+    next_count_device = scratch.next_count.get();
     reset_int_zero_async(scratch.current_count.get(), stream);
     reset_int_zero_async(scratch.new_pending_count.get(), stream);
-    reset_int_zero_async(scratch.overflow.get(), stream);
 
-    compact_pending_to_current_bucket_kernel<<<grid_for_items(pending_count), kBlockSize, 0, stream>>>(
-        pending_queue, pending_count, current_bucket, inv_delta, scratch.dist.get(),
+    compact_pending_to_current_bucket_kernel<<<device_count_blocks, kBlockSize, 0, stream>>>(
+        pending_queue, scratch.pending_count.get(), current_bucket, delta,
+        scratch.dist.get(),
         scratch.in_pending.get(), scratch.in_current.get(), current_queue,
-        scratch.current_count.get(), pending_scratch, scratch.new_pending_count.get(),
-        n_int, scratch.overflow.get());
+        scratch.current_count.get(), pending_scratch, scratch.new_pending_count.get());
     DS_DELTA_HIP_CHECK(hipGetLastError());
-    throw_if_overflow(scratch.overflow.get(), stream);
 
-    current_count = copy_scalar_to_host(scratch.current_count.get(), stream);
+    current_count = copy_scalar_to_host(
+        scratch.current_count.get(), stream, scratch.host_scalar.get());
     DS_DELTA_HIP_CHECK(hipMemcpyAsync(scratch.pending_count.get(),
                                       scratch.new_pending_count.get(),
                                       sizeof(int),
@@ -1536,12 +1953,16 @@ DeltaSteppingCsrResult run_delta_stepping_impl(
     std::swap(pending_queue, pending_scratch);
   }
 
+  int touched_count_for_reset = -1;
+  if (use_target_set || target >= 0) {
+    touched_count_for_reset =
+        materialize_predecessors_from_keys(
+            d_adjacency, scratch, vertex_costs, stream);
+  }
   if (use_target_set) {
-    extract_target_paths_to_result(result, d_adjacency, scratch, *targets,
-                                   vertex_costs, stream);
+    extract_target_paths_to_result(result, scratch, *targets, stream);
   } else if (target >= 0) {
-    copy_predecessors_to_result(result, d_adjacency, scratch.dist.get(),
-                                vertex_costs, scratch.pred_node.get(),
+    copy_predecessors_to_result(result, d_adjacency, scratch.pred_node.get(),
                                 scratch.pred_edge.get(), stream);
   }
   if (use_target_set) {
@@ -1555,24 +1976,113 @@ DeltaSteppingCsrResult run_delta_stepping_impl(
   } else {
     result.dist = copy_dist_to_host(scratch.dist.get(), n, stream);
   }
-  reset_touched_vertices(scratch, inf, stream);
+  reset_touched_vertices(scratch, inf, stream, touched_count_for_reset);
   return result;
 }
 
 }  // namespace ds_delta_detail
 
-struct DeltaSteppingCsrWorkspace::Impl {
+struct DeltaSteppingCsrGraph::Impl {
   ds_delta_detail::DeviceCsrOwner adjacency;
-  ds_delta_detail::OutgoingCsrOwner outgoing;
-  ds_delta_detail::DeltaSteppingScratch scratch;
-  ds_delta_detail::DeviceBuffer<float> vertex_costs;
-  bool has_vertex_costs = false;
+  float max_edge_value = 0.0f;
+  bool has_exact_unit_edge_values = false;
+  int device = 0;
 
   Impl(const HostCsrF32& host, hipStream_t stream)
       : adjacency(ds_delta_detail::copy_host_csr_to_device(host, stream)),
-        outgoing(ds_delta_detail::build_outgoing_csr_from_incoming(adjacency.view, stream)),
+        max_edge_value(ds_delta_detail::max_edge_value(host.values)),
+        has_exact_unit_edge_values(
+            ds_delta_detail::has_exact_unit_edge_values(host.values)) {
+    DS_DELTA_HIP_CHECK(hipGetDevice(&device));
+  }
+};
+
+DeltaSteppingCsrGraph::DeltaSteppingCsrGraph(const HostCsrF32& adjacency,
+                                             hipStream_t stream) {
+  using namespace ds_delta_detail;
+  validate_host_csr_arrays(adjacency);
+  if (adjacency.rows <= 0 || adjacency.rows != adjacency.cols) {
+    throw std::invalid_argument("CSR graph must be nonempty and square");
+  }
+  if (static_cast<unsigned long long>(adjacency.rows) >
+      static_cast<unsigned long long>(std::numeric_limits<int>::max())) {
+    throw std::overflow_error(
+        "frontier vertices are stored as int; rows must fit in int");
+  }
+  impl_ = std::make_shared<Impl>(adjacency, stream);
+}
+
+DeltaSteppingCsrGraph::~DeltaSteppingCsrGraph() = default;
+DeltaSteppingCsrGraph::DeltaSteppingCsrGraph(
+    DeltaSteppingCsrGraph&&) noexcept = default;
+DeltaSteppingCsrGraph& DeltaSteppingCsrGraph::operator=(
+    DeltaSteppingCsrGraph&&) noexcept = default;
+
+struct DeltaSteppingCsrWorkspace::Impl {
+  std::shared_ptr<const DeltaSteppingCsrGraph::Impl> shared_graph;
+  std::unique_ptr<ds_delta_detail::DeviceCsrOwner> owned_adjacency;
+  ds_delta_detail::DeltaSteppingScratch scratch;
+  ds_delta_detail::DeviceBuffer<float> vertex_costs;
+  float max_edge_value = 0.0f;
+  bool has_exact_unit_edge_values = false;
+  bool has_vertex_costs = false;
+  hipStream_t stream = nullptr;
+
+  Impl(const HostCsrF32& host, hipStream_t stream)
+      : owned_adjacency(std::make_unique<ds_delta_detail::DeviceCsrOwner>(
+            ds_delta_detail::copy_host_csr_to_device(host, stream))),
         scratch(host.rows),
-        vertex_costs(static_cast<std::size_t>(host.rows)) {}
+        max_edge_value(ds_delta_detail::max_edge_value(host.values)),
+        has_exact_unit_edge_values(
+            ds_delta_detail::has_exact_unit_edge_values(host.values)),
+        stream(stream) {}
+
+  static std::shared_ptr<const DeltaSteppingCsrGraph::Impl>
+  require_shared_graph(
+      const std::shared_ptr<const DeltaSteppingCsrGraph>& candidate) {
+    if (!candidate || !candidate->impl_) {
+      throw std::invalid_argument(
+          "delta-stepping shared graph must not be null");
+    }
+    return candidate->impl_;
+  }
+
+  Impl(std::shared_ptr<const DeltaSteppingCsrGraph> graph,
+       hipStream_t stream)
+      : shared_graph(require_shared_graph(graph)),
+        scratch(shared_graph->adjacency.view.rows),
+        max_edge_value(shared_graph->max_edge_value),
+        has_exact_unit_edge_values(shared_graph->has_exact_unit_edge_values),
+        stream(stream) {
+    int current_device = 0;
+    DS_DELTA_HIP_CHECK(hipGetDevice(&current_device));
+    if (current_device != shared_graph->device) {
+      throw std::invalid_argument(
+          "delta-stepping shared graph belongs to a different HIP device");
+    }
+  }
+
+  const ds_delta_detail::DeviceCsrOwner& adjacency() const {
+    if (shared_graph) {
+      return shared_graph->adjacency;
+    }
+    return *owned_adjacency;
+  }
+
+  ds_delta_detail::DeviceCsrOwner& mutable_adjacency() {
+    if (!owned_adjacency) {
+      throw std::logic_error(
+          "update_values is unavailable for an immutable shared delta graph");
+    }
+    return *owned_adjacency;
+  }
+
+  void require_stream(hipStream_t candidate) const {
+    if (candidate != stream) {
+      throw std::invalid_argument(
+          "DeltaSteppingCsrWorkspace is stream-affine; use its construction stream");
+    }
+  }
 };
 
 DeltaSteppingCsrWorkspace::DeltaSteppingCsrWorkspace(const HostCsrF32& adjacency,
@@ -1589,6 +2099,11 @@ DeltaSteppingCsrWorkspace::DeltaSteppingCsrWorkspace(const HostCsrF32& adjacency
   impl_ = std::make_unique<Impl>(adjacency, stream);
 }
 
+DeltaSteppingCsrWorkspace::DeltaSteppingCsrWorkspace(
+    std::shared_ptr<const DeltaSteppingCsrGraph> adjacency,
+    hipStream_t stream)
+    : impl_(std::make_unique<Impl>(std::move(adjacency), stream)) {}
+
 DeltaSteppingCsrWorkspace::~DeltaSteppingCsrWorkspace() = default;
 DeltaSteppingCsrWorkspace::DeltaSteppingCsrWorkspace(
     DeltaSteppingCsrWorkspace&&) noexcept = default;
@@ -1601,18 +2116,29 @@ void DeltaSteppingCsrWorkspace::update_values(const std::vector<float>& values,
   if (!impl_) {
     throw std::runtime_error("DeltaSteppingCsrWorkspace has no implementation");
   }
-  if (values.size() != static_cast<std::size_t>(impl_->adjacency.view.nnz)) {
+  impl_->require_stream(stream);
+  DeviceCsrOwner& adjacency = impl_->mutable_adjacency();
+  if (values.size() != static_cast<std::size_t>(adjacency.view.nnz)) {
     throw std::invalid_argument("updated CSR values size does not match workspace nnz");
   }
-  if (impl_->adjacency.view.nnz == 0) {
+  for (const float value : values) {
+    if (!std::isfinite(value) || value < 0.0f) {
+      throw std::invalid_argument(
+          "updated CSR values must be finite and nonnegative");
+    }
+  }
+  impl_->has_exact_unit_edge_values =
+      ds_delta_detail::has_exact_unit_edge_values(values);
+  if (adjacency.view.nnz == 0) {
+    impl_->max_edge_value = 0.0f;
     return;
   }
-  DS_DELTA_HIP_CHECK(hipMemcpyAsync(impl_->adjacency.values.get(),
+  impl_->max_edge_value = max_edge_value(values);
+  DS_DELTA_HIP_CHECK(hipMemcpyAsync(adjacency.values.get(),
                                     values.data(),
                                     values.size() * sizeof(float),
                                     hipMemcpyHostToDevice,
                                     stream));
-  update_outgoing_values_from_incoming(impl_->outgoing, impl_->adjacency.view, stream);
 }
 
 void DeltaSteppingCsrWorkspace::update_vertex_costs(
@@ -1622,13 +2148,18 @@ void DeltaSteppingCsrWorkspace::update_vertex_costs(
   if (!impl_) {
     throw std::runtime_error("DeltaSteppingCsrWorkspace has no implementation");
   }
-  if (vertex_costs.size() != static_cast<std::size_t>(impl_->adjacency.view.rows)) {
+  impl_->require_stream(stream);
+  const DeviceCsrOwner& adjacency = impl_->adjacency();
+  if (vertex_costs.size() != static_cast<std::size_t>(adjacency.view.rows)) {
     throw std::invalid_argument("vertex cost size does not match workspace rows");
   }
   for (const float cost : vertex_costs) {
     if (!std::isfinite(cost) || cost < 0.0f) {
       throw std::invalid_argument("vertex costs must be finite nonnegative values");
     }
+  }
+  if (impl_->vertex_costs.size() < vertex_costs.size()) {
+    impl_->vertex_costs.reset(vertex_costs.size());
   }
   DS_DELTA_HIP_CHECK(hipMemcpyAsync(impl_->vertex_costs.get(),
                                     vertex_costs.data(),
@@ -1650,14 +2181,16 @@ DeltaSteppingCsrResult DeltaSteppingCsrWorkspace::run(
   if (!impl_) {
     throw std::runtime_error("DeltaSteppingCsrWorkspace has no implementation");
   }
-  validate_device_csr_shape(impl_->adjacency.view, sources, target, delta);
-  return run_delta_stepping_impl(impl_->adjacency.view,
-                                 impl_->outgoing,
+  impl_->require_stream(stream);
+  const DeviceCsrOwner& adjacency = impl_->adjacency();
+  validate_device_csr_shape(adjacency.view, sources, target, delta);
+  return run_delta_stepping_impl(adjacency.view,
                                  impl_->scratch,
                                  sources,
                                  target,
                                  nullptr,
                                  impl_->has_vertex_costs ? impl_->vertex_costs.get() : nullptr,
+                                 !impl_->has_vertex_costs && impl_->max_edge_value <= delta,
                                  delta,
                                  max_iters,
                                  stream,
@@ -1677,15 +2210,29 @@ DeltaSteppingCsrResult DeltaSteppingCsrWorkspace::run(
   if (!impl_) {
     throw std::runtime_error("DeltaSteppingCsrWorkspace has no implementation");
   }
-  validate_device_csr_shape(impl_->adjacency.view, sources, -1, delta);
-  validate_target_list_common_shape(impl_->adjacency.view.rows, targets);
-  return run_delta_stepping_impl(impl_->adjacency.view,
-                                 impl_->outgoing,
+  impl_->require_stream(stream);
+  const DeviceCsrOwner& adjacency = impl_->adjacency();
+  validate_device_csr_shape(adjacency.view, sources, -1, delta);
+  validate_target_list_common_shape(adjacency.view.rows, targets);
+  if (impl_->has_exact_unit_edge_values &&
+      !impl_->has_vertex_costs &&
+      adjacency.view.rows <= kMaxUnitSpecializationRows &&
+      max_iters < 0 &&
+      progress_callback == nullptr) {
+    return run_unit_weight_specialization(adjacency.view,
+                                          impl_->scratch,
+                                          sources,
+                                          targets,
+                                          delta,
+                                          stream);
+  }
+  return run_delta_stepping_impl(adjacency.view,
                                  impl_->scratch,
                                  sources,
                                  -1,
                                  &targets,
                                  impl_->has_vertex_costs ? impl_->vertex_costs.get() : nullptr,
+                                 !impl_->has_vertex_costs && impl_->max_edge_value <= delta,
                                  delta,
                                  max_iters,
                                  stream,
@@ -1723,10 +2270,9 @@ DeltaSteppingCsrResult delta_stepping_minplus_hip_csr(
 
   validate_device_csr_shape(d_adjacency, sources, target, delta);
   validate_device_csr_contents(d_adjacency, stream);
-  OutgoingCsrOwner outgoing = build_outgoing_csr_from_incoming(d_adjacency, stream);
   DeltaSteppingScratch scratch(d_adjacency.rows);
-  return run_delta_stepping_impl(d_adjacency, outgoing, scratch, sources, target,
-                                 nullptr, nullptr, delta, max_iters, stream, progress_callback,
+  return run_delta_stepping_impl(d_adjacency, scratch, sources, target,
+                                 nullptr, nullptr, false, delta, max_iters, stream, progress_callback,
                                  progress_user_data);
 }
 
