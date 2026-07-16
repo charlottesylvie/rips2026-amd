@@ -7,19 +7,6 @@
 #error "delta-threading header is required for this comparison"
 #endif
 
-#if __has_include("../../delta_threading_v2/src/delta_stepping_hip_CSR_threads_v2.hpp")
-#include "../../delta_threading_v2/src/delta_stepping_hip_CSR_threads_v2.hpp"
-#else
-#error "delta-threading V2 header is required for this comparison"
-#endif
-
-#if __has_include("../../delta_stepping_gpu_opt/src/delta_stepping_hip_CSR.hpp")
-#define SSSP_HAS_DELTA_STEPPING_GPU_OPT 1
-#include "../../delta_stepping_gpu_opt/src/delta_stepping_hip_CSR.hpp"
-#else
-#define SSSP_HAS_DELTA_STEPPING_GPU_OPT 0
-#endif
-
 #include <hip/hip_runtime.h>
 
 #include <algorithm>
@@ -392,42 +379,22 @@ int main(int argc, char** argv) {
 
     DeltaSteppingCsrResult last_delta;
     DeltaSteppingThreadsCsrResult last_threads;
-    DeltaSteppingThreadsV2CsrResult last_threads_v2;
-#if SSSP_HAS_DELTA_STEPPING_GPU_OPT
-    DeltaSteppingGpuOptCsrResult last_gpu_opt;
-#endif
 
     for (int i = 0; i < warmup; ++i) {
       last_delta = delta_stepping_minplus_hip_csr(
           d_graph.view, source, delta, max_iters, stream);
       last_threads = delta_stepping_threads_minplus_hip_csr(
           d_threads_graph.view, source, delta, max_iters, stream);
-      last_threads_v2 = delta_stepping_threads_v2_minplus_hip_csr(
-          d_threads_graph.view, source, delta, max_iters, stream);
-#if SSSP_HAS_DELTA_STEPPING_GPU_OPT
-      last_gpu_opt = delta_stepping_gpu_opt_minplus_hip_csr(
-          d_graph.view, source, delta, max_iters, stream);
-#endif
     }
 
     std::vector<double> delta_gpu_ms;
     std::vector<double> delta_wall_ms;
     std::vector<double> threads_gpu_ms;
     std::vector<double> threads_wall_ms;
-    std::vector<double> threads_v2_gpu_ms;
-    std::vector<double> threads_v2_wall_ms;
     delta_gpu_ms.reserve(static_cast<std::size_t>(repeats));
     delta_wall_ms.reserve(static_cast<std::size_t>(repeats));
     threads_gpu_ms.reserve(static_cast<std::size_t>(repeats));
     threads_wall_ms.reserve(static_cast<std::size_t>(repeats));
-    threads_v2_gpu_ms.reserve(static_cast<std::size_t>(repeats));
-    threads_v2_wall_ms.reserve(static_cast<std::size_t>(repeats));
-#if SSSP_HAS_DELTA_STEPPING_GPU_OPT
-    std::vector<double> gpu_opt_gpu_ms;
-    std::vector<double> gpu_opt_wall_ms;
-    gpu_opt_gpu_ms.reserve(static_cast<std::size_t>(repeats));
-    gpu_opt_wall_ms.reserve(static_cast<std::size_t>(repeats));
-#endif
 
     for (int i = 0; i < repeats; ++i) {
       auto delta_result = time_call(stream, [&] {
@@ -438,62 +405,27 @@ int main(int argc, char** argv) {
         return delta_stepping_threads_minplus_hip_csr(
             d_threads_graph.view, source, delta, max_iters, stream);
       });
-      auto threads_v2_result = time_call(stream, [&] {
-        return delta_stepping_threads_v2_minplus_hip_csr(
-            d_threads_graph.view, source, delta, max_iters, stream);
-      });
-#if SSSP_HAS_DELTA_STEPPING_GPU_OPT
-      auto gpu_opt_result = time_call(stream, [&] {
-        return delta_stepping_gpu_opt_minplus_hip_csr(
-            d_graph.view, source, delta, max_iters, stream);
-      });
-#endif
 
       last_delta = std::move(delta_result.result);
       last_threads = std::move(threads_result.result);
-      last_threads_v2 = std::move(threads_v2_result.result);
       delta_gpu_ms.push_back(delta_result.timing.gpu_ms);
       delta_wall_ms.push_back(delta_result.timing.wall_ms);
       threads_gpu_ms.push_back(threads_result.timing.gpu_ms);
       threads_wall_ms.push_back(threads_result.timing.wall_ms);
-      threads_v2_gpu_ms.push_back(threads_v2_result.timing.gpu_ms);
-      threads_v2_wall_ms.push_back(threads_v2_result.timing.wall_ms);
-#if SSSP_HAS_DELTA_STEPPING_GPU_OPT
-      last_gpu_opt = std::move(gpu_opt_result.result);
-      gpu_opt_gpu_ms.push_back(gpu_opt_result.timing.gpu_ms);
-      gpu_opt_wall_ms.push_back(gpu_opt_result.timing.wall_ms);
-#endif
 
       std::cout << "run " << std::setw(2) << i
                 << " | Delta gpu/wall " << std::setw(10) << delta_gpu_ms.back()
                 << " / " << std::setw(10) << delta_wall_ms.back() << " ms"
                 << " | Threads gpu/wall " << std::setw(10) << threads_gpu_ms.back()
-                << " / " << std::setw(10) << threads_wall_ms.back() << " ms"
-                << " | Threads-V2 gpu/wall " << std::setw(10) << threads_v2_gpu_ms.back()
-                << " / " << std::setw(10) << threads_v2_wall_ms.back() << " ms";
-#if SSSP_HAS_DELTA_STEPPING_GPU_OPT
-      std::cout << " | GPU-opt gpu/wall " << std::setw(10) << gpu_opt_gpu_ms.back()
-                << " / " << std::setw(10) << gpu_opt_wall_ms.back() << " ms";
-#endif
-      std::cout << '\n';
+                << " / " << std::setw(10) << threads_wall_ms.back() << " ms\n";
     }
 
     const Stats delta_gpu = stats_of(delta_gpu_ms);
     const Stats delta_wall = stats_of(delta_wall_ms);
     const Stats threads_gpu = stats_of(threads_gpu_ms);
     const Stats threads_wall = stats_of(threads_wall_ms);
-    const Stats threads_v2_gpu = stats_of(threads_v2_gpu_ms);
-    const Stats threads_v2_wall = stats_of(threads_v2_wall_ms);
     const CompareSummary threads_cmp = compare_distances(
         last_delta.dist, last_threads.dist, 1e-4f);
-    const CompareSummary threads_v2_cmp = compare_distances(
-        last_delta.dist, last_threads_v2.dist, 1e-4f);
-#if SSSP_HAS_DELTA_STEPPING_GPU_OPT
-    const Stats gpu_opt_gpu = stats_of(gpu_opt_gpu_ms);
-    const Stats gpu_opt_wall = stats_of(gpu_opt_wall_ms);
-    const CompareSummary gpu_opt_cmp = compare_distances(
-        last_delta.dist, last_gpu_opt.dist, 1e-4f);
-#endif
 
     std::cout << std::fixed << std::setprecision(3);
     std::cout << "\nSummary\n";
@@ -502,20 +434,7 @@ int main(int argc, char** argv) {
     std::cout << "  Delta-Threading converged=" << last_threads.converged
               << " iterations=" << last_threads.iterations_used << '\n';
     std::cout << "  Threading distance mismatches > 1e-4: " << threads_cmp.mismatches
-              << " max_abs_diff=" << threads_cmp.max_abs_diff << '\n';
-    std::cout << "  Threading-V2 converged=" << last_threads_v2.converged
-              << " iterations=" << last_threads_v2.iterations_used << '\n';
-    std::cout << "  Threading-V2 distance mismatches > 1e-4: "
-              << threads_v2_cmp.mismatches
-              << " max_abs_diff=" << threads_v2_cmp.max_abs_diff << '\n';
-#if SSSP_HAS_DELTA_STEPPING_GPU_OPT
-    std::cout << "  Delta-Stepping GPU-opt converged=" << last_gpu_opt.converged
-              << " iterations=" << last_gpu_opt.iterations_used << '\n';
-    std::cout << "  GPU-opt distance mismatches > 1e-4: " << gpu_opt_cmp.mismatches
-              << " max_abs_diff=" << gpu_opt_cmp.max_abs_diff << "\n\n";
-#else
-    std::cout << "  Delta-Stepping GPU-opt: unavailable (header not found)\n\n";
-#endif
+              << " max_abs_diff=" << threads_cmp.max_abs_diff << "\n\n";
 
     std::cout << "Timing table, milliseconds\n";
     std::cout << "  Algorithm        GPU mean   GPU min    GPU max    Wall mean  Wall min   Wall max\n";
@@ -527,16 +446,6 @@ int main(int argc, char** argv) {
               << std::setw(10) << threads_gpu.mean << std::setw(10) << threads_gpu.min
               << std::setw(10) << threads_gpu.max << std::setw(11) << threads_wall.mean
               << std::setw(10) << threads_wall.min << std::setw(10) << threads_wall.max << '\n';
-    std::cout << "  Delta-Thr-V2 "
-              << std::setw(10) << threads_v2_gpu.mean << std::setw(10) << threads_v2_gpu.min
-              << std::setw(10) << threads_v2_gpu.max << std::setw(11) << threads_v2_wall.mean
-              << std::setw(10) << threads_v2_wall.min << std::setw(10) << threads_v2_wall.max << '\n';
-#if SSSP_HAS_DELTA_STEPPING_GPU_OPT
-    std::cout << "  Delta-GPU-opt "
-              << std::setw(10) << gpu_opt_gpu.mean << std::setw(10) << gpu_opt_gpu.min
-              << std::setw(10) << gpu_opt_gpu.max << std::setw(11) << gpu_opt_wall.mean
-              << std::setw(10) << gpu_opt_wall.min << std::setw(10) << gpu_opt_wall.max << '\n';
-#endif
 
     const double delta_gpu_speedup = threads_gpu.mean > 0.0
         ? delta_gpu.mean / threads_gpu.mean : 0.0;
@@ -545,27 +454,9 @@ int main(int argc, char** argv) {
     std::cout << "\nSpeedup, baseline time / Delta-Threading time\n"
               << "  Delta-Stepping GPU-event: " << delta_gpu_speedup << "x\n"
               << "  Delta-Stepping wall time: " << delta_wall_speedup << "x\n";
-    const double v2_gpu_speedup = threads_v2_gpu.mean > 0.0
-        ? threads_gpu.mean / threads_v2_gpu.mean : 0.0;
-    const double v2_wall_speedup = threads_v2_wall.mean > 0.0
-        ? threads_wall.mean / threads_v2_wall.mean : 0.0;
-    std::cout << "  Delta-Thread V1 / V2 GPU-event: " << v2_gpu_speedup << "x\n"
-              << "  Delta-Thread V1 / V2 wall time: " << v2_wall_speedup << "x\n";
-#if SSSP_HAS_DELTA_STEPPING_GPU_OPT
-    const double gpu_opt_gpu_speedup = threads_gpu.mean > 0.0
-        ? gpu_opt_gpu.mean / threads_gpu.mean : 0.0;
-    const double gpu_opt_wall_speedup = threads_wall.mean > 0.0
-        ? gpu_opt_wall.mean / threads_wall.mean : 0.0;
-    std::cout << "  GPU-opt GPU-event: " << gpu_opt_gpu_speedup << "x\n"
-              << "  GPU-opt wall time: " << gpu_opt_wall_speedup << "x\n";
-#endif
 
     check_hip(hipStreamDestroy(stream), "destroy stream");
-    return threads_cmp.mismatches == 0 && threads_v2_cmp.mismatches == 0
-#if SSSP_HAS_DELTA_STEPPING_GPU_OPT
-        && gpu_opt_cmp.mismatches == 0
-#endif
-        ? 0 : 2;
+    return threads_cmp.mismatches == 0 ? 0 : 2;
   } catch (const std::exception& e) {
     std::cerr << "error: " << e.what() << '\n';
     print_usage(argv[0]);
