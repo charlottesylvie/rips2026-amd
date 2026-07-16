@@ -1,0 +1,608 @@
+{
+  "allocations": [
+    {
+      "agent_type": "CPU",
+      "bytes": 79692120,
+      "calls": 36,
+      "duration_seconds": 0.016596068,
+      "type": "ALLOC"
+    },
+    {
+      "agent_type": "CPU",
+      "bytes": 0,
+      "calls": 32,
+      "duration_seconds": 0.015158369,
+      "type": "FREE"
+    },
+    {
+      "agent_type": "GPU",
+      "bytes": 0,
+      "calls": 740,
+      "duration_seconds": 0.014653385,
+      "type": "FREE"
+    },
+    {
+      "agent_type": "GPU",
+      "bytes": 4499968668,
+      "calls": 740,
+      "duration_seconds": 0.010919901,
+      "type": "ALLOC"
+    },
+    {
+      "agent_type": "unknown",
+      "bytes": 0,
+      "calls": 8,
+      "duration_seconds": 2.01e-07,
+      "type": "FREE"
+    }
+  ],
+  "copy_api": {
+    "at_most_64_bytes": {
+      "aggregate_api_seconds": 30.317532838,
+      "average_api_microseconds": 154.85747987761587,
+      "average_bytes_per_call": 7.7277923351568365,
+      "bytes": 1512924,
+      "calls": 195777
+    },
+    "by_direction": {
+      "DeviceToDevice": {
+        "aggregate_api_seconds": 0.063615513,
+        "average_api_microseconds": 6.6480837078064585,
+        "average_bytes_per_call": 4.0,
+        "bytes": 38276,
+        "calls": 9569
+      },
+      "DeviceToHost": {
+        "aggregate_api_seconds": 35.001962062,
+        "average_api_microseconds": 242.42104139626693,
+        "average_bytes_per_call": 35.92855213491706,
+        "bytes": 5187544,
+        "calls": 144385
+      },
+      "HostToDevice": {
+        "aggregate_api_seconds": 0.291686032,
+        "average_api_microseconds": 6.053084419357517,
+        "average_bytes_per_call": 7699.523947870839,
+        "bytes": 371024660,
+        "calls": 48188
+      }
+    },
+    "by_direction_and_size": {
+      "DeviceToDevice:at_most_64_bytes": {
+        "aggregate_api_seconds": 0.063615513,
+        "average_api_microseconds": 6.6480837078064585,
+        "average_bytes_per_call": 4.0,
+        "bytes": 38276,
+        "calls": 9569
+      },
+      "DeviceToHost:65_bytes_to_4_kib": {
+        "aggregate_api_seconds": 4.774341439,
+        "average_api_microseconds": 913.9244714777948,
+        "average_bytes_per_call": 299.05895865237363,
+        "bytes": 1562284,
+        "calls": 5224
+      },
+      "DeviceToHost:at_most_64_bytes": {
+        "aggregate_api_seconds": 29.993507506,
+        "average_api_microseconds": 216.01218216649502,
+        "average_bytes_per_call": 7.778438758093208,
+        "bytes": 1080044,
+        "calls": 138851
+      },
+      "DeviceToHost:over_4_kib": {
+        "aggregate_api_seconds": 0.234113117,
+        "average_api_microseconds": 755.2036032258065,
+        "average_bytes_per_call": 8210.374193548387,
+        "bytes": 2545216,
+        "calls": 310
+      },
+      "HostToDevice:65_bytes_to_4_kib": {
+        "aggregate_api_seconds": 0.004585082,
+        "average_api_microseconds": 5.537538647342996,
+        "average_bytes_per_call": 313.3816425120773,
+        "bytes": 259480,
+        "calls": 828
+      },
+      "HostToDevice:at_most_64_bytes": {
+        "aggregate_api_seconds": 0.260409819,
+        "average_api_microseconds": 5.498866461135629,
+        "average_bytes_per_call": 8.332537956373926,
+        "bytes": 394604,
+        "calls": 47357
+      },
+      "HostToDevice:over_4_kib": {
+        "aggregate_api_seconds": 0.026691131,
+        "average_api_microseconds": 8897.043666666666,
+        "average_bytes_per_call": 123456858.66666667,
+        "bytes": 370370576,
+        "calls": 3
+      }
+    },
+    "total": {
+      "aggregate_api_seconds": 35.357263607,
+      "average_api_microseconds": 174.9129998070663,
+      "average_bytes_per_call": 1861.3176875661663,
+      "bytes": 376250480,
+      "calls": 202142
+    }
+  },
+  "device": {
+    "aggregate_dispatch_seconds": 73.884293641,
+    "at_least_one_dispatch_percent_of_process_wall": 92.43656680348417,
+    "at_least_one_dispatch_percent_of_span": 99.3524520461812,
+    "average_in_flight_concurrency_during_dispatch_union": 3.8252435785395553,
+    "categories": [
+      {
+        "aggregate_seconds": 30.826110565,
+        "aggregate_share_percent": 41.72214288842294,
+        "calls": 202128,
+        "category": "Runtime status/copy kernels"
+      },
+      {
+        "aggregate_seconds": 24.287023191,
+        "aggregate_share_percent": 32.87169978102437,
+        "calls": 96115,
+        "category": "Light-edge relaxation"
+      },
+      {
+        "aggregate_seconds": 6.649274931,
+        "aggregate_share_percent": 8.999578399312426,
+        "calls": 9654,
+        "category": "Sparse state reset"
+      },
+      {
+        "aggregate_seconds": 6.390790338,
+        "aggregate_share_percent": 8.649727869163266,
+        "calls": 9654,
+        "category": "Predecessor materialization"
+      },
+      {
+        "aggregate_seconds": 2.573238777,
+        "aggregate_share_percent": 3.482795395599551,
+        "calls": 96115,
+        "category": "Queue flag clearing"
+      },
+      {
+        "aggregate_seconds": 1.769069246,
+        "aggregate_share_percent": 2.394377964274541,
+        "calls": 222050,
+        "category": "Runtime memset/fill kernels"
+      },
+      {
+        "aggregate_seconds": 0.748204106,
+        "aggregate_share_percent": 1.0126700400432675,
+        "calls": 19138,
+        "category": "Pending-bucket management"
+      },
+      {
+        "aggregate_seconds": 0.355515897,
+        "aggregate_share_percent": 0.4811792594613323,
+        "calls": 19308,
+        "category": "Path extraction"
+      },
+      {
+        "aggregate_seconds": 0.21846479,
+        "aggregate_share_percent": 0.2956850221259599,
+        "calls": 19223,
+        "category": "Target settlement"
+      },
+      {
+        "aggregate_seconds": 0.0666018,
+        "aggregate_share_percent": 0.09014338057235105,
+        "calls": 9662,
+        "category": "Initialization/validation"
+      }
+    ],
+    "concurrency_seconds": {
+      "0": 0.125888592,
+      "1": 0.293850667,
+      "2": 0.610992271,
+      "3": 1.271870668,
+      "4": 17.138211607
+    },
+    "copy_buffer_dispatch_duration": {
+      "at_least_1ms_calls": 9972,
+      "at_least_1ms_share_of_aggregate_percent": 82.00898798015454,
+      "calls": 202128,
+      "p50_microseconds": 1.723,
+      "p90_microseconds": 126.719,
+      "p95_microseconds": 978.844,
+      "p99_microseconds": 3323.98
+    },
+    "dispatch_union_seconds": 19.314925213,
+    "first_start_nanoseconds": 682678850590293,
+    "interval_union_islands": 46285,
+    "kernel_calls": 703047,
+    "last_end_nanoseconds": 682698291404098,
+    "maximum_concurrency": 4,
+    "percent_of_span_at_maximum_concurrency": 88.15583431282187,
+    "span_seconds": 19.440813805
+  },
+  "hardware_agents": [
+    {
+      "cu_count": 32,
+      "io_links": [
+        {
+          "flags": {
+            "NoAtomics32bit": 0,
+            "NoAtomics64bit": 0,
+            "NoPeerToPeerDMA": 0,
+            "NonCoherent": 1,
+            "Override": 1
+          },
+          "max_bandwidth": 32000,
+          "max_latency": 0,
+          "min_bandwidth": 0,
+          "min_latency": 0,
+          "node_from": 0,
+          "node_to": 1,
+          "recommended_transfer_size": 0,
+          "type": 2,
+          "version_major": 0,
+          "version_minor": 0,
+          "weight": 20
+        }
+      ],
+      "memory_banks": [
+        {
+          "flags": {
+            "HotPluggable": 0,
+            "NonVolatile": 0
+          },
+          "heap_type": 0,
+          "mem_clk_max": 8000,
+          "size_in_bytes": 67037921280,
+          "width": 32
+        }
+      ],
+      "name": "AMD RYZEN AI MAX+ 395 w/ Radeon 8060S",
+      "product_name": "AMD RYZEN AI MAX+ 395 w/ Radeon 8060S",
+      "type": "CPU",
+      "wavefront_size": 0
+    },
+    {
+      "cu_count": 40,
+      "io_links": [
+        {
+          "flags": {
+            "NoAtomics32bit": 0,
+            "NoAtomics64bit": 0,
+            "NoPeerToPeerDMA": 0,
+            "NonCoherent": 0,
+            "Override": 1
+          },
+          "max_bandwidth": 32000,
+          "max_latency": 0,
+          "min_bandwidth": 0,
+          "min_latency": 0,
+          "node_from": 1,
+          "node_to": 0,
+          "recommended_transfer_size": 0,
+          "type": 2,
+          "version_major": 0,
+          "version_minor": 0,
+          "weight": 20
+        }
+      ],
+      "memory_banks": [
+        {
+          "flags": {
+            "HotPluggable": 0,
+            "NonVolatile": 0
+          },
+          "heap_type": 1,
+          "mem_clk_max": 1000,
+          "size_in_bytes": 68719476736,
+          "width": 256
+        }
+      ],
+      "name": "gfx1151",
+      "product_name": "Radeon 8060S Graphics",
+      "type": "GPU",
+      "wavefront_size": 32
+    }
+  ],
+  "hardware_counter_rows": {
+    "counters_collection": 0,
+    "pmc_events": 0,
+    "samples": 0
+  },
+  "hip_api": {
+    "by_name": {
+      "hipFree": {
+        "aggregate_seconds": 2.825745476,
+        "average_microseconds": 3818.574967567568,
+        "calls": 740,
+        "maximum_milliseconds": 58.857433
+      },
+      "hipGetDevice": {
+        "aggregate_seconds": 1.3657e-05,
+        "average_microseconds": 1.3657000000000001,
+        "calls": 10,
+        "maximum_milliseconds": 0.005511
+      },
+      "hipGetLastError": {
+        "aggregate_seconds": 0.009731073,
+        "average_microseconds": 0.034894782137849675,
+        "calls": 278869,
+        "maximum_milliseconds": 0.003877
+      },
+      "hipHostFree": {
+        "aggregate_seconds": 0.0899652,
+        "average_microseconds": 5622.825,
+        "calls": 16,
+        "maximum_milliseconds": 13.659026
+      },
+      "hipHostMalloc": {
+        "aggregate_seconds": 0.003255212,
+        "average_microseconds": 203.45075,
+        "calls": 16,
+        "maximum_milliseconds": 1.03487
+      },
+      "hipLaunchKernel": {
+        "aggregate_seconds": 1.500091505,
+        "average_microseconds": 5.379197777451061,
+        "calls": 278869,
+        "maximum_milliseconds": 40.725814
+      },
+      "hipMalloc": {
+        "aggregate_seconds": 0.033482729,
+        "average_microseconds": 45.24693108108108,
+        "calls": 740,
+        "maximum_milliseconds": 16.50719
+      },
+      "hipMemGetInfo": {
+        "aggregate_seconds": 1.2894e-05,
+        "average_microseconds": 12.894,
+        "calls": 1,
+        "maximum_milliseconds": 0.012894
+      },
+      "hipMemcpyAsync": {
+        "aggregate_seconds": 35.357263607,
+        "average_microseconds": 174.9129998070663,
+        "calls": 202142,
+        "maximum_milliseconds": 37.255939
+      },
+      "hipMemsetAsync": {
+        "aggregate_seconds": 1.247305404,
+        "average_microseconds": 5.635908275120417,
+        "calls": 221314,
+        "maximum_milliseconds": 41.042139
+      },
+      "hipSetDevice": {
+        "aggregate_seconds": 6.2767e-05,
+        "average_microseconds": 7.845875,
+        "calls": 8,
+        "maximum_milliseconds": 0.015519
+      },
+      "hipStreamCreateWithFlags": {
+        "aggregate_seconds": 0.101095415,
+        "average_microseconds": 12636.926875,
+        "calls": 8,
+        "maximum_milliseconds": 20.499248
+      },
+      "hipStreamDestroy": {
+        "aggregate_seconds": 0.005504516,
+        "average_microseconds": 688.0645,
+        "calls": 8,
+        "maximum_milliseconds": 0.874427
+      },
+      "hipStreamSynchronize": {
+        "aggregate_seconds": 111.333582647,
+        "average_microseconds": 1052.6007624751821,
+        "calls": 105770,
+        "maximum_milliseconds": 53.675453
+      }
+    },
+    "worker_stream_synchronize": [
+      {
+        "active_span_percent": 72.9969408771841,
+        "active_span_seconds": 19.41224775,
+        "aggregate_seconds": 14.170347013,
+        "calls": 13462,
+        "tid": 39170
+      },
+      {
+        "active_span_percent": 71.87499590334819,
+        "active_span_seconds": 19.367187803,
+        "aggregate_seconds": 13.92016544,
+        "calls": 13081,
+        "tid": 39171
+      },
+      {
+        "active_span_percent": 73.40124352920897,
+        "active_span_seconds": 19.395073494,
+        "aggregate_seconds": 14.236225128,
+        "calls": 13446,
+        "tid": 39172
+      },
+      {
+        "active_span_percent": 69.16116296339288,
+        "active_span_seconds": 19.371068993,
+        "aggregate_seconds": 13.397256594,
+        "calls": 12905,
+        "tid": 39173
+      },
+      {
+        "active_span_percent": 72.23352449270914,
+        "active_span_seconds": 19.405203212,
+        "aggregate_seconds": 14.017062215,
+        "calls": 13298,
+        "tid": 39174
+      },
+      {
+        "active_span_percent": 70.56133980956851,
+        "active_span_seconds": 19.379217801,
+        "aggregate_seconds": 13.674235725,
+        "calls": 12945,
+        "tid": 39175
+      },
+      {
+        "active_span_percent": 71.49286717863136,
+        "active_span_seconds": 19.409929654,
+        "aggregate_seconds": 13.876715227,
+        "calls": 13391,
+        "tid": 39176
+      },
+      {
+        "active_span_percent": 72.40681451830078,
+        "active_span_seconds": 19.392588143,
+        "aggregate_seconds": 14.041555327,
+        "calls": 13241,
+        "tid": 39177
+      }
+    ]
+  },
+  "markers": {
+    "delta_step.generic": {
+      "aggregate_seconds": 154.984378868,
+      "average_seconds": 0.0160539029281127,
+      "calls": 9654,
+      "first_start_nanoseconds": 682678848074859,
+      "last_end_nanoseconds": 682698291384932,
+      "maximum_seconds": 0.346848608,
+      "minimum_seconds": 0.000442443
+    },
+    "delta_step.upload_graph": {
+      "aggregate_seconds": 0.116184714,
+      "average_seconds": 0.116184714,
+      "calls": 1,
+      "first_start_nanoseconds": 682678708743420,
+      "last_end_nanoseconds": 682678824928134,
+      "maximum_seconds": 0.116184714,
+      "minimum_seconds": 0.116184714
+    },
+    "pathfinder.load_csr": {
+      "aggregate_seconds": 0.122651043,
+      "average_seconds": 0.122651043,
+      "calls": 1,
+      "first_start_nanoseconds": 682677763508415,
+      "last_end_nanoseconds": 682677886159458,
+      "maximum_seconds": 0.122651043,
+      "minimum_seconds": 0.122651043
+    },
+    "pathfinder.load_metadata": {
+      "aggregate_seconds": 0.771909762,
+      "average_seconds": 0.771909762,
+      "calls": 1,
+      "first_start_nanoseconds": 682677888493584,
+      "last_end_nanoseconds": 682678660403346,
+      "maximum_seconds": 0.771909762,
+      "minimum_seconds": 0.771909762
+    },
+    "pathfinder.route_net": {
+      "aggregate_seconds": 155.131540187,
+      "average_seconds": 0.005535272253871406,
+      "calls": 28026,
+      "first_start_nanoseconds": 682678848041666,
+      "last_end_nanoseconds": 682698291510709,
+      "maximum_seconds": 0.347088871,
+      "minimum_seconds": 9e-08
+    },
+    "pathfinder.run": {
+      "aggregate_seconds": 19.653544621,
+      "average_seconds": 19.653544621,
+      "calls": 1,
+      "first_start_nanoseconds": 682678660416842,
+      "last_end_nanoseconds": 682698313961463,
+      "maximum_seconds": 19.653544621,
+      "minimum_seconds": 19.653544621
+    },
+    "pathfinder.sssp": {
+      "aggregate_seconds": 155.000755017,
+      "average_seconds": 0.01605559923523928,
+      "calls": 9654,
+      "first_start_nanoseconds": 682678848072594,
+      "last_end_nanoseconds": 682698291386154,
+      "maximum_seconds": 0.346852635,
+      "minimum_seconds": 0.000443736
+    },
+    "pathfinder.write_routes": {
+      "aggregate_seconds": 0.264169099,
+      "average_seconds": 0.264169099,
+      "calls": 1,
+      "first_start_nanoseconds": 682698313966963,
+      "last_end_nanoseconds": 682698578136062,
+      "maximum_seconds": 0.264169099,
+      "minimum_seconds": 0.264169099
+    }
+  },
+  "process": {
+    "command": "./pathfinder logicnets_jscl_PathFinderFile.phys.pathfinder-work/logicnets_jscl_PathFinderFile.csrbin logicnets_jscl_PathFinderFile.phys.pathfinder-work/logicnets_jscl_PathFinderFile.csrbin.ifmeta.bin --routes-out logicnets_jscl_PathFinderFile.phys.pathfinder-work/logicnets_jscl_PathFinderFile.routes.jsonl --allow-unrouted --sssp-engine delta-step --max-sssp-iters 2147483647",
+    "end_nanoseconds": 682698625971636,
+    "pid": 39155,
+    "start_nanoseconds": 682677730642135,
+    "timeline": [
+      {
+        "duration_seconds": 0.122651043,
+        "end_nanoseconds": 682677886159458,
+        "marker": "pathfinder.load_csr",
+        "start_nanoseconds": 682677763508415
+      },
+      {
+        "duration_seconds": 0.771909762,
+        "end_nanoseconds": 682678660403346,
+        "marker": "pathfinder.load_metadata",
+        "start_nanoseconds": 682677888493584
+      },
+      {
+        "duration_seconds": 19.653544621,
+        "end_nanoseconds": 682698313961463,
+        "marker": "pathfinder.run",
+        "start_nanoseconds": 682678660416842
+      },
+      {
+        "duration_seconds": 0.116184714,
+        "end_nanoseconds": 682678824928134,
+        "marker": "delta_step.upload_graph",
+        "start_nanoseconds": 682678708743420
+      },
+      {
+        "duration_seconds": 0.264169099,
+        "end_nanoseconds": 682698578136062,
+        "marker": "pathfinder.write_routes",
+        "start_nanoseconds": 682698313966963
+      }
+    ],
+    "wall_seconds": 20.895329501
+  },
+  "scope": "inner pathfinder process only; converter, route serializer wrapper, checker, and wirelength are outside this database",
+  "source_database": "/Users/jasperkra-caskey/RIPS-AMD-2026/39155_results.db",
+  "sssp": {
+    "duration_milliseconds": {
+      "maximum": 346.848608,
+      "p50": 11.993599,
+      "p90": 33.232951,
+      "p95": 42.468475,
+      "p99": 72.647375
+    },
+    "generic_calls": 9654,
+    "operations_per_call": {
+      "HIP memcpy calls": 20.93867826807541,
+      "Kernel launches": 28.886368344727575,
+      "Runtime copy kernels": 20.937228091982597,
+      "Runtime fill kernels": 23.000828672053036,
+      "Stream synchronizations": 10.956080381189144
+    }
+  },
+  "transfer_engine": [
+    {
+      "bytes": 370370576,
+      "calls": 13,
+      "destination_type": "GPU",
+      "duration_seconds": 0.004632432,
+      "effective_gigabytes_per_second": 79.95164872360782,
+      "name": "MEMORY_COPY_HOST_TO_DEVICE",
+      "source_type": "CPU"
+    },
+    {
+      "bytes": 208248,
+      "calls": 11,
+      "destination_type": "CPU",
+      "duration_seconds": 5.5383e-05,
+      "effective_gigabytes_per_second": 3.760143004170955,
+      "name": "MEMORY_COPY_DEVICE_TO_HOST",
+      "source_type": "GPU"
+    }
+  ]
+}

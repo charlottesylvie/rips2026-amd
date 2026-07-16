@@ -37,7 +37,6 @@ struct Options {
   std::vector<std::string> converter_args;
   std::vector<std::string> pathfinder_args;
   bool allow_unrouted = true;
-  bool converter_bounds_set = false;
 };
 
 std::string env_or_default(const char* name, const char* fallback) {
@@ -163,8 +162,8 @@ void print_usage(const char* program) {
       << "  --present-factor <float>       Compatibility-only; accepted by pathfinder and ignored.\n"
       << "  --present-multiplier <float>   Compatibility-only; accepted by pathfinder and ignored.\n"
       << "  --history-factor <float>       Compatibility-only; accepted by pathfinder and ignored.\n"
-      << "  --full-device                  Import the whole device instead of nxroute bounds.\n"
-      << "  --nxroute-bounds               Import X36..X90, Y60..Y239. Default for fair nxroute-poc comparison.\n"
+      << "  --full-device                  Import the whole device (default).\n"
+      << "  --nxroute-bounds               Import X36..X90, Y60..Y239 for nxroute-poc comparisons.\n"
       << "  --bounds <minX> <maxX> <minY> <maxY>\n"
       << "                                 Forwarded to interchange_to_csr.\n"
       << "  --node-bounds-mode <mode>      Forwarded to interchange_to_csr.\n";
@@ -232,13 +231,10 @@ Options parse_args(int argc, char** argv) {
       options.pathfinder_args.push_back(option);
       options.pathfinder_args.push_back(require_value(option.c_str()));
     } else if (option == "--full-device") {
-      options.converter_bounds_set = true;
       options.converter_args.push_back(option);
     } else if (option == "--nxroute-bounds") {
-      options.converter_bounds_set = true;
       options.converter_args.push_back(option);
     } else if (option == "--bounds") {
-      options.converter_bounds_set = true;
       options.converter_args.push_back(option);
       for (int j = 0; j < 4; ++j) {
         options.converter_args.push_back(require_value("--bounds"));
@@ -297,9 +293,6 @@ int main(int argc, char** argv) {
         "--metadata",
         metadata_path.string(),
     };
-    if (!options.converter_bounds_set) {
-      convert_cmd.push_back("--nxroute-bounds");
-    }
     convert_cmd.insert(convert_cmd.end(),
                        options.converter_args.begin(),
                        options.converter_args.end());

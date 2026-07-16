@@ -212,11 +212,13 @@ Useful options:
 | Option | Meaning |
 | --- | --- |
 | `--bounds <minX> <maxX> <minY> <maxY>` | Import a tile-coordinate subset. |
+| `--nxroute-bounds` | Import the older proof-of-concept subset: `X36..X90`, `Y60..Y239`. |
 | `--node-bounds-mode <mode>` | Select `poc-base-wire`, `fully-contained`, or `intersects`. |
 | `--full-device` | Import every tile that has XY coordinates. |
 
-Default bounds match the older proof-of-concept flow: `X36..X90` and
-`Y60..Y239`.
+The converter and `PathFinderFile` wrapper import the full device by default.
+Use `--nxroute-bounds` only for an explicit comparison with the older
+proof-of-concept flow.
 
 ### `pathfinder`
 
@@ -279,7 +281,7 @@ Useful wrapper options:
 | `--routes-to-phys <path>` | Override route reconstructor. Env: `ROUTES_TO_PHYS`. |
 | `--sssp-engine`, `--use-delta-step`, `--delta`, `--max-sssp-iters`, `--parallel-net-workers`, `--capacity` | Forwarded to `pathfinder`. |
 | `--max-pathfinder-iters`, `--present-factor`, `--present-multiplier`, `--history-factor`, `--route-batch-size` | Compatibility-only; forwarded to `pathfinder` and ignored. |
-| `--full-device`, `--bounds`, `--node-bounds-mode` | Forwarded to `interchange_to_csr`. |
+| `--full-device`, `--nxroute-bounds`, `--bounds`, `--node-bounds-mode` | Forwarded to `interchange_to_csr`; full-device conversion is the default. |
 
 ## File Formats And Artifacts
 
@@ -392,9 +394,9 @@ output, and computes the benchmark score.
   `routes_to_phys.cpp`.
 - PathFinder routes against internal route requests from the metadata sidecar.
   Use `--routes-out` and `--keep-work-dir` when debugging route-tree output.
-- The default converter bounds are intentionally smaller than the full device
-  to keep early experiments tractable. Use `--full-device` only when the build
-  and runtime environment can handle the larger graph.
+- Full-device conversion is the default. Use `--nxroute-bounds` or explicit
+  `--bounds` only for intentionally bounded experiments, and validate that the
+  selected region covers every source and sink being benchmarked.
 - On macOS, prefer CPU-stub tests unless ROCm/HIP headers and runtime are
   available through a container or remote machine.
 - Generated benchmark assets, routed outputs, logs, and temporary work
