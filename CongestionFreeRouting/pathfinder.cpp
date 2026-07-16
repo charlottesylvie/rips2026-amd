@@ -1,5 +1,6 @@
 #include "pathfinder.hpp"
 
+#include "bellman_ford/bf8.hpp"
 #include "delta_stepping/delta_stepping_hip_CSR.hpp"
 #include "profiling/roctx_ranges.hpp"
 #include "unit_bfs/unit_bfs_hip_CSR.hpp"
@@ -12,11 +13,13 @@
 // routing graph.  GPU delta-stepping remains selectable for comparison.
 //
 // Example GPU build from the repository root:
-//   hipcc -std=c++17 -O3 -x hip \
+//   hipcc -std=c++17 -O3 -x hip -DBF8_NO_MAIN \
 //     -I HIP_kernel/bellman_ford/src \
+//     -I CongestionFreeRouting/bellman_ford \
 //     -I CongestionFreeRouting/delta_stepping \
 //     -I CongestionFreeRouting/unit_bfs \
 //     CongestionFreeRouting/pathfinder.cpp \
+//     CongestionFreeRouting/bellman_ford/bf8.cpp \
 //     CongestionFreeRouting/delta_stepping/delta_stepping_hip_CSR.cpp \
 //     CongestionFreeRouting/unit_bfs/unit_bfs_hip_CSR.cpp \
 //     -pthread \
@@ -1008,6 +1011,9 @@ SsspEngine parse_sssp_engine_arg(const char* text) {
   if (value == "delta-step" || value == "delta-stepping" || value == "delta") {
     return SsspEngine::kDeltaStep;
   }
+  if (value == "bellman-ford" || value == "bellman_ford" || value == "bf8") {
+    return SsspEngine::kBellmanFord;
+  }
   throw std::runtime_error("invalid sssp-engine: " + value);
 }
 
@@ -1017,6 +1023,8 @@ const char* sssp_engine_name(SsspEngine engine) {
       return "unit-bfs";
     case SsspEngine::kDeltaStep:
       return "delta-step";
+    case SsspEngine::kBellmanFord:
+      return "bellman-ford";
   }
   return "unknown";
 }
@@ -1026,14 +1034,14 @@ void print_usage(const char* program) {
       << "Usage:\n"
       << "  " << program << " <graph.csrbin> [metadata.ifmeta.bin] [options]\n\n"
       << "Options:\n"
-      << "  --sssp-engine <unit-bfs|delta-step>\n"
+      << "  --sssp-engine <unit-bfs|delta-step|bellman-ford>\n"
       << "                                  Shortest-path backend. Default: unit-bfs\n"
       << "  --use-delta-step                Use delta-step backend for comparison.\n"
       << "  --delta <float>                 Delta-stepping bucket width. Default: 4\n"
-      << "  --max-sssp-iters <int>          Delta-step rounds or unit-BFS depth cap; -1 for default.\n"
+      << "  --max-sssp-iters <int>          Delta rounds, BFS depth, or Bellman-Ford rounds; -1 for default.\n"
       << "  --capacity <int>                Capacity used only for overuse diagnostics. Default: 1\n"
       << "  --net-limit <count>             Route only the first count requests.\n"
-      << "  --parallel-net-workers <count>  Independent net workers. Default: 0 (auto-selects up to 8).\n"
+      << "  --parallel-net-workers <count>  Independent net workers. Default: 0 (engine-dependent auto).\n"
       << "  --allow-unrouted                Write partial routes even if some sinks are unreached.\n"
       << "  --routes-out <path>             Write routed PIP tree data as JSONL.\n"
       << "\nCompatibility-only options accepted and ignored by this one-shot router:\n"
@@ -1405,6 +1413,29 @@ PathfinderResult run_pathfinder(const HostCsrF32& base_graph,
           result.nets,
           [shared_graph](hipStream_t worker_stream) {
             return DeltaSteppingCsrWorkspace(shared_graph, worker_stream);
+          });
+      break;
+    }
+    case SsspEngine::kBellmanFord: {
+      auto shared_graph =
+          std::make_shared<BellmanFordCsrGraph>(base_graph, stream);
+      PathfinderOptions bellman_ford_options = options;
+      if (bellman_ford_options.parallel_net_workers == 0) {
+        // Start conservatively: every worker owns a full frontier state and
+        // may copy one packed predecessor tree to the host per legal source.
+        bellman_ford_options.parallel_net_workers = 1;
+        std::cout << "[pathfinder] auto-selected 1 Bellman-Ford worker(s)\n";
+      }
+      route_all_nets_with_workspace(
+          base_graph,
+          metadata,
+          bellman_ford_options,
+          stream,
+          route_request_count,
+          progress_interval,
+          result.nets,
+          [shared_graph](hipStream_t worker_stream) {
+            return BellmanFordCsrWorkspace(shared_graph, worker_stream);
           });
       break;
     }
