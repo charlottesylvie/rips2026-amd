@@ -1,7 +1,6 @@
 #include "delta_stepping_hip_CSR_threads.hpp"
 
 #include <hip/hip_runtime.h>
-#include <rocprim/rocprim.hpp>
 
 #include <algorithm>
 #include <cmath>
@@ -116,26 +115,6 @@ struct DeviceCsrOwner {
     view.colind = colind.get();
     view.values = values.get();
   }
-};
-
-// Retained only for the legacy transpose helpers below.  The public threaded
-// solver no longer constructs or uses this representation.
-struct OutgoingCsrOwner {
-  Offset rows = 0;
-  Offset cols = 0;
-  Offset nnz = 0;
-  DeviceBuffer<Offset> rowptr;
-  DeviceBuffer<Index> colind;
-  DeviceBuffer<float> values;
-  DeviceBuffer<Offset> incoming_edge;
-
-  OutgoingCsrOwner() = default;
-  OutgoingCsrOwner(Offset rows_, Offset cols_, Offset nnz_)
-      : rows(rows_), cols(cols_), nnz(nnz_),
-        rowptr(static_cast<std::size_t>(rows_) + 1),
-        colind(static_cast<std::size_t>(nnz_)),
-        values(static_cast<std::size_t>(nnz_)),
-        incoming_edge(static_cast<std::size_t>(nnz_)) {}
 };
 
 struct DeltaSteppingScratch {
@@ -336,7 +315,7 @@ inline void validate_host_csr_arrays(const HostCsrF32& g) {
   }
   for (std::size_t e = 0; e < nnz; ++e) {
     if (g.colind[e] < 0 || static_cast<Offset>(g.colind[e]) >= g.cols) {
-      throw std::invalid_argument("CSR colind contains an out-of-range source vertex");
+      throw std::invalid_argument("CSR colind contains an out-of-range destination vertex");
     }
     if (!std::isfinite(g.values[e]) || g.values[e] < 0.0f) {
       throw std::invalid_argument("delta-stepping requires finite nonnegative edge weights");
@@ -402,18 +381,6 @@ inline void reset_overflow_async(int* d_value, hipStream_t stream) {
   (void)d_value;
   (void)stream;
 #endif
-}
-
-__device__ inline Offset atomic_add_offset(Offset* ptr, Offset value) {
-  static_assert(sizeof(Offset) == 4 || sizeof(Offset) == 8,
-                "Offset must be a 32-bit or 64-bit integer type");
-  if constexpr (sizeof(Offset) == 8) {
-    return static_cast<Offset>(atomicAdd(reinterpret_cast<unsigned long long*>(ptr),
-                                         static_cast<unsigned long long>(value)));
-  } else {
-    return static_cast<Offset>(atomicAdd(reinterpret_cast<unsigned int*>(ptr),
-                                         static_cast<unsigned int>(value)));
-  }
 }
 
 __device__ inline float atomic_min_float_nonnegative(float* addr, float value) {
@@ -496,64 +463,12 @@ __global__ void validate_device_csr_kernel(Offset rows,
       continue;
     }
     for (Offset e = begin; e < end; ++e) {
-      const Index src = colind[e];
+      const Index dst = colind[e];
       const float w = values[e];
-      if (src < 0 || static_cast<Offset>(src) >= cols || !isfinite(w) || w < 0.0f) {
+      if (dst < 0 || static_cast<Offset>(dst) >= cols || !isfinite(w) || w < 0.0f) {
         atomicExch(invalid, 1);
       }
     }
-  }
-}
-
-__global__ void count_out_degrees_from_incoming_kernel(Offset rows,
-                                                       const Offset* in_rowptr,
-                                                       const Index* in_colind,
-                                                       Offset* out_degree) {
-  // Public CSR row dst enumerates incoming edges src -> dst. Count by src.
-  for (Offset dst = static_cast<Offset>(blockIdx.x) * blockDim.x + threadIdx.x;
-       dst < rows;
-       dst += static_cast<Offset>(blockDim.x) * gridDim.x) {
-    for (Offset e = in_rowptr[dst]; e < in_rowptr[dst + 1]; ++e) {
-      const Offset src = static_cast<Offset>(in_colind[e]);
-      atomic_add_offset(&out_degree[src], static_cast<Offset>(1));
-    }
-  }
-}
-
-__global__ void set_last_rowptr_kernel(Offset* rowptr, Offset rows, Offset nnz) {
-  if (blockIdx.x == 0 && threadIdx.x == 0) rowptr[rows] = nnz;
-}
-
-__global__ void fill_outgoing_from_incoming_kernel(Offset rows,
-                                                   const Offset* in_rowptr,
-                                                   const Index* in_colind,
-                                                   const float* in_values,
-                                                   Offset* cursor,
-                                                   Index* out_colind,
-                                                   float* out_values,
-                                                   Offset* out_incoming_edge) {
-  // Transpose incoming-edge CSR into outgoing CSR: output row src stores dst.
-  for (Offset dst = static_cast<Offset>(blockIdx.x) * blockDim.x + threadIdx.x;
-       dst < rows;
-       dst += static_cast<Offset>(blockDim.x) * gridDim.x) {
-    for (Offset e = in_rowptr[dst]; e < in_rowptr[dst + 1]; ++e) {
-      const Offset src = static_cast<Offset>(in_colind[e]);
-      const Offset pos = atomic_add_offset(&cursor[src], static_cast<Offset>(1));
-      out_colind[pos] = static_cast<Index>(dst);
-      out_values[pos] = in_values[e];
-      out_incoming_edge[pos] = e;
-    }
-  }
-}
-
-__global__ void update_outgoing_values_from_incoming_kernel(Offset nnz,
-                                                            const float* in_values,
-                                                            const Offset* out_incoming_edge,
-                                                            float* out_values) {
-  for (Offset e = static_cast<Offset>(blockIdx.x) * blockDim.x + threadIdx.x;
-       e < nnz;
-       e += static_cast<Offset>(blockDim.x) * gridDim.x) {
-    out_values[e] = in_values[out_incoming_edge[e]];
   }
 }
 
@@ -1130,70 +1045,6 @@ void validate_device_csr_contents(const minplus_sparse::DeviceCsrF32& g, hipStre
     throw std::invalid_argument(
         "invalid device CSR: rowptr/colind must be in range and weights finite nonnegative");
   }
-}
-
-OutgoingCsrOwner build_outgoing_csr_from_incoming(const minplus_sparse::DeviceCsrF32& in,
-                                                  hipStream_t stream) {
-  OutgoingCsrOwner out(in.rows, in.cols, in.nnz);
-  DeviceBuffer<Offset> degree(static_cast<std::size_t>(in.rows));
-  DeviceBuffer<Offset> cursor(static_cast<std::size_t>(in.rows));
-
-  DS_DELTA_HIP_CHECK(hipMemsetAsync(degree.get(), 0,
-                                    static_cast<std::size_t>(in.rows) * sizeof(Offset), stream));
-  count_out_degrees_from_incoming_kernel<<<grid_for_items(in.rows), kBlockSize, 0, stream>>>(
-      in.rows, in.rowptr, in.colind, degree.get());
-  DS_DELTA_HIP_CHECK(hipGetLastError());
-
-  std::size_t temp_bytes = 0;
-  const std::size_t scan_items = static_cast<std::size_t>(in.rows);
-
-  // Same rocPRIM argument order used by bf_hip_CSR_device_utils.hpp:
-  //   input, output, initial_value, size, scan_op, stream.
-  DS_DELTA_HIP_CHECK(rocprim::exclusive_scan(nullptr,
-                                             temp_bytes,
-                                             degree.get(),
-                                             out.rowptr.get(),
-                                             static_cast<Offset>(0),
-                                             scan_items,
-                                             rocprim::plus<Offset>(),
-                                             stream));
-  DeviceBuffer<unsigned char> temp(temp_bytes);
-  DS_DELTA_HIP_CHECK(rocprim::exclusive_scan(temp.get(),
-                                             temp_bytes,
-                                             degree.get(),
-                                             out.rowptr.get(),
-                                             static_cast<Offset>(0),
-                                             scan_items,
-                                             rocprim::plus<Offset>(),
-                                             stream));
-
-  set_last_rowptr_kernel<<<1, 1, 0, stream>>>(out.rowptr.get(), in.rows, in.nnz);
-  DS_DELTA_HIP_CHECK(hipGetLastError());
-  DS_DELTA_HIP_CHECK(hipMemcpyAsync(cursor.get(), out.rowptr.get(),
-                                    static_cast<std::size_t>(in.rows) * sizeof(Offset),
-                                    hipMemcpyDeviceToDevice, stream));
-
-  if (in.nnz != 0) {
-    fill_outgoing_from_incoming_kernel<<<grid_for_items(in.rows), kBlockSize, 0, stream>>>(
-        in.rows, in.rowptr, in.colind, in.values, cursor.get(), out.colind.get(),
-        out.values.get(), out.incoming_edge.get());
-    DS_DELTA_HIP_CHECK(hipGetLastError());
-  }
-  return out;
-}
-
-void update_outgoing_values_from_incoming(OutgoingCsrOwner& outgoing,
-                                          const minplus_sparse::DeviceCsrF32& incoming,
-                                          hipStream_t stream) {
-  if (incoming.nnz == 0) {
-    return;
-  }
-  update_outgoing_values_from_incoming_kernel<<<grid_for_items(incoming.nnz),
-                                                kBlockSize,
-                                                0,
-                                                stream>>>(
-      incoming.nnz, incoming.values, outgoing.incoming_edge.get(), outgoing.values.get());
-  DS_DELTA_HIP_CHECK(hipGetLastError());
 }
 
 void initialize_scratch_once(DeltaSteppingScratch& scratch,
