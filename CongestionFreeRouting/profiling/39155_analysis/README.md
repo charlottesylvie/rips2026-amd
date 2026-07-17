@@ -154,30 +154,32 @@ deserve an A/B test, but they are secondary to the status-loop hypothesis.
 Do not use this forced-generic mode for the production `logicnets_jscl` result.
 The current converter writes every edge weight as exactly `1.0f`, and the
 finite `--max-sssp-iters` value disables the exact-unit Delta specialization.
-Use either the default `unit-bfs` engine or `delta-step` without the finite
-iteration option. Benchmark both before choosing one.
+The full-device CSR also has 28,226,432 rows, above that specialization's
+`2^24`-row guard, so removing the finite option alone does not activate it on
+this graph. Use the default `unit-bfs` engine for the production baseline and
+compare it with generic Delta-Stepping. Test the Delta exact-unit path only on
+an eligible smaller/bounded CSR unless its float-depth guard is redesigned.
 
-### Provisional generic Delta-Stepping order
+### Generic Delta-Stepping order after the counter follow-up
 
-1. Keep loop-control state on the GPU. Replace intermediate scalar D2H copies
-   and `hipStreamSynchronize` calls with device-side iteration/termination,
-   larger device-controlled batches, or a persistent control kernel. Pack any
-   unavoidable completion data into one transfer per query.
-2. Reduce or eliminate ROCclr copy/fill dispatches. Initialize counters in
-   existing kernels, carry current counts/minimum bucket/settlement state on
-   device, and fuse dependent status decisions where correctness permits.
-3. Eliminate predecessor materialization and exact-edge row recovery, ideally
+1. Eliminate predecessor materialization and exact-edge row recovery, ideally
    by publishing a compact original predecessor-edge ID with the winning key.
-4. Reduce full global state passes. Generation-stamp or fuse touched-state
-   reset and queue-flag clearing if their production traces remain material.
+2. Reduce sparse touched-state reset, starting with mode-specialized removal of
+   writes that are already made logically stale by distance/key validity.
+3. Keep loop-control state on the GPU. Replace intermediate scalar D2H copies
+   and `hipStreamSynchronize` calls with device-side iteration/termination or
+   larger device-controlled batches.
+4. Use compact 32-bit row/edge state when graph size permits, then measure the
+   cache and traffic effect.
 5. Test 1, 2, 4, and 8 workers. All four observed ROCm queues have a dispatch
    in flight for most of the kernel span; four workers may preserve throughput
    while reducing tail latency and duplicated state, but CU and memory-system
    saturation are unknown.
 6. Pre-reserve and reuse query/path buffers to avoid small reallocations and
    synchronizing frees.
-7. Use hardware counters to decide whether compact 32-bit offsets, degree-aware
-   scheduling, locality changes, or arithmetic tuning should move higher.
+7. Collect reached-row degree histograms before implementing degree-aware
+   scheduling. Deprioritize ROCclr copy/fill and pending-bucket redesigns: the
+   counter profile measures them at only about 1% each.
 
 The four-slot aggregate-work lower bound is 18.471 s versus a 19.441 s observed
 GPU span, so merely filling submission gaps has only about 5% headroom under
@@ -199,7 +201,7 @@ on the host. A production Unit-BFS trace must confirm the exact call mix.
 
 ## Required follow-up tests
 
-These tests are necessary before either optimization roadmap is reordered.
+These tests remain useful for validating the reordered optimization roadmaps.
 Target `logicnets_jscl_PathFinderFile.phys` directly to avoid checker and
 wirelength work.
 
@@ -219,7 +221,7 @@ make ROUTER=PathFinderFile BENCHMARKS="logicnets_jscl" VERBOSE=1 \
   logicnets_jscl_PathFinderFile.phys
 ```
 
-Exact-unit Delta specialization:
+Delta without a finite iteration limit (still generic on this full-device CSR):
 
 ```bash
 make ROUTER=PathFinderFile BENCHMARKS="logicnets_jscl" VERBOSE=1 \
@@ -270,11 +272,11 @@ depend on the installed ROCm version:
 
 ```bash
 rocprof-compute profile --list-available-metrics
-rocprofv3-avail list --pmc -d 0
-rocprofv3-avail info --pmc -d 0
+rocprofv3-avail -d 0 list --pmc
+rocprofv3-avail -d 0 info --pmc
 ```
 
-Use `rocprofv3-avail pmc-check -d 0 <counter ...>` before grouping counters.
+Use `rocprofv3-avail -d 0 pmc-check <counter ...>` before grouping counters.
 AMD documents these commands in the
 [`rocprofv3-avail` guide](https://rocm.docs.amd.com/projects/rocprofiler-sdk/en/develop/how-to/using-rocprofv3-avail.html).
 
