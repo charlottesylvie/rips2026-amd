@@ -152,6 +152,7 @@ void print_usage(const char* program) {
       << "  --sssp-engine <unit-bfs|delta-step|bellman-ford>\n"
       << "                                 Forwarded to pathfinder. Default: unit-bfs\n"
       << "  --use-delta-step               Forwarded to pathfinder for comparison.\n"
+      << "  --delta-force-legacy-parent    Forwarded for generic Delta parent-path A/B comparison.\n"
       << "  --delta <float>                Forwarded to pathfinder.\n"
       << "  --max-sssp-iters <int>         Forwarded to pathfinder.\n"
       << "  --net-limit <count>            Forwarded to pathfinder.\n"
@@ -215,7 +216,8 @@ Options parse_args(int argc, char** argv) {
       options.routes_to_phys = require_value("--routes-to-phys");
     } else if (option == "--strict-routing") {
       options.allow_unrouted = false;
-    } else if (option == "--use-delta-step") {
+    } else if (option == "--use-delta-step" ||
+               option == "--delta-force-legacy-parent") {
       options.pathfinder_args.push_back(option);
     } else if (option == "--sssp-engine" ||
                option == "--delta" ||

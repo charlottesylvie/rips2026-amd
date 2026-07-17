@@ -1,6 +1,6 @@
 #include "pathfinder.hpp"
 
-#include "bellman_ford/bf9.hpp"
+#include "bellman_ford/bf10.hpp"
 #include "delta_stepping/delta_stepping_hip_CSR.hpp"
 #include "profiling/roctx_ranges.hpp"
 #include "unit_bfs/unit_bfs_hip_CSR.hpp"
@@ -10,17 +10,17 @@
 // This keeps the same benchmark-facing and route JSON APIs, but the routing
 // pass intentionally ignores present/historical congestion.  The default
 // engine uses a unit-weight GPU BFS specialized for the converter's unit
-// routing graph. GPU delta-stepping and Bellman-Ford bf9 remain selectable for
+// routing graph. GPU delta-stepping and Bellman-Ford bf10 remain selectable for
 // comparison.
 //
 // Example GPU build from the repository root:
-//   hipcc -std=c++17 -O3 -x hip -DBF9_NO_MAIN \
+//   hipcc -std=c++17 -O3 -x hip -DBF10_NO_MAIN \
 //     -I HIP_kernel/bellman_ford/src \
 //     -I CongestionFreeRouting/bellman_ford \
 //     -I CongestionFreeRouting/delta_stepping \
 //     -I CongestionFreeRouting/unit_bfs \
 //     CongestionFreeRouting/pathfinder.cpp \
-//     CongestionFreeRouting/bellman_ford/bf9.cpp \
+//     CongestionFreeRouting/bellman_ford/bf10.cpp \
 //     CongestionFreeRouting/delta_stepping/delta_stepping_hip_CSR.cpp \
 //     CongestionFreeRouting/unit_bfs/unit_bfs_hip_CSR.cpp \
 //     -pthread \
@@ -1013,7 +1013,7 @@ SsspEngine parse_sssp_engine_arg(const char* text) {
     return SsspEngine::kDeltaStep;
   }
   if (value == "bellman-ford" || value == "bellman_ford" || value == "bf8" ||
-      value == "bf9") {
+      value == "bf9" || value == "bf10") {
     return SsspEngine::kBellmanFord;
   }
   throw std::runtime_error("invalid sssp-engine: " + value);
@@ -1036,11 +1036,13 @@ void print_usage(const char* program) {
       << "Usage:\n"
       << "  " << program << " <graph.csrbin> [metadata.ifmeta.bin] [options]\n\n"
       << "Options:\n"
-      << "  --sssp-engine <unit-bfs|delta-step|bellman-ford>\n"
-      << "                                  Shortest-path backend. Default: unit-bfs\n"
+      << "  --sssp-engine <unit-bfs|delta-step|bellman-ford|bf10>\n"
+      << "                                  Shortest-path backend. bellman-ford and bf10 select BF10;\n"
+      << "                                  bf8 and bf9 are compatibility aliases. Default: unit-bfs\n"
       << "  --use-delta-step                Use delta-step backend for comparison.\n"
       << "  --delta <float>                 Delta-stepping bucket width. Default: 4\n"
       << "  --max-sssp-iters <int>          Delta rounds, BFS depth, or Bellman-Ford rounds; -1 for default.\n"
+      << "  --delta-force-legacy-parent     Force generic Delta predecessor recovery for A/B comparison.\n"
       << "  --capacity <int>                Capacity used only for overuse diagnostics. Default: 1\n"
       << "  --net-limit <count>             Route only the first count requests.\n"
       << "  --parallel-net-workers <count>  Independent net workers. Default: 0 (engine-dependent auto).\n"
@@ -1405,6 +1407,14 @@ PathfinderResult run_pathfinder(const HostCsrF32& base_graph,
                   << delta_options.parallel_net_workers
                   << " delta-step worker(s)\n";
       }
+      const DeltaSteppingCsrParentMode parent_mode =
+          delta_options.delta_force_legacy_parent
+              ? DeltaSteppingCsrParentMode::kForceLegacy
+              : DeltaSteppingCsrParentMode::kAutomatic;
+      if (parent_mode == DeltaSteppingCsrParentMode::kForceLegacy) {
+        std::cout << "[pathfinder] selected forced legacy parent mode for "
+                     "generic vector-target delta runs\n";
+      }
       route_all_nets_with_workspace(
           base_graph,
           metadata,
@@ -1413,18 +1423,20 @@ PathfinderResult run_pathfinder(const HostCsrF32& base_graph,
           route_request_count,
           progress_interval,
           result.nets,
-          [shared_graph](hipStream_t worker_stream) {
-            return DeltaSteppingCsrWorkspace(shared_graph, worker_stream);
+          [shared_graph, parent_mode](hipStream_t worker_stream) {
+            return DeltaSteppingCsrWorkspace(shared_graph, worker_stream,
+                                             parent_mode);
           });
       break;
     }
     case SsspEngine::kBellmanFord: {
+      std::cout << "[pathfinder] selected Bellman-Ford bf10 backend\n";
       auto shared_graph =
-          std::make_shared<BellmanFordCsrGraph>(base_graph, stream);
+          std::make_shared<BellmanFord10CsrGraph>(base_graph, stream);
       PathfinderOptions bellman_ford_options = options;
       if (bellman_ford_options.parallel_net_workers == 0) {
         // Start conservatively: every worker owns a full frontier state and
-        // may copy one packed predecessor tree to the host per legal source.
+        // persistent reconstruction scratch buffers.
         bellman_ford_options.parallel_net_workers = 1;
         std::cout << "[pathfinder] auto-selected 1 Bellman-Ford worker(s)\n";
       }
@@ -1437,7 +1449,7 @@ PathfinderResult run_pathfinder(const HostCsrF32& base_graph,
           progress_interval,
           result.nets,
           [shared_graph](hipStream_t worker_stream) {
-            return BellmanFordCsrWorkspace(shared_graph, worker_stream);
+            return BellmanFord10CsrWorkspace(shared_graph, worker_stream);
           });
       break;
     }
@@ -1642,6 +1654,8 @@ int main(int argc, char** argv) {
       } else if (option == "--max-sssp-iters") {
         options.max_sssp_iterations =
             routing::parse_int_arg(require_value("--max-sssp-iters"), "max-sssp-iters");
+      } else if (option == "--delta-force-legacy-parent") {
+        options.delta_force_legacy_parent = true;
       } else if (option == "--capacity") {
         options.capacity = routing::parse_int_arg(require_value("--capacity"), "capacity");
       } else if (option == "--present-factor") {

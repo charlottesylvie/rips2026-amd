@@ -4,6 +4,8 @@
 
 #include <hip/hip_runtime.h>
 
+#include <cstdint>
+#include <limits>
 #include <memory>
 #include <vector>
 
@@ -16,6 +18,24 @@
 using DeltaSteppingCsrProgress = BellmanFordCsrProgress;
 using DeltaSteppingCsrProgressCallback = BellmanFordCsrProgressCallback;
 using DeltaSteppingCsrResult = BellmanFordCsrResult;
+
+enum class DeltaSteppingCsrParentMode {
+  // Applies only to eligible generic vector-target workspace runs. Unit-BFS,
+  // single-target/full-predecessor, full-distance, and raw-device APIs retain
+  // their existing implementations.
+  kAutomatic,
+  kForceLegacy,
+};
+
+// A graph with 2^32 edges is still eligible: its largest original CSR edge ID
+// is UINT32_MAX. Keep this helper allocation-free so boundary behavior can be
+// validated without constructing an impractically large graph.
+constexpr bool delta_stepping_compact_edge_ids_eligible(
+    minplus_sparse::Offset nnz) noexcept {
+  return nnz >= 0 &&
+         static_cast<std::uint64_t>(nnz) <=
+             (std::uint64_t{1} << std::numeric_limits<std::uint32_t>::digits);
+}
 
 // Immutable device CSR that can be shared by independent Delta-Stepping
 // workspaces. The graph and every workspace using it must remain on the HIP
@@ -48,12 +68,25 @@ class DeltaSteppingCsrWorkspace {
   // use the same stream handle. Separate workspaces may use separate streams.
   explicit DeltaSteppingCsrWorkspace(const HostCsrF32& adjacency,
                                      hipStream_t stream = nullptr);
+  DeltaSteppingCsrWorkspace(const HostCsrF32& adjacency,
+                            hipStream_t stream,
+                            DeltaSteppingCsrParentMode parent_mode)
+      : DeltaSteppingCsrWorkspace(adjacency, stream) {
+    parent_mode_ = parent_mode;
+  }
   // Shared-graph workspaces keep private mutable search state but reuse the
   // immutable CSR. update_values() is intentionally unavailable for this form;
   // update_vertex_costs() remains workspace-local and is supported.
   explicit DeltaSteppingCsrWorkspace(
       std::shared_ptr<const DeltaSteppingCsrGraph> adjacency,
       hipStream_t stream = nullptr);
+  DeltaSteppingCsrWorkspace(
+      std::shared_ptr<const DeltaSteppingCsrGraph> adjacency,
+      hipStream_t stream,
+      DeltaSteppingCsrParentMode parent_mode)
+      : DeltaSteppingCsrWorkspace(adjacency, stream) {
+    parent_mode_ = parent_mode;
+  }
   ~DeltaSteppingCsrWorkspace();
 
   DeltaSteppingCsrWorkspace(const DeltaSteppingCsrWorkspace&) = delete;
@@ -95,6 +128,8 @@ class DeltaSteppingCsrWorkspace {
       void* progress_user_data = nullptr);
 
  private:
+  DeltaSteppingCsrParentMode parent_mode_ =
+      DeltaSteppingCsrParentMode::kAutomatic;
   std::unique_ptr<Impl> impl_;
 };
 

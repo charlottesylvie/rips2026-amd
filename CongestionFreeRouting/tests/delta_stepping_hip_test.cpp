@@ -346,6 +346,93 @@ void validate_compact_target_paths(
           label + ": aggregate target_reached flag mismatch");
 }
 
+void validate_parent_mode_agreement(
+    const std::string& label,
+    const DeltaSteppingCsrResult& automatic,
+    const DeltaSteppingCsrResult& legacy) {
+  require(automatic.target_distances.size() ==
+              legacy.target_distances.size(),
+          label + ": target distance count differs between parent modes");
+  for (std::size_t i = 0; i < automatic.target_distances.size(); ++i) {
+    require(close_enough(automatic.target_distances[i],
+                         legacy.target_distances[i]),
+            label + ": target distance differs between parent modes");
+  }
+  require(automatic.target_reached == legacy.target_reached,
+          label + ": aggregate target status differs between parent modes");
+  require(automatic.stopped_on_target == legacy.stopped_on_target,
+          label + ": target-stop status differs between parent modes");
+  require(automatic.converged == legacy.converged,
+          label + ": convergence status differs between parent modes");
+  require(automatic.iterations_used == legacy.iterations_used,
+          label + ": bucket iteration count differs between parent modes");
+}
+
+void run_compact_parent_mode_comparison(
+    const std::string& label,
+    const HostCsrF32& graph,
+    const std::vector<int>& sources,
+    const std::vector<int>& targets,
+    float delta,
+    hipStream_t stream,
+    const std::vector<float>* vertex_costs = nullptr,
+    int max_iters = -1) {
+  auto shared_graph =
+      std::make_shared<DeltaSteppingCsrGraph>(graph, stream);
+  DeltaSteppingCsrWorkspace automatic(shared_graph, stream);
+  DeltaSteppingCsrWorkspace legacy(
+      shared_graph, stream, DeltaSteppingCsrParentMode::kForceLegacy);
+  if (vertex_costs != nullptr) {
+    automatic.update_vertex_costs(*vertex_costs, stream);
+    legacy.update_vertex_costs(*vertex_costs, stream);
+  }
+
+  const std::vector<float> expected =
+      cpu_dijkstra_outgoing_multi_source(graph, sources, vertex_costs);
+  const DeltaSteppingCsrResult automatic_result = automatic.run(
+      sources, targets, delta, max_iters, stream, nullptr, nullptr);
+  const DeltaSteppingCsrResult legacy_result = legacy.run(
+      sources, targets, delta, max_iters, stream, nullptr, nullptr);
+  validate_compact_target_paths(label + ": automatic",
+                                graph,
+                                sources,
+                                targets,
+                                expected,
+                                automatic_result,
+                                vertex_costs);
+  validate_compact_target_paths(label + ": forced legacy",
+                                graph,
+                                sources,
+                                targets,
+                                expected,
+                                legacy_result,
+                                vertex_costs);
+  validate_parent_mode_agreement(label, automatic_result, legacy_result);
+  require(automatic_result.pred_node.empty() &&
+              automatic_result.pred_edge.empty(),
+          label + ": compact result unexpectedly materialized full predecessors");
+}
+
+void test_compact_edge_id_eligibility() {
+  const std::uint64_t edge_id_count_limit = std::uint64_t{1} << 32;
+  require(!delta_stepping_compact_edge_ids_eligible(
+              static_cast<Offset>(-1)),
+          "negative nnz was compact-edge eligible");
+  require(delta_stepping_compact_edge_ids_eligible(0),
+          "empty graph was not compact-edge eligible");
+  require(delta_stepping_compact_edge_ids_eligible(1),
+          "single-edge graph was not compact-edge eligible");
+  require(delta_stepping_compact_edge_ids_eligible(
+              static_cast<Offset>(edge_id_count_limit - 1)),
+          "UINT32_MAX-edge graph was not compact-edge eligible");
+  require(delta_stepping_compact_edge_ids_eligible(
+              static_cast<Offset>(edge_id_count_limit)),
+          "2^32-edge graph was not compact-edge eligible");
+  require(!delta_stepping_compact_edge_ids_eligible(
+              static_cast<Offset>(edge_id_count_limit + 1)),
+          "graph above the 32-bit edge-ID boundary was eligible");
+}
+
 void validate_single_target_predecessors(
     const std::string& label,
     const HostCsrF32& graph,
@@ -466,6 +553,203 @@ HostCsrF32 make_weighted_corner_graph() {
        {11, 10, 1.5f}});
 }
 
+void test_generic_compact_parent_modes(hipStream_t stream) {
+  const HostCsrF32 all_light = make_outgoing_csr(
+      6,
+      {{0, 2, 1.5f},
+       {0, 1, 0.25f},
+       {0, 1, 0.5f},
+       {1, 3, 0.75f},
+       {2, 3, 0.25f},
+       {3, 4, 1.25f}});
+  run_compact_parent_mode_comparison("generic weighted all-light",
+                                     all_light,
+                                     {0, 0},
+                                     {0, 4, 3, 5, 4},
+                                     2.0f,
+                                     stream);
+
+  const HostCsrF32 all_heavy = make_outgoing_csr(
+      6,
+      {{0, 2, 1.25f},
+       {0, 1, 0.75f},
+       {1, 3, 0.75f},
+       {2, 3, 1.5f},
+       {3, 4, 0.75f}});
+  run_compact_parent_mode_comparison("generic weighted all-heavy",
+                                     all_heavy,
+                                     {0},
+                                     {4, 3, 0, 5},
+                                     0.5f,
+                                     stream);
+
+  // Row zero deliberately mixes light/heavy work, keeps parallel edges, and
+  // offers three equal-distance ways to reach vertex four. Parent modes may
+  // choose different valid original edges; only distance/path validity is
+  // compared.
+  const HostCsrF32 mixed = make_outgoing_csr(
+      6,
+      {{0, 4, 1.25f},
+       {0, 2, 0.75f},
+       {0, 1, 0.25f},
+       {0, 3, 2.5f},
+       {0, 1, 0.25f},
+       {1, 4, 1.0f},
+       {2, 4, 0.5f},
+       {3, 4, 0.25f}});
+  run_compact_parent_mode_comparison("generic weighted mixed rows",
+                                     mixed,
+                                     {0, 0},
+                                     {4, 4, 0, 5, 2},
+                                     1.0f,
+                                     stream);
+
+  const HostCsrF32 cost_graph = make_outgoing_csr(
+      6,
+      {{0, 2, 0.75f},
+       {0, 1, 0.75f},
+       {1, 3, 0.75f},
+       {2, 3, 0.75f},
+       {1, 4, 0.75f},
+       {3, 4, 0.75f}});
+  std::vector<float> vertex_costs(
+      static_cast<std::size_t>(cost_graph.rows), 1.0f);
+  vertex_costs[1] = 0.5f;
+  vertex_costs[2] = 2.0f;
+  vertex_costs[3] = 2.0f;
+  vertex_costs[4] = 0.25f;
+  run_compact_parent_mode_comparison(
+      "vertex costs reclassify light and heavy edges",
+      cost_graph,
+      {0},
+      {4, 3, 2, 5, 0},
+      1.0f,
+      stream,
+      &vertex_costs);
+}
+
+void test_compact_early_settlement_reset(hipStream_t stream) {
+  const HostCsrF32 graph = make_outgoing_csr(
+      5,
+      {{0, 1, 0.25f},
+       {0, 2, 5.0f},
+       {2, 3, 0.25f},
+       {3, 4, 0.25f}});
+  DeltaSteppingCsrWorkspace workspace(graph, stream);
+  const std::vector<float> expected =
+      cpu_dijkstra_outgoing_multi_source(graph, {0});
+
+  const DeltaSteppingCsrResult early = workspace.run(
+      std::vector<int>{0}, std::vector<int>{1}, 1.0f, -1,
+      stream, nullptr, nullptr);
+  validate_compact_target_paths("compact early settlement",
+                                graph,
+                                {0},
+                                {1},
+                                expected,
+                                early);
+  require(early.stopped_on_target && !early.converged,
+          "compact early-settlement query did not stop on its target");
+
+  // The first bucket also discovers vertex two in a future bucket. Repeating
+  // from the same source requires reduced reset to clear that live pending
+  // membership bit; otherwise vertex two cannot be enqueued again.
+  const std::vector<int> later_targets = {3, 4, 1};
+  const DeltaSteppingCsrResult repeated = workspace.run(
+      std::vector<int>{0}, later_targets, 1.0f, -1,
+      stream, nullptr, nullptr);
+  validate_compact_target_paths("compact after early-settlement reset",
+                                graph,
+                                {0},
+                                later_targets,
+                                expected,
+                                repeated);
+  require(repeated.stopped_on_target,
+          "repeated compact query lost pending work after early settlement");
+
+  const HostCsrF32 all_light_graph = make_outgoing_csr(
+      5,
+      {{0, 1, 0.25f},
+       {0, 2, 0.75f},
+       {2, 3, 0.75f},
+       {3, 4, 0.25f}});
+  DeltaSteppingCsrWorkspace all_light_workspace(all_light_graph, stream);
+  const std::vector<float> all_light_expected =
+      cpu_dijkstra_outgoing_multi_source(all_light_graph, {0});
+  const DeltaSteppingCsrResult all_light_early = all_light_workspace.run(
+      std::vector<int>{0}, std::vector<int>{1}, 1.0f, -1,
+      stream, nullptr, nullptr);
+  validate_compact_target_paths("all-light compact early settlement",
+                                all_light_graph,
+                                {0},
+                                {1},
+                                all_light_expected,
+                                all_light_early);
+  require(all_light_early.stopped_on_target && !all_light_early.converged,
+          "all-light compact query did not stop with future work queued");
+
+  // All individual edges are light, but the cumulative 0->2->3 distance is
+  // in a future bucket. This repeats the live-pending reset check through the
+  // specialization that intentionally omits the in_heavy reset store.
+  const std::vector<int> all_light_later_targets = {3, 4};
+  const DeltaSteppingCsrResult all_light_repeated = all_light_workspace.run(
+      std::vector<int>{0}, all_light_later_targets, 1.0f, -1,
+      stream, nullptr, nullptr);
+  validate_compact_target_paths("all-light compact pending reset",
+                                all_light_graph,
+                                {0},
+                                all_light_later_targets,
+                                all_light_expected,
+                                all_light_repeated);
+  require(all_light_repeated.stopped_on_target,
+          "all-light compact repeat lost future-bucket pending work");
+}
+
+void test_compact_weight_class_updates(hipStream_t stream) {
+  HostCsrF32 graph = make_outgoing_csr(
+      6,
+      {{0, 1, 0.25f},
+       {0, 2, 0.75f},
+       {1, 3, 0.5f},
+       {2, 3, 0.25f},
+       {3, 4, 0.5f},
+       {4, 5, 0.25f}});
+  DeltaSteppingCsrWorkspace workspace(graph, stream);
+  const std::vector<int> sources = {0};
+  const std::vector<int> targets = {5, 4, 0, 5};
+  auto validate_current = [&](const std::string& label,
+                              const std::vector<float>* vertex_costs) {
+    const DeltaSteppingCsrResult result = workspace.run(
+        sources, targets, 1.0f, -1, stream, nullptr, nullptr);
+    validate_compact_target_paths(
+        label,
+        graph,
+        sources,
+        targets,
+        cpu_dijkstra_outgoing_multi_source(graph, sources, vertex_costs),
+        result,
+        vertex_costs);
+  };
+
+  validate_current("updated topology map all-light", nullptr);
+
+  graph.values = {2.0f, 0.25f, 1.5f, 0.25f, 0.5f, 2.0f};
+  workspace.update_values(graph.values, stream);
+  validate_current("updated topology map mixed-heavy", nullptr);
+
+  graph.values = {0.375f, 0.625f, 0.5f, 0.25f, 0.75f, 0.5f};
+  workspace.update_values(graph.values, stream);
+  validate_current("updated topology map back to all-light", nullptr);
+
+  std::vector<float> vertex_costs(
+      static_cast<std::size_t>(graph.rows), 1.0f);
+  vertex_costs[1] = 4.0f;
+  vertex_costs[3] = 3.0f;
+  vertex_costs[5] = 2.5f;
+  workspace.update_vertex_costs(vertex_costs, stream);
+  validate_current("updated topology map with vertex costs", &vertex_costs);
+}
+
 void test_empty_and_singleton_graphs(hipStream_t stream) {
   {
     const HostCsrF32 graph = make_outgoing_csr(1, {});
@@ -492,6 +776,15 @@ void test_empty_and_singleton_graphs(hipStream_t stream) {
                                stream,
                                nullptr,
                                true);
+    run_compact_parent_mode_comparison(
+        "empty-edge compact parent modes",
+        graph,
+        {1, 1},
+        {1, 0, 4, 1},
+        0.25f,
+        stream,
+        nullptr,
+        std::numeric_limits<int>::max());
   }
 }
 
@@ -598,6 +891,12 @@ void test_zero_weight_scc_predecessors(hipStream_t stream) {
                              stream,
                              nullptr,
                              true);
+  run_compact_parent_mode_comparison("zero-weight SCC compact parent modes",
+                                     graph,
+                                     {0},
+                                     {1, 2, 3, 4},
+                                     0.5f,
+                                     stream);
 }
 
 void test_float_bucket_boundaries_and_saturation(hipStream_t stream) {
@@ -709,8 +1008,12 @@ void test_batched_closure_and_iteration_fallback(hipStream_t stream) {
   {
     const HostCsrF32 graph = make_outgoing_csr(
         4,
-        {{0, 1, 1.0f}, {1, 2, 1.0f}, {2, 3, 1.0f}});
+        {{0, 1, 0.75f}, {1, 2, 1.25f}, {2, 3, 0.5f}});
     DeltaSteppingCsrWorkspace workspace(graph, stream);
+    DeltaSteppingCsrWorkspace legacy(
+        graph, stream, DeltaSteppingCsrParentMode::kForceLegacy);
+    const std::vector<float> expected =
+        cpu_dijkstra_outgoing_multi_source(graph, {0});
     const DeltaSteppingCsrResult zero_iterations = workspace.run(
         std::vector<int>{0}, std::vector<int>{3},
         1.0f, 0, stream, nullptr, nullptr);
@@ -728,12 +1031,42 @@ void test_batched_closure_and_iteration_fallback(hipStream_t stream) {
     require(!limited.converged,
             "limited generic run incorrectly reported full convergence");
 
+    const std::vector<int> partial_targets = {1, 3};
+    std::vector<float> partial_expected = expected;
+    partial_expected[3] = kInf;
+    const DeltaSteppingCsrResult automatic_partial = workspace.run(
+        std::vector<int>{0}, partial_targets,
+        1.0f, 1, stream, nullptr, nullptr);
+    const DeltaSteppingCsrResult legacy_partial = legacy.run(
+        std::vector<int>{0}, partial_targets,
+        1.0f, 1, stream, nullptr, nullptr);
+    validate_compact_target_paths("weighted finite-limit automatic",
+                                  graph,
+                                  {0},
+                                  partial_targets,
+                                  partial_expected,
+                                  automatic_partial);
+    validate_compact_target_paths("weighted finite-limit forced legacy",
+                                  graph,
+                                  {0},
+                                  partial_targets,
+                                  partial_expected,
+                                  legacy_partial);
+    validate_parent_mode_agreement("weighted finite-limit parent modes",
+                                   automatic_partial,
+                                   legacy_partial);
+    require(automatic_partial.iterations_used == 1 &&
+                legacy_partial.iterations_used == 1 &&
+                !automatic_partial.stopped_on_target &&
+                !legacy_partial.stopped_on_target &&
+                !automatic_partial.converged &&
+                !legacy_partial.converged,
+            "weighted finite-limit parent modes did not preserve the cap");
+
     std::vector<DeltaSteppingCsrProgress> progress;
     const DeltaSteppingCsrResult callback_result = workspace.run(
         std::vector<int>{0}, std::vector<int>{3},
         1.0f, -1, stream, record_progress, &progress);
-    const std::vector<float> expected =
-        cpu_dijkstra_outgoing_multi_source(graph, {0});
     validate_compact_target_paths("generic callback fallback",
                                   graph,
                                   {0},
@@ -751,7 +1084,55 @@ void test_batched_closure_and_iteration_fallback(hipStream_t stream) {
               "generic callback reported the wrong unlimited iteration cap");
     }
     require(callback_result.stopped_on_target && !callback_result.converged,
-            "unit-graph callback fallback did not stop on its target");
+            "weighted callback run did not stop on its target");
+
+    std::vector<DeltaSteppingCsrProgress> legacy_progress;
+    const DeltaSteppingCsrResult legacy_callback_result = legacy.run(
+        std::vector<int>{0}, std::vector<int>{3},
+        1.0f, -1, stream, record_progress, &legacy_progress);
+    validate_compact_target_paths("forced-legacy weighted callback",
+                                  graph,
+                                  {0},
+                                  {3},
+                                  expected,
+                                  legacy_callback_result);
+    validate_parent_mode_agreement("weighted callback parent modes",
+                                   callback_result,
+                                   legacy_callback_result);
+    require(!legacy_progress.empty(),
+            "forced-legacy weighted callback did not report progress");
+    for (std::size_t i = 0; i < legacy_progress.size(); ++i) {
+      require(legacy_progress[i].iteration == static_cast<int>(i + 1) &&
+                  legacy_progress[i].convergence_checked,
+              "forced-legacy weighted callback sequence is invalid");
+    }
+    require(progress.size() == legacy_progress.size(),
+            "callback count differs between compact parent modes");
+    for (std::size_t i = 0; i < progress.size(); ++i) {
+      require(progress[i].max_iters == legacy_progress[i].max_iters &&
+                  progress[i].changed == legacy_progress[i].changed,
+              "callback payload differs between compact parent modes");
+    }
+  }
+  {
+    const HostCsrF32 exact_unit_graph = make_outgoing_csr(
+        4,
+        {{0, 1, 1.0f}, {1, 2, 1.0f}, {2, 3, 1.0f}});
+    DeltaSteppingCsrWorkspace exact_unit_workspace(exact_unit_graph, stream);
+    const DeltaSteppingCsrResult limited_exact_unit =
+        exact_unit_workspace.run(std::vector<int>{0},
+                                 std::vector<int>{3},
+                                 1.0f,
+                                 1,
+                                 stream,
+                                 nullptr,
+                                 nullptr);
+    require(limited_exact_unit.iterations_used == 1 &&
+                !limited_exact_unit.target_reached &&
+                !limited_exact_unit.stopped_on_target &&
+                !limited_exact_unit.converged,
+            "finite iteration cap did not keep an exact-unit graph on its "
+            "generic fallback");
   }
 }
 
@@ -974,11 +1355,22 @@ void test_workspace_reuse_and_updates(hipStream_t stream) {
   const HostCsrF32 original = make_weighted_corner_graph();
   HostCsrF32 current = original;
   DeltaSteppingCsrWorkspace workspace(original, stream);
+  DeltaSteppingCsrWorkspace legacy_workspace(
+      original, stream, DeltaSteppingCsrParentMode::kForceLegacy);
 
   const std::vector<int> primary_sources = {0, 8, 0};
   const std::vector<int> primary_targets = {7, 4, 0, 8, 9, 7, 11};
   run_full_and_target_checks("weighted baseline",
                              workspace,
+                             current,
+                             primary_sources,
+                             primary_targets,
+                             2.25f,
+                             stream,
+                             nullptr,
+                             true);
+  run_full_and_target_checks("weighted baseline forced legacy",
+                             legacy_workspace,
                              current,
                              primary_sources,
                              primary_targets,
@@ -1019,8 +1411,18 @@ void test_workspace_reuse_and_updates(hipStream_t stream) {
                           (0.5f + 0.25f * static_cast<float>(edge % 5));
   }
   workspace.update_values(current.values, stream);
+  legacy_workspace.update_values(current.values, stream);
   run_full_and_target_checks("updated edge values",
                              workspace,
+                             current,
+                             primary_sources,
+                             primary_targets,
+                             1.75f,
+                             stream,
+                             nullptr,
+                             true);
+  run_full_and_target_checks("updated edge values forced legacy",
+                             legacy_workspace,
                              current,
                              primary_sources,
                              primary_targets,
@@ -1035,6 +1437,7 @@ void test_workspace_reuse_and_updates(hipStream_t stream) {
         0.5f + 0.375f * static_cast<float>((vertex * 7) % 6);
   }
   workspace.update_vertex_costs(vertex_costs, stream);
+  legacy_workspace.update_vertex_costs(vertex_costs, stream);
   run_full_and_target_checks("destination vertex costs",
                              workspace,
                              current,
@@ -1044,6 +1447,92 @@ void test_workspace_reuse_and_updates(hipStream_t stream) {
                              stream,
                              &vertex_costs,
                              true);
+  run_full_and_target_checks("destination vertex costs forced legacy",
+                             legacy_workspace,
+                             current,
+                             primary_sources,
+                             primary_targets,
+                             2.0f,
+                             stream,
+                             &vertex_costs,
+                             true);
+}
+
+void test_compact_legacy_mode_alternation(hipStream_t stream) {
+  const HostCsrF32 graph = make_weighted_corner_graph();
+  DeltaSteppingCsrWorkspace workspace(graph, stream);
+
+  const std::vector<int> primary_sources = {0, 8, 0};
+  const std::vector<int> primary_targets = {4, 7, 7, 0, 8};
+  const std::vector<float> primary_expected =
+      cpu_dijkstra_outgoing_multi_source(graph, primary_sources);
+
+  // Start with compact mode on a fresh workspace. This proves its source
+  // marker and core initialization do not depend on a preceding legacy run.
+  const DeltaSteppingCsrResult compact_first = workspace.run(
+      primary_sources, primary_targets, 1.25f, -1, stream, nullptr, nullptr);
+  validate_compact_target_paths("fresh compact before legacy",
+                                graph,
+                                primary_sources,
+                                primary_targets,
+                                primary_expected,
+                                compact_first);
+  require(compact_first.stopped_on_target &&
+              compact_first.pred_node.empty() &&
+              compact_first.pred_edge.empty(),
+          "fresh compact run materialized legacy predecessor storage");
+
+  const std::vector<float> disconnected_expected =
+      cpu_dijkstra_outgoing_multi_source(graph, {10});
+  const DeltaSteppingCsrResult single_after_compact = workspace.run(
+      std::vector<int>{10}, 11, 0.5f, -1, stream, nullptr, nullptr);
+  validate_single_target_predecessors("single target after compact",
+                                      graph,
+                                      {10},
+                                      11,
+                                      disconnected_expected[11],
+                                      single_after_compact);
+
+  const DeltaSteppingCsrResult full_after_single = workspace.run(
+      primary_sources, -1, 1.25f, -1, stream, nullptr, nullptr);
+  validate_full_distances("full after compact and single",
+                          primary_expected,
+                          full_after_single);
+
+  const std::vector<int> disconnected_targets = {11, 10, 0, 9, 11};
+  const DeltaSteppingCsrResult compact_after_legacy = workspace.run(
+      std::vector<int>{10}, disconnected_targets, 0.5f, -1,
+      stream, nullptr, nullptr);
+  validate_compact_target_paths("compact after legacy full run",
+                                graph,
+                                {10},
+                                disconnected_targets,
+                                disconnected_expected,
+                                compact_after_legacy);
+  require(compact_after_legacy.converged &&
+              !compact_after_legacy.stopped_on_target,
+          "compact run with unreachable targets did not exhaust its component");
+
+  const DeltaSteppingCsrResult second_single = workspace.run(
+      primary_sources, 4, 1.25f, -1, stream, nullptr, nullptr);
+  validate_single_target_predecessors("second single target after compact",
+                                      graph,
+                                      primary_sources,
+                                      4,
+                                      primary_expected[4],
+                                      second_single);
+  require(second_single.pred_node[10] == -1 &&
+              second_single.pred_edge[10] == static_cast<Offset>(-1),
+          "compact mode left a legacy predecessor marker on an untouched source");
+  const DeltaSteppingCsrResult repeated_compact = workspace.run(
+      primary_sources, primary_targets, 1.25f, -1,
+      stream, nullptr, nullptr);
+  validate_compact_target_paths("repeated compact after legacy",
+                                graph,
+                                primary_sources,
+                                primary_targets,
+                                primary_expected,
+                                repeated_compact);
 }
 
 HostCsrF32 make_random_graph(int vertex_count,
@@ -1130,8 +1619,12 @@ void test_seeded_random_graphs(hipStream_t stream) {
 
 int main() {
   try {
+    test_compact_edge_id_eligibility();
     HipStream stream;
     test_empty_and_singleton_graphs(stream.get());
+    test_generic_compact_parent_modes(stream.get());
+    test_compact_early_settlement_reset(stream.get());
+    test_compact_weight_class_updates(stream.get());
     test_unit_weight_specialization(stream.get());
     test_zero_weight_scc_predecessors(stream.get());
     test_float_bucket_boundaries_and_saturation(stream.get());
@@ -1139,6 +1632,7 @@ int main() {
     test_wave_boundary_contention(stream.get());
     test_shared_graph_workspaces(stream.get());
     test_workspace_reuse_and_updates(stream.get());
+    test_compact_legacy_mode_alternation(stream.get());
     test_seeded_random_graphs(stream.get());
     test_stream_affinity(stream.get());
     check_hip(hipStreamSynchronize(stream.get()), "final hipStreamSynchronize");
