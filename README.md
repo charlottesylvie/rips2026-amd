@@ -6,8 +6,9 @@ kernels for shortest-path experiments.
 
 The current benchmark-facing flow is the C++ `PathFinderFile` wrapper. It
 converts FPGA Interchange inputs into an internal CSR graph, routes nets with a
-one-shot shortest-path pass, and writes a routed `.phys` file. Overused nodes
-are reported as diagnostics; they do not make the one-shot router fail.
+one-shot shortest-path pass, and writes a routed `.phys` file. A separate
+snapshot workflow runs real congestion-aware PathFinder iterations and freezes
+their weighted CSR states for delta-stepping versus Bellman-Ford timing.
 
 ## Project Status
 
@@ -52,6 +53,7 @@ Forward wrapper or PathFinder tuning options through `PATHFINDER_ARGS`:
 
 ```bash
 make ROUTER=PathFinderFile BENCHMARKS="boom_med_pb" VERBOSE=1 \
+  PATHFINDER_SSSP_ENGINE=delta-step \
   PATHFINDER_ARGS="--delta 2 --max-pathfinder-iters 20 --keep-work-dir"
 ```
 
@@ -104,10 +106,12 @@ the generated `.csrbin`, metadata, and routes files for debugging.
 | Path | Purpose |
 | --- | --- |
 | `CongestionFreeRouting/interchange_to_csr.cpp` | Converts FPGA Interchange `.phys`, `.netlist`, and `.device` inputs into the router CSR graph and metadata sidecar. |
-| `CongestionFreeRouting/pathfinder.cpp` / `CongestionFreeRouting/pathfinder.hpp` | Implements the current one-shot source-to-sink shortest-path router over CSR input. |
+| `CongestionFreeRouting/pathfinder.cpp` / `CongestionFreeRouting/pathfinder.hpp` | Implements one-pass routing plus optional congestion iterations that save weighted CSR snapshots. |
 | `CongestionFreeRouting/routes_to_phys.cpp` | Reconstructs a routed FPGA Interchange `PhysicalNetlist` from route JSONL output. |
 | `CongestionFreeRouting/pathfinder_router.cpp` | Benchmark-facing C++ wrapper that runs the full conversion, routing, and reconstruction pipeline. |
 | `CongestionFreeRouting/pathfinder_benchmark.py` | Older Python wrapper/reference implementation. Useful for reference and writer tests, but not the preferred benchmark-facing router. |
+| `CongestionFreeRouting/pathfinder_snapshot_benchmark.py` | Converts one or more Interchange benchmarks and writes post-iteration real-congestion CSR snapshot pairs. |
+| `CongestionFreeRouting/pathfinder_sssp_compare.cpp` | Routes all nets once per weighted SSSP engine and emits comparable timing/verification JSON. |
 | `CongestionFreeRouting/tests` | CPU-only routing tests. |
 
 ### HIP Kernels
@@ -157,11 +161,13 @@ g++ -std=c++17 -O3 -I"$SCHEMA_DIR" \
   "$SCHEMA_DIR"/References.capnp.c++ \
   -lcapnp -lkj -lz -o interchange_to_csr
 
-hipcc -std=c++17 -O3 -x hip \
+hipcc -std=c++17 -O3 -x hip -DBF8_NO_MAIN \
   -I HIP_kernel/bellman_ford/src \
+  -I CongestionFreeRouting/bellman_ford \
   -I CongestionFreeRouting/delta_stepping \
   -I CongestionFreeRouting/unit_bfs \
   CongestionFreeRouting/pathfinder.cpp \
+  CongestionFreeRouting/bellman_ford/bf8.cpp \
   CongestionFreeRouting/delta_stepping/delta_stepping_hip_CSR.cpp \
   CongestionFreeRouting/unit_bfs/unit_bfs_hip_CSR.cpp \
   -pthread -o pathfinder
@@ -233,15 +239,20 @@ Tuning options:
 
 | Option | Default | Meaning |
 | --- | --- | --- |
-| `--sssp-engine <unit-bfs\|delta-step>` | `unit-bfs` | Shortest-path backend. |
+| `--sssp-engine <unit-bfs\|delta-step\|bellman-ford>` | `unit-bfs` | Shortest-path backend. |
 | `--use-delta-step` | unset | Shorthand for `--sssp-engine delta-step`. |
 | `--delta <float>` | `4` | Delta-stepping bucket width; meaningful for delta-step. |
-| `--max-sssp-iters <int>` | `-1` | Delta-step bucket rounds or unit-BFS depth cap; `-1` uses the default. |
-| `--capacity <int>` | `1` | Capacity used only for overuse diagnostics. |
+| `--max-sssp-iters <int>` | `-1` | Delta-step bucket rounds, Bellman-Ford rounds, or unit-BFS depth cap; `-1` uses the default. |
+| `--capacity <int>` | `1` | Resource capacity; drives costs in congestion mode. |
 | `--net-limit <count>` | unset | Route only the first `count` requests. |
-| `--parallel-net-workers <count>` | `0` | Independent net workers; `0` auto-selects up to 8 from available GPU memory. Both engines share one immutable CSR across worker-private search state. |
+| `--parallel-net-workers <count>` | `0` | Independent one-pass net workers; `0` auto-selects a safe count. Congestion snapshots are sequential for deterministic costs. |
 | `--routes-out <path>` | unset | Write routed PIP tree data as JSONL. |
-| `--max-pathfinder-iters`, `--present-factor`, `--present-multiplier`, `--history-factor`, `--route-batch-size` | ignored | Compatibility-only options accepted by the one-shot router. |
+| `--max-pathfinder-iters <int>` | `1` | Run real PathFinder rip-up/reroute iterations; specifying it selects congestion mode. |
+| `--present-factor`, `--present-multiplier`, `--history-factor`, `--route-batch-size` | `1, 2, 1, 256` | Congestion-cost parameters. |
+| `--snapshot-iters <1,3,5,...>` + `--snapshot-dir <path>` | unset | Save post-iteration weighted CSR/metadata pairs. |
+
+Congestion iterations and snapshot capture require `delta-step`; use
+`pathfinder_sssp_compare` to run Bellman-Ford against a frozen weighted CSR.
 
 The converter emits exact unit weights. For unlimited multi-target calls with
 no vertex-cost override or progress callback, the delta backend automatically
@@ -280,7 +291,7 @@ Useful wrapper options:
 | `--pathfinder <path>` | Override PathFinder executable. Env: `PATHFINDER_BIN`. |
 | `--routes-to-phys <path>` | Override route reconstructor. Env: `ROUTES_TO_PHYS`. |
 | `--sssp-engine`, `--use-delta-step`, `--delta`, `--max-sssp-iters`, `--parallel-net-workers`, `--capacity` | Forwarded to `pathfinder`. |
-| `--max-pathfinder-iters`, `--present-factor`, `--present-multiplier`, `--history-factor`, `--route-batch-size` | Compatibility-only; forwarded to `pathfinder` and ignored. |
+| `--max-pathfinder-iters`, `--present-factor`, `--present-multiplier`, `--history-factor`, `--route-batch-size` | Forwarded as real congestion-loop settings. Use `pathfinder_snapshot_benchmark.py` for persistent snapshots instead of this full `.phys` wrapper. |
 | `--full-device`, `--nxroute-bounds`, `--bounds`, `--node-bounds-mode` | Forwarded to `interchange_to_csr`; full-device conversion is the default. |
 
 ## File Formats And Artifacts

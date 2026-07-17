@@ -5,12 +5,11 @@
 #include "profiling/roctx_ranges.hpp"
 #include "unit_bfs/unit_bfs_hip_CSR.hpp"
 
-// One-shot shortest-path router for the repository PathFinder flow.
-//
-// This keeps the same benchmark-facing and route JSON APIs, but the routing
-// pass intentionally ignores present/historical congestion.  The default
-// engine uses a unit-weight GPU BFS specialized for the converter's unit
-// routing graph.  GPU delta-stepping remains selectable for comparison.
+// CSR PathFinder router for the repository benchmark flow. Its default is a
+// fast one-pass unit-BFS route, while --snapshot-iters enables deterministic
+// congestion rip-up/reroute and freezes weighted CSR workloads for later SSSP
+// comparisons. GPU delta-stepping and Bellman-Ford are selectable comparison
+// engines.
 //
 // Example GPU build from the repository root:
 //   hipcc -std=c++17 -O3 -x hip -DBF8_NO_MAIN \
@@ -34,6 +33,7 @@
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
 #include <fstream>
 #include <iostream>
 #include <limits>
@@ -60,6 +60,13 @@ std::uint64_t read_u64(std::ifstream& in, const char* name) {
     throw std::runtime_error(std::string("failed while reading ") + name);
   }
   return value;
+}
+
+void write_u64(std::ofstream& out, std::uint64_t value, const char* name) {
+  out.write(reinterpret_cast<const char*>(&value), sizeof(value));
+  if (!out) {
+    throw std::runtime_error(std::string("failed while writing ") + name);
+  }
 }
 
 int read_route_node(std::ifstream& in, const char* name) {
@@ -89,6 +96,21 @@ void read_array(std::ifstream& in,
   in.read(reinterpret_cast<char*>(values.data()), static_cast<std::streamsize>(bytes));
   if (!in) {
     throw std::runtime_error(std::string("failed while reading ") + name);
+  }
+}
+
+template <typename T>
+void write_array(std::ofstream& out,
+                 const std::vector<T>& values,
+                 const char* name) {
+  if (values.empty()) {
+    return;
+  }
+  const std::size_t bytes = values.size() * sizeof(T);
+  out.write(reinterpret_cast<const char*>(values.data()),
+            static_cast<std::streamsize>(bytes));
+  if (!out) {
+    throw std::runtime_error(std::string("failed while writing ") + name);
   }
 }
 
@@ -148,6 +170,37 @@ void validate_options(const PathfinderOptions& options) {
   }
   if (options.capacity <= 0) {
     throw std::invalid_argument("capacity must be positive");
+  }
+  if (options.max_pathfinder_iterations <= 0) {
+    throw std::invalid_argument("max-pathfinder-iters must be positive");
+  }
+  if (!(options.initial_present_factor >= 0.0f) ||
+      !std::isfinite(options.initial_present_factor)) {
+    throw std::invalid_argument("present-factor must be finite and nonnegative");
+  }
+  if (!(options.present_factor_multiplier >= 1.0f) ||
+      !std::isfinite(options.present_factor_multiplier)) {
+    throw std::invalid_argument("present-multiplier must be finite and >= 1");
+  }
+  if (!(options.history_factor >= 0.0f) ||
+      !std::isfinite(options.history_factor)) {
+    throw std::invalid_argument("history-factor must be finite and nonnegative");
+  }
+  if (options.route_batch_size == 0) {
+    throw std::invalid_argument("route-batch-size must be positive");
+  }
+  for (const int iteration : options.snapshot_iterations) {
+    if (iteration <= 0) {
+      throw std::invalid_argument("snapshot iterations must be positive");
+    }
+    if (iteration > options.max_pathfinder_iterations) {
+      throw std::invalid_argument(
+          "snapshot iteration exceeds max-pathfinder-iters");
+    }
+  }
+  if (!options.snapshot_iterations.empty() && !options.snapshot_callback) {
+    throw std::invalid_argument(
+        "snapshot iterations require a Pathfinder snapshot callback");
   }
 }
 
@@ -589,6 +642,99 @@ void commit_net_occupancy(const RoutedNet& net, std::vector<int>& occupancy) {
   }
 }
 
+void remove_net_occupancy(const RoutedNet& net, std::vector<int>& occupancy) {
+  if (!net.reached_all_sinks) {
+    return;
+  }
+  for (const int node : net.unique_nodes) {
+    if (node < 0 || static_cast<std::size_t>(node) >= occupancy.size()) {
+      continue;
+    }
+    int& used = occupancy[static_cast<std::size_t>(node)];
+    if (used <= 0) {
+      throw std::runtime_error("PathFinder rip-up found inconsistent occupancy");
+    }
+    --used;
+  }
+}
+
+bool net_needs_reroute(const RoutedNet& net,
+                       const std::vector<int>& occupancy,
+                       int capacity) {
+  if (!net.reached_all_sinks) {
+    return true;
+  }
+  for (const int node : net.unique_nodes) {
+    if (node >= 0 && static_cast<std::size_t>(node) < occupancy.size() &&
+        occupancy[static_cast<std::size_t>(node)] > capacity) {
+      return true;
+    }
+  }
+  return false;
+}
+
+std::size_t route_request_weight(const RouteRequest& request) {
+  return request.sources.size() + request.sinks.size();
+}
+
+// PathFinder charges for entering the destination routing node.  Keep this
+// calculation on the host so the same costed CSR can be captured as a frozen
+// workload and later reused by every SSSP comparison implementation.
+void update_costed_graph_values(const HostCsrF32& base_graph,
+                                const std::vector<int>& occupancy,
+                                const std::vector<float>& history,
+                                const PathfinderOptions& options,
+                                float present_factor,
+                                HostCsrF32& graph) {
+  if (occupancy.size() != static_cast<std::size_t>(base_graph.rows) ||
+      history.size() != static_cast<std::size_t>(base_graph.rows)) {
+    throw std::invalid_argument("congestion state size does not match CSR rows");
+  }
+  // Keep the immutable topology allocated across batches.  The caller owns
+  // this internal CSR and only its values are mutable between cost updates.
+  if (graph.rows != base_graph.rows ||
+      graph.cols != base_graph.cols ||
+      graph.nnz != base_graph.nnz ||
+      graph.rowptr.size() != base_graph.rowptr.size() ||
+      graph.colind.size() != base_graph.colind.size()) {
+    throw std::invalid_argument("costed CSR topology does not match base CSR");
+  }
+  graph.values.resize(base_graph.values.size());
+  for (minplus_sparse::Offset source = 0; source < base_graph.rows; ++source) {
+    for (minplus_sparse::Offset edge =
+             base_graph.rowptr[static_cast<std::size_t>(source)];
+         edge < base_graph.rowptr[static_cast<std::size_t>(source + 1)];
+         ++edge) {
+      const int destination = base_graph.colind[static_cast<std::size_t>(edge)];
+      const std::size_t destination_index = static_cast<std::size_t>(destination);
+      const int overuse_if_taken =
+          occupancy[destination_index] + 1 - options.capacity;
+      const float present_cost = overuse_if_taken > 0
+          ? 1.0f + present_factor * static_cast<float>(overuse_if_taken)
+          : 1.0f;
+      const float historical_cost = 1.0f + history[destination_index];
+      graph.values[static_cast<std::size_t>(edge)] =
+          base_graph.values[static_cast<std::size_t>(edge)] *
+          present_cost * historical_cost;
+    }
+  }
+}
+
+HostCsrF32 make_costed_graph(const HostCsrF32& base_graph,
+                             const std::vector<int>& occupancy,
+                             const std::vector<float>& history,
+                             const PathfinderOptions& options,
+                             float present_factor) {
+  HostCsrF32 graph = base_graph;
+  update_costed_graph_values(base_graph,
+                             occupancy,
+                             history,
+                             options,
+                             present_factor,
+                             graph);
+  return graph;
+}
+
 void update_congestion_stats(const std::vector<int>& occupancy,
                              int capacity,
                              int* overused_nodes,
@@ -845,6 +991,7 @@ void route_all_nets_with_workspace(const HostCsrF32& base_graph,
                                    hipStream_t stream,
                                    std::size_t route_request_count,
                                    std::size_t progress_interval,
+                                   bool report_progress,
                                    std::vector<RoutedNet>& nets,
                                    WorkspaceFactory workspace_factory) {
   std::size_t worker_count =
@@ -876,8 +1023,9 @@ void route_all_nets_with_workspace(const HostCsrF32& base_graph,
                     options,
                     stream);
 
-      if ((net_index + 1) == route_request_count ||
-          (net_index + 1) % progress_interval == 0) {
+      if (report_progress &&
+          ((net_index + 1) == route_request_count ||
+           (net_index + 1) % progress_interval == 0)) {
         print_pathfinder_progress(1, 1, net_index + 1, route_request_count);
       }
     }
@@ -893,10 +1041,11 @@ void route_all_nets_with_workspace(const HostCsrF32& base_graph,
   std::size_t last_reported = 0;
   const int worker_device = current_worker_device();
 
-  auto report_progress = [&](std::size_t completed) {
+  auto report_completed_progress = [&](std::size_t completed) {
     std::lock_guard<std::mutex> lock(progress_mutex);
-    if (completed == route_request_count ||
-        completed - last_reported >= progress_interval) {
+    if (report_progress &&
+        (completed == route_request_count ||
+         completed - last_reported >= progress_interval)) {
       last_reported = completed;
       print_pathfinder_progress(1, 1, completed, route_request_count);
     }
@@ -939,7 +1088,7 @@ void route_all_nets_with_workspace(const HostCsrF32& base_graph,
 
         const std::size_t completed =
             completed_nets.fetch_add(1, std::memory_order_relaxed) + 1;
-        report_progress(completed);
+        report_completed_progress(completed);
       }
     } catch (...) {
       failed.store(true, std::memory_order_relaxed);
@@ -961,6 +1110,225 @@ void route_all_nets_with_workspace(const HostCsrF32& base_graph,
   if (first_exception) {
     std::rethrow_exception(first_exception);
   }
+}
+
+bool congestion_iterations_requested(const PathfinderOptions& options) {
+  return options.enable_congestion ||
+         options.max_pathfinder_iterations > 1 ||
+         !options.snapshot_iterations.empty();
+}
+
+bool snapshot_requested(const PathfinderOptions& options, int iteration) {
+  return std::find(options.snapshot_iterations.begin(),
+                   options.snapshot_iterations.end(),
+                   iteration) != options.snapshot_iterations.end();
+}
+
+bool snapshot_requested_after(const PathfinderOptions& options, int iteration) {
+  return std::any_of(options.snapshot_iterations.begin(),
+                     options.snapshot_iterations.end(),
+                     [iteration](int requested_iteration) {
+                       return requested_iteration > iteration;
+                     });
+}
+
+// This is intentionally sequential.  Every batch observes a single
+// congestion snapshot, then commits its routes before the next batch is
+// costed.  Parallel net workers would race that occupancy transition and make
+// saved CSR snapshots nondeterministic.
+PathfinderResult run_congestion_pathfinder(const HostCsrF32& base_graph,
+                                           const RoutingMetadata& metadata,
+                                           const PathfinderOptions& options,
+                                           hipStream_t stream) {
+  if (options.sssp_engine != SsspEngine::kDeltaStep) {
+    throw std::invalid_argument(
+        "congestion iterations require --sssp-engine delta-step; use the "
+        "frozen CSR snapshots to compare other engines");
+  }
+
+  PathfinderResult result;
+  result.occupancy.assign(static_cast<std::size_t>(base_graph.rows), 0);
+  result.history.assign(static_cast<std::size_t>(base_graph.rows), 0.0f);
+  const std::size_t route_request_count =
+      options.net_limit == 0
+          ? metadata.route_requests.size()
+          : std::min(options.net_limit, metadata.route_requests.size());
+  result.nets.resize(route_request_count);
+
+  DeltaSteppingCsrWorkspace workspace(base_graph, stream);
+  HostCsrF32 costed_graph = base_graph;
+  std::vector<std::uint32_t> route_tree_seen(
+      static_cast<std::size_t>(base_graph.rows), 0);
+  std::vector<int> route_parent_by_child(
+      static_cast<std::size_t>(base_graph.rows), -1);
+  std::vector<std::uint32_t> route_parent_seen(
+      static_cast<std::size_t>(base_graph.rows), 0);
+  std::uint32_t route_tree_stamp = 0;
+  float present_factor = options.initial_present_factor;
+
+  if (options.report_progress) {
+    std::cout << "[pathfinder] congestion snapshot mode: iterations="
+              << options.max_pathfinder_iterations
+              << " batches=" << options.route_batch_size
+              << " requested_snapshots=" << options.snapshot_iterations.size()
+              << "\n";
+  }
+
+  for (int iteration = 1;
+       iteration <= options.max_pathfinder_iterations;
+       ++iteration) {
+    PATHFINDER_PROFILE_RANGE("pathfinder.congestion_iteration");
+    std::vector<std::size_t> reroute_indices;
+    reroute_indices.reserve(route_request_count);
+    if (iteration == 1) {
+      std::fill(result.occupancy.begin(), result.occupancy.end(), 0);
+      for (std::size_t net_index = 0; net_index < route_request_count; ++net_index) {
+        reroute_indices.push_back(net_index);
+      }
+    } else {
+      for (std::size_t net_index = 0; net_index < route_request_count; ++net_index) {
+        if (net_needs_reroute(result.nets[net_index],
+                              result.occupancy,
+                              options.capacity)) {
+          reroute_indices.push_back(net_index);
+        }
+      }
+      for (const std::size_t net_index : reroute_indices) {
+        remove_net_occupancy(result.nets[net_index], result.occupancy);
+      }
+    }
+
+    std::stable_sort(
+        reroute_indices.begin(), reroute_indices.end(),
+        [&](std::size_t left, std::size_t right) {
+          const std::size_t left_weight =
+              route_request_weight(metadata.route_requests[left]);
+          const std::size_t right_weight =
+              route_request_weight(metadata.route_requests[right]);
+          return left_weight == right_weight ? left < right
+                                             : left_weight > right_weight;
+        });
+
+    const std::size_t reroute_count = reroute_indices.size();
+    const std::size_t progress_interval =
+        std::max<std::size_t>(1, reroute_count / 100);
+    if (options.report_progress) {
+      std::cout << "[pathfinder] iteration " << iteration
+                << "/" << options.max_pathfinder_iterations
+                << " present_factor=" << present_factor
+                << " rerouting=" << reroute_count
+                << "/" << route_request_count << "\n";
+    }
+
+    for (std::size_t batch_begin = 0;
+         batch_begin < reroute_count;
+         batch_begin += options.route_batch_size) {
+      const std::size_t batch_end =
+          std::min(reroute_count, batch_begin + options.route_batch_size);
+      update_costed_graph_values(base_graph,
+                                 result.occupancy,
+                                 result.history,
+                                 options,
+                                 present_factor,
+                                 costed_graph);
+      workspace.update_values(costed_graph.values, stream);
+
+      std::vector<std::size_t> completed_batch;
+      completed_batch.reserve(batch_end - batch_begin);
+      for (std::size_t route_pos = batch_begin; route_pos < batch_end; ++route_pos) {
+        const std::size_t net_index = reroute_indices[route_pos];
+        const std::uint32_t tree_stamp =
+            next_tree_stamp(route_tree_seen, &route_tree_stamp);
+        result.nets[net_index] = route_net(costed_graph,
+                                           workspace,
+                                           metadata.route_requests[net_index],
+                                           route_tree_seen,
+                                           route_parent_by_child,
+                                           route_parent_seen,
+                                           tree_stamp,
+                                           options,
+                                           stream);
+        completed_batch.push_back(net_index);
+        if (options.report_progress &&
+            ((route_pos + 1) == reroute_count ||
+             (route_pos + 1) % progress_interval == 0)) {
+          print_pathfinder_progress(iteration,
+                                    options.max_pathfinder_iterations,
+                                    route_pos + 1,
+                                    reroute_count);
+        }
+      }
+      for (const std::size_t net_index : completed_batch) {
+        commit_net_occupancy(result.nets[net_index], result.occupancy);
+      }
+    }
+
+    result.all_sinks_reached = true;
+    for (const RoutedNet& net : result.nets) {
+      if (!net.reached_all_sinks) {
+        result.all_sinks_reached = false;
+        break;
+      }
+    }
+    result.iterations_used = iteration;
+    update_congestion_stats(result.occupancy,
+                            options.capacity,
+                            &result.overused_nodes,
+                            &result.max_occupancy);
+    result.routed = result.all_sinks_reached && result.overused_nodes == 0;
+
+    // A frozen snapshot represents the completed iteration's global
+    // congestion landscape. Overuse is added to history and the present
+    // factor is advanced before materializing costs for an additional entrant
+    // at each destination. It is deliberately a stable post-iteration
+    // workload, not a literal later batch after the next iteration's rip-up.
+    if (!result.routed) {
+      for (std::size_t node = 0; node < result.occupancy.size(); ++node) {
+        const int overuse = result.occupancy[node] - options.capacity;
+        if (overuse > 0) {
+          result.history[node] +=
+              options.history_factor * static_cast<float>(overuse);
+        }
+      }
+      present_factor *= options.present_factor_multiplier;
+    }
+
+    if (snapshot_requested(options, iteration)) {
+      PathfinderSnapshot snapshot;
+      snapshot.iteration = iteration;
+      snapshot.present_factor = present_factor;
+      snapshot.overused_nodes = result.overused_nodes;
+      snapshot.max_occupancy = result.max_occupancy;
+      snapshot.all_sinks_reached = result.all_sinks_reached;
+      snapshot.occupancy = result.occupancy;
+      snapshot.history = result.history;
+      snapshot.costed_graph = make_costed_graph(base_graph,
+                                                 snapshot.occupancy,
+                                                 snapshot.history,
+                                                 options,
+                                                 snapshot.present_factor);
+      options.snapshot_callback(snapshot);
+    }
+
+    if (options.report_progress) {
+      std::cout << "[pathfinder] iteration " << iteration
+                << " complete: all_sinks_reached="
+                << (result.all_sinks_reached ? "true" : "false")
+                << " overused_nodes=" << result.overused_nodes
+                << " max_occupancy=" << result.max_occupancy
+                << " routed=" << (result.routed ? "true" : "false")
+                << "\n";
+    }
+    // A caller may explicitly request checkpoints after convergence.  Do not
+    // silently omit those files: subsequent passes have no reroutes and thus
+    // faithfully capture the unchanged legal congestion state.  Ordinary
+    // congestion runs still stop as soon as they converge.
+    if (result.routed && !snapshot_requested_after(options, iteration)) {
+      break;
+    }
+  }
+
+  return result;
 }
 
 }  // namespace
@@ -1039,17 +1407,19 @@ void print_usage(const char* program) {
       << "  --use-delta-step                Use delta-step backend for comparison.\n"
       << "  --delta <float>                 Delta-stepping bucket width. Default: 4\n"
       << "  --max-sssp-iters <int>          Delta rounds, BFS depth, or Bellman-Ford rounds; -1 for default.\n"
-      << "  --capacity <int>                Capacity used only for overuse diagnostics. Default: 1\n"
+      << "  --capacity <int>                Resource capacity for congestion costs. Default: 1\n"
+      << "  --max-pathfinder-iters <int>    Enable delta-step congestion routing for this many rounds.\n"
+      << "  --present-factor <float>        Initial present congestion factor. Default: 1\n"
+      << "  --present-multiplier <float>    Per-round present-factor multiplier. Default: 2\n"
+      << "  --history-factor <float>        Historical congestion increment. Default: 1\n"
+      << "  --route-batch-size <count>      Nets routed per congestion-cost snapshot. Default: 256\n"
+      << "  --snapshot-iters <1,3,5,...>    Save frozen costed CSRs after these PathFinder rounds.\n"
+      << "  --snapshot-dir <path>           Directory for --snapshot-iters CSR/metadata pairs.\n"
       << "  --net-limit <count>             Route only the first count requests.\n"
       << "  --parallel-net-workers <count>  Independent net workers. Default: 0 (engine-dependent auto).\n"
       << "  --allow-unrouted                Write partial routes even if some sinks are unreached.\n"
       << "  --routes-out <path>             Write routed PIP tree data as JSONL.\n"
-      << "\nCompatibility-only options accepted and ignored by this one-shot router:\n"
-      << "  --max-pathfinder-iters <int>\n"
-      << "  --present-factor <float>\n"
-      << "  --present-multiplier <float>\n"
-      << "  --history-factor <float>\n"
-      << "  --route-batch-size <count>\n";
+      << "\nCongestion runs require delta-step; snapshots capture the post-iteration global congestion landscape.\n";
 }
 
 HostCsrF32 load_csrbin(const std::filesystem::path& path) {
@@ -1103,6 +1473,47 @@ HostCsrF32 load_csrbin(const std::filesystem::path& path) {
   read_array(in, graph.values, values_count, "CSR values");
   validate_csr(graph);
   return graph;
+}
+
+void write_csrbin(const std::filesystem::path& path, const HostCsrF32& graph) {
+  validate_csr(graph);
+  if (path.has_parent_path()) {
+    std::filesystem::create_directories(path.parent_path());
+  }
+  std::ofstream out(path, std::ios::binary | std::ios::trunc);
+  if (!out) {
+    throw std::runtime_error("could not open CSR output file: " + path.string());
+  }
+
+  out.write(CSR_MAGIC, sizeof(CSR_MAGIC));
+  if (!out) {
+    throw std::runtime_error("failed while writing CSR magic");
+  }
+  const std::uint64_t rows = static_cast<std::uint64_t>(graph.rows);
+  const std::uint64_t cols = static_cast<std::uint64_t>(graph.cols);
+  const std::uint64_t nnz = static_cast<std::uint64_t>(graph.nnz);
+  write_u64(out, EXPECTED_CSR_VERSION, "CSR format version");
+  write_u64(out, EXPECTED_OUTGOING_EDGE_ORIENTATION, "CSR orientation");
+  write_u64(out, rows, "CSR row count");
+  write_u64(out, cols, "CSR column count");
+  // HostCsrF32 intentionally does not retain the converter's declared and
+  // loaded edge counts. Readers ignore those advisory fields, so the frozen
+  // graph's actual edge count is the faithful value for both.
+  write_u64(out, nnz, "CSR declared edge count");
+  write_u64(out, nnz, "CSR loaded edge count");
+  write_u64(out, nnz, "CSR nnz");
+  write_u64(out,
+            static_cast<std::uint64_t>(graph.rowptr.size()),
+            "CSR rowptr count");
+  write_u64(out,
+            static_cast<std::uint64_t>(graph.colind.size()),
+            "CSR colind count");
+  write_u64(out,
+            static_cast<std::uint64_t>(graph.values.size()),
+            "CSR values count");
+  write_array(out, graph.rowptr, "CSR rowptr");
+  write_array(out, graph.colind, "CSR colind");
+  write_array(out, graph.values, "CSR values");
 }
 
 RoutingMetadata load_interchange_metadata(const std::filesystem::path& path) {
@@ -1347,6 +1758,10 @@ PathfinderResult run_pathfinder(const HostCsrF32& base_graph,
     throw std::runtime_error("metadata edge attributes do not match CSR nnz");
   }
 
+  if (congestion_iterations_requested(options)) {
+    return run_congestion_pathfinder(base_graph, metadata, options, stream);
+  }
+
   PathfinderResult result;
   result.occupancy.assign(static_cast<std::size_t>(base_graph.rows), 0);
 
@@ -1366,9 +1781,11 @@ PathfinderResult run_pathfinder(const HostCsrF32& base_graph,
       if (unit_options.parallel_net_workers == 0) {
         unit_options.parallel_net_workers = recommend_unit_bfs_worker_count(
             base_graph.rows, route_request_count, stream);
-        std::cout << "[pathfinder] auto-selected "
-                  << unit_options.parallel_net_workers
-                  << " unit-BFS worker(s)\n";
+        if (unit_options.report_progress) {
+          std::cout << "[pathfinder] auto-selected "
+                    << unit_options.parallel_net_workers
+                    << " unit-BFS worker(s)\n";
+        }
       }
       route_all_nets_with_workspace(
           base_graph,
@@ -1377,6 +1794,7 @@ PathfinderResult run_pathfinder(const HostCsrF32& base_graph,
           stream,
           route_request_count,
           progress_interval,
+          unit_options.report_progress,
           result.nets,
           [shared_graph](hipStream_t worker_stream) {
             return UnitBfsCsrWorkspace(shared_graph, worker_stream);
@@ -1399,9 +1817,11 @@ PathfinderResult run_pathfinder(const HostCsrF32& base_graph,
         delta_options.parallel_net_workers = recommend_delta_worker_count(
             base_graph.rows, route_request_count, uses_unit_specialization,
             stream);
-        std::cout << "[pathfinder] auto-selected "
-                  << delta_options.parallel_net_workers
-                  << " delta-step worker(s)\n";
+        if (delta_options.report_progress) {
+          std::cout << "[pathfinder] auto-selected "
+                    << delta_options.parallel_net_workers
+                    << " delta-step worker(s)\n";
+        }
       }
       route_all_nets_with_workspace(
           base_graph,
@@ -1410,10 +1830,11 @@ PathfinderResult run_pathfinder(const HostCsrF32& base_graph,
           stream,
           route_request_count,
           progress_interval,
+          delta_options.report_progress,
           result.nets,
           [shared_graph](hipStream_t worker_stream) {
             return DeltaSteppingCsrWorkspace(shared_graph, worker_stream);
-          });
+      });
       break;
     }
     case SsspEngine::kBellmanFord: {
@@ -1424,7 +1845,9 @@ PathfinderResult run_pathfinder(const HostCsrF32& base_graph,
         // Start conservatively: every worker owns a full frontier state and
         // may copy one packed predecessor tree to the host per legal source.
         bellman_ford_options.parallel_net_workers = 1;
-        std::cout << "[pathfinder] auto-selected 1 Bellman-Ford worker(s)\n";
+        if (bellman_ford_options.report_progress) {
+          std::cout << "[pathfinder] auto-selected 1 Bellman-Ford worker(s)\n";
+        }
       }
       route_all_nets_with_workspace(
           base_graph,
@@ -1433,6 +1856,7 @@ PathfinderResult run_pathfinder(const HostCsrF32& base_graph,
           stream,
           route_request_count,
           progress_interval,
+          bellman_ford_options.report_progress,
           result.nets,
           [shared_graph](hipStream_t worker_stream) {
             return BellmanFordCsrWorkspace(shared_graph, worker_stream);
@@ -1604,8 +2028,11 @@ int main(int argc, char** argv) {
     const std::filesystem::path csr_path = argv[1];
     std::filesystem::path metadata_path;
     std::filesystem::path routes_out_path;
+    std::filesystem::path snapshot_dir;
     routing::PathfinderOptions options;
     bool allow_unrouted_routes = false;
+    bool max_pathfinder_iters_was_set = false;
+    bool sssp_engine_was_set = false;
 
     int arg = 2;
     if (arg < argc && std::string(argv[arg]).rfind("--", 0) != 0) {
@@ -1630,31 +2057,62 @@ int main(int argc, char** argv) {
       if (option == "--sssp-engine") {
         options.sssp_engine =
             routing::parse_sssp_engine_arg(require_value("--sssp-engine"));
+        sssp_engine_was_set = true;
       } else if (option == "--use-delta-step") {
         options.sssp_engine = routing::SsspEngine::kDeltaStep;
+        sssp_engine_was_set = true;
       } else if (option == "--delta") {
         options.delta = routing::parse_float_arg(require_value("--delta"), "delta");
       } else if (option == "--max-pathfinder-iters") {
-        (void)routing::parse_int_arg(require_value("--max-pathfinder-iters"),
-                                     "max-pathfinder-iters");
+        options.max_pathfinder_iterations = routing::parse_int_arg(
+            require_value("--max-pathfinder-iters"), "max-pathfinder-iters");
+        // Supplying the flag opts into the real PathFinder loop even for a
+        // single round, which is useful when capturing/inspecting its costs.
+        options.enable_congestion = true;
+        max_pathfinder_iters_was_set = true;
       } else if (option == "--max-sssp-iters") {
         options.max_sssp_iterations =
             routing::parse_int_arg(require_value("--max-sssp-iters"), "max-sssp-iters");
       } else if (option == "--capacity") {
         options.capacity = routing::parse_int_arg(require_value("--capacity"), "capacity");
       } else if (option == "--present-factor") {
-        (void)routing::parse_float_arg(require_value("--present-factor"), "present-factor");
+        options.initial_present_factor = routing::parse_float_arg(
+            require_value("--present-factor"), "present-factor");
       } else if (option == "--present-multiplier") {
-        (void)routing::parse_float_arg(require_value("--present-multiplier"),
-                                       "present-multiplier");
+        options.present_factor_multiplier = routing::parse_float_arg(
+            require_value("--present-multiplier"), "present-multiplier");
       } else if (option == "--history-factor") {
-        (void)routing::parse_float_arg(require_value("--history-factor"), "history-factor");
+        options.history_factor = routing::parse_float_arg(
+            require_value("--history-factor"), "history-factor");
       } else if (option == "--net-limit") {
         options.net_limit =
             routing::parse_size_arg(require_value("--net-limit"), "net-limit");
       } else if (option == "--route-batch-size") {
-        (void)routing::parse_size_arg(require_value("--route-batch-size"),
-                                      "route-batch-size");
+        options.route_batch_size = routing::parse_size_arg(
+            require_value("--route-batch-size"), "route-batch-size");
+      } else if (option == "--snapshot-iters") {
+        const std::string values = require_value("--snapshot-iters");
+        if (values.empty()) {
+          throw std::runtime_error("--snapshot-iters requires at least one iteration");
+        }
+        std::size_t begin = 0;
+        while (begin < values.size()) {
+          const std::size_t comma = values.find(',', begin);
+          const std::size_t end = comma == std::string::npos ? values.size() : comma;
+          if (end == begin) {
+            throw std::runtime_error("--snapshot-iters contains an empty value");
+          }
+          const std::string value = values.substr(begin, end - begin);
+          options.snapshot_iterations.push_back(
+              routing::parse_int_arg(value.c_str(), "snapshot iteration"));
+          if (comma == std::string::npos) {
+            break;
+          }
+          begin = comma + 1;
+        }
+        options.enable_congestion = true;
+      } else if (option == "--snapshot-dir") {
+        snapshot_dir = require_value("--snapshot-dir");
       } else if (option == "--parallel-net-workers") {
         options.parallel_net_workers =
             routing::parse_size_arg(require_value("--parallel-net-workers"),
@@ -1666,6 +2124,141 @@ int main(int argc, char** argv) {
       } else {
         throw std::runtime_error("unknown option: " + option);
       }
+    }
+
+    if (options.snapshot_iterations.empty() != snapshot_dir.empty()) {
+      throw std::runtime_error(
+          "--snapshot-iters and --snapshot-dir must be supplied together");
+    }
+    if (!options.snapshot_iterations.empty()) {
+      std::sort(options.snapshot_iterations.begin(),
+                options.snapshot_iterations.end());
+      const auto duplicate = std::adjacent_find(options.snapshot_iterations.begin(),
+                                                options.snapshot_iterations.end());
+      if (duplicate != options.snapshot_iterations.end()) {
+        throw std::runtime_error("--snapshot-iters must not contain duplicates");
+      }
+      const int last_snapshot = options.snapshot_iterations.back();
+      if (max_pathfinder_iters_was_set &&
+          options.max_pathfinder_iterations < last_snapshot) {
+        throw std::runtime_error(
+            "--max-pathfinder-iters is smaller than a requested snapshot iteration");
+      }
+      if (!max_pathfinder_iters_was_set) {
+        options.max_pathfinder_iterations = last_snapshot;
+      }
+      const std::filesystem::path snapshot_root = snapshot_dir;
+      const std::filesystem::path snapshot_metadata = metadata_path;
+      const std::filesystem::path source_csr = csr_path;
+      const int snapshot_capacity = options.capacity;
+      const float snapshot_delta = options.delta;
+      const float snapshot_initial_present_factor = options.initial_present_factor;
+      const float snapshot_history_factor = options.history_factor;
+      const float snapshot_present_multiplier = options.present_factor_multiplier;
+      const int snapshot_max_pathfinder_iterations =
+          options.max_pathfinder_iterations;
+      const std::size_t snapshot_route_batch_size = options.route_batch_size;
+      const std::size_t snapshot_net_limit = options.net_limit;
+      const bool snapshot_report_progress = options.report_progress;
+      options.snapshot_callback =
+          [snapshot_root,
+           snapshot_metadata,
+           source_csr,
+           snapshot_capacity,
+           snapshot_delta,
+           snapshot_initial_present_factor,
+           snapshot_history_factor,
+           snapshot_present_multiplier,
+           snapshot_max_pathfinder_iterations,
+           snapshot_route_batch_size,
+           snapshot_net_limit,
+           snapshot_report_progress](const routing::PathfinderSnapshot& snapshot) {
+            std::filesystem::create_directories(snapshot_root);
+            const std::string stem = "iteration-" + std::to_string(snapshot.iteration);
+            const std::filesystem::path snapshot_csr =
+                snapshot_root / (stem + ".csrbin");
+            const std::filesystem::path snapshot_metadata_out =
+                std::filesystem::path(snapshot_csr.string() + ".ifmeta.bin");
+            const std::filesystem::path manifest_path =
+                snapshot_root / (stem + ".snapshot.json");
+            routing::write_csrbin(snapshot_csr, snapshot.costed_graph);
+            std::filesystem::copy_file(snapshot_metadata,
+                                       snapshot_metadata_out,
+                                       std::filesystem::copy_options::overwrite_existing);
+
+            std::ofstream manifest(manifest_path, std::ios::trunc);
+            if (!manifest) {
+              throw std::runtime_error(
+                  "could not write snapshot manifest: " + manifest_path.string());
+            }
+            const auto write_json_string = [&manifest](const std::string& text) {
+              manifest << '"';
+              for (const unsigned char ch : text) {
+                switch (ch) {
+                  case '"': manifest << "\\\""; break;
+                  case '\\': manifest << "\\\\"; break;
+                  case '\n': manifest << "\\n"; break;
+                  case '\r': manifest << "\\r"; break;
+                  case '\t': manifest << "\\t"; break;
+                  default: manifest << static_cast<char>(ch); break;
+                }
+              }
+              manifest << '"';
+            };
+            int total_occupancy = 0;
+            std::size_t history_nodes = 0;
+            float max_history = 0.0f;
+            for (std::size_t node = 0; node < snapshot.occupancy.size(); ++node) {
+              total_occupancy += snapshot.occupancy[node];
+              const float history = snapshot.history[node];
+              if (history != 0.0f) {
+                ++history_nodes;
+              }
+              max_history = std::max(max_history, history);
+            }
+            manifest << "{\n  \"cost_phase\": \"post_iteration_global_cost\",\n"
+                     << "  \"iteration\": " << snapshot.iteration << ",\n"
+                     << "  \"delta\": " << snapshot_delta << ",\n"
+                     << "  \"initial_present_factor\": "
+                     << snapshot_initial_present_factor << ",\n"
+                     << "  \"present_factor\": " << snapshot.present_factor << ",\n"
+                     << "  \"capacity\": " << snapshot_capacity << ",\n"
+                     << "  \"history_factor\": " << snapshot_history_factor << ",\n"
+                     << "  \"present_multiplier\": " << snapshot_present_multiplier << ",\n"
+                     << "  \"max_pathfinder_iterations\": "
+                     << snapshot_max_pathfinder_iterations << ",\n"
+                     << "  \"route_batch_size\": "
+                     << snapshot_route_batch_size << ",\n"
+                     << "  \"net_limit\": " << snapshot_net_limit << ",\n"
+                     << "  \"all_sinks_reached\": "
+                     << (snapshot.all_sinks_reached ? "true" : "false") << ",\n"
+                     << "  \"overused_nodes\": " << snapshot.overused_nodes << ",\n"
+                     << "  \"max_occupancy\": " << snapshot.max_occupancy << ",\n"
+                     << "  \"total_occupancy\": " << total_occupancy << ",\n"
+                     << "  \"history_nodes\": " << history_nodes << ",\n"
+                     << "  \"max_history\": " << max_history << ",\n"
+                     << "  \"source_csr\": ";
+            write_json_string(source_csr.string());
+            manifest << ",\n  \"csrbin\": ";
+            write_json_string(snapshot_csr.filename().string());
+            manifest << ",\n  \"metadata\": ";
+            write_json_string(snapshot_metadata_out.filename().string());
+            manifest << "\n}\n";
+            if (!manifest) {
+              throw std::runtime_error(
+                  "failed while writing snapshot manifest: " + manifest_path.string());
+            }
+            if (snapshot_report_progress) {
+              std::cout << "[pathfinder] wrote congestion snapshot "
+                        << snapshot_csr << "\n";
+            }
+          };
+    }
+    // The normal one-shot default is unit BFS. Any congestion run needs a
+    // weighted implementation; choose delta-step unless the caller made an
+    // explicit engine selection (which validation will check).
+    if (options.enable_congestion && !sssp_engine_was_set) {
+      options.sssp_engine = routing::SsspEngine::kDeltaStep;
     }
 
     HostCsrF32 graph = [&]() {
@@ -1692,7 +2285,10 @@ int main(int argc, char** argv) {
       }
     }
 
-    return result.routed || allow_unrouted_routes ? 0 : 2;
+    return result.routed || allow_unrouted_routes ||
+                   !options.snapshot_iterations.empty()
+               ? 0
+               : 2;
   } catch (const std::exception& ex) {
     std::cerr << "error: " << ex.what() << "\n";
     if (argc < 2) {

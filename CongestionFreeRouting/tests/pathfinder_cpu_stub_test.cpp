@@ -663,6 +663,81 @@ int main() {
   require(overlap_routes_json.find("\"from\":1,\"to\":2") != std::string::npos,
           "overlapping route output should include the shared shortest path");
 
+  // Snapshot mode must materialize outgoing-edge costs using each edge's
+  // destination-node congestion.  The two routes both occupy node 2 in the
+  // first pass, so its post-iteration cost is higher than an unused node.
+  routing::PathfinderOptions snapshot_options;
+  snapshot_options.sssp_engine = routing::SsspEngine::kDeltaStep;
+  snapshot_options.delta = 1.0f;
+  snapshot_options.enable_congestion = true;
+  snapshot_options.max_pathfinder_iterations = 1;
+  snapshot_options.route_batch_size = 256;
+  snapshot_options.snapshot_iterations = {1};
+  std::vector<routing::PathfinderSnapshot> snapshots;
+  snapshot_options.snapshot_callback = [&snapshots](
+      const routing::PathfinderSnapshot& snapshot) {
+    snapshots.push_back(snapshot);
+  };
+  routing::PathfinderResult snapshot_result =
+      routing::run_pathfinder(congestion_graph,
+                              congestion_metadata,
+                              snapshot_options,
+                              nullptr);
+  require(snapshot_result.iterations_used == 1,
+          "snapshot mode should complete the requested PathFinder iteration");
+  require(snapshot_result.overused_nodes > 0,
+          "snapshot fixture should retain its intentional shared-node overuse");
+  require(snapshot_result.history[2] == 1.0f,
+          "snapshot mode should accumulate history for the overused node");
+  require(snapshots.size() == 1 && snapshots[0].iteration == 1,
+          "snapshot callback should run only for the requested iteration");
+  require(snapshots[0].costed_graph.rowptr == congestion_graph.rowptr &&
+              snapshots[0].costed_graph.colind == congestion_graph.colind,
+          "snapshot must preserve CSR topology");
+  require(snapshots[0].costed_graph.values[0] == 10.0f &&
+              snapshots[0].costed_graph.values[1] == 10.0f,
+          "both outgoing edges entering the shared node should receive its cost");
+  require(snapshots[0].costed_graph.values[2] == 1.0f,
+          "an edge entering an unused node should retain its base cost");
+  const std::filesystem::path snapshot_roundtrip_path =
+      std::filesystem::temp_directory_path() / "pathfinder_snapshot_roundtrip.csrbin";
+  routing::write_csrbin(snapshot_roundtrip_path, snapshots[0].costed_graph);
+  const HostCsrF32 snapshot_roundtrip = routing::load_csrbin(snapshot_roundtrip_path);
+  require(snapshot_roundtrip.values == snapshots[0].costed_graph.values,
+          "written congestion snapshot should round-trip through the CSR reader");
+
+  // A legal route can converge before the last requested checkpoint.  Snapshot
+  // mode must still emit each requested iteration rather than silently leaving
+  // the benchmark driver with a partial set of files.
+  routing::PathfinderOptions converged_snapshot_options;
+  converged_snapshot_options.sssp_engine = routing::SsspEngine::kDeltaStep;
+  converged_snapshot_options.delta = 1.0f;
+  converged_snapshot_options.enable_congestion = true;
+  converged_snapshot_options.max_pathfinder_iterations = 3;
+  converged_snapshot_options.snapshot_iterations = {1, 3};
+  converged_snapshot_options.report_progress = false;
+  std::vector<routing::PathfinderSnapshot> converged_snapshots;
+  const routing::RoutingMetadata converged_metadata = make_metadata();
+  converged_snapshot_options.snapshot_callback = [&converged_snapshots](
+      const routing::PathfinderSnapshot& snapshot) {
+    converged_snapshots.push_back(snapshot);
+  };
+  const routing::PathfinderResult converged_snapshot_result =
+      routing::run_pathfinder(graph,
+                              converged_metadata,
+                              converged_snapshot_options,
+                              nullptr);
+  require(converged_snapshot_result.routed &&
+              converged_snapshot_result.iterations_used == 3,
+          "requested late snapshots should keep a converged run alive");
+  require(converged_snapshots.size() == 2 &&
+              converged_snapshots[0].iteration == 1 &&
+              converged_snapshots[1].iteration == 3,
+          "converged snapshot mode should emit all requested checkpoints");
+  require(converged_snapshots[0].costed_graph.values ==
+              converged_snapshots[1].costed_graph.values,
+          "late converged snapshots should preserve the stable congestion state");
+
   auto movable_delta_graph =
       std::make_shared<DeltaSteppingCsrGraph>(congestion_graph, nullptr);
   DeltaSteppingCsrWorkspace retained_delta_workspace(

@@ -7,6 +7,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
+#include <functional>
 #include <limits>
 #include <string>
 #include <vector>
@@ -89,14 +90,46 @@ enum class SsspEngine {
   kBellmanFord,
 };
 
+// A frozen routing workload captured after a complete PathFinder iteration.
+// The topology is unchanged from the input CSR; costed_graph.values contains
+// the congestion-derived edge costs that should be used by a subsequent
+// one-pass SSSP comparison.
+struct PathfinderSnapshot {
+  int iteration = 0;
+  float present_factor = 1.0f;
+  int overused_nodes = 0;
+  int max_occupancy = 0;
+  bool all_sinks_reached = false;
+  std::vector<int> occupancy;
+  std::vector<float> history;
+  HostCsrF32 costed_graph;
+};
+
+using PathfinderSnapshotCallback = std::function<void(const PathfinderSnapshot&)>;
+
 struct PathfinderOptions {
   SsspEngine sssp_engine = SsspEngine::kUnitBfs;
   float delta = 4.0f;
+  // The regular router remains a one-pass router unless congestion iterations
+  // are explicitly enabled (or a snapshot is requested).
+  int max_pathfinder_iterations = 1;
   int max_sssp_iterations = -1;
   int capacity = 1;
+  float initial_present_factor = 1.0f;
+  float present_factor_multiplier = 2.0f;
+  float history_factor = 1.0f;
   std::size_t net_limit = 0;
+  std::size_t route_batch_size = 256;
   // Zero enables conservative GPU-memory-aware selection (up to eight).
   std::size_t parallel_net_workers = 0;
+  // Disable progress/status output when routing is embedded in a structured
+  // benchmark result such as pathfinder_sssp_compare.
+  bool report_progress = true;
+  // Enables the rip-up/reroute loop even when only one iteration is wanted.
+  // --snapshot-iters uses this internally.
+  bool enable_congestion = false;
+  std::vector<int> snapshot_iterations;
+  PathfinderSnapshotCallback snapshot_callback;
 };
 
 struct PathfinderResult {
@@ -106,10 +139,12 @@ struct PathfinderResult {
   int overused_nodes = 0;
   int max_occupancy = 0;
   std::vector<int> occupancy;
+  std::vector<float> history;
   std::vector<RoutedNet> nets;
 };
 
 HostCsrF32 load_csrbin(const std::filesystem::path& path);
+void write_csrbin(const std::filesystem::path& path, const HostCsrF32& graph);
 RoutingMetadata load_interchange_metadata(const std::filesystem::path& path);
 
 std::vector<PathEdge> reconstruct_shortest_path(

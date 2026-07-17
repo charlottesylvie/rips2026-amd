@@ -27,12 +27,14 @@ Add the following to the normal `pathfinder` build:
 For example:
 
 ```bash
-hipcc -std=c++17 -O3 -x hip \
+hipcc -std=c++17 -O3 -x hip -DBF8_NO_MAIN \
   -DPATHFINDER_ENABLE_ROCTX \
   -I HIP_kernel/bellman_ford/src \
+  -I CongestionFreeRouting/bellman_ford \
   -I CongestionFreeRouting/delta_stepping \
   -I CongestionFreeRouting/unit_bfs \
   CongestionFreeRouting/pathfinder.cpp \
+  CongestionFreeRouting/bellman_ford/bf8.cpp \
   CongestionFreeRouting/delta_stepping/delta_stepping_hip_CSR.cpp \
   CongestionFreeRouting/unit_bfs/unit_bfs_hip_CSR.cpp \
   -pthread -lrocprofiler-sdk-roctx -o pathfinder
@@ -63,11 +65,110 @@ make ... PATHFINDER_SSSP_ENGINE=delta-step \
   PATHFINDER_PROFILE=rocprofv3
 ```
 
-For a meaningful general-weight profile, supply a converter with the same CLI
-that emits representative weights through `INTERCHANGE_TO_CSR`, or run a
-prebuilt weighted CSR workload directly under the selected profiler. The
-Makefile integration needs no change once the benchmark pipeline emits those
-weights.
+For a meaningful general-weight profile, generate a real-congestion snapshot
+with the workflow below, then run the comparison executable on that frozen
+CSR. The converter topology and metadata remain unchanged; only the saved CSR
+edge values reflect PathFinder's accumulated present and historical costs.
+
+## Real-congestion snapshot workflow
+
+The snapshot generator runs the Interchange converter once per benchmark, then
+runs weighted delta-stepping PathFinder iterations and saves normal,
+independently usable `RIPSCSR1` files. For example:
+
+```bash
+python3 CongestionFreeRouting/pathfinder_snapshot_benchmark.py \
+  --benchmarks-dir /path/to/benchmarks \
+  --benchmarks logicnets_jscl,boom_med_pb \
+  --device /path/to/xcvu3p.device \
+  --out-dir results/pathfinder-snapshots \
+  --snapshot-iters 1,3,5,8 \
+  --delta 4 --capacity 1 \
+  --present-factor 1 --present-multiplier 2 --history-factor 1 \
+  --route-batch-size 256
+```
+
+For each benchmark this creates:
+
+```text
+results/pathfinder-snapshots/<benchmark>/
+  base.csrbin
+  base.csrbin.ifmeta.bin
+  iteration-1.csrbin
+  iteration-1.csrbin.ifmeta.bin
+  iteration-1.snapshot.json
+  ...
+```
+
+`iteration-N.csrbin` is a static outgoing CSR materialized from the completed
+iteration `N`'s global occupancy/history state, with the present factor
+advanced after a nonconverged iteration as PathFinder normally does, and
+congestion charged to each edge's destination node. The manifest
+records this as `"cost_phase": "post_iteration_global_cost"`. It is a stable
+all-net workload for comparison, rather than a literal CSR for a later
+PathFinder batch (which would first rip up selected congested nets).
+If PathFinder converges before a requested checkpoint, it does not reroute
+already legal nets just to manufacture more work; it emits each later requested
+snapshot from that unchanged converged congestion state. The generator still
+checks that every requested artifact was written. It also refuses existing
+generated snapshot artifacts by default; pass `--overwrite` to replace that
+benchmark's prior snapshot files.
+
+## Compare SSSP implementations on one frozen workload
+
+Build `pathfinder_sssp_compare` with the same sources as `pathfinder`, adding
+`CongestionFreeRouting/pathfinder_sssp_compare.cpp` and defining `BF8_NO_MAIN`
+when `bf8.cpp` is linked. For example:
+
+```bash
+hipcc -std=c++17 -O3 -x hip -DBF8_NO_MAIN -DROUTING_PATHFINDER_NO_MAIN \
+  -DPATHFINDER_ENABLE_ROCTX \
+  -I HIP_kernel/bellman_ford/src \
+  -I CongestionFreeRouting/bellman_ford \
+  -I CongestionFreeRouting/delta_stepping \
+  -I CongestionFreeRouting/unit_bfs \
+  CongestionFreeRouting/pathfinder_sssp_compare.cpp \
+  CongestionFreeRouting/pathfinder.cpp \
+  CongestionFreeRouting/bellman_ford/bf8.cpp \
+  CongestionFreeRouting/delta_stepping/delta_stepping_hip_CSR.cpp \
+  CongestionFreeRouting/unit_bfs/unit_bfs_hip_CSR.cpp \
+  -pthread -lrocprofiler-sdk-roctx -o pathfinder_sssp_compare
+```
+
+Then each engine routes every net once without modifying the frozen CSR:
+
+```bash
+./pathfinder_sssp_compare \
+  results/pathfinder-snapshots/logicnets_jscl/iteration-3.csrbin \
+  --engines delta-step,bellman-ford \
+  --warmups 1 --repeats 5 --delta 4 --parallel-net-workers 1 \
+  --verify --baseline delta-step \
+  --json-out results/comparisons/logicnets_jscl.iteration-3.json
+```
+
+The JSON reports full-pass wall-time statistics, reached sinks, route-edge
+count, a distance checksum, speedup against the selected baseline, and
+verification mismatches. It defaults to one cross-net worker for every engine
+so the timing compares the SSSP implementations rather than their distinct
+auto-scheduling policies. It intentionally rejects unit BFS on weighted
+snapshots: BFS ignores CSR values and is not a correct weighted SSSP baseline.
+Pass `--allow-inexact-unit-bfs` only when a topology-only comparison is wanted.
+For exact delta-step versus Bellman-Ford verification, leave
+`--max-sssp-iters` at its default unlimited value; a finite cap bounds
+delta buckets and Bellman-Ford rounds differently.
+
+Profile only the comparison phase by wrapping that executable directly:
+
+```bash
+rocprofv3 --runtime-trace --stats --output-directory traces/logicnets.iter3 -- \
+  ./pathfinder_sssp_compare \
+    results/pathfinder-snapshots/logicnets_jscl/iteration-3.csrbin \
+    --engines delta-step,bellman-ford --warmups 0 --repeats 1 --verify
+```
+
+The trace contains outer `pathfinder.compare.<engine>` ROCTx ranges and the
+existing per-net/per-SSSP ranges, so conversion and PathFinder warm-up are not
+included in the comparison trace.
 
 The default integration runs:
 

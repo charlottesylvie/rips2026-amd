@@ -116,7 +116,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument(
         "--max-pathfinder-iters",
         type=int,
-        help="compatibility-only for the one-shot router; forwarded and ignored",
+        help="PathFinder congestion rounds; this selects delta-step congestion routing",
     )
     parser.add_argument(
         "--max-sssp-iters",
@@ -126,28 +126,28 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument(
         "--capacity",
         type=int,
-        help="capacity used only for overuse diagnostics",
+        help="routing-resource capacity used by congestion costs",
     )
     parser.add_argument(
         "--present-factor",
         type=float,
-        help="compatibility-only for the one-shot router; forwarded and ignored",
+        help="initial present congestion factor",
     )
     parser.add_argument(
         "--present-multiplier",
         type=float,
-        help="compatibility-only for the one-shot router; forwarded and ignored",
+        help="per-round present congestion multiplier",
     )
     parser.add_argument(
         "--history-factor",
         type=float,
-        help="compatibility-only for the one-shot router; forwarded and ignored",
+        help="historical congestion increment",
     )
     parser.add_argument("--net-limit", type=int)
     parser.add_argument(
         "--route-batch-size",
         type=int,
-        help="compatibility-only for the one-shot router; forwarded and ignored",
+        help="nets per congestion-cost batch",
     )
     parser.add_argument(
         "--keep-work-dir",
