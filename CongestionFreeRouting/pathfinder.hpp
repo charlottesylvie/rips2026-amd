@@ -95,7 +95,7 @@ struct PathfinderOptions {
   int max_sssp_iterations = -1;
   int capacity = 1;
   std::size_t net_limit = 0;
-  // Zero enables conservative GPU-memory-aware selection (up to eight).
+  // Zero enables engine-dependent automatic worker selection.
   std::size_t parallel_net_workers = 0;
 };
 

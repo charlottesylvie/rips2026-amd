@@ -10,6 +10,9 @@ namespace {
 
 std::atomic<int> g_multisource_delta_calls{0};
 std::atomic<int> g_delta_graph_uploads{0};
+std::atomic<int> g_bellman_ford_calls{0};
+std::atomic<int> g_bellman_ford_graph_uploads{0};
+std::atomic<int> g_bellman_ford_workspace_constructions{0};
 std::atomic<int> g_unit_bfs_calls{0};
 std::atomic<int> g_unit_bfs_graph_uploads{0};
 
@@ -283,6 +286,120 @@ routing::RoutingMetadata make_two_net_metadata(const HostCsrF32& graph) {
 }
 
 }  // namespace
+
+struct BellmanFordCsrGraph::Impl {
+  explicit Impl(const HostCsrF32& adjacency) : graph(adjacency) {}
+
+  HostCsrF32 graph;
+};
+
+BellmanFordCsrGraph::BellmanFordCsrGraph(const HostCsrF32& adjacency,
+                                         hipStream_t stream)
+    : impl_(std::make_shared<Impl>(adjacency)) {
+  (void)stream;
+  ++g_bellman_ford_graph_uploads;
+}
+
+BellmanFordCsrGraph::~BellmanFordCsrGraph() = default;
+BellmanFordCsrGraph::BellmanFordCsrGraph(BellmanFordCsrGraph&&) noexcept = default;
+BellmanFordCsrGraph& BellmanFordCsrGraph::operator=(
+    BellmanFordCsrGraph&&) noexcept = default;
+
+struct BellmanFordCsrWorkspace::Impl {
+  std::shared_ptr<const BellmanFordCsrGraph::Impl> graph;
+};
+
+BellmanFordCsrWorkspace::BellmanFordCsrWorkspace(const HostCsrF32& adjacency,
+                                                 hipStream_t stream)
+    : impl_(std::make_unique<Impl>()) {
+  (void)stream;
+  ++g_bellman_ford_workspace_constructions;
+  ++g_bellman_ford_graph_uploads;
+  impl_->graph = std::make_shared<BellmanFordCsrGraph::Impl>(adjacency);
+}
+
+BellmanFordCsrWorkspace::BellmanFordCsrWorkspace(
+    std::shared_ptr<const BellmanFordCsrGraph> adjacency,
+    hipStream_t stream)
+    : impl_(std::make_unique<Impl>()) {
+  (void)stream;
+  ++g_bellman_ford_workspace_constructions;
+  if (!adjacency || !adjacency->impl_) {
+    throw std::invalid_argument("Bellman-Ford shared graph must not be null");
+  }
+  impl_->graph = adjacency->impl_;
+}
+
+BellmanFordCsrWorkspace::~BellmanFordCsrWorkspace() = default;
+BellmanFordCsrWorkspace::BellmanFordCsrWorkspace(
+    BellmanFordCsrWorkspace&&) noexcept = default;
+BellmanFordCsrWorkspace& BellmanFordCsrWorkspace::operator=(
+    BellmanFordCsrWorkspace&&) noexcept = default;
+
+BellmanFordCsrResult BellmanFordCsrWorkspace::run(
+    const std::vector<int>& sources,
+    const std::vector<int>& targets,
+    float delta,
+    int max_iters,
+    hipStream_t stream,
+    BellmanFordCsrProgressCallback progress_callback,
+    void* progress_user_data) {
+  (void)delta;
+  (void)max_iters;
+  (void)stream;
+  (void)progress_callback;
+  (void)progress_user_data;
+  ++g_bellman_ford_calls;
+
+  BellmanFordCsrResult result;
+  const HostCsrF32& graph = impl_->graph->graph;
+  const CpuSsspResult cpu_result =
+      cpu_dijkstra_outgoing_csr_multi(graph, sources);
+  fill_compact_target_paths(graph, sources, targets, cpu_result, result);
+  result.target = -1;
+  result.iterations_used = 1;
+  result.converged = true;
+  result.stopped_on_target = result.target_reached;
+  return result;
+}
+
+BellmanFordCsrResult BellmanFordCsrWorkspace::run(
+    const std::vector<int>& sources,
+    int target,
+    float delta,
+    int max_iters,
+    hipStream_t stream,
+    BellmanFordCsrProgressCallback progress_callback,
+    void* progress_user_data) {
+  BellmanFordCsrResult result = run(sources,
+                                    std::vector<int>{target},
+                                    delta,
+                                    max_iters,
+                                    stream,
+                                    progress_callback,
+                                    progress_user_data);
+  result.target = target;
+  result.target_distance = result.target_distances.front();
+  result.target_reached = std::isfinite(result.target_distance);
+  return result;
+}
+
+BellmanFordCsrResult BellmanFordCsrWorkspace::run(
+    int source,
+    int target,
+    float delta,
+    int max_iters,
+    hipStream_t stream,
+    BellmanFordCsrProgressCallback progress_callback,
+    void* progress_user_data) {
+  return run(std::vector<int>{source},
+             target,
+             delta,
+             max_iters,
+             stream,
+             progress_callback,
+             progress_user_data);
+}
 
 struct DeltaSteppingCsrGraph::Impl {
   explicit Impl(const HostCsrF32& adjacency) : graph(adjacency) {}
@@ -723,6 +840,75 @@ int main() {
           "parallel delta workers should share one uploaded CSR graph");
   require(g_unit_bfs_calls == 0,
           "parallel explicit delta routing should not call unit BFS");
+
+  routing::PathfinderOptions parallel_bellman_ford_options = parallel_options;
+  parallel_bellman_ford_options.sssp_engine =
+      routing::SsspEngine::kBellmanFord;
+  g_bellman_ford_calls = 0;
+  g_bellman_ford_graph_uploads = 0;
+  g_bellman_ford_workspace_constructions = 0;
+  g_multisource_delta_calls = 0;
+  g_unit_bfs_calls = 0;
+  const routing::PathfinderResult parallel_bellman_ford_result =
+      routing::run_pathfinder(congestion_graph,
+                              congestion_metadata,
+                              parallel_bellman_ford_options,
+                              nullptr);
+  require(parallel_bellman_ford_result.routed,
+          "parallel Bellman-Ford routing should preserve routed status");
+  require(parallel_bellman_ford_result.nets[0].sinks[0].nodes ==
+              std::vector<int>({0, 2, 4}),
+          "Bellman-Ford should preserve the first net route");
+  require(parallel_bellman_ford_result.nets[1].sinks[0].nodes ==
+              std::vector<int>({1, 2, 5}),
+          "Bellman-Ford should preserve the second net route");
+  require(g_bellman_ford_calls == 2,
+          "parallel Bellman-Ford routing should call Bellman-Ford once per net");
+  require(g_bellman_ford_graph_uploads == 1,
+          "parallel Bellman-Ford workers should share one uploaded CSR graph");
+  require(g_bellman_ford_workspace_constructions == 2,
+          "explicitly requested Bellman-Ford workers should own two workspaces");
+  require(g_multisource_delta_calls == 0,
+          "explicit Bellman-Ford routing should not call delta-step");
+  require(g_unit_bfs_calls == 0,
+          "explicit Bellman-Ford routing should not call unit BFS");
+
+  const std::filesystem::path bellman_ford_routes_path =
+      "/tmp/congestion_free_bellman_ford_routes.jsonl";
+  routing::write_routes_jsonl(bellman_ford_routes_path,
+                              congestion_graph,
+                              congestion_metadata,
+                              parallel_bellman_ford_result);
+  std::ifstream bellman_ford_routes_file(bellman_ford_routes_path);
+  const std::string bellman_ford_routes_json(
+      (std::istreambuf_iterator<char>(bellman_ford_routes_file)),
+      std::istreambuf_iterator<char>());
+  require(bellman_ford_routes_json.find("\"net\":\"net_a\"") !=
+              std::string::npos,
+          "Bellman-Ford route output should use the existing net-level schema");
+  require(bellman_ford_routes_json.find("\"sources\":[") !=
+              std::string::npos &&
+              bellman_ford_routes_json.find("\"sinks\":[") !=
+              std::string::npos &&
+              bellman_ford_routes_json.find("\"edges\":[") !=
+              std::string::npos,
+          "Bellman-Ford route output should retain sources, sinks, and PIP edges");
+  require(bellman_ford_routes_json.find("\"type\":\"path\"") ==
+              std::string::npos,
+          "Bellman-Ford PathFinder output must not use standalone bf8/bf9 JSONL");
+
+  require(routing::parse_sssp_engine_arg("bellman-ford") ==
+              routing::SsspEngine::kBellmanFord,
+          "bellman-ford engine name should parse");
+  require(routing::parse_sssp_engine_arg("bf8") ==
+              routing::SsspEngine::kBellmanFord,
+          "bf8 engine alias should parse");
+  require(routing::parse_sssp_engine_arg("bf9") ==
+              routing::SsspEngine::kBellmanFord,
+          "bf9 engine alias should parse");
+  require(std::string(routing::sssp_engine_name(
+              routing::SsspEngine::kBellmanFord)) == "bellman-ford",
+          "Bellman-Ford engine should have a stable display name");
 
   routing::PathfinderOptions auto_worker_options = parallel_options;
   auto_worker_options.parallel_net_workers = 0;

@@ -1,6 +1,6 @@
 #include "pathfinder.hpp"
 
-#include "bellman_ford/bf8.hpp"
+#include "bellman_ford/bf9.hpp"
 #include "delta_stepping/delta_stepping_hip_CSR.hpp"
 #include "profiling/roctx_ranges.hpp"
 #include "unit_bfs/unit_bfs_hip_CSR.hpp"
@@ -10,16 +10,17 @@
 // This keeps the same benchmark-facing and route JSON APIs, but the routing
 // pass intentionally ignores present/historical congestion.  The default
 // engine uses a unit-weight GPU BFS specialized for the converter's unit
-// routing graph.  GPU delta-stepping remains selectable for comparison.
+// routing graph. GPU delta-stepping and Bellman-Ford bf9 remain selectable for
+// comparison.
 //
 // Example GPU build from the repository root:
-//   hipcc -std=c++17 -O3 -x hip -DBF8_NO_MAIN \
+//   hipcc -std=c++17 -O3 -x hip -DBF9_NO_MAIN \
 //     -I HIP_kernel/bellman_ford/src \
 //     -I CongestionFreeRouting/bellman_ford \
 //     -I CongestionFreeRouting/delta_stepping \
 //     -I CongestionFreeRouting/unit_bfs \
 //     CongestionFreeRouting/pathfinder.cpp \
-//     CongestionFreeRouting/bellman_ford/bf8.cpp \
+//     CongestionFreeRouting/bellman_ford/bf9.cpp \
 //     CongestionFreeRouting/delta_stepping/delta_stepping_hip_CSR.cpp \
 //     CongestionFreeRouting/unit_bfs/unit_bfs_hip_CSR.cpp \
 //     -pthread \
@@ -1011,7 +1012,8 @@ SsspEngine parse_sssp_engine_arg(const char* text) {
   if (value == "delta-step" || value == "delta-stepping" || value == "delta") {
     return SsspEngine::kDeltaStep;
   }
-  if (value == "bellman-ford" || value == "bellman_ford" || value == "bf8") {
+  if (value == "bellman-ford" || value == "bellman_ford" || value == "bf8" ||
+      value == "bf9") {
     return SsspEngine::kBellmanFord;
   }
   throw std::runtime_error("invalid sssp-engine: " + value);
