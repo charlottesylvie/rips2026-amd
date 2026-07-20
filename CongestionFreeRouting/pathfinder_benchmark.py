@@ -29,6 +29,7 @@ import argparse
 import gzip
 import hashlib
 import json
+import math
 import os
 import re
 import subprocess
@@ -67,6 +68,28 @@ def run_command(argv: list[str], label: str) -> None:
 def executable_path(value: str, env_name: str) -> str:
     override = os.environ.get(env_name)
     return override if override else value
+
+
+def delta_arg(value: str) -> str:
+    if value == "auto":
+        return value
+    try:
+        numeric = float(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("delta must be positive or 'auto'") from exc
+    if not math.isfinite(numeric) or numeric <= 0.0:
+        raise argparse.ArgumentTypeError("delta must be positive or 'auto'")
+    return value
+
+
+def positive_float_arg(value: str) -> float:
+    try:
+        numeric = float(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("value must be finite and positive") from exc
+    if not math.isfinite(numeric) or numeric <= 0.0:
+        raise argparse.ArgumentTypeError("value must be finite and positive")
+    return numeric
 
 
 def default_schema_dir() -> Path | None:
@@ -121,7 +144,30 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         default=executable_path("pathfinder", "PATHFINDER_BIN"),
         help="PathFinder executable path, or set PATHFINDER_BIN",
     )
-    parser.add_argument("--delta", type=float, help="delta-step bucket width")
+    engine = parser.add_mutually_exclusive_group()
+    engine.add_argument(
+        "--sssp-engine",
+        choices=("unit-bfs", "delta-step", "bellman-ford"),
+        help="shortest-path backend forwarded to PathFinder",
+    )
+    engine.add_argument(
+        "--use-delta-step",
+        action="store_true",
+        help="shorthand forwarded to select the delta-step backend",
+    )
+    parser.add_argument(
+        "--delta", type=delta_arg, help="positive delta-step bucket width or 'auto'"
+    )
+    parser.add_argument(
+        "--delta-multiplier",
+        type=positive_float_arg,
+        help="positive sweep multiplier used with --delta auto",
+    )
+    parser.add_argument(
+        "--delta-force-legacy-parent",
+        action="store_true",
+        help="force legacy generic-delta predecessor recovery",
+    )
     parser.add_argument(
         "--max-pathfinder-iters",
         type=int,
@@ -153,6 +199,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         help="compatibility-only for the one-shot router; forwarded and ignored",
     )
     parser.add_argument("--net-limit", type=int)
+    parser.add_argument("--parallel-net-workers", type=int)
     parser.add_argument(
         "--route-batch-size",
         type=int,
@@ -173,8 +220,14 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
 
 def pathfinder_args(args: argparse.Namespace) -> list[str]:
     forwarded: list[str] = []
+    if args.use_delta_step:
+        forwarded.append("--use-delta-step")
+    if args.delta_force_legacy_parent:
+        forwarded.append("--delta-force-legacy-parent")
     for attr, option in (
+        ("sssp_engine", "--sssp-engine"),
         ("delta", "--delta"),
+        ("delta_multiplier", "--delta-multiplier"),
         ("max_pathfinder_iters", "--max-pathfinder-iters"),
         ("max_sssp_iters", "--max-sssp-iters"),
         ("capacity", "--capacity"),
@@ -182,6 +235,7 @@ def pathfinder_args(args: argparse.Namespace) -> list[str]:
         ("present_multiplier", "--present-multiplier"),
         ("history_factor", "--history-factor"),
         ("net_limit", "--net-limit"),
+        ("parallel_net_workers", "--parallel-net-workers"),
         ("route_batch_size", "--route-batch-size"),
     ):
         value = getattr(args, attr)

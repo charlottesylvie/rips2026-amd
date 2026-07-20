@@ -143,9 +143,22 @@ void validate_csr(const HostCsrF32& graph) {
 }
 
 void validate_options(const PathfinderOptions& options) {
-  if (options.sssp_engine == SsspEngine::kDeltaStep &&
-      (!(options.delta > 0.0f) || !std::isfinite(options.delta))) {
-    throw std::invalid_argument("PathFinder delta must be finite and positive");
+  if (options.sssp_engine == SsspEngine::kDeltaStep) {
+    if (!(options.delta_multiplier > 0.0f) ||
+        !std::isfinite(options.delta_multiplier)) {
+      throw std::invalid_argument(
+          "PathFinder automatic delta multiplier must be finite and positive");
+    }
+    if (!options.delta_auto) {
+      if (!(options.delta > 0.0f) || !std::isfinite(options.delta)) {
+        throw std::invalid_argument(
+            "PathFinder delta must be finite and positive");
+      }
+      if (options.delta_multiplier != 1.0f) {
+        throw std::invalid_argument(
+            "--delta-multiplier requires --delta auto");
+      }
+    }
   }
   if (options.capacity <= 0) {
     throw std::invalid_argument("capacity must be positive");
@@ -738,6 +751,26 @@ int current_worker_device() {
 #endif
 }
 
+int current_device_wavefront_size() {
+#if defined(__HIPCC__) || defined(__HIP_PLATFORM_AMD__)
+  const int device = current_worker_device();
+  hipDeviceProp_t properties{};
+  const hipError_t status = hipGetDeviceProperties(&properties, device);
+  if (status != hipSuccess) {
+    throw std::runtime_error(std::string("hipGetDeviceProperties failed: ") +
+                             hipGetErrorString(status));
+  }
+  if (properties.warpSize <= 0) {
+    throw std::runtime_error(
+        "HIP device reported a nonpositive runtime wavefront size");
+  }
+  return properties.warpSize;
+#else
+  throw std::runtime_error(
+      "automatic delta requires a HIP runtime device query");
+#endif
+}
+
 void select_worker_device(int device) {
 #if defined(__HIPCC__) || defined(__HIP_PLATFORM_AMD__)
   const hipError_t status = hipSetDevice(device);
@@ -1047,6 +1080,18 @@ float parse_float_arg(const char* text, const char* name) {
   return value;
 }
 
+void parse_delta_arg(const char* text, PathfinderOptions* options) {
+  if (options == nullptr) {
+    throw std::invalid_argument("delta option destination must not be null");
+  }
+  if (std::string(text) == "auto") {
+    options->delta_auto = true;
+    return;
+  }
+  options->delta = parse_float_arg(text, "delta");
+  options->delta_auto = false;
+}
+
 SsspEngine parse_sssp_engine_arg(const char* text) {
   const std::string value(text);
   if (value == "unit-bfs" || value == "bfs") {
@@ -1083,7 +1128,8 @@ void print_usage(const char* program) {
       << "                                  Shortest-path backend. bellman-ford and bf10 select BF10;\n"
       << "                                  bf8 and bf9 are compatibility aliases. Default: unit-bfs\n"
       << "  --use-delta-step                Use delta-step backend for comparison.\n"
-      << "  --delta <float>                 Delta-stepping bucket width. Default: 1\n"
+      << "  --delta <float|auto>            Delta-stepping bucket width. Default: 1\n"
+      << "  --delta-multiplier <float>      Positive sweep multiplier for --delta auto. Default: 1\n"
       << "  --max-sssp-iters <int>          Delta rounds, BFS depth, or Bellman-Ford rounds; -1 for default.\n"
       << "  --delta-force-legacy-parent     Force generic Delta predecessor recovery for A/B comparison.\n"
       << "  --capacity <int>                Capacity used only for overuse diagnostics. Default: 1\n"
@@ -1376,8 +1422,23 @@ PathfinderResult run_pathfinder(const HostCsrF32& base_graph,
                                 const PathfinderOptions& options,
                                 hipStream_t stream) {
   PATHFINDER_PROFILE_RANGE("pathfinder.run");
-  validate_csr(base_graph);
   validate_options(options);
+  int automatic_delta_wavefront_size = 0;
+  float resolved_automatic_delta = options.delta;
+  if (options.sssp_engine == SsspEngine::kDeltaStep &&
+      options.delta_auto) {
+    PATHFINDER_PROFILE_RANGE("pathfinder.delta_auto_stats");
+    automatic_delta_wavefront_size = current_device_wavefront_size();
+    // The resolver performs the same complete CSR validation while it gathers
+    // the weight statistics. Avoid a second O(V + E) validation pass on large
+    // device graphs.
+    resolved_automatic_delta = delta_stepping_auto_delta(
+        base_graph,
+        automatic_delta_wavefront_size,
+        options.delta_multiplier);
+  } else {
+    validate_csr(base_graph);
+  }
   if (metadata.node_device_ids.size() != static_cast<std::size_t>(base_graph.rows)) {
     throw std::runtime_error("metadata node count does not match CSR row count");
   }
@@ -1431,9 +1492,19 @@ PathfinderResult run_pathfinder(const HostCsrF32& base_graph,
       break;
     }
     case SsspEngine::kDeltaStep: {
+      PathfinderOptions delta_options = options;
+      if (delta_options.delta_auto) {
+        delta_options.delta = resolved_automatic_delta;
+        std::ostringstream message;
+        message.precision(std::numeric_limits<float>::max_digits10);
+        message << "[pathfinder] resolved automatic delta="
+                << delta_options.delta
+                << " (wavefront=" << automatic_delta_wavefront_size
+                << ", multiplier=" << delta_options.delta_multiplier << ")\n";
+        std::cout << message.str();
+      }
       auto shared_graph =
           std::make_shared<DeltaSteppingCsrGraph>(base_graph, stream);
-      PathfinderOptions delta_options = options;
       if (delta_options.parallel_net_workers == 0) {
         const bool uses_unit_specialization =
             delta_options.max_sssp_iterations < 0 &&
@@ -1690,7 +1761,10 @@ int main(int argc, char** argv) {
       } else if (option == "--use-delta-step") {
         options.sssp_engine = routing::SsspEngine::kDeltaStep;
       } else if (option == "--delta") {
-        options.delta = routing::parse_float_arg(require_value("--delta"), "delta");
+        routing::parse_delta_arg(require_value("--delta"), &options);
+      } else if (option == "--delta-multiplier") {
+        options.delta_multiplier = routing::parse_float_arg(
+            require_value("--delta-multiplier"), "delta-multiplier");
       } else if (option == "--max-pathfinder-iters") {
         (void)routing::parse_int_arg(require_value("--max-pathfinder-iters"),
                                      "max-pathfinder-iters");

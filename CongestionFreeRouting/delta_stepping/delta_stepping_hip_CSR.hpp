@@ -1,6 +1,7 @@
 #pragma once
 
 #include "bf_hip_CSR.hpp"
+#include "delta_stepping_auto_delta.hpp"
 
 #include <hip/hip_runtime.h>
 

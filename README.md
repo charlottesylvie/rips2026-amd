@@ -75,6 +75,15 @@ make ROUTER=PathFinderFile BENCHMARKS="boom_med_pb" VERBOSE=1 \
   PATHFINDER_SSSP_ENGINE=delta-step
 ```
 
+The delta backend also accepts a graph-aware bucket-width seed and a sweep
+multiplier while retaining numeric widths as explicit overrides:
+
+```bash
+make ROUTER=PathFinderFile BENCHMARKS="boom_med_pb" VERBOSE=1 \
+  PATHFINDER_SSSP_ENGINE=delta-step \
+  PATHFINDER_ARGS="--delta auto --delta-multiplier 0.5"
+```
+
 For AMD GPU profiling through the same Makefile path, see
 [`CongestionFreeRouting/GPU_PROFILING.md`](CongestionFreeRouting/GPU_PROFILING.md).
 The integration can wrap only the inner GPU router with `rocprofv3`,
@@ -278,7 +287,8 @@ Tuning options:
 | --- | --- | --- |
 | `--sssp-engine <unit-bfs\|delta-step>` | `unit-bfs` | Shortest-path backend. |
 | `--use-delta-step` | unset | Shorthand for `--sssp-engine delta-step`. |
-| `--delta <float>` | `1` | Delta-stepping bucket width; meaningful for delta-step. |
+| `--delta <float\|auto>` | `1` | Explicit Delta-Stepping bucket width, or a graph-aware seed based on runtime wavefront size, average edge weight, and average out-degree. |
+| `--delta-multiplier <float>` | `1` | Positive multiplier for sweeping around `--delta auto`; rejected with an explicit numeric width. |
 | `--max-sssp-iters <int>` | `-1` | Delta-step bucket rounds or unit-BFS depth cap; `-1` uses the default. |
 | `--capacity <int>` | `1` | Capacity used only for overuse diagnostics. |
 | `--net-limit <count>` | unset | Route only the first `count` requests. |
@@ -290,6 +300,15 @@ The converter emits exact unit weights. For unlimited multi-target calls with
 no vertex-cost override or progress callback, the delta backend automatically
 uses its equivalent append-only unit-weight specialization; weighted and
 limited-iteration calls retain generic delta-stepping.
+
+Automatic delta is resolved once before worker dispatch, so every worker uses
+the same numeric width. Its graph-statistics scan is reported separately as
+the optional `pathfinder.delta_auto_stats` ROCTX range. The low-level helper
+also accepts destination vertex costs and computes the exact mean of
+`edge_weight(u,v) * vertex_cost(v)`; the one-shot PathFinder currently has no
+dynamic vertex-cost state and therefore resolves from immutable edge weights.
+Low-level callers that update edge values or vertex costs must resolve a new
+numeric width from the updated host data before the next run.
 
 ### `routes_to_phys`
 
@@ -323,7 +342,7 @@ Useful wrapper options:
 | `--interchange-to-csr <path>` | Override converter executable. Env: `INTERCHANGE_TO_CSR`. |
 | `--pathfinder <path>` | Override PathFinder executable. Env: `PATHFINDER_BIN`. |
 | `--routes-to-phys <path>` | Override route reconstructor. Env: `ROUTES_TO_PHYS`. |
-| `--sssp-engine`, `--use-delta-step`, `--delta`, `--max-sssp-iters`, `--parallel-net-workers`, `--capacity` | Forwarded to `pathfinder`. |
+| `--sssp-engine`, `--use-delta-step`, `--delta`, `--delta-multiplier`, `--max-sssp-iters`, `--parallel-net-workers`, `--capacity` | Forwarded to `pathfinder`. |
 | `--max-pathfinder-iters`, `--present-factor`, `--present-multiplier`, `--history-factor`, `--route-batch-size` | Compatibility-only; forwarded to `pathfinder` and ignored. |
 
 ## File Formats And Artifacts
@@ -372,6 +391,12 @@ g++ -std=c++17 -O2 -pthread \
   -o /tmp/pathfinder_bf10_cpu_stub_test
 
 /tmp/pathfinder_bf10_cpu_stub_test
+```
+
+Automatic-delta benchmark argument parsing/forwarding test:
+
+```bash
+python3 CongestionFreeRouting/tests/pathfinder_benchmark_args_test.py
 ```
 
 Unit-BFS compact-offset and batched-level correctness test (requires an AMD HIP

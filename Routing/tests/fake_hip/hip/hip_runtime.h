@@ -5,6 +5,10 @@
 using hipStream_t = void*;
 using hipError_t = int;
 
+struct hipDeviceProp_t {
+  int warpSize = 64;
+};
+
 constexpr hipError_t hipSuccess = 0;
 constexpr unsigned int hipStreamNonBlocking = 1;
 
@@ -18,6 +22,11 @@ inline hipError_t hipGetDevice(int* device) {
 }
 
 inline hipError_t hipSetDevice(int) {
+  return hipSuccess;
+}
+
+inline hipError_t hipGetDeviceProperties(hipDeviceProp_t* properties, int) {
+  properties->warpSize = 64;
   return hipSuccess;
 }
 

@@ -99,6 +99,10 @@ struct PathfinderOptions {
   std::size_t net_limit = 0;
   // Zero enables engine-dependent automatic worker selection.
   std::size_t parallel_net_workers = 0;
+  // Appended to preserve positional aggregate initialization of every older
+  // option field. A numeric delta remains an explicit override.
+  bool delta_auto = false;
+  float delta_multiplier = 1.0f;
 };
 
 struct PathfinderResult {

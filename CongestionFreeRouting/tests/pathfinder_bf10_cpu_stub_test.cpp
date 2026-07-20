@@ -26,6 +26,18 @@ std::atomic<int> g_bellman_ford_graph_uploads{0};
 std::atomic<int> g_bellman_ford_workspace_constructions{0};
 std::atomic<int> g_unit_bfs_calls{0};
 std::atomic<int> g_unit_bfs_graph_uploads{0};
+std::mutex g_delta_values_mutex;
+std::vector<float> g_delta_values;
+
+void clear_recorded_deltas() {
+  std::lock_guard<std::mutex> lock(g_delta_values_mutex);
+  g_delta_values.clear();
+}
+
+std::vector<float> recorded_deltas() {
+  std::lock_guard<std::mutex> lock(g_delta_values_mutex);
+  return g_delta_values;
+}
 
 struct CpuSsspResult {
   std::vector<float> dist;
@@ -608,12 +620,15 @@ DeltaSteppingCsrResult delta_stepping_minplus_hip_csr(
     hipStream_t stream,
     DeltaSteppingCsrProgressCallback progress_callback,
     void* progress_user_data) {
-  (void)delta;
   (void)max_iters;
   (void)stream;
   (void)progress_callback;
   (void)progress_user_data;
   ++g_multisource_delta_calls;
+  {
+    std::lock_guard<std::mutex> lock(g_delta_values_mutex);
+    g_delta_values.push_back(delta);
+  }
 
   DeltaSteppingCsrResult result;
   result.target = target;
@@ -775,6 +790,118 @@ UnitBfsCsrResult UnitBfsCsrWorkspace::run(
 int main() {
   require(routing::PathfinderOptions{}.delta == 1.0f,
           "default delta-stepping bucket width must be one");
+  require(!routing::PathfinderOptions{}.delta_auto,
+          "automatic delta must remain an explicit opt-in");
+  const routing::PathfinderOptions legacy_positional_options{
+      routing::SsspEngine::kDeltaStep, 2.0f, 7, true, 3, 4, 5};
+  require(legacy_positional_options.max_sssp_iterations == 7 &&
+              legacy_positional_options.delta_force_legacy_parent &&
+              legacy_positional_options.capacity == 3 &&
+              legacy_positional_options.net_limit == 4 &&
+              legacy_positional_options.parallel_net_workers == 5 &&
+              !legacy_positional_options.delta_auto &&
+              legacy_positional_options.delta_multiplier == 1.0f,
+          "new delta controls must preserve legacy aggregate field positions");
+
+  HostCsrF32 delta_stats_graph;
+  delta_stats_graph.rows = 4;
+  delta_stats_graph.cols = 4;
+  delta_stats_graph.nnz = 2;
+  delta_stats_graph.rowptr = {0, 2, 2, 2, 2};
+  delta_stats_graph.colind = {1, 2};
+  delta_stats_graph.values = {2.0f, 6.0f};
+  require(delta_stepping_auto_delta(delta_stats_graph, 64) == 512.0f,
+          "automatic delta must include isolated rows in average degree");
+  require(delta_stepping_auto_delta(delta_stats_graph, 32) == 256.0f,
+          "automatic delta must use the runtime wavefront size");
+  require(delta_stepping_auto_delta(delta_stats_graph, 64, 0.25f) ==
+              128.0f,
+          "automatic delta must apply its sweep multiplier to the seed");
+
+  delta_stats_graph.values = {0.0f, 6.0f};
+  require(delta_stepping_auto_delta(delta_stats_graph, 64) == 384.0f,
+          "zero-weight edges must still contribute to average degree");
+  delta_stats_graph.values = {2.0f, 6.0f};
+  const std::vector<float> destination_costs = {1000.0f, 2.0f, 4.0f, 1.0f};
+  require(delta_stepping_auto_delta(delta_stats_graph,
+                                    destination_costs,
+                                    64) == 1792.0f,
+          "automatic delta must apply costs at edge destinations");
+  require(delta_stepping_auto_delta(
+              delta_stats_graph, std::vector<float>(4, 0.0f), 64, 0.5f) ==
+              0.5f,
+          "all-zero effective weights must use the documented positive fallback");
+
+  HostCsrF32 empty_delta_graph;
+  empty_delta_graph.rows = 4;
+  empty_delta_graph.cols = 4;
+  empty_delta_graph.nnz = 0;
+  empty_delta_graph.rowptr = {0, 0, 0, 0, 0};
+  require(delta_stepping_auto_delta(empty_delta_graph, 64, 2.0f) == 2.0f,
+          "an edgeless graph must use the positive fallback and multiplier");
+  require(delta_stepping_auto_delta(
+              empty_delta_graph,
+              64,
+              std::numeric_limits<float>::denorm_min()) ==
+              std::numeric_limits<float>::min(),
+          "automatic delta must clamp tiny widths above device flush-to-zero");
+
+  delta_stats_graph.values.assign(
+      2, std::numeric_limits<float>::max());
+  const std::vector<float> maximum_costs(
+      4, std::numeric_limits<float>::max());
+  require(delta_stepping_auto_delta(delta_stats_graph, maximum_costs, 64) ==
+              std::numeric_limits<float>::max(),
+          "automatic delta must clamp overflowing effective-weight seeds");
+
+  auto require_auto_delta_rejects = [&](int wavefront, float multiplier) {
+    bool rejected = false;
+    try {
+      (void)delta_stepping_auto_delta(
+          empty_delta_graph, wavefront, multiplier);
+    } catch (const std::invalid_argument&) {
+      rejected = true;
+    }
+    require(rejected,
+            "automatic delta must reject an invalid wavefront or multiplier");
+  };
+  require_auto_delta_rejects(0, 1.0f);
+  require_auto_delta_rejects(64, 0.0f);
+  require_auto_delta_rejects(64, -1.0f);
+  require_auto_delta_rejects(
+      64, std::numeric_limits<float>::infinity());
+  require_auto_delta_rejects(
+      64, std::numeric_limits<float>::quiet_NaN());
+
+  routing::PathfinderOptions parsed_delta_options;
+  routing::parse_delta_arg("auto", &parsed_delta_options);
+  require(parsed_delta_options.delta_auto,
+          "--delta auto must select automatic mode");
+  routing::parse_delta_arg("2.5", &parsed_delta_options);
+  require(!parsed_delta_options.delta_auto &&
+              parsed_delta_options.delta == 2.5f,
+          "a numeric --delta must restore explicit override mode");
+  bool invalid_delta_text_rejected = false;
+  try {
+    routing::parse_delta_arg("aut", &parsed_delta_options);
+  } catch (const std::runtime_error&) {
+    invalid_delta_text_rejected = true;
+  }
+  require(invalid_delta_text_rejected,
+          "--delta must reject strings other than exact 'auto'");
+
+  routing::PathfinderOptions invalid_multiplier_options;
+  invalid_multiplier_options.sssp_engine = routing::SsspEngine::kDeltaStep;
+  invalid_multiplier_options.delta_multiplier = 2.0f;
+  bool explicit_multiplier_rejected = false;
+  try {
+    routing::validate_options(invalid_multiplier_options);
+  } catch (const std::invalid_argument&) {
+    explicit_multiplier_rejected = true;
+  }
+  require(explicit_multiplier_rejected,
+          "a multiplier with explicit delta must not be silently ignored");
+
   const HostCsrF32 graph = make_tree_graph();
   const std::vector<float> dist = cpu_dijkstra_outgoing_csr(graph, 0);
   const std::vector<routing::PathEdge> path =
@@ -895,9 +1022,11 @@ int main() {
 
   routing::PathfinderOptions parallel_delta_options = parallel_options;
   parallel_delta_options.sssp_engine = routing::SsspEngine::kDeltaStep;
+  parallel_delta_options.delta = 2.5f;
   g_multisource_delta_calls = 0;
   g_unit_bfs_calls = 0;
   g_delta_graph_uploads = 0;
+  clear_recorded_deltas();
   routing::PathfinderResult parallel_delta_result =
       routing::run_pathfinder(congestion_graph,
                               congestion_metadata,
@@ -911,6 +1040,45 @@ int main() {
           "parallel delta workers should share one uploaded CSR graph");
   require(g_unit_bfs_calls == 0,
           "parallel explicit delta routing should not call unit BFS");
+  const std::vector<float> explicit_deltas = recorded_deltas();
+  require(explicit_deltas.size() == 2 &&
+              std::all_of(explicit_deltas.begin(),
+                          explicit_deltas.end(),
+                          [](float value) { return value == 2.5f; }),
+          "an explicit numeric delta must reach every worker unchanged");
+
+  routing::PathfinderOptions graph_aware_delta_options =
+      parallel_delta_options;
+  graph_aware_delta_options.delta_auto = true;
+  graph_aware_delta_options.delta_multiplier = 0.25f;
+  HostCsrF32 graph_aware_weighted_graph = congestion_graph;
+  std::fill(graph_aware_weighted_graph.values.begin(),
+            graph_aware_weighted_graph.values.end(),
+            2.0f);
+  const float expected_graph_aware_delta = delta_stepping_auto_delta(
+      graph_aware_weighted_graph,
+      64,
+      graph_aware_delta_options.delta_multiplier);
+  g_multisource_delta_calls = 0;
+  g_delta_graph_uploads = 0;
+  clear_recorded_deltas();
+  const routing::PathfinderResult graph_aware_delta_result =
+      routing::run_pathfinder(graph_aware_weighted_graph,
+                              congestion_metadata,
+                              graph_aware_delta_options,
+                              nullptr);
+  require(graph_aware_delta_result.routed,
+          "graph-aware delta routing should preserve routed status");
+  require(g_multisource_delta_calls == 2 && g_delta_graph_uploads == 1,
+          "graph-aware delta must preserve shared parallel dispatch");
+  const std::vector<float> automatic_deltas = recorded_deltas();
+  require(automatic_deltas.size() == 2 &&
+              std::all_of(automatic_deltas.begin(),
+                          automatic_deltas.end(),
+                          [expected_graph_aware_delta](float value) {
+                            return value == expected_graph_aware_delta;
+                          }),
+          "automatic delta must resolve once and reach every worker identically");
 
   routing::PathfinderOptions parallel_bellman_ford_options = parallel_options;
   parallel_bellman_ford_options.sssp_engine =

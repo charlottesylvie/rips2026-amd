@@ -772,6 +772,38 @@ void test_compact_weight_class_updates(hipStream_t stream) {
   validate_current("updated topology map with vertex costs", &vertex_costs);
 }
 
+void test_compact_to_unit_storage_transition(hipStream_t stream) {
+  HostCsrF32 graph = make_weighted_corner_graph();
+  DeltaSteppingCsrWorkspace workspace(graph, stream);
+  const std::vector<int> sources = {0, 8, 0};
+  const std::vector<int> targets = {4, 7, 0, 8, 7};
+
+  const DeltaSteppingCsrResult compact_result = workspace.run(
+      sources, targets, 1.25f, -1, stream, nullptr, nullptr);
+  validate_compact_target_paths(
+      "compact storage before unit specialization",
+      graph,
+      sources,
+      targets,
+      cpu_dijkstra_outgoing_multi_source(graph, sources),
+      compact_result);
+
+  // The compact-parent run above deliberately never needs legacy predecessor
+  // buffers. Switching the same workspace to exact unit weights must allocate
+  // them lazily before the append-only specialization writes predecessor data.
+  std::fill(graph.values.begin(), graph.values.end(), 1.0f);
+  workspace.update_values(graph.values, stream);
+  const DeltaSteppingCsrResult unit_result = workspace.run(
+      sources, targets, 0.5f, -1, stream, nullptr, nullptr);
+  validate_compact_target_paths(
+      "unit specialization after compact-only storage",
+      graph,
+      sources,
+      targets,
+      cpu_dijkstra_outgoing_multi_source(graph, sources),
+      unit_result);
+}
+
 void test_empty_and_singleton_graphs(hipStream_t stream) {
   {
     const HostCsrF32 graph = make_outgoing_csr(1, {});
@@ -2227,6 +2259,7 @@ int main() {
     test_generic_compact_parent_modes(stream.get());
     test_compact_early_settlement_reset(stream.get());
     test_compact_weight_class_updates(stream.get());
+    test_compact_to_unit_storage_transition(stream.get());
     test_unit_weight_specialization(stream.get());
     test_default_stream_deep_wide_batching();
     test_zero_weight_scc_predecessors(stream.get());

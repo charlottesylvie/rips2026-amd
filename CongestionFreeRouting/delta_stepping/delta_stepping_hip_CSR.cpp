@@ -209,6 +209,8 @@ struct DeltaSteppingScratch {
   // begin/end, next depth, whether the last expansion was active, last
   // discovered bucket, and distinct bucket rounds.
   DeviceBuffer<int> unit_status;
+  // Lazy: compact edge-parent searches need neither legacy predecessor array.
+  // Unit specialization and legacy/wide generic paths allocate both together.
   DeviceBuffer<int> pred_node;
   DeviceBuffer<Offset> pred_edge;
   DeviceBuffer<unsigned long long> parent_key;
@@ -233,10 +235,18 @@ struct DeltaSteppingScratch {
         in_pending(static_cast<std::size_t>(rows_)),
         current_queue(static_cast<std::size_t>(rows_)),
         unit_status(kUnitStatusCount),
-        pred_node(static_cast<std::size_t>(rows_)),
-        pred_edge(static_cast<std::size_t>(rows_)),
         host_scalar(1),
         host_unit_status(kUnitStatusCount) {}
+
+  void ensure_legacy_predecessor_storage() {
+    const std::size_t vertex_count = static_cast<std::size_t>(rows);
+    if (pred_node.size() < vertex_count) {
+      pred_node.reset(vertex_count);
+    }
+    if (pred_edge.size() < vertex_count) {
+      pred_edge.reset(vertex_count);
+    }
+  }
 
   void ensure_generic_storage() {
     const std::size_t vertex_count = static_cast<std::size_t>(rows);
@@ -1738,6 +1748,7 @@ void initialize_legacy_predecessors_once(DeltaSteppingScratch& scratch,
                                          Offset n,
                                          hipStream_t stream) {
   if (scratch.legacy_predecessors_initialized) return;
+  scratch.ensure_legacy_predecessor_storage();
   initialize_legacy_predecessors_kernel
       <<<grid_for_items(n), kBlockSize, 0, stream>>>(
           n, scratch.pred_node.get(), scratch.pred_edge.get());
@@ -1750,6 +1761,7 @@ void initialize_unit_scratch_storage_once(DeltaSteppingScratch& scratch,
                                           float inf,
                                           hipStream_t stream) {
   if (scratch.unit_initialized) return;
+  scratch.ensure_legacy_predecessor_storage();
   initialize_unit_arrays_kernel<<<grid_for_items(n), kBlockSize, 0, stream>>>(
       n, inf, scratch.dist.get(), scratch.in_pending.get(),
       scratch.pred_node.get(), scratch.pred_edge.get());

@@ -1,290 +1,213 @@
-# Delta-Stepping Optimization Roadmap
+# Generic Delta-Stepping Optimization Roadmap
 
-## Audit status (2026-07-19)
+## Project direction (2026-07-20)
 
-The original summary contained 22 equally weighted items (priorities `0` through
-`21`). The audit found 11 fully implemented items, or **50.0%** (`11 / 22`).
-Three additional items are partial; assigning each half credit gives **56.8%**
-(`12.5 / 22`). Completed tasks have been removed from the active roadmap.
+The primary optimization target is now the generic nonnegative-weight SSSP
+backend. UnitBFS remains a useful specialization, but project-wide scheduling,
+memory-layout, and traversal work should first improve arbitrary weighted
+graphs.
 
-The three partial items are:
+The highest-upside direction is not another incremental flat-bucket change. It
+is a cuGraph-inspired adaptive Near/Far scheduler backed by reusable
+degree-aware edge expansion and destination aggregation. The existing
+Delta-Stepping implementation should remain available as a correctness and
+performance reference while this backend is developed.
 
-- the direct HIP regression is extensive, and the target gfx1151 run exposed
-  an explicit-stream controller-state failure; full validation of the
-  guarded path remains;
-- query/path buffers now grow geometrically, but PathFinder does not pre-reserve
-  metadata-derived capacities; and
-- compile-time kernel modes exist, but architecture, block-size, batch-size,
-  launch-bound, and compiler tuning have not been performed on the target GPU.
+Impact estimates below are qualitative until they are measured on genuinely
+weighted graphs. They are workload-dependent and are not additive.
 
-The code audit confirmed the completed exact-unit specialization and four-level
-status batching on the default/null stream; shared immutable CSR with lazy
-24-byte unit scratch and memory-aware workers; default-stream four-round generic
-light-closure batching; device-counted heavy and pending scans; compile-time
-relaxation modes; thread-per-short-row relaxation; per-successful-append atomic
-queue reservations; removal of overflow and touched membership
-synchronization/state; pinned scalar transfers with device-final pending
-reduction; float-correct same-bucket closure and terminal saturation; and
-race-safe parent publication with sparse exact-edge recovery.
+## Current implementation audit
 
-Parallel explicit worker streams now host-check every exact-unit BFS level and
-every generic light-closure round. Four-round device-controlled batching is
-gated to `stream == nullptr`: on gfx1151, batched dependent kernels otherwise
-produced state in which expansion counters advanced without matching frontier
-bounds. Retain this correctness gate until the failure is resolved and the
-affected runtime is validated.
+The generic path currently has these important properties:
 
-A later correctness audit removed wave-coalesced reservation from irregular
-adjacency loops because lanes can reach different dynamic collective calls.
-The completion percentages above are historical; a safe buffered reservation
-replacement remains future work.
+- Low-level runs still take a numeric `delta`. PathFinder can now resolve
+  `--delta auto` once from the active HIP wave size, average edge weight, and
+  average out-degree, with an explicit multiplier and numeric override. A
+  host helper also supports exact destination-cost-weighted statistics.
+- One GPU thread owns each active CSR row and scans that row serially.
+- Mixed rows are scanned during light closure and scanned again during the
+  heavy pass.
+- Future work is stored in one flat pending set. The implementation scans it to
+  find the minimum bucket, then scans it again to select and compact that
+  bucket.
+- Frontier counts, target settlement, and the next bucket still create
+  host-visible controller boundaries. Explicit worker streams host-check every
+  generic light-closure round because dependent batched dispatches exposed a
+  controller-state failure on gfx1151.
+- Queue reservations and competing distance updates use scalar global atomics.
+- Automatic compact-parent generic scratch is approximately 48 bytes per
+  vertex before per-target buffers because legacy predecessor arrays are now
+  lazy. At 28,226,432 vertices this is approximately 1.26 GiB per worker.
+  Forced-legacy or compact-map allocation fallback still grows to about 60
+  bytes per vertex (1.58 GiB).
+- Device CSR row offsets and legacy predecessor edges are always 64-bit.
 
-## Target-GPU profiling update (2026-07-17)
+Two previously listed tasks are already complete for automatic vector-target
+runs and must not remain active priorities:
 
-The first hardware-counter profile now exists for the Radeon 8060S/Strix Halo
-(`gfx1151`, 40 CUs, wave32). It used one worker and the first 100
-`logicnets_jscl` nets. The finite `--max-sssp-iters 2147483647` argument forced
-the generic all-edges-light Delta-Stepping path; these measurements do not
-describe the exact-unit specialization or a genuinely mixed-weight graph. The
-full-device CSR has 28,226,432 rows, above the specialization's
-`2^24 = 16,777,216`-row exact-float guard, so removing the finite option alone
-would still leave this particular graph on generic Delta-Stepping.
+- the winning 64-bit parent key already contains `{distance_bits,
+  original_edge_id}` when the graph has an eligible compact edge map; and
+- compact target-path extraction uses that edge ID directly, so predecessor-row
+  recovery is now only a legacy or allocation-fallback behavior.
 
-Four counter-replay passes were highly repeatable: summed kernel time was
-604.4--608.7 ms (0.39% coefficient of variation). Mean kernel-time allocation
-was:
+The retained 2026-07-17 gfx1151 profile predates the compact-parent path and
+used generic **all-edges-light** Delta-Stepping. Its 24.1% predecessor
+materialization measurement describes the old fallback, not current automatic
+vector-target routing. Its pending-bucket result also cannot predict a
+heterogeneous weighted workload.
 
-| Phase | Kernel time (ms) | Share |
-| --- | ---: | ---: |
-| Light-edge relaxation | 259.6 | 42.8% |
-| Sparse touched-state reset | 175.1 | 28.9% |
-| Predecessor materialization | 145.9 | 24.1% |
-| All other kernels and runtime helpers | 25.9 | 4.3% |
+## Ranked remaining changes
 
-Reset plus predecessor materialization therefore consumes **52.9%** of kernel
-time. Their combined kernel-only Amdahl ceiling is 2.12x if they were removed
-entirely; this is not an end-to-end prediction because graph loading, host
-round trips, and output remain.
+| Impact rank | Optimization | Expected impact | Invasiveness | Status and rationale |
+| ---: | --- | --- | --- | --- |
+| 1 | Add an adaptive two-level Near/Far backend | Very high on heterogeneous weighted graphs | Very high | Four queues, bounded urgent work, queue sharding, and lazy stale filtering replace the flat pending scan and classical light/heavy traversal structure. |
+| 2 | Slim generic state and reset traffic | High | Medium--High | Add mode-specific allocation, compact or versioned membership, bounded queues, and eligible 32-bit row offsets. This directly targets the large per-worker footprint and irregular writes. |
+| 3 | Add degree-aware, edge-balanced expansion | High on general or skewed graphs; modest on uniformly short rows | High | Retain thread-per-row for short rows, but add packed-wave, wave-per-row, and CTA/edge-balanced paths for longer rows. |
+| 4 | Aggregate competing candidates by destination before global updates | High when frontier destinations collide | High | Start with wave-local aggregation after edge balancing; use block/global sort-reduce only when telemetry justifies it. |
+| 5 | Remove the generic host-controlled inner loop | High for many small closure rounds or buckets | High | Keep scheduler state on the device. Evaluate persistent/cooperative execution or HIP Graph capture only after data dependencies no longer require host decisions. |
+| 6 | Add a distances-only execution mode | High for competitive SSSP benchmarks; low for routing calls that require paths | Low--Medium | Make predecessor output optional and omit `parent_key`, `edge_source`, predecessor storage, and path extraction when unused. |
+| 7 | Validate and tune automatic delta selection | Medium--High and workload-dependent | Low | PathFinder resolution, numeric override, multiplier, runtime wave size, destination-cost helper, and numeric edge-case clamps are implemented. Weighted GPU sweeps and workspace-integrated refresh after value/cost updates remain. |
+| 8 | Batch independent searches in one launch | High throughput upside when one search underfills the GPU | Very high | Pursue only after per-search state is smaller and the single-query scheduler is stable. |
+| 9 | Prepartition static light/heavy adjacency | Medium--High only on fixed-weight mixed rows | High | Conditional fallback for classic Delta-Stepping. Destination vertex-cost updates can invalidate the partition. |
+| 10 | Add circular buckets and a nonempty bitmap | Medium--High only when retaining classic Delta-Stepping | High | Near/Far largely supersedes this redesign. Implement it only if classic Delta remains the intended production scheduler. |
+| 11 | Relabel vertices or reorder adjacency for locality | Medium | High | Requires complete original-ID and metadata remapping and must amortize preprocessing. |
+| 12 | Tune block sizes, launch bounds, architecture flags, and compiler options | Low--Medium | Low | Repeat after structural changes; tuning alone will not remove current memory and synchronization costs. |
 
-| Hot kernel | Profiler VALU estimate vs FP32 single-issue peak | GL1 hit | GL2 hit | Resident waves per WGP | Wave cycles waiting for any reason |
-| --- | ---: | ---: | ---: | ---: | ---: |
-| Relax light edges | 1.12% | 1.83% | 21.41% | 54.25 / 64 | 99.42% |
-| Reset touched vertices | 0.09% | ~0.00% | 16.45% | 44.31 / 64 | 53.78% |
-| Materialize predecessors | 0.39% | 4.04% | 19.74% | 52.26 / 64 | 99.80% |
+## Recommended implementation order
 
-The VALU percentage follows ROCm Compute Profiler's gfx115x System SOL formula:
-wave32 aggregate VALU instructions divided by the 14.848-TFLOP/s FP32
-single-issue FMA ceiling at 2.9 GHz. The numerator includes integer and logic
-VALU instructions, so it is a conservative throughput proxy rather than a true
-floating-point operation count. Even with that caveat, the result decisively
-rules out arithmetic-throughput saturation. High wave residency, low cache hit
-rates, and high wait fractions instead point to irregular memory dependency and
-state-traffic costs.
+### Phase 0: establish the weighted baseline
 
-The separate `compute_thruput_util` metric-set run was incomplete on this
-ROCm/gfx1151 combination: metrics 11.2.5 and 11.2.6 were skipped and the output
-contained no VALU instruction counter. Do not use that run to claim VALU, VMEM,
-SALU, or branch utilization. The System SOL counters above are the usable data.
-Likewise, `max_mclk` was reported as zero, so request-derived fabric rates are
-not calibrated physical DRAM bandwidth percentages.
+Create a benchmark matrix that actually exercises the generic algorithm:
 
-The work is strongly skewed across nets. The ten largest searches account for
-72.4% of reset time and 69.0% of materialization time; launch size and duration
-correlate at 0.995 and 0.997 respectively. Future telemetry should attach the
-net identity and reached/touched count to each search so these outliers can be
-reproduced directly.
+1. low-degree, high-diameter road-like graphs with broad positive weights;
+2. skewed-degree RMAT or scale-free graphs;
+3. routing graphs with non-unit edge weights; and
+4. routing graphs with destination vertex costs enabled and updated.
 
-The retained profile predates the explicit-stream safety gate, so reprofile
-before using its launch or synchronization counts to predict current parallel
-worker performance.
+For each search record attempted and successful relaxations, light and heavy
+edge visits, light-closure rounds, absolute bucket span, queue peaks, live and
+stale pending entries, reached-row degree histograms, duplicate destination
+rate, atomic retries, device/host synchronization time, and reset time. Report
+single-source distance-only latency separately from multi-source/multi-target
+path-producing routing.
 
-Except for the measured values above, percentages below remain engineering
-estimates. They are not additive and must be validated separately for
-exact-unit and genuinely weighted graphs.
+### Phase 1: low-risk weighted improvements
 
-## Remaining work
+1. **Implemented for PathFinder:** add `delta=auto` behind an explicit mode
+   while preserving numeric `delta`.
+2. **Implemented for immutable PathFinder graphs and the host helper:** compute
+   the initial value from the active device wave size, average
+   out-degree, and average **effective** edge weight. When vertex costs are
+   active, low-level callers must recompute from updated host data; automatic
+   workspace refresh remains future work.
+3. **Controls implemented; GPU sweep pending:** test multipliers such as
+   `0.25`, `0.5`, `1`, `2`, and `4` around the seed.
+4. Add a distances-only result mode and allocate parent/path state lazily.
+5. Instantiate eligible 32-bit device row offsets while retaining public
+   64-bit edge identities and a forced-wide A/B path.
+6. **Implemented:** stop allocating legacy `pred_node` and `pred_edge` arrays
+   for automatic compact-parent searches; allocate them on the first unit or
+   legacy/wide run instead.
 
-| Priority | Optimization or validation | State | Expected improvement | Risk | Invasiveness |
-| ---: | --- | --- | ---: | ---: | ---: |
-| 1 | Run correctness and Unit-BFS performance validation on the target AMD GPU; test Delta exact-unit only on an eligible graph | Partial: counter run complete; explicit-stream failure reproduced and guarded-path validation pending | Establishes correctness and the relevant production baseline | Low | Low |
-| 2 | Publish the winning compact edge ID and eliminate predecessor-row recovery | Parent publication complete; recovery is measured at 24.1% of kernel time | Up to 1.32x kernel-only if removed | Medium | Medium--High |
-| 3 | Remove avoidable sparse-reset writes, then evaluate generation-stamped state | Reset is measured at 28.9% of kernel time | Up to 1.41x kernel-only if removed | Medium | Medium--High |
-| 4 | Add adaptive 32-bit internal row and predecessor-edge offsets | Not started; strongly supported by low cache hit rates | 5--20%, plus lower worker memory | Medium | Medium |
-| 5 | Reduce host round trips with safe device-resident batching and then HIP graph capture | Four-round batching is null-stream-only; explicit streams host-check each level/round | 5--25% end-to-end | Medium | Medium--High |
-| 6 | Batch independent nets in one launch | Not started; worker-count scaling was flat | 1.5--5x when individual searches underfill the GPU | High | High |
-| 7 | Pre-reserve query/path buffers from route metadata | Partial: geometric growth complete | 2--8% | Low | Low |
-| 8 | Tune block size, launch bounds, architecture, and compiler | Partial: hot kernels already show high wave residency | 0--10% | Low | Low |
-| 9 | Add a hybrid degree-aware scheduler | Still profile-gated; reached-row degree data is missing | 5--35% only if long rows dominate | Medium | Medium |
-| 10 | Replace pending rescans with circular buckets and a nonempty bitmap | Deprioritized for this run: reduce plus compact are only 1.0% of kernel time | 1.2--4x only on many-bucket weighted graphs | High | High |
-| 11 | Prepartition light and heavy adjacency | Not evaluated by the all-edges-light profile | 10--80% only on mixed-weight rows | Medium | High |
-| 12 | Add persistent/asynchronous Delta-Stepping | Future research after simpler batching | 1.3--3x on suitable weighted graphs | High | High |
+### Phase 2: reusable traversal primitives
 
-## Highest-priority changes
+Build one degree-aware outgoing-edge expansion layer usable by both classic
+Delta-Stepping and Near/Far:
 
-### 1. Validate the relevant production path on the target AMD GPU
+- one thread per short row;
+- several lanes or one packed wave for collections of short/medium rows;
+- one wave per longer row; and
+- one CTA or an edge-balanced representation for extreme rows.
 
-Compile and repeatedly run `tests/delta_stepping_hip_test.cpp`. The suite already
-covers exact-unit and arbitrary weighted graphs, float bucket boundaries,
-terminal-bucket saturation, duplicate sources/targets, zero-weight SCCs,
-limited iterations, callbacks, workspace reuse, concurrent streams, graph
-sharing, updates, vertex costs, queue boundary cases, and CPU-Dijkstra result
-comparison. Host-only or fake-HIP tests cannot validate real ballot, shuffle,
-atomic, stream, or floating-point device behavior.
+Use AMD's runtime wave size rather than hard-coding CUDA warp assumptions.
+Choose thresholds from reached-frontier telemetry. Once lanes process edges in
+a convergence-safe pattern, add wave-local destination grouping and
+wave-coalesced queue reservation. Do not place wave collectives directly in the
+current divergent per-thread adjacency loops.
 
-Exercise both execution modes explicitly: null-stream cases must cover
-four-round device batching, while concurrent nonblocking streams must preserve
-the host-visible boundary between every level/round. Do not infer
-explicit-stream safety from a passing default-stream batch.
+### Phase 3: Near/Far A/B backend
 
-The counter run validates that the generic path executes. The finite
-maximum-iteration argument disabled the exact-unit fast path, but the
-28,226,432-row full-device CSR also exceeds that path's `2^24`-row guard.
-Therefore, benchmark dedicated Unit-BFS against generic Delta-Stepping first;
-Delta without the finite argument is still generic for this graph. Validate the
-Delta exact-unit specialization separately on an eligible smaller/bounded CSR,
-or redesign it around integer BFS depth before considering it a full-device
-production option. Then sweep `1`, `2`, `4`, and `8` workers. For a genuinely
-weighted generic path, record light-round counts, remaining synchronizations,
-pending live/stale ratios, reached-row degrees, exact-edge recovery time, and
-allocation stalls.
+Implement Near/Far behind a selectable backend flag and retain classic Delta
+for comparison. The first version should include:
 
-### 2. Eliminate predecessor-row recovery
+- current and next urgent/near-near queues;
+- a near-far queue and a far queue;
+- lazy validation against the current distance so stale entries can be skipped
+  without requiring unique membership in every queue;
+- multiple queue subpartitions to reduce tail contention;
+- a CU-scaled cap on urgent work so a very large near set spills safely to less
+  urgent queues; and
+- original edge IDs and optional predecessor output.
 
-The current `parent_key` atomically publishes distance bits plus predecessor
-node, after which `materialize_predecessors_kernel` scans the predecessor's CSR
-row to rediscover the exact edge. The materialization pass is now measured at
-24.1% of all kernel time and has a 19.7% GL2 hit rate with 99.8% of wave cycles
-in `SQ_WAIT_ANY`.
+Tune the number of subpartitions and the urgent-work cap on AMD hardware rather
+than copying cuGraph's CUDA constants unchanged. Use effective weights for all
+threshold decisions when destination vertex costs are enabled.
 
-For graphs with fewer than `2^32` edges, replace the low 32 bits of the winning
-key with the original edge ID. Prefer a single nonnegative-float-ordered
-64-bit `{distance_bits, edge_id}` atomic state so distance and parent cannot
-diverge. Build one shared 32-bit edge-to-source array, or an equivalent compact
-mapping, and have target path extraction decode the state directly. This can
-remove the predecessor materialization launch, the dependent row scan, and
-potentially the separate `pred_node` and `pred_edge` arrays. Retain the current
-wide fallback and test equal-distance parallel edges and deterministic
-tie-breaking explicitly.
+### Phase 4: contention and state reduction
 
-### 3. Reduce or eliminate sparse reset
+Measure the candidate-to-unique-destination ratio after degree-aware expansion.
+Use wave-local reduction unconditionally only when it wins. Add block-level or
+global radix sort/reduce by destination for large, collision-heavy frontiers;
+small or low-collision frontiers should retain the direct atomic path.
 
-`reset_touched_vertices_kernel` is 28.9% of kernel time and writes seven
-scattered arrays per reached vertex. Start with a low-risk specialized reset:
-do not clear `pred_node` or `pred_edge` when current-run distance/key validity
-already gates their use, and do not touch `in_heavy` in the compiled
-all-edges-light mode. Prove which membership flags are zero at normal and
-target-early termination, clearing only the queues that can remain live.
+Fold queue-state changes into the selected scheduler rather than optimizing
+the old flat membership arrays twice. Evaluate packed membership, per-query
+epochs, or queue entries tagged with the distance/generation that created them.
+The goal is to remove scattered reset writes without adding more cost to the
+relaxation hot path.
 
-Then A/B a generation-stamped state word that treats stale distance, parent,
-and membership values as logically empty without scattering a reset over every
-touched vertex. Account for the extra checks/atomics in relaxation; a faster
-reset that slows the 42.8% relaxation kernel is not a win. The ten hard nets
-that dominate reset time should be a dedicated regression subset.
+### Phase 5: device-resident control and query batching
 
-### 4. Use compact internal offsets
+After the queue design is stable, remove per-round and per-bucket host
+decisions. Preserve the gfx1151 explicit-stream correctness gate until a new
+controller has been stress-tested on concurrent streams. HIP Graph capture is
+useful only after the captured sequence no longer depends on scalar D2H values.
 
-Delta-Stepping still uses 64-bit `minplus_sparse::Offset` for device row offsets
-and predecessor edges. When `nnz <= INT32_MAX`, convert row offsets to signed
-32-bit, store compact predecessor-edge IDs, instantiate both offset widths, and
-widen only while producing public output. Keep 64-bit on-disk and public edge
-IDs and add a forced-wide same-graph A/B mode.
+Batch multiple searches inside one launch only after the single-query backend
+is competitive. Give every query independent distance/parent epochs and queue
+state, and schedule work by available edges rather than assigning one static
+block group to each query.
 
-Prefer packing the winning 32-bit original edge ID into the existing 64-bit
-distance/key state. A shared compact edge-source map can then recover the
-predecessor without scanning the winning predecessor's row, completing the
-remaining exact-edge-recovery task while preserving strict-decrease parent
-publication.
+## Deprioritized alternatives
 
-### 5. Add degree-aware scheduling only if profiles justify it
-
-Thread-per-vertex is appropriate for short FPGA rows. The measured relaxation
-kernel already has about 54 resident waves per WGP and only 1.12% of the
-profiler's arithmetic peak, so occupancy or VALU throughput alone does not
-justify a cooperative-row rewrite. First profile the degree distribution of
-vertices actually reached by the ten hard nets. If long or skewed rows dominate,
-use one thread for short rows, a few lanes for medium rows, one wave for long
-rows, and optionally one block for extreme outliers. A first version can divert
-only long rows to a secondary cooperative queue.
-
-### 6. Finish allocation and target tuning
-
-The scratch allocator now grows sources, targets, and compact paths
-geometrically. PathFinder should additionally reserve maximum source/sink
-capacities from route metadata before workers start. Do not reserve worst-case
-`targets * vertices` path storage. Move target prefix/offset work to the device
-only if extraction remains material after compact parent work.
-
-Measure four-round batching against other batch sizes on the default/null
-stream. Benchmark explicit worker streams separately with their required
-per-level/per-round host checks; do not enable speculative batching there until
-the gfx1151 controller-state failure is resolved. Profile 128- and 256-thread
-blocks per kernel. Current hot kernels use 24 VGPRs, 128 SGPRs, no scratch, and
-no dynamic LDS, while measured wave residency is already high. Treat block-size
-tuning as a secondary experiment. Inspect register pressure before adding
-`__launch_bounds__`; use exact `--offload-arch`; test wave32/wave64 where
-supported; add `__restrict__` only to proven non-aliasing pointers; and use
-fast-math only if the float-boundary regressions remain correct.
-
-## Conditional weighted-graph redesigns
-
-The generic implementation maintains one unique pending set, scans it for the
-minimum bucket, and scans again to select/compact. In the current all-edges-light
-profile, reduction plus compaction is only 1.0% of kernel time, so a circular
-bucket redesign is not justified. Reconsider it only when a genuinely weighted
-profile shows many live buckets. The design must handle ring generations, stale
-entries, concurrent bit clearing/appending, terminal float buckets, duplicate
-capacity, and target settlement by absolute bucket.
-
-Prepartition light/heavy adjacency only for workloads that repeatedly scan
-mixed rows. Preserve a mapping to original CSR edge IDs. Destination vertex
-cost updates change effective edge classes, so either rebuild the partition or
-fall back to the current scan when costs are active.
-
-Reset cost is now material, so compact/epoch-stamped state has moved into active
-work. Add HIP graph capture only after batch tuning and only if launch gaps
-remain. Attempt multi-net launches or persistent ADDS only if tuned independent
-streams still underfill the GPU.
+- Do not implement circular buckets before Near/Far unless maintaining a
+  textbook Delta-Stepping scheduler is itself a requirement.
+- Do not prepartition light/heavy edges when destination costs can change their
+  effective class. A fixed-weight specialization may still benefit.
+- Do not copy cuGraph's global destination sort/reduce into every frontier.
+  Low-degree routing graphs may spend more on sorting than they save in atomics.
+- Do not treat HIP Graph capture as a substitute for eliminating host-dependent
+  control.
+- Direction-optimizing BFS, bidirectional search, and A* are separate routing
+  algorithms, not generic full-SSSP optimizations.
+- Multi-GPU work follows a competitive single-GPU implementation.
 
 ## Correctness invariants
 
-Future changes must preserve:
+All backends must preserve:
 
-1. outgoing CSR orientation and original 64-bit public edge identity;
-2. finite nonnegative edge weights and destination-cost multipliers;
-3. complete same-bucket light closure, including nominally heavy candidates
-   that round into the current bucket and saturated terminal-bucket edges;
-4. heavy relaxation from every vertex settled in the bucket using its final
-   distance for that bucket;
-5. strict monotone distance decreases and the queue uniqueness/capacity proof;
-6. target settlement only after its bucket is fully closed;
-7. duplicate source/target semantics and sparse workspace reset;
-8. exact-unit gating: unit weights, no vertex costs, at most `2^24` rows,
-   unlimited iterations, no callback, and the target-set overload;
-9. float bucket calculation by nonnegative `distance / delta` truncation;
-10. race-safe strict-winner parent publication, including zero-weight SCCs;
-11. per-workspace stream ordering, including null-stream-only four-round
-    batching and explicit-stream host checks, plus shared-graph lifetime/device
-    rules.
+1. outgoing CSR orientation and original public 64-bit edge identity;
+2. finite nonnegative edge weights and destination-cost multiplication;
+3. monotone strict distance decreases and deterministic valid parent ties;
+4. correct zero-weight edges, parallel edges, self-loops, and zero-weight SCCs;
+5. target settlement only when no more urgent work can lower that target;
+6. duplicate source and target semantics;
+7. exact paths rooted at one of the requested sources;
+8. safe workspace reuse after convergence, early target termination,
+   iteration limits, callbacks, and exceptions;
+9. null-stream and concurrent explicit-stream ordering on gfx1151; and
+10. a wide-offset fallback when rows or edges do not fit the compact form.
 
-## Verification and benchmark protocol
+## Acceptance gates
 
-Run focused sizes around the hardware wave and block boundaries, including
-`1`, `waveSize - 1`, `waveSize`, `waveSize + 1`, `255`, `256`, and `257`.
-Exercise zero through extreme degrees; all/sparse/no-lane appends; exactly `V`
-queue entries; values immediately around bucket boundaries; all-light,
-all-heavy, and mixed rows; pending-to-current decreases; duplicate and source
-targets; unreachable nodes; self-loops, parallel edges, unsorted rows;
-iteration/batch boundaries; callbacks; updates; repeated calls; and concurrent
-streams. Compare distances with CPU Dijkstra and validate paths independently.
+Every optimization must pass CPU-Dijkstra distance comparison and independent
+path validation. Test frontier sizes around wave and block boundaries, zero to
+extreme degree, all-light/all-heavy/mixed rows, weights immediately around
+thresholds, unreachable targets, terminal distances, repeated workspaces, and
+concurrent streams.
 
-Report separately:
-
-1. graph validation/upload and workspace construction;
-2. traversal through target settlement;
-3. predecessor/path extraction and sparse reset; and
-4. full PathFinder wall time across many nets.
-
-Use HIP events for GPU intervals, wall time for end-to-end routing, a warm-up,
-and repeated-run medians with dispersion. Keep graph, net order, target sets,
-worker count, validation, clocks, compiler, architecture, and delta fixed for
-comparisons. Maintain both production exact-unit and genuinely weighted suites.
+Report graph upload, traversal, path extraction, reset, and end-to-end routing
+separately. Use warm-ups, repeated medians with dispersion, identical graph and
+query order, fixed clocks when possible, and explicit compiler/architecture
+records. Compare the classic and Near/Far backends in both distances-only and
+path-producing modes.

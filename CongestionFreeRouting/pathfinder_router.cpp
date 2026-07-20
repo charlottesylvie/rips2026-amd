@@ -187,7 +187,8 @@ void print_usage(const char* program) {
       << "                                 Forwarded to pathfinder. Default: unit-bfs\n"
       << "  --use-delta-step               Forwarded to pathfinder for comparison.\n"
       << "  --delta-force-legacy-parent    Forwarded for generic Delta parent-path A/B comparison.\n"
-      << "  --delta <float>                Forwarded to pathfinder.\n"
+      << "  --delta <float|auto>           Forwarded to pathfinder.\n"
+      << "  --delta-multiplier <float>     Forwarded for an automatic-delta sweep.\n"
       << "  --max-sssp-iters <int>         Forwarded to pathfinder.\n"
       << "  --net-limit <count>            Forwarded to pathfinder.\n"
       << "  --parallel-net-workers <count> Forwarded to pathfinder; 0 enables engine-dependent auto-selection.\n"
@@ -252,6 +253,7 @@ Options parse_args(int argc, char** argv) {
       options.pathfinder_args.push_back(option);
     } else if (option == "--sssp-engine" ||
                option == "--delta" ||
+               option == "--delta-multiplier" ||
                option == "--max-pathfinder-iters" ||
                option == "--max-sssp-iters" ||
                option == "--net-limit" ||

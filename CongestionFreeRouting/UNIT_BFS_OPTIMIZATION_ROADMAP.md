@@ -1,172 +1,121 @@
-# Unit-BFS Optimization Roadmap
+# UnitBFS Optimization Roadmap
 
-## Audit status (2026-07-19)
+## Scope and project priority (2026-07-20)
 
-The original roadmap contained 24 equally weighted optimization items. Two are
-implemented: adaptive 32-bit device row offsets and predecessor-edge IDs, and
-four-level device-controlled BFS batching after the first level on the
-default/null stream. That is **8.3% implemented** (`2 / 24`). Both changes
-retain their target-AMD validation work below; implementation status alone is
-not a performance claim.
+UnitBFS is the specialized fast path for exact unit-weight routing graphs. It is
+no longer the primary research target: new project-wide traversal work should
+first improve the generic weighted SSSP backend described in
+`DELTA_STEPPING_OPTIMIZATION_ROADMAP.md` and `cuGraph-roadmap.md`.
 
-The code audit also confirmed the pre-roadmap baseline: outgoing CSR is uploaded
-once and shared by memory-aware parallel workers; traversal uses one append-only
-frontier/visited queue, per-successful-claim atomic reservations, a non-atomic
-visited precheck before the authoritative CAS, pinned status transfers, direct
-source initialization, sparse reset, and one predecessor-chain traversal for
-compact path extraction. Frontier bounds, completed depth, target progress, and
-the stopping condition now remain device-resident between batched status checks.
+UnitBFS should remain correct, stable, and fast for its eligible inputs. New
+UnitBFS-only structural work is deferred unless profiling shows that it is
+material to the production workload or it naturally reuses a primitive built
+for generic weighted SSSP.
 
-The gfx1151 direct-dispatch run exposed inconsistent controller state after
-dependent kernels were batched on parallel explicit streams. Those streams now
-host-check every level; four-level device batching remains enabled only when
-`stream == nullptr`. This is a correctness gate, not a tuning choice to remove
-without reproducing and resolving the runtime failure.
+Percentages below are unmeasured engineering estimates. They are
+workload-dependent and are not additive.
 
-Percentages below are unmeasured engineering estimates for the unit-BFS routing
-portion. They are workload-dependent and are not additive.
+## Implemented changes
 
-## Target-GPU profiling status (2026-07-17)
+The two selected UnitBFS-only changes are implemented:
 
-The new Radeon 8060S/Strix Halo hardware-counter archive profiles forced
-generic, all-edges-light Delta-Stepping, not Unit-BFS. Its low cache hit rates
-and state-management cost must not be copied directly into Unit-BFS estimates.
-It does make the dedicated Unit-BFS baseline more important: the production
-CSR has 28,226,432 rows, above Delta-Stepping's current
-`2^24 = 16,777,216`-row exact-unit guard, so Unit-BFS is the only specialized
-unit-weight path that can execute on the full-device graph today.
+1. eligible device row offsets and predecessor edge IDs use a compact 32-bit
+   representation with a wide fallback; and
+2. the default/null stream no longer performs a host round trip after every
+   BFS level. It checks the first expansion and then batches four
+   device-controlled levels before polling status.
 
-The next 100-net counter run should therefore use `PATHFINDER_SSSP_ENGINE=unit-bfs`
-with one worker and the same System SOL blocks. Report frontier expansion,
-sparse reset, path extraction, copies/fills, per-level synchronization, cache
-hit rates, resident waves, and wait fractions separately. Follow it with
-profiler-free worker sweeps; the flat worker scaling measured for generic
-Delta-Stepping is not automatically transferable to Unit-BFS.
+The gfx1151 direct-dispatch audit found inconsistent controller state when
+dependent kernels were batched on parallel explicit streams. Those streams
+therefore retain a host-visible boundary after every level. This is a
+correctness gate, not an optimization opportunity to remove without first
+reproducing and fixing the underlying behavior.
 
-## Remaining work
+The current implementation also retains the useful baseline design: one shared
+uploaded outgoing CSR, memory-aware worker creation, one append-only
+frontier/visited queue, an inexpensive visited precheck before the authoritative
+atomic claim, sparse reset, pinned status transfer, direct source
+initialization, and compact target-path extraction with original outgoing edge
+IDs.
 
-| Priority | Optimization or validation | Expected improvement | Risk | Invasiveness |
-| ---: | --- | ---: | ---: | ---: |
-| 1 | Profile 100-net Unit-BFS, benchmark worker counts, and validate compact/wide offsets on the target AMD GPU | Establishes the real production baseline; possible 1.2--3x throughput from worker tuning | Low | Low |
-| 2 | Validate default-stream four-level batching and the explicit-stream host-check gate; tune the batch/grid size | Confirms or revises the estimated 15--40% where batching is safe | Low | Low |
-| 3 | Add hybrid degree-aware frontier expansion | 10--35% | Medium | High |
-| 4 | Pre-reserve per-worker query buffers from route metadata | 2--8% | Low | Low |
-| 5 | Batch independent nets in one GPU launch | 1.5--4x throughput | High | High |
-| 6 | Add a persistent/cooperative BFS kernel | 1.3--2.5x | High | High |
-| 7 | Use generation-stamped visitation | 3--10% | Medium | Medium |
-| 8 | Improve small-target detection | 2--10% | Medium | Medium |
-| 9 | Fuse more target path extraction | 3--12% | Medium | High |
-| 10 | Capture repeated level batches in a HIP graph | 5--15% after batching | Medium | High |
-| 11 | Relabel nodes or reorder CSR neighbors for locality | 0--30% | High | High |
-| 12 | Add direction-optimizing BFS | 1.2--3x on wide searches | High | High |
-| 13 | Add bidirectional BFS | 1.3--5x on suitable searches | High | High |
-| 14 | Add a safe spatially bounded or A*-like mode | 1.5--10x on suitable nets | High | High |
-| 15 | Partition independent nets across multiple GPUs | Up to near-linear throughput scaling | Medium | High |
-| 16 | Tune block size, launch bounds, architecture, and compiler flags | 0--10% | Low | Low |
-| 17 | Add safe per-thread or block-level buffered queue reservation | 0--10% | Medium | Medium |
-| 18 | Remove duplicate CSR validation | 1--5% startup | Low | Low |
-| 19 | Skip or lazily load unused node metadata | 2--15% full wrapper | Medium | Medium |
-| 20 | Cache tile-coordinate parsing during conversion | 2--10% full wrapper | Low | Low |
+## Measured worker result
 
-The former separate tasks for a high-degree kernel and hybrid expansion are now
-one degree-aware scheduling task. Likewise, neighbor ordering and full node
-relabeling are grouped because both require the same edge-identity and metadata
-remapping audit. This consolidation does not change the historical `1 / 24`
-completion calculation.
+On `logicnets_jscl`, the manual worker sweep found:
 
-## Highest-priority changes
+- 4 and 8 workers were best and very similar;
+- 2 workers were worse; and
+- 1 worker was significantly worse.
 
-### 1. Establish the AMD baseline
+Use 4 workers as the conservative baseline and retain 8 as the first comparison
+point. Do not infer the same optimum for generic weighted Delta-Stepping; its
+per-worker state and controller behavior are different.
 
-Compile and repeatedly run `tests/unit_bfs_hip_test.cpp` on the target GPU. Run
-both automatic compact offsets and `UnitBfsCsrOffsetMode::kForce64Bit`, then
-collect a one-worker 100-net System SOL profile and compare explicit worker
-counts `1`, `2`, `4`, and `8` on the production graph. The current automatic
-policy chooses at most eight workers from free memory, net count, and CPU
-concurrency, but the throughput-optimal count is not known.
+## Remaining UnitBFS work
 
-Record full routing time, traversal time, path extraction, launch gaps,
-synchronization time, achieved occupancy, memory bandwidth, and atomic
-contention. Do not claim a speedup until the target-GPU run passes and the same
-graph, nets, worker count, and validation settings are compared.
+| Priority | Optimization or validation | Expected impact | Invasiveness | Disposition |
+| ---: | --- | --- | --- | --- |
+| 1 | Validate compact/wide offsets, four-level null-stream batching, and explicit-stream host checks on the target AMD GPU | Establishes correctness and the production baseline | Low | Required maintenance |
+| 2 | Reprofile 4 versus 8 workers on a fixed net set and record traversal, synchronization, reset, and path extraction separately | Establishes the production worker default | Low | Required measurement |
+| 3 | Reuse the generic degree-aware edge-expansion primitive | Medium only if reached rows are skewed | Medium once the shared primitive exists | Wait for generic implementation |
+| 4 | Pre-reserve source, target, and compact-path capacities from route metadata | 2--8% | Low | Low-risk follow-up |
+| 5 | Add generation-stamped visitation only if reset becomes material | 3--10% | Medium | Profile-gated |
+| 6 | Batch independent nets in one GPU launch | High throughput upside | High | Follow generic state/scheduler work |
+| 7 | Add persistent/cooperative BFS or HIP Graph capture | Medium on launch-bound searches | High | Defer until traces justify it |
+| 8 | Relabel vertices or reorder neighbors for locality | 0--30% | High | Defer; preserve original IDs |
+| 9 | Tune block size, launch bounds, architecture, and compiler flags | 0--10% | Low | Repeat after shared primitive changes |
 
-### 2. Validate and tune batched BFS levels
+## Recommended order
 
-On the default/null stream, dedicated Unit-BFS checks the first expansion
-immediately, then queues four device-controlled expansions and frontier
-advances before copying status. Later rounds become no-ops after an empty
-frontier, complete target discovery, or `max_depth`. Progress callbacks and all
-explicit streams use one host-checked level at a time. The explicit-stream gate
-avoids the gfx1151 controller-state failure described above. The batched
-launch grid is sized from both the visible frontier and the current device's
-compute-unit count so growth inside a batch does not inherit a tiny
-source-frontier grid.
+1. Run the full UnitBFS HIP regression on the target GPU in automatic compact
+   and forced-wide modes.
+2. Benchmark 4 and 8 workers repeatedly with identical graph, nets, validation,
+   and clocks. Use 4 as the default baseline unless 8 wins consistently by a
+   meaningful margin.
+3. Profile a representative 100-net run and record reached-row degree,
+   per-level frontier size, launch gaps, host-poll time, reset, and extraction.
+4. Finish the generic weighted degree-aware expansion primitive.
+5. Reuse that primitive in UnitBFS only if UnitBFS telemetry predicts a win.
+6. Pursue UnitBFS-specific batching, persistence, or locality work only after
+   the generic weighted roadmap reaches a competitive baseline.
 
-The HIP regression suite covers exact `iterations_used`, `max_depth` around
-batch boundaries, targets in every round, growing and exhausted frontiers,
-callback equivalence, repeated workspaces, both offset widths, and original
-outgoing CSR edge IDs. Run it on the target GPU, then trace a deep no-callback
-query to verify traversal status polls fall from `D` to approximately
-`1 + ceil((D - 1) / 4)` on the null stream and remain one per level on
-parallel explicit worker streams.
+## Shared versus specialized work
 
-### 3. Add degree-aware expansion
+The following generic-roadmap changes can be shared with UnitBFS:
 
-The current kernel assigns one thread to each frontier vertex. Profile the
-degree distribution of vertices that actually reach frontiers, then use one
-thread for short rows, four or eight lanes for medium rows, one wave for long
-rows, and optionally one block for extreme outliers. A simple first version can
-send only high-degree vertices to a secondary cooperative kernel.
+- adaptive 32-bit CSR row offsets;
+- degree-aware and edge-balanced outgoing-edge expansion;
+- safe wave-local queue reservation after convergent work assignment;
+- query-buffer capacity management;
+- optional generation/epoch infrastructure; and
+- benchmark and profiling instrumentation.
 
-### 4. Pre-reserve query storage
+The following cuGraph-inspired weighted changes do not directly belong in
+UnitBFS:
 
-Source, target, and compact path buffers currently grow exactly on demand;
-`hipMalloc`/`hipFree` may synchronize. PathFinder already knows maximum source
-and sink counts from route metadata, so reserve those capacities before worker
-threads start. Grow path buffers geometrically rather than allocating the
-worst-case `targets * vertices` size.
+- automatic delta selection;
+- Near/Far distance queues;
+- light/heavy edge classification;
+- weighted destination-candidate reduction; and
+- weighted target-settlement thresholds.
 
-## Conditional follow-ups
-
-- Add HIP graph capture only if batched traces remain launch-bound.
-- Attempt true multi-net batching only if explicit-stream workers, including
-  their required host checks, still underfill the GPU.
-- Consider a persistent kernel only after level batching is measured.
-- Pursue direction-optimizing, bidirectional, or spatial search only when
-  profiling shows that reducing explored vertices is necessary.
-- Use generation stamps only if sparse-reset time is material.
-- Change target detection or path extraction only if those stages are visible
-  in profiles.
-
-Node relabeling, neighbor reordering, and spatial pruning must preserve the
-mapping to original outgoing 64-bit CSR edge IDs. Spatial bounds must have an
-unrestricted fallback so reachable sinks cannot be incorrectly reported as
-unreachable.
-
-## End-to-end wrapper work
-
-The converter still computes and writes six node-metadata arrays, and the
-loader reads them regardless of whether the selected routing mode uses them.
-Make that work optional before attempting more invasive metadata changes.
-Coordinate parsing can also be cached per tile instead of repeatedly parsing
-tile names. Finally, validation currently occurs at the file boundary,
-PathFinder entry, and shared unit-BFS graph construction; a trusted internal
-constructor can remove the final repeated `O(V+E)` scan while retaining
-boundary validation.
+Direction-optimizing BFS, bidirectional BFS, and A*-like routing may reduce the
+number of visited vertices, but they change the algorithm or result scope. Keep
+them outside the competitive generic full-SSSP roadmap.
 
 ## Verification requirements
 
-Every traversal change must test frontier sizes below, at, and above the AMD
-wave size; skewed degrees; duplicate sources and targets; source targets;
-unreachable targets; depth limits around termination; repeated workspace calls;
-concurrent explicit-stream workers with per-level host checks; null-stream
-four-level batches; and that every returned edge belongs to the predecessor's
-original outgoing CSR row.
+Test frontier sizes below, at, and above the AMD wave and block sizes; growing
+and exhausted four-level batches; targets discovered in every batch position;
+depth caps around batch boundaries; duplicate/source/unreachable targets;
+repeated workspace reuse; concurrent explicit streams; null-stream batching;
+and both compact and wide offsets. Every returned edge must belong to the
+predecessor's original outgoing CSR row.
 
 Measure separately:
 
-1. already-converted unit-BFS/PathFinder time;
-2. full `PathFinderFile` wall time; and
-3. kernel, copy, and synchronization time from ROCm profiling.
+1. already-converted UnitBFS/PathFinder time;
+2. traversal, status copies, reset, and compact extraction;
+3. full `PathFinderFile` wall time; and
+4. worker throughput for 4 and 8 workers.
 
-Use a warm-up and report the median and dispersion of repeated runs.
+Use a warm-up and report repeated-run medians and dispersion.
