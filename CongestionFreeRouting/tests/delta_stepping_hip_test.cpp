@@ -11,6 +11,7 @@
 #include <hip/hip_runtime.h>
 
 #include <algorithm>
+#include <atomic>
 #include <cmath>
 #include <cstdint>
 #include <functional>
@@ -22,6 +23,7 @@
 #include <sstream>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -810,6 +812,221 @@ HostCsrF32 make_mixed_claim_unit_graph() {
     edges.push_back({vertex, 129, 1.0f});
   }
   return make_outgoing_csr(131, edges);
+}
+
+constexpr int kDeepWideLevels = 12;
+constexpr int kDeepWideWidth = 257;
+constexpr int kDeepWideTarget = kDeepWideLevels * kDeepWideWidth;
+constexpr int kDeepWideIsolated = kDeepWideTarget + 1;
+static_assert(kDeepWideLevels > 8, "deep regression must exceed eight levels");
+static_assert(kDeepWideWidth > 256,
+              "wide regression must cross a 256-thread boundary");
+
+HostCsrF32 make_deep_wide_layered_graph(float edge_weight) {
+  // Keep 257 vertices live across twelve levels.  This crosses block and wave
+  // boundaries, reaches three four-round batches on the default stream, and
+  // remains only 3,086 rows / 3,084 edges so eight private workspaces are cheap.
+  std::vector<EdgeSpec> edges;
+  edges.reserve(static_cast<std::size_t>(kDeepWideLevels) * kDeepWideWidth);
+  for (int lane = 0; lane < kDeepWideWidth; ++lane) {
+    edges.push_back({0, lane + 1, edge_weight});
+  }
+  for (int level = 1; level < kDeepWideLevels; ++level) {
+    const int level_begin = (level - 1) * kDeepWideWidth + 1;
+    for (int lane = 0; lane < kDeepWideWidth; ++lane) {
+      const int from = level_begin + lane;
+      edges.push_back({from, from + kDeepWideWidth, edge_weight});
+    }
+  }
+  return make_outgoing_csr(kDeepWideIsolated + 1, edges);
+}
+
+void validate_deep_wide_result(const std::string& label,
+                               const HostCsrF32& graph,
+                               const std::vector<float>& expected,
+                               int target,
+                               const DeltaSteppingCsrResult& result) {
+  validate_compact_target_paths(
+      label, graph, {0}, {target}, expected, result);
+  if (target == kDeepWideTarget) {
+    require(result.target_reached && result.stopped_on_target &&
+                !result.converged,
+            label + ": reachable deep target did not stop the traversal");
+  } else {
+    require(!result.target_reached && !result.stopped_on_target &&
+                result.converged,
+            label + ": isolated target did not exhaust the traversal");
+  }
+}
+
+void test_default_stream_deep_wide_batching() {
+  // Exact unit weights select Delta's append-only Unit-BFS specialization.
+  // A null stream and no callback are the production batching preconditions.
+  const HostCsrF32 unit_graph = make_deep_wide_layered_graph(1.0f);
+  const std::vector<float> unit_expected =
+      cpu_dijkstra_outgoing_multi_source(unit_graph, {0});
+  DeltaSteppingCsrWorkspace unit_workspace(unit_graph, nullptr);
+  validate_deep_wide_result(
+      "default-stream deep-wide exact-unit batching",
+      unit_graph,
+      unit_expected,
+      kDeepWideTarget,
+      unit_workspace.run({0},
+                         std::vector<int>{kDeepWideTarget},
+                         4.0f,
+                         -1,
+                         nullptr,
+                         nullptr,
+                         nullptr));
+  validate_deep_wide_result(
+      "default-stream deep-wide exact-unit exhaustion",
+      unit_graph,
+      unit_expected,
+      kDeepWideIsolated,
+      unit_workspace.run({0},
+                         std::vector<int>{kDeepWideIsolated},
+                         4.0f,
+                         -1,
+                         nullptr,
+                         nullptr,
+                         nullptr));
+
+  // Zero-weight edges force generic Delta-Stepping while keeping all twelve
+  // levels inside one light-edge closure, so its four-round batching boundary
+  // is exercised independently of the exact-unit specialization.
+  const HostCsrF32 closure_graph = make_deep_wide_layered_graph(0.0f);
+  const std::vector<float> closure_expected =
+      cpu_dijkstra_outgoing_multi_source(closure_graph, {0});
+  DeltaSteppingCsrWorkspace closure_workspace(closure_graph, nullptr);
+  validate_deep_wide_result(
+      "default-stream deep-wide generic closure batching",
+      closure_graph,
+      closure_expected,
+      kDeepWideTarget,
+      closure_workspace.run({0},
+                            std::vector<int>{kDeepWideTarget},
+                            1.0f,
+                            -1,
+                            nullptr,
+                            nullptr,
+                            nullptr));
+  validate_deep_wide_result(
+      "default-stream deep-wide generic closure exhaustion",
+      closure_graph,
+      closure_expected,
+      kDeepWideIsolated,
+      closure_workspace.run({0},
+                            std::vector<int>{kDeepWideIsolated},
+                            1.0f,
+                            -1,
+                            nullptr,
+                            nullptr,
+                            nullptr));
+}
+
+void test_parallel_deep_wide_explicit_streams() {
+  const HostCsrF32 unit_graph = make_deep_wide_layered_graph(1.0f);
+  const HostCsrF32 closure_graph = make_deep_wide_layered_graph(0.0f);
+  auto shared_unit_graph =
+      std::make_shared<DeltaSteppingCsrGraph>(unit_graph, nullptr);
+  auto shared_closure_graph =
+      std::make_shared<DeltaSteppingCsrGraph>(closure_graph, nullptr);
+  const std::vector<float> unit_expected =
+      cpu_dijkstra_outgoing_multi_source(unit_graph, {0});
+  const std::vector<float> closure_expected =
+      cpu_dijkstra_outgoing_multi_source(closure_graph, {0});
+  int device = 0;
+  check_hip(hipGetDevice(&device), "hipGetDevice");
+
+  constexpr int kWorkers = 8;
+  constexpr int kRunsPerWorker = 4;
+  std::promise<void> start_promise;
+  const std::shared_future<void> start = start_promise.get_future().share();
+  std::atomic<int> ready{0};
+  std::vector<std::future<void>> workers;
+  workers.reserve(kWorkers);
+  for (int worker = 0; worker < kWorkers; ++worker) {
+    workers.push_back(std::async(std::launch::async, [&, worker]() {
+      bool readiness_reported = false;
+      try {
+        check_hip(hipSetDevice(device), "hipSetDevice");
+        HipStream stream;
+        DeltaSteppingCsrWorkspace unit_workspace(shared_unit_graph,
+                                                 stream.get());
+        DeltaSteppingCsrWorkspace closure_workspace(shared_closure_graph,
+                                                    stream.get());
+        ready.fetch_add(1, std::memory_order_release);
+        readiness_reported = true;
+        start.wait();
+
+        for (int repetition = 0; repetition < kRunsPerWorker; ++repetition) {
+          const std::string prefix =
+              "parallel deep-wide worker " + std::to_string(worker) +
+              " reuse " + std::to_string(repetition);
+          validate_deep_wide_result(
+              prefix + ": exact-unit target",
+              unit_graph,
+              unit_expected,
+              kDeepWideTarget,
+              unit_workspace.run({0},
+                                 std::vector<int>{kDeepWideTarget},
+                                 4.0f,
+                                 -1,
+                                 stream.get(),
+                                 nullptr,
+                                 nullptr));
+          validate_deep_wide_result(
+              prefix + ": exact-unit exhaustion",
+              unit_graph,
+              unit_expected,
+              kDeepWideIsolated,
+              unit_workspace.run({0},
+                                 std::vector<int>{kDeepWideIsolated},
+                                 4.0f,
+                                 -1,
+                                 stream.get(),
+                                 nullptr,
+                                 nullptr));
+          validate_deep_wide_result(
+              prefix + ": generic closure target",
+              closure_graph,
+              closure_expected,
+              kDeepWideTarget,
+              closure_workspace.run({0},
+                                    std::vector<int>{kDeepWideTarget},
+                                    1.0f,
+                                    -1,
+                                    stream.get(),
+                                    nullptr,
+                                    nullptr));
+          validate_deep_wide_result(
+              prefix + ": generic closure exhaustion",
+              closure_graph,
+              closure_expected,
+              kDeepWideIsolated,
+              closure_workspace.run({0},
+                                    std::vector<int>{kDeepWideIsolated},
+                                    1.0f,
+                                    -1,
+                                    stream.get(),
+                                    nullptr,
+                                    nullptr));
+        }
+      } catch (...) {
+        if (!readiness_reported) {
+          ready.fetch_add(1, std::memory_order_release);
+        }
+        throw;
+      }
+    }));
+  }
+  while (ready.load(std::memory_order_acquire) != kWorkers) {
+    std::this_thread::yield();
+  }
+  start_promise.set_value();
+  for (std::future<void>& worker : workers) {
+    worker.get();
+  }
 }
 
 void test_unit_weight_specialization(hipStream_t stream) {
@@ -1764,12 +1981,14 @@ int main() {
     test_compact_early_settlement_reset(stream.get());
     test_compact_weight_class_updates(stream.get());
     test_unit_weight_specialization(stream.get());
+    test_default_stream_deep_wide_batching();
     test_zero_weight_scc_predecessors(stream.get());
     test_float_bucket_boundaries_and_saturation(stream.get());
     test_batched_closure_and_iteration_fallback(stream.get());
     test_wave_boundary_contention(stream.get());
     test_shared_graph_workspaces(stream.get());
     test_parallel_divergent_workspaces(stream.get());
+    test_parallel_deep_wide_explicit_streams();
     test_workspace_reuse_and_updates(stream.get());
     test_compact_legacy_mode_alternation(stream.get());
     test_seeded_random_graphs(stream.get());

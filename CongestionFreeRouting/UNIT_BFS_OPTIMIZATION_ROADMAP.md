@@ -4,9 +4,10 @@
 
 The original roadmap contained 24 equally weighted optimization items. Two are
 implemented: adaptive 32-bit device row offsets and predecessor-edge IDs, and
-four-level device-controlled BFS batching after the first level. That is
-**8.3% implemented** (`2 / 24`). Both changes retain their target-AMD validation
-work below; implementation status alone is not a performance claim.
+four-level device-controlled BFS batching after the first level on the
+default/null stream. That is **8.3% implemented** (`2 / 24`). Both changes
+retain their target-AMD validation work below; implementation status alone is
+not a performance claim.
 
 The code audit also confirmed the pre-roadmap baseline: outgoing CSR is uploaded
 once and shared by memory-aware parallel workers; traversal uses one append-only
@@ -15,6 +16,12 @@ visited precheck before the authoritative CAS, pinned status transfers, direct
 source initialization, sparse reset, and one predecessor-chain traversal for
 compact path extraction. Frontier bounds, completed depth, target progress, and
 the stopping condition now remain device-resident between batched status checks.
+
+The gfx1151 direct-dispatch run exposed inconsistent controller state after
+dependent kernels were batched on parallel explicit streams. Those streams now
+host-check every level; four-level device batching remains enabled only when
+`stream == nullptr`. This is a correctness gate, not a tuning choice to remove
+without reproducing and resolving the runtime failure.
 
 Percentages below are unmeasured engineering estimates for the unit-BFS routing
 portion. They are workload-dependent and are not additive.
@@ -41,7 +48,7 @@ Delta-Stepping is not automatically transferable to Unit-BFS.
 | Priority | Optimization or validation | Expected improvement | Risk | Invasiveness |
 | ---: | --- | ---: | ---: | ---: |
 | 1 | Profile 100-net Unit-BFS, benchmark worker counts, and validate compact/wide offsets on the target AMD GPU | Establishes the real production baseline; possible 1.2--3x throughput from worker tuning | Low | Low |
-| 2 | Validate four-level batching on the target GPU and tune the batch/grid size | Confirms or revises the estimated 15--40% | Low | Low |
+| 2 | Validate default-stream four-level batching and the explicit-stream host-check gate; tune the batch/grid size | Confirms or revises the estimated 15--40% where batching is safe | Low | Low |
 | 3 | Add hybrid degree-aware frontier expansion | 10--35% | Medium | High |
 | 4 | Pre-reserve per-worker query buffers from route metadata | 2--8% | Low | Low |
 | 5 | Batch independent nets in one GPU launch | 1.5--4x throughput | High | High |
@@ -85,12 +92,14 @@ graph, nets, worker count, and validation settings are compared.
 
 ### 2. Validate and tune batched BFS levels
 
-The dedicated unit BFS now checks the first expansion immediately, then queues
-four device-controlled expansions and frontier advances before copying status.
-Later rounds become no-ops after an empty frontier, complete target discovery,
-or `max_depth`. Progress callbacks retain the historical one-level path. The
-batched launch grid is sized from both the visible frontier and the current
-device's compute-unit count so growth inside a batch does not inherit a tiny
+On the default/null stream, dedicated Unit-BFS checks the first expansion
+immediately, then queues four device-controlled expansions and frontier
+advances before copying status. Later rounds become no-ops after an empty
+frontier, complete target discovery, or `max_depth`. Progress callbacks and all
+explicit streams use one host-checked level at a time. The explicit-stream gate
+avoids the gfx1151 controller-state failure described above. The batched
+launch grid is sized from both the visible frontier and the current device's
+compute-unit count so growth inside a batch does not inherit a tiny
 source-frontier grid.
 
 The HIP regression suite covers exact `iterations_used`, `max_depth` around
@@ -98,7 +107,8 @@ batch boundaries, targets in every round, growing and exhausted frontiers,
 callback equivalence, repeated workspaces, both offset widths, and original
 outgoing CSR edge IDs. Run it on the target GPU, then trace a deep no-callback
 query to verify traversal status polls fall from `D` to approximately
-`1 + ceil((D - 1) / 4)`.
+`1 + ceil((D - 1) / 4)` on the null stream and remain one per level on
+parallel explicit worker streams.
 
 ### 3. Add degree-aware expansion
 
@@ -119,8 +129,8 @@ worst-case `targets * vertices` size.
 ## Conditional follow-ups
 
 - Add HIP graph capture only if batched traces remain launch-bound.
-- Attempt true multi-net batching only if tuned multi-stream workers underfill
-  the GPU.
+- Attempt true multi-net batching only if explicit-stream workers, including
+  their required host checks, still underfill the GPU.
 - Consider a persistent kernel only after level batching is measured.
 - Pursue direction-optimizing, bidirectional, or spatial search only when
   profiling shows that reducing explored vertices is necessary.
@@ -149,7 +159,8 @@ boundary validation.
 Every traversal change must test frontier sizes below, at, and above the AMD
 wave size; skewed degrees; duplicate sources and targets; source targets;
 unreachable targets; depth limits around termination; repeated workspace calls;
-concurrent workers; and that every returned edge belongs to the predecessor's
+concurrent explicit-stream workers with per-level host checks; null-stream
+four-level batches; and that every returned edge belongs to the predecessor's
 original outgoing CSR row.
 
 Measure separately:

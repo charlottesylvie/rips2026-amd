@@ -886,14 +886,19 @@ UnitBfsCsrResult run_unit_bfs_with_offsets(
   while (current_count > 0 && found_count < target_count &&
          result.iterations_used < max_depth) {
     // Check the first expansion immediately so the next batch can be sized
-    // from a real frontier.  Thereafter, enqueue four device-controlled levels
-    // per status copy.  Kernels after target discovery, frontier exhaustion, or
-    // max_depth become no-ops through kStatusActive.
+    // from a real frontier.  The default stream may then enqueue four
+    // device-controlled levels per status copy.  Keep every explicit stream at
+    // one level per copy.  This inserts a host-visible boundary before another
+    // expansion after observed controller-state inconsistencies when several
+    // nonblocking streams batch dependent kernels concurrently.
     const int remaining_depth = max_depth - result.iterations_used;
-    const int rounds_to_enqueue =
-        progress_callback != nullptr || result.iterations_used == 0
-            ? 1
-            : std::min(kLevelsPerStatusCheck, remaining_depth);
+    const bool batch_levels =
+        stream == nullptr && progress_callback == nullptr &&
+        result.iterations_used != 0;
+    const int rounds_to_enqueue = batch_levels
+                                      ? std::min(kLevelsPerStatusCheck,
+                                                 remaining_depth)
+                                      : 1;
     const int launch_blocks =
         rounds_to_enqueue == 1
             ? grid_for_frontier(current_count)

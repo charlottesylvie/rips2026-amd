@@ -518,58 +518,72 @@ HostCsrF32 make_divergent_claim_graph() {
   return graph;
 }
 
-HostCsrF32 make_second_speculative_round_target_graph() {
-  // Keep enough isolated rows for a production-sized batched launch grid while
-  // making the reached portion small and deterministic. Starting with two
-  // sources, the frontier sizes are exactly 2 -> 10 -> 18 -> 19. The first
-  // expansion is checked by the host, the 18-node frontier is produced by the
-  // first speculative round, and target 48 is found by the second speculative
-  // round.
+constexpr int kDeepWideLevels = 12;
+constexpr int kDeepWideWidth = 257;
+constexpr int kDeepWideTarget = kDeepWideLevels * kDeepWideWidth;
+constexpr int kDeepWideIsolated = kDeepWideTarget + 1;
+static_assert(kDeepWideLevels > 8, "deep regression must exceed eight levels");
+static_assert(kDeepWideWidth > 256,
+              "wide regression must cross a 256-thread boundary");
+
+HostCsrF32 make_deep_wide_layered_graph() {
+  // Layer one fans out past both a 256-thread block and four 64-lane waves.
+  // Every later layer keeps all 257 lanes live while preserving a unique
+  // predecessor for each vertex:
   //
-  //   {0,1} -> {2..11} -> {12..29} -> {30..48}
+  //   0 -> layer[1][0..256] -> ... -> layer[12][0..256]
   //
-  // Every reached vertex has one predecessor, so the target path and CSR edge
-  // IDs are stable even when several streams execute the graph concurrently.
-  constexpr int kRows = 1 << 18;
+  // The last lane is the reachable target and one extra row is isolated.  This
+  // compact shape crosses three four-level controller batches on the default
+  // stream and forces thirteen host-observed levels on explicit streams when
+  // the isolated target is queried.
+  constexpr int kRows = kDeepWideIsolated + 1;
   HostCsrF32 graph;
   graph.rows = kRows;
   graph.cols = kRows;
   graph.rowptr.resize(kRows + 1);
-  int next_second_level = 12;
-  int next_third_level = 30;
   for (int v = 0; v < kRows; ++v) {
     graph.rowptr[static_cast<std::size_t>(v)] =
         static_cast<Offset>(graph.colind.size());
     if (v == 0) {
-      for (int dst = 2; dst <= 6; ++dst) {
+      for (int dst = 1; dst <= kDeepWideWidth; ++dst) {
         graph.colind.push_back(dst);
       }
-    } else if (v == 1) {
-      for (int dst = 7; dst <= 11; ++dst) {
-        graph.colind.push_back(dst);
-      }
-    } else if (v >= 2 && v <= 11) {
-      const int child_count = v <= 9 ? 2 : 1;
-      for (int child = 0; child < child_count; ++child) {
-        graph.colind.push_back(next_second_level++);
-      }
-    } else if (v >= 12 && v <= 29) {
-      const int child_count = v == 12 ? 2 : 1;
-      for (int child = 0; child < child_count; ++child) {
-        graph.colind.push_back(next_third_level++);
-      }
+    } else if (v <= (kDeepWideLevels - 1) * kDeepWideWidth) {
+      graph.colind.push_back(v + kDeepWideWidth);
     }
   }
-  require_equal(next_second_level,
-                30,
-                "second-round graph second-level endpoint");
-  require_equal(next_third_level,
-                49,
-                "second-round graph third-level endpoint");
   graph.rowptr.back() = static_cast<Offset>(graph.colind.size());
   graph.nnz = static_cast<Offset>(graph.colind.size());
   graph.values.assign(graph.colind.size(), 1.0f);
   return graph;
+}
+
+ExpectedTarget reached_on_deep_wide_lane(const HostCsrF32& graph) {
+  std::vector<int> nodes = {0};
+  std::vector<Offset> edges;
+  nodes.reserve(kDeepWideLevels + 1);
+  edges.reserve(kDeepWideLevels);
+
+  int from = 0;
+  for (int level = 1; level <= kDeepWideLevels; ++level) {
+    const int to = level * kDeepWideWidth;
+    const Offset edge =
+        level == 1
+            ? graph.rowptr[0] + static_cast<Offset>(kDeepWideWidth - 1)
+            : graph.rowptr[static_cast<std::size_t>(from)];
+    require_equal(graph.colind[static_cast<std::size_t>(edge)],
+                  to,
+                  "deep-wide expected path edge");
+    edges.push_back(edge);
+    nodes.push_back(to);
+    from = to;
+  }
+  return reached(kDeepWideTarget,
+                 static_cast<float>(kDeepWideLevels),
+                 0,
+                 std::move(nodes),
+                 std::move(edges));
 }
 
 ExpectedTarget reached_on_chain(int target) {
@@ -774,6 +788,22 @@ void run_batching_suite(UnitBfsCsrOffsetMode mode,
            wide_exhausted,
            mode_label + ": wide frontier exhaustion");
 
+  const HostCsrF32 deep_wide_graph = make_deep_wide_layered_graph();
+  UnitBfsCsrWorkspace deep_wide_workspace(deep_wide_graph, nullptr, mode);
+  const ExpectedRun deep_wide_target{
+      kDeepWideLevels,
+      true,
+      true,
+      true,
+      {reached_on_deep_wide_lane(deep_wide_graph)}};
+  run_case(deep_wide_workspace,
+           deep_wide_graph,
+           {0},
+           {kDeepWideTarget},
+           -1,
+           deep_wide_target,
+           mode_label + ": deep wide default-stream batching");
+
   const HostCsrF32 mixed_graph = make_divergent_claim_graph();
   UnitBfsCsrWorkspace mixed_workspace(mixed_graph, nullptr, mode);
   const ExpectedRun mixed_early_stop{
@@ -860,30 +890,31 @@ void run_parallel_workspace_suite() {
   }
 }
 
-void run_parallel_second_speculative_round_suite() {
-  const HostCsrF32 graph = make_second_speculative_round_target_graph();
+void run_parallel_deep_wide_explicit_stream_suite() {
+  const HostCsrF32 graph = make_deep_wide_layered_graph();
   auto shared_graph = std::make_shared<UnitBfsCsrGraph>(graph, nullptr);
   int device = 0;
   check_hip(hipGetDevice(&device), "hipGetDevice");
 
-  const ExpectedRun target_in_second_round{
-      3,
+  const ExpectedRun deep_target{
+      kDeepWideLevels,
       true,
       true,
       true,
-      {reached(48,
-               3.0f,
-               1,
-               {1, 11, 29, 48},
-               {static_cast<Offset>(9),
-                static_cast<Offset>(27),
-                static_cast<Offset>(46)})}};
+      {reached_on_deep_wide_lane(graph)}};
+  const ExpectedRun deep_exhausted{
+      kDeepWideLevels + 1,
+      true,
+      false,
+      false,
+      {unreachable(kDeepWideIsolated)}};
 
   // Construct all private workspaces first, then release their first queries
-  // together. This exercises the same eight nonblocking-stream scheduling as
-  // PathFinder rather than allowing short fixtures to run mostly serially.
+  // together.  The 257-wide, twelve-level reachable traversal and thirteen-
+  // level exhaustion exercise PathFinder's eight nonblocking-stream scheduling
+  // without the former 2^18-row allocation or thousands of shallow queries.
   constexpr int kWorkers = 8;
-  constexpr int kRunsPerWorker = 512;
+  constexpr int kRunsPerWorker = 32;
   std::promise<void> start_promise;
   const std::shared_future<void> start = start_promise.get_future().share();
   std::atomic<int> ready{0};
@@ -901,9 +932,9 @@ void run_parallel_second_speculative_round_suite() {
         start.wait();
 
         for (int repetition = 0; repetition < kRunsPerWorker; ++repetition) {
-          UnitBfsCsrResult result = workspace.run(
-              std::vector<int>{0, 1},
-              std::vector<int>{48},
+          UnitBfsCsrResult reached_result = workspace.run(
+              std::vector<int>{0},
+              std::vector<int>{kDeepWideTarget},
               1.0f,
               -1,
               stream.get(),
@@ -911,9 +942,25 @@ void run_parallel_second_speculative_round_suite() {
               nullptr);
           validate_result(
               graph,
-              result,
-              target_in_second_round,
-              "parallel second speculative round worker " +
+              reached_result,
+              deep_target,
+              "parallel deep-wide target worker " +
+                  std::to_string(worker) + " reuse " +
+                  std::to_string(repetition));
+
+          UnitBfsCsrResult exhausted_result = workspace.run(
+              std::vector<int>{0},
+              std::vector<int>{kDeepWideIsolated},
+              1.0f,
+              -1,
+              stream.get(),
+              nullptr,
+              nullptr);
+          validate_result(
+              graph,
+              exhausted_result,
+              deep_exhausted,
+              "parallel deep-wide exhaustion worker " +
                   std::to_string(worker) + " reuse " +
                   std::to_string(repetition));
         }
@@ -979,7 +1026,7 @@ int main() {
     run_batching_suite(UnitBfsCsrOffsetMode::kForce64Bit,
                        "forced-64-bit batching");
     run_parallel_workspace_suite();
-    run_parallel_second_speculative_round_suite();
+    run_parallel_deep_wide_explicit_stream_suite();
 
     // The representation cutoff is compile-time production logic.  A giant CSR
     // fixture would be unsafe, and no public pure selection helper is exposed;

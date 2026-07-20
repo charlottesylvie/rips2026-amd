@@ -2024,11 +2024,15 @@ DeltaSteppingCsrResult run_unit_weight_specialization(
 
   while (current_count > 0 && found_count < target_count &&
          result.iterations_used < vertex_count) {
-    // As with weighted closure, check the first expansion immediately, then
-    // amortize status synchronization across groups of four device-controlled
-    // BFS levels. Later launches become no-ops after target discovery or an
-    // empty frontier.
-    const int rounds_to_enqueue = result.iterations_used == 0 ? 1 : 4;
+    // As with weighted closure, check the first expansion immediately.  The
+    // default stream may then amortize status synchronization across four
+    // device-controlled BFS levels.  Keep every explicit stream at one level
+    // per copy.  This inserts a host-visible boundary before another expansion
+    // after observed controller-state inconsistencies when several nonblocking
+    // streams batch dependent kernels concurrently.
+    const bool batch_levels =
+        stream == nullptr && result.iterations_used != 0;
+    const int rounds_to_enqueue = batch_levels ? 4 : 1;
     const int launch_blocks =
         rounds_to_enqueue == 1
             ? grid_for_frontier(current_count)
@@ -2268,10 +2272,13 @@ DeltaSteppingCsrResult run_delta_stepping_impl(
     int light_rounds = 0;
     while (current_count > 0) {
       // Check the first round immediately so shallow buckets pay no speculative
-      // launch cost. Once closure proves nontrivial, enqueue four device-counted
-      // ping-pong rounds before the next host synchronization.
+      // launch cost.  Only the default stream batches later device-counted
+      // ping-pong rounds.  Every explicit stream retains a host-visible count
+      // boundary between rounds after observed controller-state inconsistencies
+      // when several nonblocking streams batch dependent kernels concurrently.
       const bool batch_rounds =
-          progress_callback == nullptr && light_rounds > 0;
+          stream == nullptr && progress_callback == nullptr &&
+          light_rounds > 0;
       const int rounds_to_enqueue = batch_rounds ? 4 : 1;
       const int graph_blocks = grid_for_items(n);
       const int launch_blocks =

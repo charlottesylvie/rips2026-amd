@@ -1,6 +1,6 @@
 # Delta-Stepping Optimization Roadmap
 
-## Audit status (2026-07-14)
+## Audit status (2026-07-19)
 
 The original summary contained 22 equally weighted items (priorities `0` through
 `21`). The audit found 11 fully implemented items, or **50.0%** (`11 / 22`).
@@ -9,21 +9,30 @@ Three additional items are partial; assigning each half credit gives **56.8%**
 
 The three partial items are:
 
-- the direct HIP regression is extensive, but has not run on the target AMD
-  system;
+- the direct HIP regression is extensive, and the target gfx1151 run exposed
+  an explicit-stream controller-state failure; full validation of the
+  guarded path remains;
 - query/path buffers now grow geometrically, but PathFinder does not pre-reserve
   metadata-derived capacities; and
 - compile-time kernel modes exist, but architecture, block-size, batch-size,
   launch-bound, and compiler tuning have not been performed on the target GPU.
 
 The code audit confirmed the completed exact-unit specialization and four-level
-status batching; shared immutable CSR with lazy 24-byte unit scratch and
-memory-aware workers; four-round generic light-closure batching; device-counted
-heavy and pending scans; compile-time relaxation modes; thread-per-short-row
-relaxation; per-successful-append atomic queue reservations; removal of overflow
-and touched membership synchronization/state; pinned scalar transfers with
-device-final pending reduction; float-correct same-bucket closure and terminal
-saturation; and race-safe parent publication with sparse exact-edge recovery.
+status batching on the default/null stream; shared immutable CSR with lazy
+24-byte unit scratch and memory-aware workers; default-stream four-round generic
+light-closure batching; device-counted heavy and pending scans; compile-time
+relaxation modes; thread-per-short-row relaxation; per-successful-append atomic
+queue reservations; removal of overflow and touched membership
+synchronization/state; pinned scalar transfers with device-final pending
+reduction; float-correct same-bucket closure and terminal saturation; and
+race-safe parent publication with sparse exact-edge recovery.
+
+Parallel explicit worker streams now host-check every exact-unit BFS level and
+every generic light-closure round. Four-round device-controlled batching is
+gated to `stream == nullptr`: on gfx1151, batched dependent kernels otherwise
+produced state in which expansion counters advanced without matching frontier
+bounds. Retain this correctness gate until the failure is resolved and the
+affected runtime is validated.
 
 A later correctness audit removed wave-coalesced reservation from irregular
 adjacency loops because lanes can reach different dynamic collective calls.
@@ -85,6 +94,10 @@ correlate at 0.995 and 0.997 respectively. Future telemetry should attach the
 net identity and reached/touched count to each search so these outliers can be
 reproduced directly.
 
+The retained profile predates the explicit-stream safety gate, so reprofile
+before using its launch or synchronization counts to predict current parallel
+worker performance.
+
 Except for the measured values above, percentages below remain engineering
 estimates. They are not additive and must be validated separately for
 exact-unit and genuinely weighted graphs.
@@ -93,11 +106,11 @@ exact-unit and genuinely weighted graphs.
 
 | Priority | Optimization or validation | State | Expected improvement | Risk | Invasiveness |
 | ---: | --- | --- | ---: | ---: | ---: |
-| 1 | Run correctness and Unit-BFS performance validation on the target AMD GPU; test Delta exact-unit only on an eligible graph | Partial: counter run complete; direct HIP regression and production-path A/B pending | Establishes correctness and the relevant production baseline | Low | Low |
+| 1 | Run correctness and Unit-BFS performance validation on the target AMD GPU; test Delta exact-unit only on an eligible graph | Partial: counter run complete; explicit-stream failure reproduced and guarded-path validation pending | Establishes correctness and the relevant production baseline | Low | Low |
 | 2 | Publish the winning compact edge ID and eliminate predecessor-row recovery | Parent publication complete; recovery is measured at 24.1% of kernel time | Up to 1.32x kernel-only if removed | Medium | Medium--High |
 | 3 | Remove avoidable sparse-reset writes, then evaluate generation-stamped state | Reset is measured at 28.9% of kernel time | Up to 1.41x kernel-only if removed | Medium | Medium--High |
 | 4 | Add adaptive 32-bit internal row and predecessor-edge offsets | Not started; strongly supported by low cache hit rates | 5--20%, plus lower worker memory | Medium | Medium |
-| 5 | Reduce host round trips with device-resident batching and then HIP graph capture | Four-round batching exists; full-system trace still shows synchronization/API overhead | 5--25% end-to-end | Medium | Medium--High |
+| 5 | Reduce host round trips with safe device-resident batching and then HIP graph capture | Four-round batching is null-stream-only; explicit streams host-check each level/round | 5--25% end-to-end | Medium | Medium--High |
 | 6 | Batch independent nets in one launch | Not started; worker-count scaling was flat | 1.5--5x when individual searches underfill the GPU | High | High |
 | 7 | Pre-reserve query/path buffers from route metadata | Partial: geometric growth complete | 2--8% | Low | Low |
 | 8 | Tune block size, launch bounds, architecture, and compiler | Partial: hot kernels already show high wave residency | 0--10% | Low | Low |
@@ -117,6 +130,11 @@ limited iterations, callbacks, workspace reuse, concurrent streams, graph
 sharing, updates, vertex costs, queue boundary cases, and CPU-Dijkstra result
 comparison. Host-only or fake-HIP tests cannot validate real ballot, shuffle,
 atomic, stream, or floating-point device behavior.
+
+Exercise both execution modes explicitly: null-stream cases must cover
+four-round device batching, while concurrent nonblocking streams must preserve
+the host-visible boundary between every level/round. Do not infer
+explicit-stream safety from a passing default-stream batch.
 
 The counter run validates that the generic path executes. The finite
 maximum-iteration argument disabled the exact-unit fast path, but the
@@ -196,12 +214,14 @@ capacities from route metadata before workers start. Do not reserve worst-case
 `targets * vertices` path storage. Move target prefix/offset work to the device
 only if extraction remains material after compact parent work.
 
-Measure four-round batching against other batch sizes and profile 128- and
-256-thread blocks per kernel. Current hot kernels use 24 VGPRs, 128 SGPRs, no
-scratch, and no dynamic LDS, while measured wave residency is already high.
-Treat block-size tuning as a secondary experiment. Inspect register pressure
-before adding `__launch_bounds__`; use exact `--offload-arch`; test
-wave32/wave64 where
+Measure four-round batching against other batch sizes on the default/null
+stream. Benchmark explicit worker streams separately with their required
+per-level/per-round host checks; do not enable speculative batching there until
+the gfx1151 controller-state failure is resolved. Profile 128- and 256-thread
+blocks per kernel. Current hot kernels use 24 VGPRs, 128 SGPRs, no scratch, and
+no dynamic LDS, while measured wave residency is already high. Treat block-size
+tuning as a secondary experiment. Inspect register pressure before adding
+`__launch_bounds__`; use exact `--offload-arch`; test wave32/wave64 where
 supported; add `__restrict__` only to proven non-aliasing pointers; and use
 fast-math only if the float-boundary regressions remain correct.
 
@@ -242,7 +262,9 @@ Future changes must preserve:
    unlimited iterations, no callback, and the target-set overload;
 9. float bucket calculation by nonnegative `distance / delta` truncation;
 10. race-safe strict-winner parent publication, including zero-weight SCCs;
-11. per-workspace stream ordering and shared-graph lifetime/device rules.
+11. per-workspace stream ordering, including null-stream-only four-round
+    batching and explicit-stream host checks, plus shared-graph lifetime/device
+    rules.
 
 ## Verification and benchmark protocol
 
