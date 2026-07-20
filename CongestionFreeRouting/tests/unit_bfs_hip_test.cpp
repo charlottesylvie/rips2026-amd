@@ -395,6 +395,261 @@ void require_equivalent(const UnitBfsCsrResult& left,
                 label + ": compact path edges");
 }
 
+HostCsrF32 make_long_chain_graph() {
+  // 0 -> 1 -> ... -> 10, with vertex 11 isolated.  The depths cross both
+  // sides of the traversal's first-level check and its four-level batches.
+  constexpr int kChainVertices = 11;
+  constexpr int kRows = 12;
+  HostCsrF32 graph;
+  graph.rows = kRows;
+  graph.cols = kRows;
+  graph.rowptr.resize(kRows + 1);
+  for (int v = 0; v < kRows; ++v) {
+    graph.rowptr[static_cast<std::size_t>(v)] =
+        static_cast<Offset>(graph.colind.size());
+    if (v + 1 < kChainVertices) {
+      graph.colind.push_back(v + 1);
+    }
+  }
+  graph.rowptr.back() = static_cast<Offset>(graph.colind.size());
+  graph.nnz = static_cast<Offset>(graph.colind.size());
+  graph.values.assign(graph.colind.size(), 1.0f);
+  return graph;
+}
+
+HostCsrF32 make_wide_layered_graph() {
+  // The first checked level has one vertex, then the queued four-level batch
+  // sees frontiers of 64, 64, 64, and finally zero vertices.  Every reached
+  // vertex still has a unique parent so exact compact paths remain stable.
+  constexpr int kRows = 195;
+  HostCsrF32 graph;
+  graph.rows = kRows;
+  graph.cols = kRows;
+  graph.rowptr.resize(kRows + 1);
+  for (int v = 0; v < kRows; ++v) {
+    graph.rowptr[static_cast<std::size_t>(v)] =
+        static_cast<Offset>(graph.colind.size());
+    if (v == 0) {
+      graph.colind.push_back(1);
+    } else if (v == 1) {
+      for (int dst = 2; dst <= 65; ++dst) {
+        graph.colind.push_back(dst);
+      }
+    } else if (v >= 2 && v <= 65) {
+      graph.colind.push_back(v + 64);
+    } else if (v >= 66 && v <= 129) {
+      graph.colind.push_back(v + 64);
+    }
+  }
+  graph.rowptr.back() = static_cast<Offset>(graph.colind.size());
+  graph.nnz = static_cast<Offset>(graph.colind.size());
+  graph.values.assign(graph.colind.size(), 1.0f);
+  return graph;
+}
+
+ExpectedTarget reached_on_chain(int target) {
+  std::vector<int> nodes;
+  std::vector<Offset> edges;
+  nodes.reserve(static_cast<std::size_t>(target) + 1);
+  edges.reserve(static_cast<std::size_t>(target));
+  for (int v = 0; v <= target; ++v) {
+    nodes.push_back(v);
+    if (v < target) {
+      edges.push_back(static_cast<Offset>(v));
+    }
+  }
+  return reached(target,
+                 static_cast<float>(target),
+                 0,
+                 std::move(nodes),
+                 std::move(edges));
+}
+
+void collect_progress(const UnitBfsCsrProgress& progress, void* user_data) {
+  auto* trace = static_cast<std::vector<UnitBfsCsrProgress>*>(user_data);
+  trace->push_back(progress);
+}
+
+void validate_progress_trace(const std::vector<UnitBfsCsrProgress>& trace,
+                             int expected_iterations,
+                             int expected_max_depth,
+                             bool final_changed,
+                             const std::string& label) {
+  require_equal(trace.size(),
+                static_cast<std::size_t>(expected_iterations),
+                label + ": callback count");
+  for (int i = 0; i < expected_iterations; ++i) {
+    const UnitBfsCsrProgress& progress = trace[static_cast<std::size_t>(i)];
+    require_equal(progress.iteration, i + 1, label + ": callback iteration");
+    require_equal(progress.max_iters,
+                  expected_max_depth,
+                  label + ": callback max depth");
+    require(progress.convergence_checked,
+            label + ": callback must report a convergence check");
+    const bool expected_changed =
+        i + 1 == expected_iterations ? final_changed : true;
+    require_equal(progress.changed,
+                  expected_changed,
+                  label + ": callback changed flag");
+  }
+}
+
+void run_batching_suite(UnitBfsCsrOffsetMode mode,
+                        const std::string& mode_label) {
+  const HostCsrF32 graph = make_long_chain_graph();
+  auto shared_graph = std::make_shared<UnitBfsCsrGraph>(graph, nullptr, mode);
+  UnitBfsCsrWorkspace batched_workspace(shared_graph);
+
+  UnitBfsCsrResult depth_six_result;
+  for (const int target : std::vector<int>{1, 2, 4, 5, 6, 9, 10}) {
+    const ExpectedRun expected{
+        target, true, true, true, {reached_on_chain(target)}};
+    UnitBfsCsrResult result = run_case(
+        batched_workspace,
+        graph,
+        {0},
+        {target},
+        -1,
+        expected,
+        mode_label + ": batched target depth " + std::to_string(target));
+    if (target == 6) {
+      depth_six_result = std::move(result);
+    }
+  }
+
+  const ExpectedRun two_targets{
+      5,
+      true,
+      true,
+      true,
+      {reached_on_chain(2), reached_on_chain(5)}};
+  run_case(batched_workspace,
+           graph,
+           {0},
+           {2, 5},
+           -1,
+           two_targets,
+           mode_label + ": targets across a batch");
+
+  const ExpectedRun capped_before_target{
+      4, false, false, false, {unreachable(5)}};
+  run_case(batched_workspace,
+           graph,
+           {0},
+           {5},
+           4,
+           capped_before_target,
+           mode_label + ": cap before batch target");
+
+  const ExpectedRun target_at_cap{
+      5, true, true, true, {reached_on_chain(5)}};
+  run_case(batched_workspace,
+           graph,
+           {0},
+           {5},
+           5,
+           target_at_cap,
+           mode_label + ": target at batch cap");
+
+  const ExpectedRun exhausted{
+      11, true, false, false, {unreachable(11)}};
+  const UnitBfsCsrResult batched_exhausted = run_case(
+      batched_workspace,
+      graph,
+      {0},
+      {11},
+      -1,
+      exhausted,
+      mode_label + ": frontier exhausted inside batch");
+
+  // Installing a progress callback retains the historical one-level polling
+  // behavior.  Compare it with the batched path to cover both controller modes
+  // and ensure callback timing remains observable after every level.
+  UnitBfsCsrWorkspace callback_workspace(shared_graph);
+  std::vector<UnitBfsCsrProgress> target_trace;
+  const UnitBfsCsrResult callback_target = callback_workspace.run(
+      std::vector<int>{0},
+      std::vector<int>{6},
+      1.0f,
+      6,
+      nullptr,
+      collect_progress,
+      &target_trace);
+  const ExpectedRun target_six{
+      6, true, true, true, {reached_on_chain(6)}};
+  validate_result(
+      graph, callback_target, target_six, mode_label + ": callback target");
+  validate_progress_trace(
+      target_trace, 6, 6, true, mode_label + ": callback target");
+  require_equivalent(depth_six_result,
+                     callback_target,
+                     mode_label + ": batched versus callback target");
+
+  std::vector<UnitBfsCsrProgress> exhausted_trace;
+  const UnitBfsCsrResult callback_exhausted = callback_workspace.run(
+      std::vector<int>{0},
+      std::vector<int>{11},
+      1.0f,
+      -1,
+      nullptr,
+      collect_progress,
+      &exhausted_trace);
+  validate_result(graph,
+                  callback_exhausted,
+                  exhausted,
+                  mode_label + ": callback exhaustion");
+  validate_progress_trace(
+      exhausted_trace, 11, 12, false, mode_label + ": callback exhaustion");
+  require_equivalent(batched_exhausted,
+                     callback_exhausted,
+                     mode_label + ": batched versus callback exhaustion");
+
+  // Re-run a deep batched query after capped, exhausted, and callback-driven
+  // traversals to catch stale device-controller or reset state.
+  const ExpectedRun repeated_deep{
+      9, true, true, true, {reached_on_chain(9)}};
+  run_case(batched_workspace,
+           graph,
+           {0},
+           {9},
+           -1,
+           repeated_deep,
+           mode_label + ": repeated deep batched target");
+
+  const HostCsrF32 wide_graph = make_wide_layered_graph();
+  UnitBfsCsrWorkspace wide_workspace(wide_graph, nullptr, mode);
+  const ExpectedRun wide_target{
+      4,
+      true,
+      true,
+      true,
+      {reached(130,
+               4.0f,
+               0,
+               {0, 1, 2, 66, 130},
+               {static_cast<Offset>(0),
+                static_cast<Offset>(1),
+                static_cast<Offset>(65),
+                static_cast<Offset>(129)})}};
+  run_case(wide_workspace,
+           wide_graph,
+           {0},
+           {130},
+           -1,
+           wide_target,
+           mode_label + ": growing batched frontiers");
+
+  const ExpectedRun wide_exhausted{
+      5, true, false, false, {unreachable(194)}};
+  run_case(wide_workspace,
+           wide_graph,
+           {0},
+           {194},
+           -1,
+           wide_exhausted,
+           mode_label + ": wide frontier exhaustion");
+}
+
 }  // namespace
 
 int main() {
@@ -435,13 +690,19 @@ int main() {
       require_equivalent(auto_results[i], forced_64_results[i], label.str());
     }
 
+    run_batching_suite(UnitBfsCsrOffsetMode::kAuto,
+                       "auto/32-bit batching");
+    run_batching_suite(UnitBfsCsrOffsetMode::kForce64Bit,
+                       "forced-64-bit batching");
+
     // The representation cutoff is compile-time production logic.  A giant CSR
     // fixture would be unsafe, and no public pure selection helper is exposed;
     // its INT32_MAX boundary is therefore covered by production static_asserts.
-    std::cout << "Unit-BFS HIP 32-bit/64-bit offset test passed\n";
+    std::cout << "Unit-BFS HIP offset/batching test passed\n";
     return 0;
   } catch (const std::exception& ex) {
-    std::cerr << "Unit-BFS HIP offset test failed: " << ex.what() << '\n';
+    std::cerr << "Unit-BFS HIP offset/batching test failed: "
+              << ex.what() << '\n';
     return 1;
   }
 }

@@ -30,6 +30,18 @@ static_assert(std::numeric_limits<CompactOffset>::max() <
 constexpr int kBlockSize = 256;
 constexpr int kMaxGridX = 65535;
 constexpr int kUnvisited = std::numeric_limits<int>::max();
+constexpr int kLevelsPerStatusCheck = 4;
+constexpr int kBatchBlocksPerComputeUnit = 4;
+
+enum UnitBfsStatusIndex : int {
+  kStatusQueueTail = 0,
+  kStatusFoundCount,
+  kStatusFrontierBegin,
+  kStatusFrontierEnd,
+  kStatusCompletedDepth,
+  kStatusActive,
+  kStatusCount,
+};
 
 inline void hip_check(hipError_t status, const char* expr, const char* file, int line) {
   if (status != hipSuccess) {
@@ -126,6 +138,7 @@ struct OutgoingCsrOwner {
   Offset cols = 0;
   Offset nnz = 0;
   bool uses_32_bit_offsets = false;
+  int batched_launch_blocks = 1;
   DeviceBuffer<CompactOffset> rowptr32;
   DeviceBuffer<Offset> rowptr64;
   DeviceBuffer<Index> colind;
@@ -162,7 +175,9 @@ struct UnitBfsScratch {
   // half-open range within it, and every successfully claimed vertex is also
   // the complete list of levels that must be reset before the next run.
   DeviceBuffer<int> frontier_queue;
-  // [0] = append position / visited count, [1] = number of targets found.
+  // Device-resident traversal controller.  Keeping frontier bounds, completed
+  // depth, and the stopping condition here allows several BFS levels to be
+  // enqueued before the host checks progress.
   DeviceBuffer<int> status;
   PinnedHostBuffer<int> host_status;
   DeviceBuffer<float> target_distances;
@@ -188,8 +203,8 @@ struct UnitBfsScratch {
                         ? 0
                         : static_cast<std::size_t>(rows_)),
         frontier_queue(static_cast<std::size_t>(rows_)),
-        status(2),
-        host_status(2) {}
+        status(kStatusCount),
+        host_status(kStatusCount) {}
 
   void ensure_source_capacity(std::size_t source_count) {
     if (sources.size() < source_count) {
@@ -352,14 +367,21 @@ template <typename EdgeOffset>
 __global__ void initialize_sources_kernel(const int* sources,
                                           int source_count,
                                           int initially_found,
+                                          int target_count,
+                                          int max_depth,
                                           int* level,
                                           int* pred_node,
                                           EdgeOffset* pred_edge,
                                           int* frontier_queue,
                                           int* status) {
   if (blockIdx.x == 0 && threadIdx.x == 0) {
-    status[0] = source_count;
-    status[1] = initially_found;
+    status[kStatusQueueTail] = source_count;
+    status[kStatusFoundCount] = initially_found;
+    status[kStatusFrontierBegin] = 0;
+    status[kStatusFrontierEnd] = source_count;
+    status[kStatusCompletedDepth] = 0;
+    status[kStatusActive] =
+        source_count > 0 && initially_found < target_count && max_depth > 0;
   }
   for (int i = blockIdx.x * blockDim.x + threadIdx.x;
        i < source_count;
@@ -375,18 +397,20 @@ __global__ void initialize_sources_kernel(const int* sources,
 }
 
 template <typename EdgeOffset>
-__global__ void expand_frontier_kernel(int frontier_begin,
-                                       int frontier_end,
-                                       int next_level,
-                                       const EdgeOffset* out_rowptr,
+__global__ void expand_frontier_kernel(const EdgeOffset* out_rowptr,
                                        const Index* out_colind,
                                        int* level,
                                        int* pred_node,
                                        EdgeOffset* pred_edge,
                                        int* frontier_queue,
-                                       int* queue_tail,
                                        const int* target_multiplicity,
-                                       int* found_count) {
+                                       int* status) {
+  if (status[kStatusActive] == 0) {
+    return;
+  }
+  const int frontier_begin = status[kStatusFrontierBegin];
+  const int frontier_end = status[kStatusFrontierEnd];
+  const int next_level = status[kStatusCompletedDepth] + 1;
   for (int i = frontier_begin + blockIdx.x * blockDim.x + threadIdx.x;
        i < frontier_end;
        i += blockDim.x * gridDim.x) {
@@ -405,13 +429,32 @@ __global__ void expand_frontier_kernel(int frontier_begin,
       }
       // Reserve queue positions once per active GPU wave instead of forcing
       // every discovered vertex through the same global atomic counter.
-      const int pos = wave_append_position(claimed, queue_tail);
+      const int pos =
+          wave_append_position(claimed, status + kStatusQueueTail);
       if (claimed) {
         frontier_queue[pos] = v;
-        count_target_if_reached(v, target_multiplicity, found_count);
+        count_target_if_reached(
+            v, target_multiplicity, status + kStatusFoundCount);
       }
     }
   }
+}
+
+__global__ void advance_frontier_kernel(int target_count,
+                                        int max_depth,
+                                        int* status) {
+  if (blockIdx.x != 0 || threadIdx.x != 0 ||
+      status[kStatusActive] == 0) {
+    return;
+  }
+
+  status[kStatusFrontierBegin] = status[kStatusFrontierEnd];
+  status[kStatusFrontierEnd] = status[kStatusQueueTail];
+  ++status[kStatusCompletedDepth];
+  status[kStatusActive] =
+      status[kStatusFrontierBegin] < status[kStatusFrontierEnd] &&
+      status[kStatusFoundCount] < target_count &&
+      status[kStatusCompletedDepth] < max_depth;
 }
 
 __global__ void mark_target_multiplicity_kernel(const int* targets,
@@ -533,6 +576,17 @@ OutgoingCsrOwner copy_host_csr_to_device(
       select_32_bit_offsets(host.nnz, offset_mode);
   OutgoingCsrOwner device(
       host.rows, host.cols, host.nnz, uses_32_bit_offsets);
+  int current_device = 0;
+  hipDeviceProp_t device_properties{};
+  UNIT_BFS_HIP_CHECK(hipGetDevice(&current_device));
+  UNIT_BFS_HIP_CHECK(
+      hipGetDeviceProperties(&device_properties, current_device));
+  const long long compute_units =
+      std::max<long long>(1, device_properties.multiProcessorCount);
+  device.batched_launch_blocks = static_cast<int>(std::min<long long>(
+      grid_for_items(host.rows),
+      std::min<long long>(kMaxGridX,
+                          compute_units * kBatchBlocksPerComputeUnit)));
   const std::size_t rows = checked_size(host.rows, "rows");
   const std::size_t nnz = checked_size(host.nnz, "nnz");
   if (nnz != 0) {
@@ -596,15 +650,17 @@ void reset_visited_levels(UnitBfsScratch& scratch,
   }
 }
 
-std::array<int, 2> copy_status_to_host(UnitBfsScratch& scratch,
-                                      hipStream_t stream) {
+std::array<int, kStatusCount> copy_status_to_host(UnitBfsScratch& scratch,
+                                                  hipStream_t stream) {
   UNIT_BFS_HIP_CHECK(hipMemcpyAsync(scratch.host_status.get(),
                                     scratch.status.get(),
-                                    2 * sizeof(int),
+                                    kStatusCount * sizeof(int),
                                     hipMemcpyDeviceToHost,
                                     stream));
   UNIT_BFS_HIP_CHECK(hipStreamSynchronize(stream));
-  return {scratch.host_status.get()[0], scratch.host_status.get()[1]};
+  std::array<int, kStatusCount> status{};
+  std::copy_n(scratch.host_status.get(), kStatusCount, status.begin());
+  return status;
 }
 
 template <typename EdgeOffset>
@@ -788,6 +844,8 @@ UnitBfsCsrResult run_unit_bfs_with_offsets(
           scratch.sources.get(),
           source_count,
           initially_found,
+          target_count,
+          max_depth,
           scratch.level.get(),
           scratch.pred_node.get(),
           pred_edge,
@@ -804,35 +862,54 @@ UnitBfsCsrResult run_unit_bfs_with_offsets(
   result.target = -1;
   result.iterations_used = 0;
 
-  for (int depth = 0;
-       current_count > 0 && found_count < target_count && depth < max_depth;
-       ++depth) {
-    expand_frontier_kernel<EdgeOffset>
-        <<<grid_for_frontier(current_count), kBlockSize, 0, stream>>>(
-            frontier_begin,
-            frontier_end,
-            depth + 1,
-            out_rowptr,
-            outgoing.colind.get(),
-            scratch.level.get(),
-            scratch.pred_node.get(),
-            pred_edge,
-            scratch.frontier_queue.get(),
-            scratch.status.get(),
-            scratch.target_multiplicity.get(),
-            scratch.status.get() + 1);
-    UNIT_BFS_HIP_CHECK(hipGetLastError());
+  while (current_count > 0 && found_count < target_count &&
+         result.iterations_used < max_depth) {
+    // Check the first expansion immediately so the next batch can be sized
+    // from a real frontier.  Thereafter, enqueue four device-controlled levels
+    // per status copy.  Kernels after target discovery, frontier exhaustion, or
+    // max_depth become no-ops through kStatusActive.
+    const int remaining_depth = max_depth - result.iterations_used;
+    const int rounds_to_enqueue =
+        progress_callback != nullptr || result.iterations_used == 0
+            ? 1
+            : std::min(kLevelsPerStatusCheck, remaining_depth);
+    const int launch_blocks =
+        rounds_to_enqueue == 1
+            ? grid_for_frontier(current_count)
+            : std::min(grid_for_items(scratch.rows),
+                       std::max(grid_for_frontier(current_count),
+                                outgoing.batched_launch_blocks));
 
-    const std::array<int, 2> status = copy_status_to_host(scratch, stream);
-    queue_tail = status[0];
-    if (queue_tail < frontier_end || queue_tail > n_int) {
-      throw std::runtime_error("unit BFS append-only frontier queue overflow");
+    for (int round = 0; round < rounds_to_enqueue; ++round) {
+      expand_frontier_kernel<EdgeOffset>
+          <<<launch_blocks, kBlockSize, 0, stream>>>(
+              out_rowptr,
+              outgoing.colind.get(),
+              scratch.level.get(),
+              scratch.pred_node.get(),
+              pred_edge,
+              scratch.frontier_queue.get(),
+              scratch.target_multiplicity.get(),
+              scratch.status.get());
+      UNIT_BFS_HIP_CHECK(hipGetLastError());
+      advance_frontier_kernel<<<1, 1, 0, stream>>>(
+          target_count, max_depth, scratch.status.get());
+      UNIT_BFS_HIP_CHECK(hipGetLastError());
     }
-    current_count = queue_tail - frontier_end;
-    found_count = status[1];
-    result.iterations_used = depth + 1;
-    frontier_begin = frontier_end;
-    frontier_end = queue_tail;
+
+    const std::array<int, kStatusCount> status =
+        copy_status_to_host(scratch, stream);
+    queue_tail = status[kStatusQueueTail];
+    found_count = status[kStatusFoundCount];
+    frontier_begin = status[kStatusFrontierBegin];
+    frontier_end = status[kStatusFrontierEnd];
+    result.iterations_used = status[kStatusCompletedDepth];
+    if (queue_tail < 0 || queue_tail > n_int || frontier_begin < 0 ||
+        frontier_end < frontier_begin || frontier_end != queue_tail ||
+        result.iterations_used < 0 || result.iterations_used > max_depth) {
+      throw std::runtime_error("unit BFS device frontier state is inconsistent");
+    }
+    current_count = frontier_end - frontier_begin;
 
     if (progress_callback) {
       UnitBfsCsrProgress progress;

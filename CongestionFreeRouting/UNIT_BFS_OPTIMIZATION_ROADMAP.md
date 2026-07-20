@@ -1,20 +1,20 @@
 # Unit-BFS Optimization Roadmap
 
-## Audit status (2026-07-14)
+## Audit status (2026-07-19)
 
-The original roadmap contained 24 equally weighted optimization items. One is
-implemented: adaptive 32-bit device row offsets and predecessor-edge IDs, with
-a 64-bit fallback and 64-bit public edge IDs. That is **4.2% implemented**
-(`1 / 24`). The completed implementation item has been removed from the active
-roadmap below. Its focused HIP A/B test still needs to run on the target AMD
-system, so that validation remains listed separately.
+The original roadmap contained 24 equally weighted optimization items. Two are
+implemented: adaptive 32-bit device row offsets and predecessor-edge IDs, and
+four-level device-controlled BFS batching after the first level. That is
+**8.3% implemented** (`2 / 24`). Both changes retain their target-AMD validation
+work below; implementation status alone is not a performance claim.
 
 The code audit also confirmed the pre-roadmap baseline: outgoing CSR is uploaded
 once and shared by memory-aware parallel workers; traversal uses one append-only
 frontier/visited queue, wave-coalesced reservations, a non-atomic visited
 precheck before the authoritative CAS, pinned status transfers, direct source
 initialization, sparse reset, and one predecessor-chain traversal for compact
-path extraction.
+path extraction. Frontier bounds, completed depth, target progress, and the
+stopping condition now remain device-resident between batched status checks.
 
 Percentages below are unmeasured engineering estimates for the unit-BFS routing
 portion. They are workload-dependent and are not additive.
@@ -41,7 +41,7 @@ Delta-Stepping is not automatically transferable to Unit-BFS.
 | Priority | Optimization or validation | Expected improvement | Risk | Invasiveness |
 | ---: | --- | ---: | ---: | ---: |
 | 1 | Profile 100-net Unit-BFS, benchmark worker counts, and validate compact/wide offsets on the target AMD GPU | Establishes the real production baseline; possible 1.2--3x throughput from worker tuning | Low | Low |
-| 2 | Batch several BFS levels per host synchronization | 15--40% | Medium | High |
+| 2 | Validate four-level batching on the target GPU and tune the batch/grid size | Confirms or revises the estimated 15--40% | Low | Low |
 | 3 | Add hybrid degree-aware frontier expansion | 10--35% | Medium | High |
 | 4 | Pre-reserve per-worker query buffers from route metadata | 2--8% | Low | Low |
 | 5 | Batch independent nets in one GPU launch | 1.5--4x throughput | High | High |
@@ -83,16 +83,22 @@ synchronization time, achieved occupancy, memory bandwidth, and atomic
 contention. Do not claim a speedup until the target-GPU run passes and the same
 graph, nets, worker count, and validation settings are compared.
 
-### 2. Batch BFS levels
+### 2. Validate and tune batched BFS levels
 
-The dedicated unit BFS still copies a two-integer status record and synchronizes
-after every level. Queue four device-controlled expansions and frontier advances
-before checking status, while making later rounds no-ops after an empty frontier
-or complete target discovery. Keep the one-level path for progress callbacks.
+The dedicated unit BFS now checks the first expansion immediately, then queues
+four device-controlled expansions and frontier advances before copying status.
+Later rounds become no-ops after an empty frontier, complete target discovery,
+or `max_depth`. Progress callbacks retain the historical one-level path. The
+batched launch grid is sized from both the visible frontier and the current
+device's compute-unit count so growth inside a batch does not inherit a tiny
+source-frontier grid.
 
-Validation must cover exact `iterations_used`, `max_depth` around batch
-boundaries, targets in every round of a batch, empty and unreachable searches,
-duplicate sources and targets, and original outgoing CSR edge IDs.
+The HIP regression suite covers exact `iterations_used`, `max_depth` around
+batch boundaries, targets in every round, growing and exhausted frontiers,
+callback equivalence, repeated workspaces, both offset widths, and original
+outgoing CSR edge IDs. Run it on the target GPU, then trace a deep no-callback
+query to verify traversal status polls fall from `D` to approximately
+`1 + ceil((D - 1) / 4)`.
 
 ### 3. Add degree-aware expansion
 

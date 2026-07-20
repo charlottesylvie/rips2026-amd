@@ -317,7 +317,8 @@ g++ -std=c++17 -O2 -pthread \
 /tmp/congestion_free_pathfinder_cpu_stub_test
 ```
 
-Unit-BFS compact-offset A/B correctness test (requires an AMD HIP system):
+Unit-BFS compact-offset and batched-level correctness test (requires an AMD HIP
+system):
 
 ```bash
 hipcc -std=c++17 -O2 -x hip \
