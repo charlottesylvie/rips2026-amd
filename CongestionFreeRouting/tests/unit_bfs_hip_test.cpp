@@ -11,6 +11,7 @@
 #include <atomic>
 #include <cmath>
 #include <cstdint>
+#include <cstdlib>
 #include <future>
 #include <iostream>
 #include <limits>
@@ -559,17 +560,26 @@ HostCsrF32 make_deep_wide_layered_graph() {
   return graph;
 }
 
-ExpectedTarget reached_on_deep_wide_lane(const HostCsrF32& graph) {
-  std::vector<int> nodes = {0};
+ExpectedTarget reached_between_deep_wide_levels(const HostCsrF32& graph,
+                                                int source_level,
+                                                int target_level) {
+  require(source_level >= 0 && source_level <= target_level &&
+              target_level <= kDeepWideLevels,
+          "deep-wide expected path levels are invalid");
+  const int source =
+      source_level == 0 ? 0 : source_level * kDeepWideWidth;
+  const int target =
+      target_level == 0 ? 0 : target_level * kDeepWideWidth;
+  std::vector<int> nodes = {source};
   std::vector<Offset> edges;
-  nodes.reserve(kDeepWideLevels + 1);
-  edges.reserve(kDeepWideLevels);
+  nodes.reserve(static_cast<std::size_t>(target_level - source_level + 1));
+  edges.reserve(static_cast<std::size_t>(target_level - source_level));
 
-  int from = 0;
-  for (int level = 1; level <= kDeepWideLevels; ++level) {
+  int from = source;
+  for (int level = source_level + 1; level <= target_level; ++level) {
     const int to = level * kDeepWideWidth;
     const Offset edge =
-        level == 1
+        from == 0
             ? graph.rowptr[0] + static_cast<Offset>(kDeepWideWidth - 1)
             : graph.rowptr[static_cast<std::size_t>(from)];
     require_equal(graph.colind[static_cast<std::size_t>(edge)],
@@ -579,11 +589,26 @@ ExpectedTarget reached_on_deep_wide_lane(const HostCsrF32& graph) {
     nodes.push_back(to);
     from = to;
   }
-  return reached(kDeepWideTarget,
-                 static_cast<float>(kDeepWideLevels),
-                 0,
+  return reached(target,
+                 static_cast<float>(target_level - source_level),
+                 source,
                  std::move(nodes),
                  std::move(edges));
+}
+
+ExpectedTarget reached_on_deep_wide_lane(const HostCsrF32& graph) {
+  return reached_between_deep_wide_levels(graph, 0, kDeepWideLevels);
+}
+
+int explicit_stream_reuse_runs() {
+  constexpr int kDefaultRuns = 32;
+  const char* configured = std::getenv("UNIT_BFS_REUSE_STRESS_RUNS");
+  if (configured == nullptr || configured[0] == '\0') {
+    return kDefaultRuns;
+  }
+  const int runs = std::stoi(configured);
+  require(runs > 0, "UNIT_BFS_REUSE_STRESS_RUNS must be positive");
+  return runs;
 }
 
 ExpectedTarget reached_on_chain(int target) {
@@ -997,19 +1022,60 @@ void run_parallel_deep_wide_explicit_stream_suite(
       true,
       true,
       {reached_on_deep_wide_lane(graph)}};
-  const ExpectedRun deep_exhausted{
+  constexpr int kSourceLevelSix = 6;
+  constexpr int kSourceLevelEight = 8;
+  constexpr int kShortTargetLevel = 3;
+  constexpr int kSourceSix = kSourceLevelSix * kDeepWideWidth;
+  constexpr int kSourceEight = kSourceLevelEight * kDeepWideWidth;
+  constexpr int kShortTarget = kShortTargetLevel * kDeepWideWidth;
+  const ExpectedRun reused_target_from_six{
+      kDeepWideLevels - kSourceLevelSix,
+      true,
+      true,
+      true,
+      {reached_between_deep_wide_levels(
+          graph, kSourceLevelSix, kDeepWideLevels)}};
+  const ExpectedRun reused_target_from_nearest_source{
+      kDeepWideLevels - kSourceLevelEight,
+      true,
+      true,
+      true,
+      {reached_between_deep_wide_levels(
+          graph, kSourceLevelEight, kDeepWideLevels)}};
+  const ExpectedRun reached_and_exhausted{
+      kDeepWideLevels - kSourceLevelSix + 1,
+      true,
+      false,
+      false,
+      {reached_between_deep_wide_levels(
+           graph, kSourceLevelSix, kDeepWideLevels),
+       unreachable(kDeepWideIsolated)}};
+  const ExpectedRun duplicate_targets{
+      kDeepWideLevels - kSourceLevelSix,
+      true,
+      true,
+      true,
+      {reached_between_deep_wide_levels(
+           graph, kSourceLevelSix, kDeepWideLevels),
+       reached_between_deep_wide_levels(
+           graph, kSourceLevelSix, kDeepWideLevels)}};
+  const ExpectedRun capacity_growth_and_mixed_targets{
       kDeepWideLevels + 1,
       true,
       false,
       false,
-      {unreachable(kDeepWideIsolated)}};
+      {reached_between_deep_wide_levels(graph, 0, kDeepWideLevels),
+       reached_between_deep_wide_levels(graph, 0, kShortTargetLevel),
+       reached_between_deep_wide_levels(graph, 0, kDeepWideLevels),
+       unreachable(kDeepWideIsolated)}};
 
   // Construct all private workspaces first, then release their first queries
-  // together.  The 4097-wide, twelve-level reachable traversal and thirteen-
-  // level exhaustion exercise PathFinder's eight nonblocking-stream scheduling
-  // without the former 2^18-row allocation or thousands of shallow queries.
-  constexpr int kWorkers = 8;
-  constexpr int kRunsPerWorker = 32;
+  // together. Match the four-worker PathFinder failure and, on every reused
+  // workspace, change source sets, target counts, duplicate targets, and
+  // compact-buffer capacities. Set UNIT_BFS_REUSE_STRESS_RUNS=1200 to execute
+  // more than the 27,825 production requests that preceded the reported fault.
+  constexpr int kWorkers = 4;
+  const int runs_per_worker = explicit_stream_reuse_runs();
   std::promise<void> start_promise;
   const std::shared_future<void> start = start_promise.get_future().share();
   std::atomic<int> ready{0};
@@ -1026,7 +1092,11 @@ void run_parallel_deep_wide_explicit_stream_suite(
         readiness_reported = true;
         start.wait();
 
-        for (int repetition = 0; repetition < kRunsPerWorker; ++repetition) {
+        for (int repetition = 0; repetition < runs_per_worker; ++repetition) {
+          const std::string label =
+              mode_label + ": parallel explicit worker " +
+              std::to_string(worker) + " reuse " +
+              std::to_string(repetition);
           UnitBfsCsrResult reached_result = workspace.run(
               std::vector<int>{0},
               std::vector<int>{kDeepWideTarget},
@@ -1039,13 +1109,11 @@ void run_parallel_deep_wide_explicit_stream_suite(
               graph,
               reached_result,
               deep_target,
-              mode_label + ": parallel deep-wide target worker " +
-                  std::to_string(worker) + " reuse " +
-                  std::to_string(repetition));
+              label + ": source-zero target");
 
-          UnitBfsCsrResult exhausted_result = workspace.run(
-              std::vector<int>{0},
-              std::vector<int>{kDeepWideIsolated},
+          UnitBfsCsrResult from_six_result = workspace.run(
+              std::vector<int>{kSourceSix},
+              std::vector<int>{kDeepWideTarget},
               1.0f,
               -1,
               stream.get(),
@@ -1053,11 +1121,64 @@ void run_parallel_deep_wide_explicit_stream_suite(
               nullptr);
           validate_result(
               graph,
-              exhausted_result,
-              deep_exhausted,
-              mode_label + ": parallel deep-wide exhaustion worker " +
-                  std::to_string(worker) + " reuse " +
-                  std::to_string(repetition));
+              from_six_result,
+              reused_target_from_six,
+              label + ": same target from source six");
+
+          UnitBfsCsrResult nearest_source_result = workspace.run(
+              std::vector<int>{kSourceSix, kSourceEight},
+              std::vector<int>{kDeepWideTarget},
+              1.0f,
+              -1,
+              stream.get(),
+              nullptr,
+              nullptr);
+          validate_result(graph,
+                          nearest_source_result,
+                          reused_target_from_nearest_source,
+                          label + ": nearest current source");
+
+          UnitBfsCsrResult reached_and_exhausted_result = workspace.run(
+              std::vector<int>{kSourceSix},
+              std::vector<int>{kDeepWideTarget, kDeepWideIsolated},
+              1.0f,
+              -1,
+              stream.get(),
+              nullptr,
+              nullptr);
+          validate_result(graph,
+                          reached_and_exhausted_result,
+                          reached_and_exhausted,
+                          label + ": reached target index zero and exhaustion");
+
+          UnitBfsCsrResult duplicate_result = workspace.run(
+              std::vector<int>{kSourceSix},
+              std::vector<int>{kDeepWideTarget, kDeepWideTarget},
+              1.0f,
+              -1,
+              stream.get(),
+              nullptr,
+              nullptr);
+          validate_result(graph,
+                          duplicate_result,
+                          duplicate_targets,
+                          label + ": duplicate targets");
+
+          UnitBfsCsrResult grown_result = workspace.run(
+              std::vector<int>{0},
+              std::vector<int>{kDeepWideTarget,
+                               kShortTarget,
+                               kDeepWideTarget,
+                               kDeepWideIsolated},
+              1.0f,
+              -1,
+              stream.get(),
+              nullptr,
+              nullptr);
+          validate_result(graph,
+                          grown_result,
+                          capacity_growth_and_mixed_targets,
+                          label + ": target and compact capacity growth");
         }
       } catch (...) {
         if (!readiness_reported) {

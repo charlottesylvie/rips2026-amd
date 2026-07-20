@@ -21,6 +21,55 @@ algorithm rather than textbook Delta-Stepping. The local implementation should
 therefore add it as an A/B backend, not silently replace the current algorithm
 before correctness and performance are established.
 
+## Implementation status (2026-07-20)
+
+Stage A is **in progress**. The repository has landed these low-risk pieces:
+
+- PathFinder accepts `--delta auto`, a positive `--delta-multiplier`, and an
+  unchanged explicit numeric override. It queries `hipDeviceProp_t::warpSize`,
+  resolves one numeric width before worker dispatch, and logs the resolved
+  value, wave size, and multiplier.
+- The public host helper computes the exact mean effective weight using the
+  destination-cost convention, includes isolated vertices in average degree,
+  and clamps empty, all-zero, underflow, and overflow cases to a finite
+  positive `float` width.
+- Automatic compact-parent vector-target searches no longer allocate legacy
+  `pred_node` and 64-bit `pred_edge` arrays. They are allocated lazily on the
+  first exact-unit-specialized or legacy/wide generic run. This removes 12 bytes
+  per vertex from the eligible compact generic worker (about 323 MiB at
+  28,226,432 vertices), reducing its core per-vertex scratch estimate from
+  roughly 60 to 48 bytes.
+- Eligible vector-target searches already publish compact
+  `{distance_bits, original_edge_id}` parents and extract exact original edge
+  IDs without predecessor-row recovery. The wide/allocation-fallback path is
+  retained.
+
+Host validation covers the automatic-threshold formula, runtime wave32/wave64
+scaling, destination costs, numeric edge cases, CLI parsing, numeric override,
+parallel-worker consistency, and positional option compatibility. A HIP
+regression also covers compact-only scratch transitioning to the exact-unit
+specialization, but the current changes have not yet been compiled or executed
+on an AMD ROCm host.
+
+The following Stage A requirements remain open:
+
+- reproducible weighted GPU performance families and recorded baselines;
+- opt-in queue, degree, collision, stale-entry, atomic, and synchronization
+  telemetry;
+- a true distances-only execution specialization that omits all parent/path
+  state and the shared edge-source map;
+- eligible 32-bit device row offsets with a forced-wide A/B mode; and
+- automatic threshold refresh inside mutable low-level workspaces after
+  `update_values()` or `update_vertex_costs()`. Today callers must invoke the
+  host helper again with updated host data and pass the resulting numeric
+  width.
+
+The production routing pipeline still defaults to UnitBFS and its interchange
+graph contains exact unit edge weights. Consequently, CLI coverage of
+`delta=auto` is not a weighted generic-SSSP performance baseline. Weighted
+families or dynamic destination costs are required before using measurements
+to justify Stages B--F.
+
 ## cuGraph techniques to adopt
 
 ### 1. Graph-aware distance threshold
@@ -43,6 +92,11 @@ Treat the formula as a seed, not a universal optimum. Preserve an explicit
 numeric override and expose a multiplier that can be swept around the seed.
 Heavy-tailed distributions may need sampling, clamping, or a quantile-based
 alternative to the global mean.
+
+PathFinder now implements the mean-based seed, runtime wave query, numeric
+override, sweep multiplier, and finite-positive clamps. The remaining work is
+weighted GPU tuning and, for mutable low-level workspaces, refreshing the
+statistic after edge-value or destination-cost updates.
 
 ### 2. Two-level Near/Far scheduling
 
@@ -117,6 +171,12 @@ not provide a safe convergent collective.
 cuGraph can discard predecessor output. A competitive SSSP interface should
 offer the same choice.
 
+The current compact path-producing mode avoids legacy predecessor allocation,
+but it still allocates the compact parent key, shared edge-source map, and path
+extraction state. Full-distance APIs also still publish parent candidates.
+Therefore lazy legacy buffers are only a partial completion of this item, not a
+distances-only specialization.
+
 Distances-only mode should omit:
 
 - the compact parent key;
@@ -134,35 +194,42 @@ edge IDs are unavailable.
 
 | Local behavior | cuGraph-inspired replacement | Expected impact | Invasiveness |
 | --- | --- | --- | --- |
-| Numeric low-level delta; PathFinder auto seed available | Validate graph-aware `delta=auto` and multiplier sweeps on weighted GPUs; add workspace refresh for dynamic costs | Medium--High | Low |
+| PathFinder auto seed and numeric override implemented; mutable workspace runs still receive numeric delta | Validate multiplier sweeps on weighted GPUs and add automatic refresh after value/cost updates if useful | Medium--High | Low |
 | Flat pending set plus minimum scan and compaction | Four-queue adaptive Near/Far scheduler | Very high on heterogeneous weights | Very high |
 | Three 32-bit membership arrays | Lazy stale entries or compact/versioned state | High | Medium--High |
 | Six full-size per-worker vertex queues | Bounded, sharded scheduler queues with safe spill | High memory and cache benefit | High |
 | One thread serially scans every active row | Degree-aware, edge-balanced expansion | High on skewed graphs | High |
 | One global update sequence per candidate edge | Hierarchical reduction by destination | High when destinations collide | Medium--High to High |
 | Host-visible count and bucket transitions | Device-resident scheduler control | High on deep/small-frontier searches | High |
-| Parent state always available | Optional distances-only specialization | High for standard SSSP measurement | Low--Medium |
+| Legacy predecessor arrays are lazy for compact paths, but parent key/map and path state remain | Optional distances-only specialization | High for standard SSSP measurement | Low--Medium |
 | Always-64-bit row offsets | Eligible 32-bit device CSR specialization | Medium memory/cache benefit | Medium |
 
 ## Implementation roadmap
 
 ### Stage A: measurement and cheap specializations
 
-1. Add weighted benchmark families and CPU-Dijkstra validation.
-2. Add queue, degree, collision, stale-entry, atomic, and synchronization
-   telemetry.
-3. Validate the implemented PathFinder `delta=auto` mode and multiplier sweep
-   on weighted GPU families; add automatic low-level refresh after value/cost
-   updates if needed.
-4. Add distances-only output and finish lazy parent/path allocation. Legacy
-   predecessor arrays are already lazy for eligible compact-parent searches.
-5. Add eligible 32-bit device row offsets and a forced-wide A/B mode.
+1. **Partial:** weighted CPU-Dijkstra correctness coverage exists, including
+   all-light, all-heavy, mixed, zero-weight, random, and destination-cost
+   cases. Reproducible weighted performance families and baselines are still
+   missing.
+2. **Not started:** add opt-in queue, degree, collision, stale-entry, atomic,
+   and synchronization telemetry.
+3. **Partial:** PathFinder `delta=auto`, the multiplier, explicit override,
+   runtime wave query, host effective-weight helper, and host regressions are
+   implemented. Weighted AMD GPU sweeps and mutable-workspace refresh remain.
+4. **Partial:** legacy predecessor arrays are lazy for eligible compact-parent
+   searches. Add true distances-only execution and make the compact parent
+   key, edge-source map, and path buffers optional.
+5. **Not started:** add eligible 32-bit device row offsets and a forced-wide
+   A/B mode.
 
 Exit criterion: reproducible weighted baselines for classic Delta-Stepping in
 distance-only and path-producing modes, with enough telemetry to predict which
-structural changes matter.
+structural changes matter. **This criterion is not yet met.**
 
 ### Stage B: common edge-expansion primitive
+
+**Status: not started; gated on Stage A telemetry and weighted baselines.**
 
 1. Retain thread-per-row below a measured short-row threshold.
 2. Add lane-group/wave and CTA paths for longer rows.
@@ -175,6 +242,9 @@ short rows and improves skewed-degree weighted cases without correctness
 regressions.
 
 ### Stage C: Near/Far prototype
+
+**Status: not started. Classic Delta-Stepping remains the only generic
+weighted scheduler.**
 
 1. Add a selectable backend flag.
 2. Implement four distance queues with multiple shards.
@@ -190,6 +260,9 @@ material regression on short-row routing graphs.
 
 ### Stage D: destination aggregation
 
+**Status: not started; requires convergent edge assignment from Stage B and
+collision telemetry from Stage A.**
+
 1. Enable wave-local aggregation where collision telemetry warrants it.
 2. Add a block-local path and a direct-atomic bypass.
 3. Prototype global sort/reduce using ROCm primitives only for large frontiers.
@@ -199,6 +272,9 @@ Exit criterion: fewer global distance/parent/queue atomics and lower traversal
 time, including the cost of grouping or sorting.
 
 ### Stage E: state and controller redesign
+
+**Status: not started. Existing gfx1151 explicit-stream synchronization gates
+remain correctness requirements.**
 
 1. Combine or version queue membership state.
 2. Remove touched-state resets made obsolete by epochs or lazy entries.
@@ -213,6 +289,9 @@ across repeated queries, and no host synchronization inside steady-state
 scheduler processing.
 
 ### Stage F: throughput scaling
+
+**Status: not started; intentionally deferred until single-query state and
+control are redesigned.**
 
 1. Re-sweep independent worker counts after state reduction.
 2. Batch multiple queries in one launch when individual queries underfill the
@@ -237,6 +316,13 @@ scheduler processing.
   dependent dispatch and atomic behavior on gfx1151.
 
 ## Benchmark and acceptance requirements
+
+The existing Delta-Stepping regression suite already supplies extensive
+CPU-Dijkstra distance comparison and exact-path validation for weighted corner
+cases, zero-weight SCCs, duplicate sources/targets, early stopping, workspace
+reuse, updates, and explicit streams. These are correctness prerequisites, not
+performance evidence. The current Stage A changes still require a full HIP
+build/run and weighted timing campaign on the target AMD GPU.
 
 Benchmark at least:
 
