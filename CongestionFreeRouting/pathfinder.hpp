@@ -91,7 +91,7 @@ enum class SsspEngine {
 
 struct PathfinderOptions {
   SsspEngine sssp_engine = SsspEngine::kUnitBfs;
-  float delta = 4.0f;
+  float delta = 1.0f;
   int max_sssp_iterations = -1;
   // Explicit A/B control for generic vector-target Delta-Stepping runs.
   bool delta_force_legacy_parent = false;

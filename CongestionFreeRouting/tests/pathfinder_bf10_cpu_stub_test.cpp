@@ -773,6 +773,8 @@ UnitBfsCsrResult UnitBfsCsrWorkspace::run(
 }
 
 int main() {
+  require(routing::PathfinderOptions{}.delta == 1.0f,
+          "default delta-stepping bucket width must be one");
   const HostCsrF32 graph = make_tree_graph();
   const std::vector<float> dist = cpu_dijkstra_outgoing_csr(graph, 0);
   const std::vector<routing::PathEdge> path =

@@ -1083,7 +1083,7 @@ void print_usage(const char* program) {
       << "                                  Shortest-path backend. bellman-ford and bf10 select BF10;\n"
       << "                                  bf8 and bf9 are compatibility aliases. Default: unit-bfs\n"
       << "  --use-delta-step                Use delta-step backend for comparison.\n"
-      << "  --delta <float>                 Delta-stepping bucket width. Default: 4\n"
+      << "  --delta <float>                 Delta-stepping bucket width. Default: 1\n"
       << "  --max-sssp-iters <int>          Delta rounds, BFS depth, or Bellman-Ford rounds; -1 for default.\n"
       << "  --delta-force-legacy-parent     Force generic Delta predecessor recovery for A/B comparison.\n"
       << "  --capacity <int>                Capacity used only for overuse diagnostics. Default: 1\n"

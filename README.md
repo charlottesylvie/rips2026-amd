@@ -278,7 +278,7 @@ Tuning options:
 | --- | --- | --- |
 | `--sssp-engine <unit-bfs\|delta-step>` | `unit-bfs` | Shortest-path backend. |
 | `--use-delta-step` | unset | Shorthand for `--sssp-engine delta-step`. |
-| `--delta <float>` | `4` | Delta-stepping bucket width; meaningful for delta-step. |
+| `--delta <float>` | `1` | Delta-stepping bucket width; meaningful for delta-step. |
 | `--max-sssp-iters <int>` | `-1` | Delta-step bucket rounds or unit-BFS depth cap; `-1` uses the default. |
 | `--capacity <int>` | `1` | Capacity used only for overuse diagnostics. |
 | `--net-limit <count>` | unset | Route only the first `count` requests. |
