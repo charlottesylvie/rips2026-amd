@@ -28,6 +28,18 @@ constexpr Offset kMaxUnitSpecializationRows =
 constexpr unsigned long long kNoParentKey =
     std::numeric_limits<unsigned long long>::max();
 
+enum UnitStatusIndex : int {
+  kUnitStatusQueueTail = 0,
+  kUnitStatusFoundCount,
+  kUnitStatusFrontierBegin,
+  kUnitStatusFrontierEnd,
+  kUnitStatusCompletedDepth,
+  kUnitStatusActive,
+  kUnitStatusBucket,
+  kUnitStatusBucketRounds,
+  kUnitStatusCount,
+};
+
 inline void hip_check(hipError_t status, const char* expr, const char* file, int line) {
   if (status != hipSuccess) {
     std::ostringstream os;
@@ -210,11 +222,11 @@ struct DeltaSteppingScratch {
         dist(static_cast<std::size_t>(rows_)),
         in_pending(static_cast<std::size_t>(rows_)),
         current_queue(static_cast<std::size_t>(rows_)),
-        unit_status(8),
+        unit_status(kUnitStatusCount),
         pred_node(static_cast<std::size_t>(rows_)),
         pred_edge(static_cast<std::size_t>(rows_)),
         host_scalar(1),
-        host_unit_status(8) {}
+        host_unit_status(kUnitStatusCount) {}
 
   void ensure_generic_storage() {
     const std::size_t vertex_count = static_cast<std::size_t>(rows);
@@ -555,6 +567,24 @@ __device__ inline int append_position(bool append, int* queue_tail) {
   return append ? atomicAdd(queue_tail, 1) : -1;
 }
 
+__device__ inline int atomic_load_unit_status(int* address) {
+  // Keep the device-resident unit-BFS controller on the same coherent atomic
+  // path as its queue-tail and target-count writers.  Plain reads here can
+  // otherwise retain stale uniform data between kernels on gfx1151.
+  return atomicAdd(address, 0);
+}
+
+__device__ inline void atomic_store_unit_status(int* address, int value) {
+  atomicExch(address, value);
+}
+
+__device__ inline int atomic_load_counter(const int* address) {
+  // Queue counts are produced with atomicAdd and then consumed as uniform
+  // values by a later kernel.  Keep the read on the coherent atomic path; a
+  // plain scalar load can retain the previous dispatch's count on gfx1151.
+  return atomicAdd(const_cast<int*>(address), 0);
+}
+
 __global__ void validate_device_csr_kernel(Offset rows,
                                            Offset cols,
                                            Offset nnz,
@@ -698,20 +728,27 @@ __global__ void clear_unit_target_multiplicity_kernel(
 __global__ void initialize_unit_sources_kernel(const int* sources,
                                                int source_count,
                                                int initially_found,
+                                               int target_count,
+                                               int max_depth,
                                                float* dist,
                                                int* pred_node,
                                                Offset* pred_edge,
                                                int* frontier_queue,
                                                int* status) {
   if (blockIdx.x == 0 && threadIdx.x == 0) {
-    status[0] = source_count;
-    status[1] = initially_found;
-    status[2] = 0;
-    status[3] = source_count;
-    status[4] = 0;
-    status[5] = 0;
-    status[6] = 0;
-    status[7] = 1;
+    atomic_store_unit_status(status + kUnitStatusQueueTail, source_count);
+    atomic_store_unit_status(
+        status + kUnitStatusFoundCount, initially_found);
+    atomic_store_unit_status(status + kUnitStatusFrontierBegin, 0);
+    atomic_store_unit_status(
+        status + kUnitStatusFrontierEnd, source_count);
+    atomic_store_unit_status(status + kUnitStatusCompletedDepth, 0);
+    atomic_store_unit_status(status + kUnitStatusBucket, 0);
+    atomic_store_unit_status(status + kUnitStatusBucketRounds, 1);
+    __threadfence();
+    atomic_store_unit_status(
+        status + kUnitStatusActive,
+        source_count > 0 && initially_found < target_count && max_depth > 0);
   }
   for (int i = blockIdx.x * blockDim.x + threadIdx.x;
        i < source_count;
@@ -731,18 +768,24 @@ __global__ void expand_unit_frontier_kernel(const Offset* out_rowptr,
                                             Offset* pred_edge,
                                             int* frontier_queue,
                                             int* status,
-                                            const int* target_multiplicity,
-                                            int target_count,
-                                            int max_depth) {
-  const int frontier_begin = status[2];
-  const int frontier_end = status[3];
-  const int depth = status[4];
-  const bool active = frontier_begin < frontier_end &&
-                      status[1] < target_count && depth < max_depth;
-  if (blockIdx.x == 0 && threadIdx.x == 0) {
-    status[5] = active ? 1 : 0;
+                                            const int* target_multiplicity) {
+  __shared__ int controller[4];
+  if (threadIdx.x == 0) {
+    controller[0] = atomic_load_unit_status(status + kUnitStatusActive);
+    if (controller[0] != 0) {
+      controller[1] =
+          atomic_load_unit_status(status + kUnitStatusFrontierBegin);
+      controller[2] =
+          atomic_load_unit_status(status + kUnitStatusFrontierEnd);
+      controller[3] =
+          atomic_load_unit_status(status + kUnitStatusCompletedDepth);
+    }
   }
-  if (!active) return;
+  __syncthreads();
+  if (controller[0] == 0) return;
+  const int frontier_begin = controller[1];
+  const int frontier_end = controller[2];
+  const int depth = controller[3];
 
   const float next_distance = static_cast<float>(depth + 1);
   const unsigned int infinity_bits = __float_as_uint(INFINITY);
@@ -763,33 +806,58 @@ __global__ void expand_unit_frontier_kernel(const Offset* out_rowptr,
         pred_node[v] = u;
         pred_edge[v] = edge;
       }
-      const int pos = append_position(claimed, status);
+      const int pos =
+          append_position(claimed, status + kUnitStatusQueueTail);
       if (claimed) {
         frontier_queue[pos] = v;
         const int multiplicity = target_multiplicity[v];
         if (multiplicity > 0) {
-          atomicAdd(status + 1, multiplicity);
+          atomicAdd(status + kUnitStatusFoundCount, multiplicity);
         }
       }
     }
   }
 }
 
-__global__ void advance_unit_frontier_kernel(int* status, float delta) {
-  if (blockIdx.x == 0 && threadIdx.x == 0 && status[5] != 0) {
-    if (status[0] > status[3]) {
-      const int discovered_depth = status[4] + 1;
+__global__ void advance_unit_frontier_kernel(int* status,
+                                             float delta,
+                                             int target_count,
+                                             int max_depth) {
+  if (blockIdx.x == 0 && threadIdx.x == 0 &&
+      atomic_load_unit_status(status + kUnitStatusActive) != 0) {
+    const int queue_tail =
+        atomic_load_unit_status(status + kUnitStatusQueueTail);
+    const int previous_end =
+        atomic_load_unit_status(status + kUnitStatusFrontierEnd);
+    const int completed_depth =
+        atomic_load_unit_status(status + kUnitStatusCompletedDepth) + 1;
+    const int found_count =
+        atomic_load_unit_status(status + kUnitStatusFoundCount);
+    int bucket = atomic_load_unit_status(status + kUnitStatusBucket);
+    int bucket_rounds =
+        atomic_load_unit_status(status + kUnitStatusBucketRounds);
+    if (queue_tail > previous_end) {
+      const int discovered_depth = completed_depth;
       const int discovered_bucket =
           bucket_index(static_cast<float>(discovered_depth), delta);
-      if (discovered_bucket != status[6]) {
-        status[6] = discovered_bucket;
-        ++status[7];
+      if (discovered_bucket != bucket) {
+        bucket = discovered_bucket;
+        ++bucket_rounds;
       }
     }
-    status[2] = status[3];
-    status[3] = status[0];
-    ++status[4];
-    status[5] = 0;
+    atomic_store_unit_status(status + kUnitStatusBucket, bucket);
+    atomic_store_unit_status(
+        status + kUnitStatusBucketRounds, bucket_rounds);
+    atomic_store_unit_status(
+        status + kUnitStatusFrontierBegin, previous_end);
+    atomic_store_unit_status(status + kUnitStatusFrontierEnd, queue_tail);
+    atomic_store_unit_status(
+        status + kUnitStatusCompletedDepth, completed_depth);
+    __threadfence();
+    atomic_store_unit_status(
+        status + kUnitStatusActive,
+        previous_end < queue_tail && found_count < target_count &&
+            completed_depth < max_depth);
   }
 }
 
@@ -1153,7 +1221,11 @@ __global__ void relax_light_edges_kernel(const int* frontier,
   // FPGA routing graphs have short outgoing rows.  Assign one active vertex to
   // each thread so a 256-thread block can process up to 256 rows concurrently,
   // matching the unit-BFS traversal instead of idling most of a block per row.
-  const int frontier_count = *frontier_count_ptr;
+  __shared__ int frontier_count;
+  if (threadIdx.x == 0) {
+    frontier_count = atomic_load_counter(frontier_count_ptr);
+  }
+  __syncthreads();
   for (int fi = blockIdx.x * blockDim.x + threadIdx.x;
        fi < frontier_count;
        fi += blockDim.x * gridDim.x) {
@@ -1244,7 +1316,11 @@ __global__ void relax_heavy_edges_kernel(const int* heavy_vertices,
                                          int* pending_queue,
                                          int* pending_count,
                                          int* in_heavy) {
-  const int heavy_count_value = *heavy_count_ptr;
+  __shared__ int heavy_count_value;
+  if (threadIdx.x == 0) {
+    heavy_count_value = atomic_load_counter(heavy_count_ptr);
+  }
+  __syncthreads();
   for (int fi = blockIdx.x * blockDim.x + threadIdx.x;
        fi < heavy_count_value;
        fi += blockDim.x * gridDim.x) {
@@ -1343,7 +1419,11 @@ void launch_relax_heavy_edges(
 __global__ void clear_flags_from_queue_kernel(const int* vertices,
                                               const int* count_ptr,
                                               int* flags) {
-  const int count = *count_ptr;
+  __shared__ int count;
+  if (threadIdx.x == 0) {
+    count = atomic_load_counter(count_ptr);
+  }
+  __syncthreads();
   for (int i = blockIdx.x * blockDim.x + threadIdx.x;
        i < count;
        i += blockDim.x * gridDim.x) {
@@ -1423,8 +1503,13 @@ __global__ void reduce_min_pending_bucket_kernel(const int* pending_queue,
                                                  const int* in_pending,
                                                  int* global_min) {
   __shared__ int s_min[kBlockSize];
+  __shared__ int shared_pending_count;
   const int tid = threadIdx.x;
-  const int pending_count = *pending_count_ptr;
+  if (tid == 0) {
+    shared_pending_count = atomic_load_counter(pending_count_ptr);
+  }
+  __syncthreads();
+  const int pending_count = shared_pending_count;
   int local_min = kNoBucket;
   for (int i = blockIdx.x * blockDim.x + tid;
        i < pending_count;
@@ -1459,7 +1544,11 @@ __global__ void compact_pending_to_current_bucket_kernel(const int* pending_in,
                                                          int* current_count,
                                                          int* pending_out,
                                                          int* new_pending_count) {
-  const int pending_count = *pending_count_ptr;
+  __shared__ int pending_count;
+  if (threadIdx.x == 0) {
+    pending_count = atomic_load_counter(pending_count_ptr);
+  }
+  __syncthreads();
   for (int i = blockIdx.x * blockDim.x + threadIdx.x;
        i < pending_count;
        i += blockDim.x * gridDim.x) {
@@ -1917,6 +2006,8 @@ DeltaSteppingCsrResult run_unit_weight_specialization(
           scratch.sources.get(),
           source_count,
           initially_found,
+          target_count,
+          vertex_count,
           scratch.dist.get(),
           scratch.pred_node.get(),
           scratch.pred_edge.get(),
@@ -1953,32 +2044,51 @@ DeltaSteppingCsrResult run_unit_weight_specialization(
               scratch.pred_edge.get(),
               scratch.current_queue.get(),
               scratch.unit_status.get(),
-              scratch.in_pending.get(),
-              target_count,
-              vertex_count);
+              scratch.in_pending.get());
       DS_DELTA_HIP_CHECK(hipGetLastError());
       advance_unit_frontier_kernel<<<1, 1, 0, stream>>>(
-          scratch.unit_status.get(), delta);
+          scratch.unit_status.get(), delta, target_count, vertex_count);
       DS_DELTA_HIP_CHECK(hipGetLastError());
     }
     DS_DELTA_HIP_CHECK(hipMemcpyAsync(scratch.host_unit_status.get(),
                                       scratch.unit_status.get(),
-                                      8 * sizeof(int),
+                                      kUnitStatusCount * sizeof(int),
                                       hipMemcpyDeviceToHost,
                                       stream));
     DS_DELTA_HIP_CHECK(hipStreamSynchronize(stream));
-    queue_tail = scratch.host_unit_status.get()[0];
-    found_count = scratch.host_unit_status.get()[1];
-    const int frontier_begin = scratch.host_unit_status.get()[2];
-    const int frontier_end = scratch.host_unit_status.get()[3];
-    if (queue_tail < frontier_end || queue_tail > vertex_count ||
-        frontier_begin < 0 || frontier_end < frontier_begin) {
-      throw std::runtime_error(
-          "delta unit-weight append-only frontier queue overflow");
+    queue_tail = scratch.host_unit_status.get()[kUnitStatusQueueTail];
+    found_count = scratch.host_unit_status.get()[kUnitStatusFoundCount];
+    const int frontier_begin =
+        scratch.host_unit_status.get()[kUnitStatusFrontierBegin];
+    const int frontier_end =
+        scratch.host_unit_status.get()[kUnitStatusFrontierEnd];
+    const int completed_depth =
+        scratch.host_unit_status.get()[kUnitStatusCompletedDepth];
+    const int active =
+        scratch.host_unit_status.get()[kUnitStatusActive];
+    if (queue_tail < 0 || queue_tail > vertex_count || frontier_begin < 0 ||
+        frontier_end < frontier_begin || frontier_end != queue_tail ||
+        found_count < 0 || found_count > target_count ||
+        completed_depth < 0 || completed_depth > vertex_count ||
+        (active != 0 && active != 1)) {
+      std::ostringstream message;
+      message << "delta unit-weight device frontier state is inconsistent"
+              << " (queue_tail=" << queue_tail
+              << ", frontier_begin=" << frontier_begin
+              << ", frontier_end=" << frontier_end
+              << ", found_count=" << found_count
+              << ", completed_depth="
+              << completed_depth
+              << ", active=" << active
+              << ", rows=" << vertex_count
+              << ", sources=" << source_count
+              << ", targets=" << target_count << ')';
+      throw std::runtime_error(message.str());
     }
     current_count = frontier_end - frontier_begin;
-    result.iterations_used = scratch.host_unit_status.get()[4];
-    bucket_rounds = scratch.host_unit_status.get()[7];
+    result.iterations_used = completed_depth;
+    bucket_rounds =
+        scratch.host_unit_status.get()[kUnitStatusBucketRounds];
   }
 
   result.stopped_on_target = found_count >= target_count;

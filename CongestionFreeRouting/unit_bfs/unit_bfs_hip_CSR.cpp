@@ -323,6 +323,17 @@ __device__ inline void count_target_if_reached(int v,
   }
 }
 
+__device__ inline int atomic_load_status(int* address) {
+  // The expansion kernels update controller counters atomically.  Read every
+  // controller word through the same device-coherent path so a following
+  // kernel cannot combine fresh atomic counters with stale ordinary loads.
+  return atomicAdd(address, 0);
+}
+
+__device__ inline void atomic_store_status(int* address, int value) {
+  atomicExch(address, value);
+}
+
 __device__ inline int append_position(bool append, int* queue_tail) {
   // This helper is called from adjacency loops whose trip counts differ by
   // lane. A ballot/shuffle reservation is invalid there because lanes do not
@@ -365,13 +376,15 @@ __global__ void initialize_sources_kernel(const int* sources,
                                           int* frontier_queue,
                                           int* status) {
   if (blockIdx.x == 0 && threadIdx.x == 0) {
-    status[kStatusQueueTail] = source_count;
-    status[kStatusFoundCount] = initially_found;
-    status[kStatusFrontierBegin] = 0;
-    status[kStatusFrontierEnd] = source_count;
-    status[kStatusCompletedDepth] = 0;
-    status[kStatusActive] =
-        source_count > 0 && initially_found < target_count && max_depth > 0;
+    atomic_store_status(status + kStatusQueueTail, source_count);
+    atomic_store_status(status + kStatusFoundCount, initially_found);
+    atomic_store_status(status + kStatusFrontierBegin, 0);
+    atomic_store_status(status + kStatusFrontierEnd, source_count);
+    atomic_store_status(status + kStatusCompletedDepth, 0);
+    __threadfence();
+    atomic_store_status(
+        status + kStatusActive,
+        source_count > 0 && initially_found < target_count && max_depth > 0);
   }
   for (int i = blockIdx.x * blockDim.x + threadIdx.x;
        i < source_count;
@@ -395,12 +408,22 @@ __global__ void expand_frontier_kernel(const EdgeOffset* out_rowptr,
                                        int* frontier_queue,
                                        const int* target_multiplicity,
                                        int* status) {
-  if (status[kStatusActive] == 0) {
+  __shared__ int controller[4];
+  if (threadIdx.x == 0) {
+    controller[0] = atomic_load_status(status + kStatusActive);
+    if (controller[0] != 0) {
+      controller[1] = atomic_load_status(status + kStatusFrontierBegin);
+      controller[2] = atomic_load_status(status + kStatusFrontierEnd);
+      controller[3] = atomic_load_status(status + kStatusCompletedDepth);
+    }
+  }
+  __syncthreads();
+  if (controller[0] == 0) {
     return;
   }
-  const int frontier_begin = status[kStatusFrontierBegin];
-  const int frontier_end = status[kStatusFrontierEnd];
-  const int next_level = status[kStatusCompletedDepth] + 1;
+  const int frontier_begin = controller[1];
+  const int frontier_end = controller[2];
+  const int next_level = controller[3] + 1;
   for (int i = frontier_begin + blockIdx.x * blockDim.x + threadIdx.x;
        i < frontier_end;
        i += blockDim.x * gridDim.x) {
@@ -434,17 +457,25 @@ __global__ void advance_frontier_kernel(int target_count,
                                         int max_depth,
                                         int* status) {
   if (blockIdx.x != 0 || threadIdx.x != 0 ||
-      status[kStatusActive] == 0) {
+      atomic_load_status(status + kStatusActive) == 0) {
     return;
   }
 
-  status[kStatusFrontierBegin] = status[kStatusFrontierEnd];
-  status[kStatusFrontierEnd] = status[kStatusQueueTail];
-  ++status[kStatusCompletedDepth];
-  status[kStatusActive] =
-      status[kStatusFrontierBegin] < status[kStatusFrontierEnd] &&
-      status[kStatusFoundCount] < target_count &&
-      status[kStatusCompletedDepth] < max_depth;
+  const int frontier_begin =
+      atomic_load_status(status + kStatusFrontierEnd);
+  const int frontier_end = atomic_load_status(status + kStatusQueueTail);
+  const int completed_depth =
+      atomic_load_status(status + kStatusCompletedDepth) + 1;
+  const int found_count =
+      atomic_load_status(status + kStatusFoundCount);
+  atomic_store_status(status + kStatusFrontierBegin, frontier_begin);
+  atomic_store_status(status + kStatusFrontierEnd, frontier_end);
+  atomic_store_status(status + kStatusCompletedDepth, completed_depth);
+  __threadfence();
+  atomic_store_status(
+      status + kStatusActive,
+      frontier_begin < frontier_end && found_count < target_count &&
+          completed_depth < max_depth);
 }
 
 __global__ void mark_target_multiplicity_kernel(const int* targets,

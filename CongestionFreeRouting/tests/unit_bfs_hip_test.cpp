@@ -8,6 +8,7 @@
 //     CongestionFreeRouting/unit_bfs/unit_bfs_hip_CSR.cpp \
 //     -o /tmp/unit_bfs_hip_test && /tmp/unit_bfs_hip_test
 
+#include <atomic>
 #include <cmath>
 #include <cstdint>
 #include <future>
@@ -17,6 +18,7 @@
 #include <sstream>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -516,6 +518,60 @@ HostCsrF32 make_divergent_claim_graph() {
   return graph;
 }
 
+HostCsrF32 make_second_speculative_round_target_graph() {
+  // Keep enough isolated rows for a production-sized batched launch grid while
+  // making the reached portion small and deterministic. Starting with two
+  // sources, the frontier sizes are exactly 2 -> 10 -> 18 -> 19. The first
+  // expansion is checked by the host, the 18-node frontier is produced by the
+  // first speculative round, and target 48 is found by the second speculative
+  // round.
+  //
+  //   {0,1} -> {2..11} -> {12..29} -> {30..48}
+  //
+  // Every reached vertex has one predecessor, so the target path and CSR edge
+  // IDs are stable even when several streams execute the graph concurrently.
+  constexpr int kRows = 1 << 18;
+  HostCsrF32 graph;
+  graph.rows = kRows;
+  graph.cols = kRows;
+  graph.rowptr.resize(kRows + 1);
+  int next_second_level = 12;
+  int next_third_level = 30;
+  for (int v = 0; v < kRows; ++v) {
+    graph.rowptr[static_cast<std::size_t>(v)] =
+        static_cast<Offset>(graph.colind.size());
+    if (v == 0) {
+      for (int dst = 2; dst <= 6; ++dst) {
+        graph.colind.push_back(dst);
+      }
+    } else if (v == 1) {
+      for (int dst = 7; dst <= 11; ++dst) {
+        graph.colind.push_back(dst);
+      }
+    } else if (v >= 2 && v <= 11) {
+      const int child_count = v <= 9 ? 2 : 1;
+      for (int child = 0; child < child_count; ++child) {
+        graph.colind.push_back(next_second_level++);
+      }
+    } else if (v >= 12 && v <= 29) {
+      const int child_count = v == 12 ? 2 : 1;
+      for (int child = 0; child < child_count; ++child) {
+        graph.colind.push_back(next_third_level++);
+      }
+    }
+  }
+  require_equal(next_second_level,
+                30,
+                "second-round graph second-level endpoint");
+  require_equal(next_third_level,
+                49,
+                "second-round graph third-level endpoint");
+  graph.rowptr.back() = static_cast<Offset>(graph.colind.size());
+  graph.nnz = static_cast<Offset>(graph.colind.size());
+  graph.values.assign(graph.colind.size(), 1.0f);
+  return graph;
+}
+
 ExpectedTarget reached_on_chain(int target) {
   std::vector<int> nodes;
   std::vector<Offset> edges;
@@ -804,6 +860,80 @@ void run_parallel_workspace_suite() {
   }
 }
 
+void run_parallel_second_speculative_round_suite() {
+  const HostCsrF32 graph = make_second_speculative_round_target_graph();
+  auto shared_graph = std::make_shared<UnitBfsCsrGraph>(graph, nullptr);
+  int device = 0;
+  check_hip(hipGetDevice(&device), "hipGetDevice");
+
+  const ExpectedRun target_in_second_round{
+      3,
+      true,
+      true,
+      true,
+      {reached(48,
+               3.0f,
+               1,
+               {1, 11, 29, 48},
+               {static_cast<Offset>(9),
+                static_cast<Offset>(27),
+                static_cast<Offset>(46)})}};
+
+  // Construct all private workspaces first, then release their first queries
+  // together. This exercises the same eight nonblocking-stream scheduling as
+  // PathFinder rather than allowing short fixtures to run mostly serially.
+  constexpr int kWorkers = 8;
+  constexpr int kRunsPerWorker = 512;
+  std::promise<void> start_promise;
+  const std::shared_future<void> start = start_promise.get_future().share();
+  std::atomic<int> ready{0};
+  std::vector<std::future<void>> workers;
+  workers.reserve(kWorkers);
+  for (int worker = 0; worker < kWorkers; ++worker) {
+    workers.push_back(std::async(std::launch::async, [&, worker]() {
+      bool readiness_reported = false;
+      try {
+        check_hip(hipSetDevice(device), "hipSetDevice");
+        HipStream stream;
+        UnitBfsCsrWorkspace workspace(shared_graph, stream.get());
+        ready.fetch_add(1, std::memory_order_release);
+        readiness_reported = true;
+        start.wait();
+
+        for (int repetition = 0; repetition < kRunsPerWorker; ++repetition) {
+          UnitBfsCsrResult result = workspace.run(
+              std::vector<int>{0, 1},
+              std::vector<int>{48},
+              1.0f,
+              -1,
+              stream.get(),
+              nullptr,
+              nullptr);
+          validate_result(
+              graph,
+              result,
+              target_in_second_round,
+              "parallel second speculative round worker " +
+                  std::to_string(worker) + " reuse " +
+                  std::to_string(repetition));
+        }
+      } catch (...) {
+        if (!readiness_reported) {
+          ready.fetch_add(1, std::memory_order_release);
+        }
+        throw;
+      }
+    }));
+  }
+  while (ready.load(std::memory_order_acquire) != kWorkers) {
+    std::this_thread::yield();
+  }
+  start_promise.set_value();
+  for (std::future<void>& worker : workers) {
+    worker.get();
+  }
+}
+
 }  // namespace
 
 int main() {
@@ -849,6 +979,7 @@ int main() {
     run_batching_suite(UnitBfsCsrOffsetMode::kForce64Bit,
                        "forced-64-bit batching");
     run_parallel_workspace_suite();
+    run_parallel_second_speculative_round_suite();
 
     // The representation cutoff is compile-time production logic.  A giant CSR
     // fixture would be unsafe, and no public pure selection helper is exposed;
