@@ -13,7 +13,7 @@ replacing routed stubs with pip routeSegments.
 
 Example contest Makefile recipe:
 
-    %_pathfinder.phys: %_unrouted.phys %.netlist xcvu3p.device
+    %_pathfinder.phys: %_unrouted.phys %.netlist xcvu3p.full-poc-base-wire.devicegraph
         (/usr/bin/time python3 CongestionFreeRouting/pathfinder_benchmark.py $< $@) \
           $(call log_and_or_display,$@.log)
 
@@ -94,7 +94,16 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("input_phys", type=Path)
     parser.add_argument("output_phys", type=Path)
     parser.add_argument("--logical-netlist", type=Path)
-    parser.add_argument("--device", type=Path, default=Path("xcvu3p.device"))
+    parser.add_argument(
+        "--device-graph",
+        type=Path,
+        default=Path(
+            executable_path(
+                "xcvu3p.full-poc-base-wire.devicegraph", "DEVICE_ROUTING_GRAPH"
+            )
+        ),
+        help="precomputed device routing graph, or set DEVICE_ROUTING_GRAPH",
+    )
     parser.add_argument(
         "--schema-dir",
         type=Path,
@@ -505,13 +514,13 @@ def main(argv: list[str]) -> int:
         if args.logical_netlist is not None
         else infer_logical_netlist(input_phys).resolve()
     )
-    device = args.device.resolve()
+    device_graph = args.device_graph.resolve()
     schema_dir = args.schema_dir.resolve() if args.schema_dir is not None else None
 
     for path, label in (
         (input_phys, "input physical netlist"),
         (logical_netlist, "logical netlist"),
-        (device, "device resources"),
+        (device_graph, "device routing graph"),
     ):
         if not path.exists():
             raise FileNotFoundError(f"missing {label}: {path}")
@@ -547,11 +556,10 @@ def main(argv: list[str]) -> int:
         run_command(
             [
                 args.interchange_to_csr,
+                str(device_graph),
                 str(input_phys),
                 str(logical_netlist),
                 str(csr_path),
-                "--device",
-                str(device),
                 "--metadata",
                 str(metadata_path),
             ],

@@ -1,6 +1,6 @@
-// Converts FPGA Interchange DeviceResources plus a design's PhysicalNetlist
-// and LogicalNetlist into the CSR binary format consumed by the
-// CongestionFreeRouting HIP kernels.
+// Converts a preprocessed RIPSDRG1 device-routing graph plus a design's
+// PhysicalNetlist and LogicalNetlist into the CSR binary format consumed by
+// the CongestionFreeRouting HIP kernels.
 //
 // The primary output is a RIPSCSR1 .csrbin file:
 //
@@ -21,8 +21,9 @@
 // routing kernels, while later post-processing has enough context
 // to turn SSSP paths back into PhysPIP route branches in a routed .phys file.
 //
-// Expected generated schema headers:
-//   DeviceResources.capnp.h
+// DeviceResources parsing and invariant graph construction live in
+// device_to_routing_graph.cpp and run once per (device, bounds, bounds mode).
+// This per-benchmark stage only needs these generated schema headers:
 //   PhysicalNetlist.capnp.h
 //   LogicalNetlist.capnp.h
 //
@@ -31,7 +32,7 @@
 //   g++ -std=c++17 -O3 \
 //     -I<generated-schema-dir> \
 //     CongestionFreeRouting/interchange_to_csr.cpp \
-//     <generated-schema-dir>/DeviceResources.capnp.c++ \
+//     CongestionFreeRouting/interchange/device_routing_graph.cpp \
 //     <generated-schema-dir>/PhysicalNetlist.capnp.c++ \
 //     <generated-schema-dir>/LogicalNetlist.capnp.c++ \
 //     <generated-schema-dir>/References.capnp.c++ \
@@ -40,14 +41,14 @@
 //
 // Example use:
 //
-//   ./interchange_to_csr benchmarks/vtr_mcml_unrouted.phys \
+//   ./interchange_to_csr xcvu3p.full-poc-base-wire.devicegraph \
+//     benchmarks/vtr_mcml_unrouted.phys \
 //     benchmarks/vtr_mcml.netlist \
-//     HIP_kernel/bellman_ford/data/vtr_mcml_fpga.csrbin \
-//     --device xcvu3p.device
+//     HIP_kernel/bellman_ford/data/vtr_mcml_fpga.csrbin
 
-#include "DeviceResources.capnp.h"
 #include "LogicalNetlist.capnp.h"
 #include "PhysicalNetlist.capnp.h"
+#include "interchange/device_routing_graph.hpp"
 
 #include <capnp/serialize.h>
 #include <kj/array.h>
@@ -66,7 +67,6 @@
 #include <stdexcept>
 #include <string>
 #include <unordered_map>
-#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -79,88 +79,34 @@ static_assert(sizeof(std::int64_t) == 8, "int64_t must be 8 bytes");
 static_assert(sizeof(std::int32_t) == 4, "int32_t must be 4 bytes");
 static_assert(sizeof(float) == 4, "float must be 4 bytes");
 
+struct PipDataDisk {
+  std::uint64_t wire0_string = 0;
+  std::uint64_t wire1_string = 0;
+  std::uint64_t forward = 0;
+};
+
+static_assert(sizeof(PipDataDisk) == 3 * sizeof(std::uint64_t),
+              "PipDataDisk metadata layout changed");
+
 constexpr char CSR_MAGIC[8] = {'R', 'I', 'P', 'S', 'C', 'S', 'R', '1'};
 constexpr char METADATA_MAGIC[8] = {'R', 'I', 'P', 'S', 'I', 'F', 'M', '1'};
 constexpr std::uint64_t CSR_FORMAT_VERSION = 1;
 constexpr std::uint64_t METADATA_FORMAT_VERSION = 4;
 constexpr std::uint64_t OUTGOING_EDGE_ORIENTATION = 2;
-constexpr std::uint64_t kNoIndex =
-    std::numeric_limits<std::uint64_t>::max();
-constexpr std::uint64_t kNoLogicalNetIndex = kNoIndex;
-constexpr std::uint64_t kNoStringIndex = kNoIndex;
-
-using NodeId = std::int32_t;
-constexpr NodeId kInvalidRouteNode = -1;
-
-// Controls how the bounded tile box is applied to DeviceResources.nodes.
-// The Python proof of concept uses the first wire of each node as the "base"
-// wire and admits the node if that base wire's tile is in bounds.
-enum class NodeBoundsMode {
-  kPocBaseWire,
-  kFullyContained,
-  kIntersects,
-};
-
-constexpr int NXROUTE_MIN_X = 36;
-constexpr int NXROUTE_MAX_X = 90;
-constexpr int NXROUTE_MIN_Y = 60;
-constexpr int NXROUTE_MAX_Y = 239;
-
-// Import every XY tile by default. Use --nxroute-bounds only for apples-to-
-// apples comparison with the NetworkX proof-of-concept router.
-struct Bounds {
-  int min_x = 0;
-  int max_x = std::numeric_limits<int>::max();
-  int min_y = 0;
-  int max_y = std::numeric_limits<int>::max();
-};
-
-// Concrete site instances are resolved through their tile instance, tile type,
-// and site type. This is the C++ equivalent of site2tileAndTypes in Python.
-struct TileAndTypes {
-  std::string tile_name;
-  std::uint32_t tile_type = 0;
-  std::uint32_t site_type = 0;
-};
-
-// Key used for tile-type-local site pin lookup:
-//   (site type within tile type, site pin name) -> tile wire name.
-struct SitePinKey {
-  std::uint32_t site_type = 0;
-  std::string pin_name;
-
-  bool operator==(const SitePinKey& other) const {
-    return site_type == other.site_type && pin_name == other.pin_name;
-  }
-};
-
-struct SitePinKeyHash {
-  std::size_t operator()(const SitePinKey& key) const {
-    const std::size_t h1 = std::hash<std::uint32_t>{}(key.site_type);
-    const std::size_t h2 = std::hash<std::string>{}(key.pin_name);
-    return h1 ^ (h2 + 0x9e3779b97f4a7c15ULL + (h1 << 6) + (h1 >> 2));
-  }
-};
-
-// Sidecar metadata uses a compact local string table. CSR itself only needs
-// numeric row/column IDs, while reconstruction later needs names like tile,
-// wire, site, pin, and net.
-struct StringTable {
-  std::vector<std::string> strings;
-  std::unordered_map<std::string, std::uint64_t> ids;
-
-  std::uint64_t intern(const std::string& text) {
-    auto found = ids.find(text);
-    if (found != ids.end()) {
-      return found->second;
-    }
-
-    const std::uint64_t id = static_cast<std::uint64_t>(strings.size());
-    strings.push_back(text);
-    ids.emplace(strings.back(), id);
-    return id;
-  }
-};
+using routing::interchange::CsrGraph;
+using routing::interchange::DeviceRoutingGraph;
+using routing::interchange::EdgeAttr;
+using routing::interchange::NodeId;
+using routing::interchange::PipData;
+using routing::interchange::StringTable;
+using routing::interchange::filter_device_routing_graph;
+using routing::interchange::find_pair_node;
+using routing::interchange::kInvalidRouteNode;
+using routing::interchange::kNoIndex;
+using routing::interchange::kNoLogicalNetIndex;
+using routing::interchange::kNoStringIndex;
+using routing::interchange::node_bounds_mode_name;
+using routing::interchange::read_device_routing_graph_for_filtering;
 
 // FPGAIF stores most names as integer indexes into strList. This cache turns
 // those indexes into std::string once, avoiding repeated Cap'n Proto text copies
@@ -186,29 +132,6 @@ class TextCache {
  private:
   capnp::List<capnp::Text>::Reader strings_;
   std::vector<std::optional<std::string>> cache_;
-};
-
-// Per-PIP metadata follows the Python proof of concept:
-//   pipData[pipDataIndex] = (wire0Name, wire1Name, forward)
-struct PipData {
-  std::uint64_t wire0_string = 0;
-  std::uint64_t wire1_string = 0;
-  bool forward = true;
-};
-
-// Per-edge metadata follows the Python NetworkX edge attribute:
-//   edge["pip"] = (tileName, pipDataIndex)
-struct EdgeAttr {
-  std::uint64_t tile_string = 0;
-  std::uint64_t pip_data_index = 0;
-};
-
-// Temporary edge representation while building the graph in natural routing
-// direction. The final CSR preserves this outgoing-edge orientation.
-struct BuildEdge {
-  NodeId from = 0;
-  NodeId to = 0;
-  EdgeAttr attr;
 };
 
 // Site pin metadata is attached to sink nodes, matching the Python node
@@ -256,44 +179,16 @@ struct LogicalCellSummary {
   std::uint64_t net_count = 0;
 };
 
-// Plain CSR payload consumed by the HIP routing kernels. edge_attrs is kept in
-// the same order as colind/values so each CSR edge can recover its PIP metadata.
-// values is the separate float edge_weight[]; node coordinate ranges plus
-// tile/wire type metadata stay in the sidecar, not interleaved with edges.
-struct CsrGraph {
-  std::int64_t rows = 0;
-  std::int64_t cols = 0;
-  std::uint64_t declared_edges = 0;
-  std::uint64_t loaded_edges = 0;
-  std::vector<std::int64_t> rowptr;
-  std::vector<std::int32_t> colind;
-  std::vector<float> values;
-  std::vector<EdgeAttr> edge_attrs;
-};
-
-// All CPU-side information produced while parsing FPGAIF. The CSR arrays are
-// derived from this structure; the metadata sidecar also serializes selected
-// fields from it.
-struct RoutingGraph {
-  StringTable string_table;
-  std::vector<std::uint64_t> node_device_ids;
-  std::vector<std::int32_t> node_min_x;
-  std::vector<std::int32_t> node_max_x;
-  std::vector<std::int32_t> node_min_y;
-  std::vector<std::int32_t> node_max_y;
-  std::vector<std::uint64_t> node_tile_type_strings;
-  std::vector<std::uint64_t> node_wire_type_strings;
-  std::vector<BuildEdge> edges;
-  std::vector<PipData> pip_data;
-  std::uint64_t raw_edges_seen = 0;
-
-  std::unordered_map<std::string, std::unordered_map<std::string, NodeId>>
-      tile2wire2node;
-  std::unordered_map<std::string, TileAndTypes> site2tile_and_types;
-  std::unordered_map<
-      std::uint32_t,
-      std::unordered_map<SitePinKey, std::string, SitePinKeyHash>>
-      tile_type2site_type_pin2wire;
+// Static device fields are loaded from the preprocessed artifact. This derived
+// structure adds only benchmark-specific masks, requests, logical summaries,
+// and provenance.
+struct RoutingGraph : DeviceRoutingGraph {
+  explicit RoutingGraph(DeviceRoutingGraph&& device_graph)
+      : DeviceRoutingGraph(std::move(device_graph)) {
+    blocked_node.assign(node_device_ids.size(), 0);
+    sink_node_stops.assign(node_device_ids.size(), 0);
+    site_pin_attr_by_node.assign(node_device_ids.size(), -1);
+  }
 
   std::vector<std::uint8_t> blocked_node;
   std::vector<std::uint8_t> sink_node_stops;
@@ -301,7 +196,6 @@ struct RoutingGraph {
   std::vector<SitePinNode> site_pin_attrs;
   std::vector<RouteRequest> route_requests;
 
-  std::uint64_t device_path_string = 0;
   std::uint64_t physical_path_string = 0;
   std::uint64_t logical_path_string = 0;
   std::uint64_t logical_design_name_string = 0;
@@ -320,110 +214,25 @@ struct SitePinName {
   std::string pin;
 };
 
-// Command-line options: PhysicalNetlist and LogicalNetlist inputs are required.
-// DeviceResources is still required for topology, but it defaults to
-// xcvu3p.device or can be supplied by --device.
+// The static device graph is an explicit positional input so a benchmark can
+// never silently pay the DeviceResources build cost.
 struct Options {
-  std::filesystem::path device_path = "xcvu3p.device";
+  std::filesystem::path device_graph_path;
   std::filesystem::path phys_path;
   std::filesystem::path logical_path;
   std::filesystem::path output_path;
   std::filesystem::path metadata_path;
-  Bounds bounds;
-  NodeBoundsMode node_bounds_mode = NodeBoundsMode::kPocBaseWire;
 };
 
-bool has_prefix(const std::string& text, const char* prefix) {
-  const std::string prefix_text(prefix);
-  return text.size() >= prefix_text.size() &&
-         text.compare(0, prefix_text.size(), prefix_text) == 0;
-}
-
-std::optional<std::pair<int, int>> parse_tile_xy(const std::string& tile_name) {
-  const std::size_t marker = tile_name.rfind("_X");
-  if (marker == std::string::npos) {
-    return std::nullopt;
-  }
-
-  std::size_t pos = marker + 2;
-  if (pos >= tile_name.size() || tile_name[pos] < '0' || tile_name[pos] > '9') {
-    return std::nullopt;
-  }
-
-  int x = 0;
-  while (pos < tile_name.size() && tile_name[pos] >= '0' && tile_name[pos] <= '9') {
-    x = x * 10 + (tile_name[pos] - '0');
-    ++pos;
-  }
-
-  if (pos >= tile_name.size() || tile_name[pos] != 'Y') {
-    return std::nullopt;
-  }
-  ++pos;
-  if (pos >= tile_name.size() || tile_name[pos] < '0' || tile_name[pos] > '9') {
-    return std::nullopt;
-  }
-
-  int y = 0;
-  while (pos < tile_name.size() && tile_name[pos] >= '0' && tile_name[pos] <= '9') {
-    y = y * 10 + (tile_name[pos] - '0');
-    ++pos;
-  }
-
-  return std::make_pair(x, y);
-}
-
-// Print the node-bounds mode in logs so graph size can be interpreted without
-// guessing which subset policy was used.
-const char* node_bounds_mode_name(NodeBoundsMode mode) {
-  switch (mode) {
-    case NodeBoundsMode::kPocBaseWire:
-      return "poc-base-wire";
-    case NodeBoundsMode::kFullyContained:
-      return "fully-contained";
-    case NodeBoundsMode::kIntersects:
-      return "intersects";
-  }
-  return "unknown";
-}
-
-// Parse the explicit node filtering policy. The default is poc-base-wire
-// because that matches nxroute-poc.py. fully-contained is useful when you want
-// the graph to contain only routing nodes whose every wire lies in the box.
-NodeBoundsMode parse_node_bounds_mode(const std::string& text) {
-  if (text == "poc-base-wire" || text == "poc") {
-    return NodeBoundsMode::kPocBaseWire;
-  }
-  if (text == "fully-contained" || text == "contained") {
-    return NodeBoundsMode::kFullyContained;
-  }
-  if (text == "intersects" || text == "any") {
-    return NodeBoundsMode::kIntersects;
-  }
-  throw std::runtime_error("unknown node bounds mode: " + text);
-}
-
-// Print the supported invocation forms. The .phys and .netlist files describe
-// the design; DeviceResources describes the routing fabric and is supplied with
-// --device or defaults to ./xcvu3p.device.
 void print_usage(const char* program) {
   std::cerr
       << "Usage:\n"
       << "  " << program
-      << " <unrouted.phys> <logical.netlist> <output.csrbin> [options]\n"
-      << "  " << program
-      << " <device.device> <unrouted.phys> <logical.netlist> "
+      << " <device.devicegraph> <unrouted.phys> <logical.netlist> "
          "<output.csrbin> [options]\n\n"
       << "Options:\n"
-      << "  --device <path>                FPGAIF DeviceResources input.\n"
-      << "  --metadata <path>              Sidecar FPGA metadata output.\n"
-      << "  --bounds <minX> <maxX> <minY> <maxY>\n"
-      << "                                 Tile-coordinate subset to import.\n"
-      << "  --nxroute-bounds               Import nxroute-poc subset: X36..X90, Y60..Y239.\n"
-      << "  --node-bounds-mode <mode>      poc-base-wire, fully-contained, "
-         "or intersects.\n"
-      << "  --full-device                  Import every tile that has XY coords (default).\n\n"
-      << "Default bounds import the whole device graph.\n";
+      << "  --metadata <path>              Sidecar FPGA metadata output.\n\n"
+      << "Generate <device.devicegraph> once with device_to_routing_graph.\n";
 }
 
 std::filesystem::path default_metadata_path(
@@ -433,26 +242,7 @@ std::filesystem::path default_metadata_path(
   return path;
 }
 
-// Parse integer CLI arguments with a useful error message. This is used both
-// for explicit --bounds and for tile coordinate text captured from tile names.
-int parse_int_arg(const char* text, const char* name) {
-  try {
-    std::size_t consumed = 0;
-    const int value = std::stoi(text, &consumed);
-    if (consumed != std::string(text).size()) {
-      throw std::invalid_argument("trailing characters");
-    }
-    return value;
-  } catch (const std::exception&) {
-    throw std::runtime_error(std::string("invalid ") + name + ": " + text);
-  }
-}
 
-// Split positional inputs from options:
-//   physical netlist + logical netlist + output
-//   device + physical netlist + logical netlist + output
-// Device path can also be supplied by --device. Metadata path and tile bounds
-// are independent options.
 Options parse_options(int argc, char** argv) {
   Options options;
   std::vector<std::filesystem::path> positional;
@@ -460,54 +250,11 @@ Options parse_options(int argc, char** argv) {
   for (int i = 1; i < argc; ++i) {
     const std::string arg(argv[i]);
 
-    if (arg == "--device") {
-      if (i + 1 >= argc) {
-        throw std::runtime_error("--device requires a path");
-      }
-      options.device_path = argv[++i];
-      continue;
-    }
-
     if (arg == "--metadata") {
       if (i + 1 >= argc) {
         throw std::runtime_error("--metadata requires a path");
       }
       options.metadata_path = argv[++i];
-      continue;
-    }
-
-    if (arg == "--bounds") {
-      if (i + 4 >= argc) {
-        throw std::runtime_error("--bounds requires four integer arguments");
-      }
-      options.bounds.min_x = parse_int_arg(argv[++i], "minX");
-      options.bounds.max_x = parse_int_arg(argv[++i], "maxX");
-      options.bounds.min_y = parse_int_arg(argv[++i], "minY");
-      options.bounds.max_y = parse_int_arg(argv[++i], "maxY");
-      continue;
-    }
-
-    if (arg == "--nxroute-bounds") {
-      options.bounds.min_x = NXROUTE_MIN_X;
-      options.bounds.max_x = NXROUTE_MAX_X;
-      options.bounds.min_y = NXROUTE_MIN_Y;
-      options.bounds.max_y = NXROUTE_MAX_Y;
-      continue;
-    }
-
-    if (arg == "--node-bounds-mode") {
-      if (i + 1 >= argc) {
-        throw std::runtime_error("--node-bounds-mode requires a mode");
-      }
-      options.node_bounds_mode = parse_node_bounds_mode(argv[++i]);
-      continue;
-    }
-
-    if (arg == "--full-device") {
-      options.bounds.min_x = 0;
-      options.bounds.min_y = 0;
-      options.bounds.max_x = std::numeric_limits<int>::max();
-      options.bounds.max_y = std::numeric_limits<int>::max();
       continue;
     }
 
@@ -518,26 +265,17 @@ Options parse_options(int argc, char** argv) {
     positional.emplace_back(arg);
   }
 
-  if (positional.size() == 3) {
-    options.phys_path = positional[0];
-    options.logical_path = positional[1];
-    options.output_path = positional[2];
-  } else if (positional.size() == 4) {
-    options.device_path = positional[0];
+  if (positional.size() == 4) {
+    options.device_graph_path = positional[0];
     options.phys_path = positional[1];
     options.logical_path = positional[2];
     options.output_path = positional[3];
   } else {
-    throw std::runtime_error("expected three or four positional arguments");
+    throw std::runtime_error("expected four positional arguments");
   }
 
   if (options.metadata_path.empty()) {
     options.metadata_path = default_metadata_path(options.output_path);
-  }
-
-  if (options.bounds.min_x > options.bounds.max_x ||
-      options.bounds.min_y > options.bounds.max_y) {
-    throw std::runtime_error("invalid bounds: min is greater than max");
   }
 
   return options;
@@ -552,8 +290,16 @@ std::vector<std::uint8_t> read_gzip_or_plain_file(
   if (!file) {
     throw std::runtime_error("could not open input file: " + path.string());
   }
+  (void)gzbuffer(file, 1 << 20);
 
   std::vector<std::uint8_t> bytes;
+  std::error_code size_error;
+  const std::uintmax_t encoded_size =
+      std::filesystem::file_size(path, size_error);
+  if (!size_error &&
+      encoded_size <= std::numeric_limits<std::size_t>::max()) {
+    bytes.reserve(static_cast<std::size_t>(encoded_size));
+  }
   std::array<std::uint8_t, 1 << 20> buffer{};
 
   while (true) {
@@ -597,26 +343,6 @@ std::vector<capnp::word> bytes_to_words(
   std::vector<capnp::word> words(word_count);
   std::memcpy(words.data(), bytes.data(), bytes.size());
   return words;
-}
-
-void check_device_payload_size(const std::filesystem::path& path,
-                               std::size_t decoded_bytes) {
-  constexpr std::size_t kMinExpectedDeviceBytes = 1 << 20;
-  if (path.filename() != "xcvu3p.device" ||
-      decoded_bytes >= kMinExpectedDeviceBytes) {
-    return;
-  }
-
-  throw std::runtime_error(
-      "device resources file is suspiciously small: " + path.string() +
-      " has only " + std::to_string(decoded_bytes) +
-      " decoded bytes; regenerate it with `rm -f xcvu3p.device && make "
-      "xcvu3p.device`");
-}
-
-std::uint64_t edge_key(NodeId from, NodeId to) {
-  return (static_cast<std::uint64_t>(static_cast<std::uint32_t>(from)) << 32) |
-         static_cast<std::uint32_t>(to);
 }
 
 // Validate signed offsets before writing them into unsigned binary headers.
@@ -670,45 +396,12 @@ void write_string(std::ofstream& out, const std::string& text) {
   }
 }
 
-// Resolve a PhysicalNetlist site pin back to the routing graph:
-//   site name -> concrete tile/type info
-//   tile type + site type + pin name -> tile wire name
-//   tile name + tile wire name -> compact CSR node ID
+// Direct lookup records were resolved once by device_to_routing_graph.
 std::optional<NodeId> get_node_from_site_pin(const RoutingGraph& graph,
                                              const std::string& site_name,
                                              const std::string& pin_name) {
-  const auto site_it = graph.site2tile_and_types.find(site_name);
-  if (site_it == graph.site2tile_and_types.end()) {
-    return std::nullopt;
-  }
-
-  const TileAndTypes& tile_and_types = site_it->second;
-  const auto tile_type_it =
-      graph.tile_type2site_type_pin2wire.find(tile_and_types.tile_type);
-  if (tile_type_it == graph.tile_type2site_type_pin2wire.end()) {
-    return std::nullopt;
-  }
-
-  SitePinKey key;
-  key.site_type = tile_and_types.site_type;
-  key.pin_name = pin_name;
-
-  const auto wire_it = tile_type_it->second.find(key);
-  if (wire_it == tile_type_it->second.end()) {
-    return std::nullopt;
-  }
-
-  const auto tile_it = graph.tile2wire2node.find(tile_and_types.tile_name);
-  if (tile_it == graph.tile2wire2node.end()) {
-    return std::nullopt;
-  }
-
-  const auto node_it = tile_it->second.find(wire_it->second);
-  if (node_it == tile_it->second.end()) {
-    return std::nullopt;
-  }
-
-  return node_it->second;
+  return find_pair_node(graph.site_pin_nodes, graph.string_table, site_name,
+                        pin_name);
 }
 
 // Record the sink-site-pin node attribute once. The sidecar stores this as the
@@ -774,17 +467,8 @@ std::vector<SitePinName> extract_site_pins(
 std::optional<NodeId> find_tile_wire_node(const RoutingGraph& graph,
                                           const std::string& tile_name,
                                           const std::string& wire_name) {
-  const auto tile_it = graph.tile2wire2node.find(tile_name);
-  if (tile_it == graph.tile2wire2node.end()) {
-    return std::nullopt;
-  }
-
-  const auto wire_it = tile_it->second.find(wire_name);
-  if (wire_it == tile_it->second.end()) {
-    return std::nullopt;
-  }
-
-  return wire_it->second;
+  return find_pair_node(graph.tile_wire_nodes, graph.string_table, tile_name,
+                        wire_name);
 }
 
 // Convert Cap'n Proto text into an owned string. strList entries use TextCache,
@@ -800,10 +484,9 @@ void parse_logical_netlist(const std::filesystem::path& logical_path,
   // LogicalNetlist is design connectivity: logical cells, nets, ports, and
   // port instances. It does not contain routing wires or PIPs, but preserving
   // it lets later tools relate physical route results back to logical nets.
-  const std::vector<std::uint8_t> bytes =
-      read_gzip_or_plain_file(logical_path);
-  graph.logical_netlist_bytes = bytes;
+  std::vector<std::uint8_t> bytes = read_gzip_or_plain_file(logical_path);
   std::vector<capnp::word> words = bytes_to_words(bytes);
+  graph.logical_netlist_bytes = std::move(bytes);
 
   capnp::ReaderOptions reader_options;
   reader_options.traversalLimitInWords =
@@ -917,389 +600,6 @@ void parse_logical_netlist(const std::filesystem::path& logical_path,
   }
 }
 
-void build_device_routing_graph(const std::filesystem::path& device_path,
-                                const Bounds& bounds,
-                                NodeBoundsMode node_bounds_mode,
-                                RoutingGraph& graph) {
-  // Load the whole DeviceResources message into memory, matching the Python
-  // proof of concept. DeviceResources is the fabric database: tiles, wires,
-  // routing nodes, tile types, PIPs, site types, and site instances.
-  const std::vector<std::uint8_t> bytes = read_gzip_or_plain_file(device_path);
-  check_device_payload_size(device_path, bytes.size());
-  std::vector<capnp::word> words = bytes_to_words(bytes);
-
-  capnp::ReaderOptions reader_options;
-  reader_options.traversalLimitInWords =
-      std::numeric_limits<std::uint64_t>::max();
-  reader_options.nestingLimit = 1 << 20;
-
-  capnp::FlatArrayMessageReader reader(
-      kj::arrayPtr(words.data(), words.size()), reader_options);
-  const auto device = reader.getRoot<DeviceResources::Device>();
-  TextCache strings(device.getStrList());
-
-  const auto tile_list = device.getTileList();
-  const auto tile_types = device.getTileTypeList();
-  const auto wires = device.getWires();
-  const auto nodes = device.getNodes();
-  const auto wire_types = device.getWireTypes();
-
-  // First pass over tileList: keep only tiles whose names carry X/Y coordinates
-  // inside the selected bounds. Store the FPGAIF StringIdx values exactly like
-  // nxroute-poc.py, which compares Wire.tile StringIdx against Tile.name
-  // StringIdx.
-  std::unordered_set<std::uint32_t> in_bounds_tile_name_ids;
-  std::vector<std::uint32_t> in_bounds_tile_indices;
-  std::unordered_map<std::uint32_t, std::uint32_t> tile_index_by_name_id;
-  tile_index_by_name_id.reserve(tile_list.size());
-
-  for (std::uint32_t tile_index = 0; tile_index < tile_list.size();
-       ++tile_index) {
-    const auto tile = tile_list[tile_index];
-    tile_index_by_name_id.emplace(tile.getName(), tile_index);
-    const std::string& tile_name = strings.get(tile.getName());
-
-    const std::optional<std::pair<int, int>> xy = parse_tile_xy(tile_name);
-    if (!xy.has_value()) {
-      continue;
-    }
-
-    const int x = xy->first;
-    const int y = xy->second;
-    if (x < bounds.min_x || x > bounds.max_x || y < bounds.min_y ||
-        y > bounds.max_y) {
-      continue;
-    }
-
-    in_bounds_tile_name_ids.insert(tile.getName());
-    in_bounds_tile_indices.push_back(tile_index);
-  }
-
-  if (nodes.size() > static_cast<std::uint64_t>(
-                         std::numeric_limits<NodeId>::max())) {
-    throw std::runtime_error("device has too many nodes for 32-bit CSR IDs");
-  }
-
-  // Build CSR/compact node IDs from DeviceResources.nodes. FPGAIF already
-  // groups electrically-equivalent wires into routing nodes. The default
-  // node-bounds mode is the POC rule:
-  //   baseWireIdx = node.wires[0]
-  //   include node iff wires[baseWireIdx].tile is in tileNames
-  // Other node-bounds modes are kept as options for experiments, but they do
-  // not change how metadata is stored once a node is imported.
-  for (std::uint32_t node_index = 0; node_index < nodes.size(); ++node_index) {
-    const auto node = nodes[node_index];
-    const auto node_wires = node.getWires();
-    if (node_wires.size() == 0) {
-      continue;
-    }
-
-    const auto base_wire = wires[node_wires[0]];
-    const bool base_wire_in_bounds =
-        in_bounds_tile_name_ids.find(base_wire.getTile()) !=
-        in_bounds_tile_name_ids.end();
-
-    bool any_wire_in_bounds = false;
-    bool all_wires_in_bounds = true;
-    for (std::uint32_t wire_offset = 0; wire_offset < node_wires.size();
-         ++wire_offset) {
-      const auto wire = wires[node_wires[wire_offset]];
-      const bool wire_in_bounds =
-          in_bounds_tile_name_ids.find(wire.getTile()) !=
-          in_bounds_tile_name_ids.end();
-      any_wire_in_bounds = any_wire_in_bounds || wire_in_bounds;
-      all_wires_in_bounds = all_wires_in_bounds && wire_in_bounds;
-    }
-
-    bool include_node = false;
-    switch (node_bounds_mode) {
-      case NodeBoundsMode::kPocBaseWire:
-        include_node = base_wire_in_bounds;
-        break;
-      case NodeBoundsMode::kFullyContained:
-        include_node = all_wires_in_bounds;
-        break;
-      case NodeBoundsMode::kIntersects:
-        include_node = any_wire_in_bounds;
-        break;
-    }
-
-    if (!include_node) {
-      continue;
-    }
-
-    std::uint32_t metadata_wire_index = node_wires[0];
-    if (!base_wire_in_bounds) {
-      for (std::uint32_t wire_offset = 0; wire_offset < node_wires.size();
-           ++wire_offset) {
-        const auto wire = wires[node_wires[wire_offset]];
-        if (in_bounds_tile_name_ids.find(wire.getTile()) !=
-            in_bounds_tile_name_ids.end()) {
-          metadata_wire_index = node_wires[wire_offset];
-          break;
-        }
-      }
-    }
-    const auto metadata_wire = wires[metadata_wire_index];
-    std::int32_t node_min_x = std::numeric_limits<std::int32_t>::max();
-    std::int32_t node_max_x = std::numeric_limits<std::int32_t>::min();
-    std::int32_t node_min_y = std::numeric_limits<std::int32_t>::max();
-    std::int32_t node_max_y = std::numeric_limits<std::int32_t>::min();
-    bool has_node_xy = false;
-    for (std::uint32_t wire_offset = 0; wire_offset < node_wires.size();
-         ++wire_offset) {
-      const auto wire = wires[node_wires[wire_offset]];
-      const std::string& tile_name = strings.get(wire.getTile());
-      const std::optional<std::pair<int, int>> xy = parse_tile_xy(tile_name);
-      if (!xy.has_value()) {
-        continue;
-      }
-      has_node_xy = true;
-      node_min_x = std::min(node_min_x, static_cast<std::int32_t>(xy->first));
-      node_max_x = std::max(node_max_x, static_cast<std::int32_t>(xy->first));
-      node_min_y = std::min(node_min_y, static_cast<std::int32_t>(xy->second));
-      node_max_y = std::max(node_max_y, static_cast<std::int32_t>(xy->second));
-    }
-    if (!has_node_xy) {
-      node_min_x = -1;
-      node_max_x = -1;
-      node_min_y = -1;
-      node_max_y = -1;
-    }
-
-    std::uint64_t node_tile_type_string = kNoStringIndex;
-    const auto tile_index_it = tile_index_by_name_id.find(metadata_wire.getTile());
-    if (tile_index_it != tile_index_by_name_id.end()) {
-      const auto tile = tile_list[tile_index_it->second];
-      const std::uint32_t tile_type_index = tile.getType();
-      if (tile_type_index < tile_types.size()) {
-        node_tile_type_string =
-            graph.string_table.intern(strings.get(tile_types[tile_type_index].getName()));
-      }
-    }
-    std::uint64_t node_wire_type_string = kNoStringIndex;
-    const std::uint32_t wire_type_index = metadata_wire.getType();
-    if (wire_type_index < wire_types.size()) {
-      node_wire_type_string =
-          graph.string_table.intern(strings.get(wire_types[wire_type_index].getName()));
-    }
-
-    const NodeId compact_node =
-        static_cast<NodeId>(graph.node_device_ids.size());
-    graph.node_device_ids.push_back(node_index);
-    graph.node_min_x.push_back(node_min_x);
-    graph.node_max_x.push_back(node_max_x);
-    graph.node_min_y.push_back(node_min_y);
-    graph.node_max_y.push_back(node_max_y);
-    graph.node_tile_type_strings.push_back(node_tile_type_string);
-    graph.node_wire_type_strings.push_back(node_wire_type_string);
-
-    for (std::uint32_t wire_offset = 0; wire_offset < node_wires.size();
-         ++wire_offset) {
-      const auto wire = wires[node_wires[wire_offset]];
-      const std::string& tile_name = strings.get(wire.getTile());
-      const std::string& wire_name = strings.get(wire.getWire());
-      graph.tile2wire2node[tile_name][wire_name] = compact_node;
-    }
-  }
-
-  if (graph.node_device_ids.empty()) {
-    throw std::runtime_error("no routing nodes were imported from device");
-  }
-
-  graph.blocked_node.assign(graph.node_device_ids.size(), 0);
-  graph.sink_node_stops.assign(graph.node_device_ids.size(), 0);
-  graph.site_pin_attr_by_node.assign(graph.node_device_ids.size(), -1);
-
-  // Edge deduplication is by compact node pair. If two PIPs produce the same
-  // source/destination pair, the latest attribute is kept, which mirrors the
-  // "single pip attribute per edge" simplification in the NetworkX example.
-  std::unordered_map<std::uint64_t, std::size_t> edge_index_by_pair;
-  edge_index_by_pair.reserve(graph.node_device_ids.size() * 4);
-
-  // PIP metadata is stored once per unique (wire0, wire1, forward) tuple.
-  // Edges then point at this table through pip_data_index.
-  std::unordered_map<std::string, std::uint64_t> pip_data_index_by_key;
-
-  auto intern_pip_data = [&](const std::string& wire0_name,
-                             const std::string& wire1_name,
-                             bool forward) -> std::uint64_t {
-    std::string key;
-    key.reserve(wire0_name.size() + wire1_name.size() + 3);
-    key.append(wire0_name);
-    key.push_back('\x1f');
-    key.append(wire1_name);
-    key.push_back('\x1f');
-    key.push_back(forward ? '1' : '0');
-
-    const auto found = pip_data_index_by_key.find(key);
-    if (found != pip_data_index_by_key.end()) {
-      return found->second;
-    }
-
-    PipData data;
-    data.wire0_string = graph.string_table.intern(wire0_name);
-    data.wire1_string = graph.string_table.intern(wire1_name);
-    data.forward = forward;
-
-    const std::uint64_t index =
-        static_cast<std::uint64_t>(graph.pip_data.size());
-    graph.pip_data.push_back(data);
-    pip_data_index_by_key.emplace(std::move(key), index);
-    return index;
-  };
-
-  auto add_or_update_edge = [&](NodeId from, NodeId to, EdgeAttr attr) {
-    if (from < 0 || to < 0) {
-      return;
-    }
-
-    ++graph.raw_edges_seen;
-    if (from == to) {
-      return;
-    }
-
-    const std::uint64_t key = edge_key(from, to);
-    const auto found = edge_index_by_pair.find(key);
-    if (found != edge_index_by_pair.end()) {
-      graph.edges[found->second].attr = attr;
-      return;
-    }
-
-    BuildEdge edge;
-    edge.from = from;
-    edge.to = to;
-    edge.attr = attr;
-    edge_index_by_pair.emplace(key, graph.edges.size());
-    graph.edges.push_back(edge);
-  };
-
-  // Build graph edges from tile type PIPs. A tile instance chooses a tile type;
-  // the tile type lists possible PIPs by wire index within that tile type.
-  // Those wire names are mapped through tile2wire2node to compact graph nodes.
-  for (const std::uint32_t tile_index : in_bounds_tile_indices) {
-    const auto tile = tile_list[tile_index];
-    const std::string& tile_name = strings.get(tile.getName());
-    const auto wire2node_it = graph.tile2wire2node.find(tile_name);
-    if (wire2node_it == graph.tile2wire2node.end()) {
-      continue;
-    }
-
-    const bool is_cle_or_rclk_tile =
-        has_prefix(tile_name, "CLE") || has_prefix(tile_name, "RCLK");
-    const auto tile_type = tile_types[tile.getType()];
-    const auto tile_wires = tile_type.getWires();
-    const auto pips = tile_type.getPips();
-
-    for (std::uint32_t pip_index = 0; pip_index < pips.size(); ++pip_index) {
-      const auto pip = pips[pip_index];
-      if (is_cle_or_rclk_tile && !pip.isConventional()) {
-        continue;
-      }
-
-      const std::string& wire0_name = strings.get(tile_wires[pip.getWire0()]);
-      const std::string& wire1_name = strings.get(tile_wires[pip.getWire1()]);
-
-      const auto node0_it = wire2node_it->second.find(wire0_name);
-      if (node0_it == wire2node_it->second.end()) {
-        continue;
-      }
-
-      const auto node1_it = wire2node_it->second.find(wire1_name);
-      if (node1_it == wire2node_it->second.end()) {
-        continue;
-      }
-
-      EdgeAttr forward_attr;
-      forward_attr.tile_string = graph.string_table.intern(tile_name);
-      forward_attr.pip_data_index =
-          intern_pip_data(wire0_name, wire1_name, true);
-      add_or_update_edge(node0_it->second, node1_it->second, forward_attr);
-
-      if (!pip.getDirectional()) {
-        EdgeAttr reverse_attr;
-        reverse_attr.tile_string = forward_attr.tile_string;
-        reverse_attr.pip_data_index =
-            intern_pip_data(wire0_name, wire1_name, false);
-        add_or_update_edge(node1_it->second, node0_it->second, reverse_attr);
-      }
-    }
-  }
-
-  // Build site type pin-name tables so site pin indexes from siteTypeList can
-  // later be paired with primaryPinsToTileWires in tileTypeList.
-  const auto site_type_list = device.getSiteTypeList();
-  std::vector<std::vector<std::string>> site_type_pin_names(
-      site_type_list.size());
-
-  for (std::uint32_t site_type_index = 0;
-       site_type_index < site_type_list.size();
-       ++site_type_index) {
-    const auto site_type = site_type_list[site_type_index];
-    const auto pins = site_type.getPins();
-    auto& pin_names = site_type_pin_names[site_type_index];
-    pin_names.reserve(pins.size());
-    for (std::uint32_t pin_index = 0; pin_index < pins.size(); ++pin_index) {
-      pin_names.push_back(strings.get(pins[pin_index].getName()));
-    }
-  }
-
-  // Build tile type local mapping:
-  //   tile type -> (site type in tile type, pin name) -> tile wire name.
-  // This is the first half of translating a PhysicalNetlist site pin into a
-  // routing graph node.
-  for (std::uint32_t tile_type_index = 0; tile_type_index < tile_types.size();
-       ++tile_type_index) {
-    const auto tile_type = tile_types[tile_type_index];
-    const auto site_types = tile_type.getSiteTypes();
-    auto& pin_to_wire = graph.tile_type2site_type_pin2wire[tile_type_index];
-
-    for (std::uint32_t site_type_index = 0;
-         site_type_index < site_types.size();
-         ++site_type_index) {
-      const auto site_type = site_types[site_type_index];
-      const std::uint32_t primary_type = site_type.getPrimaryType();
-      if (primary_type >= site_type_pin_names.size()) {
-        continue;
-      }
-
-      const auto primary_pins_to_tile_wires =
-          site_type.getPrimaryPinsToTileWires();
-      const auto& pin_names = site_type_pin_names[primary_type];
-      const std::uint32_t pin_count = std::min<std::uint32_t>(
-          primary_pins_to_tile_wires.size(), pin_names.size());
-
-      for (std::uint32_t pin_index = 0; pin_index < pin_count; ++pin_index) {
-        SitePinKey key;
-        key.site_type = site_type_index;
-        key.pin_name = pin_names[pin_index];
-        pin_to_wire.emplace(std::move(key),
-                            strings.get(primary_pins_to_tile_wires[pin_index]));
-      }
-    }
-  }
-
-  // Build concrete site-instance mapping:
-  //   site name -> tile name, tile type, site type.
-  // Combined with the tile-type pin map above, this completes sitePin -> node.
-  for (const std::uint32_t tile_index : in_bounds_tile_indices) {
-    const auto tile = tile_list[tile_index];
-    const std::string& tile_name = strings.get(tile.getName());
-    const auto sites = tile.getSites();
-
-    for (std::uint32_t site_index = 0; site_index < sites.size();
-         ++site_index) {
-      const auto site = sites[site_index];
-      TileAndTypes tile_and_types;
-      tile_and_types.tile_name = tile_name;
-      tile_and_types.tile_type = tile.getType();
-      tile_and_types.site_type = site.getType();
-      graph.site2tile_and_types[strings.get(site.getName())] =
-          std::move(tile_and_types);
-    }
-  }
-}
-
 void parse_physical_netlist(const std::filesystem::path& phys_path,
                             RoutingGraph& graph) {
   using PhysNetlist = PhysicalNetlist::PhysNetlist;
@@ -1308,9 +608,9 @@ void parse_physical_netlist(const std::filesystem::path& phys_path,
   // PhysicalNetlist is design-specific. It supplies unrouted signal stubs,
   // legal source site pins, and already-occupied routing from fixed or
   // pre-routed nets.
-  const std::vector<std::uint8_t> bytes = read_gzip_or_plain_file(phys_path);
-  graph.physical_netlist_bytes = bytes;
+  std::vector<std::uint8_t> bytes = read_gzip_or_plain_file(phys_path);
   std::vector<capnp::word> words = bytes_to_words(bytes);
+  graph.physical_netlist_bytes = std::move(bytes);
 
   capnp::ReaderOptions reader_options;
   reader_options.traversalLimitInWords =
@@ -1323,6 +623,7 @@ void parse_physical_netlist(const std::filesystem::path& phys_path,
   TextCache strings(netlist.getStrList());
 
   const auto phys_nets = netlist.getPhysNets();
+  graph.route_requests.reserve(phys_nets.size());
   for (std::uint32_t net_index = 0; net_index < phys_nets.size();
        ++net_index) {
     const auto net = phys_nets[net_index];
@@ -1350,6 +651,8 @@ void parse_physical_netlist(const std::filesystem::path& phys_path,
       // inter-site routing fabric.
       const std::vector<SitePinName> source_pins =
           extract_site_pins(net.getSources(), strings);
+      request.sources.reserve(source_pins.size());
+      request.sinks.reserve(sink_pins.size());
       bool has_valid_source = false;
       for (const SitePinName& source_pin : source_pins) {
         SitePinNode source;
@@ -1450,87 +753,10 @@ void parse_physical_netlist(const std::filesystem::path& phys_path,
   }
 }
 
-struct CsrEntry {
-  std::int32_t col = 0;
-  float value = 1.0f;
-  EdgeAttr attr;
-};
-
-// Convert the natural directed routing graph into outgoing CSR:
-//   row u contains columns v for every routing edge u -> v.
-// Blocked nodes and sink-stop source nodes are filtered out here, so the GPU
-// graph never sees those edges or needs an expensive transpose before routing.
 CsrGraph make_outgoing_csr(const RoutingGraph& graph) {
-  CsrGraph csr;
-  csr.rows = static_cast<std::int64_t>(graph.node_device_ids.size());
-  csr.cols = csr.rows;
-  csr.declared_edges = graph.raw_edges_seen;
-  csr.loaded_edges = static_cast<std::uint64_t>(graph.edges.size());
-  csr.rowptr.resize(static_cast<std::size_t>(csr.rows) + 1);
-
-  auto edge_is_importable = [&](const BuildEdge& edge) {
-    if (edge.from < 0 || edge.to < 0 || edge.from >= csr.rows ||
-        edge.to >= csr.rows) {
-      return false;
-    }
-
-    if (graph.blocked_node[edge.from] || graph.blocked_node[edge.to]) {
-      return false;
-    }
-
-    if (graph.sink_node_stops[edge.from]) {
-      return false;
-    }
-    return true;
-  };
-
-  for (const BuildEdge& edge : graph.edges) {
-    if (edge_is_importable(edge)) {
-      ++csr.rowptr[static_cast<std::size_t>(edge.from) + 1];
-    }
-  }
-
-  for (std::int64_t row = 0; row < csr.rows; ++row) {
-    csr.rowptr[static_cast<std::size_t>(row + 1)] +=
-        csr.rowptr[static_cast<std::size_t>(row)];
-  }
-
-  std::vector<CsrEntry> entries(static_cast<std::size_t>(csr.rowptr.back()));
-  std::vector<std::int64_t> cursor = csr.rowptr;
-  for (const BuildEdge& edge : graph.edges) {
-    if (!edge_is_importable(edge)) {
-      continue;
-    }
-
-    const std::size_t row = static_cast<std::size_t>(edge.from);
-    const std::size_t pos = static_cast<std::size_t>(cursor[row]++);
-    entries[pos] = {edge.to, 1.0f, edge.attr};
-  }
-
-  csr.colind.resize(entries.size());
-  csr.values.resize(entries.size());
-  csr.edge_attrs.resize(entries.size());
-  for (std::int64_t row = 0; row < csr.rows; ++row) {
-    const std::size_t begin =
-        static_cast<std::size_t>(csr.rowptr[static_cast<std::size_t>(row)]);
-    const std::size_t end =
-        static_cast<std::size_t>(csr.rowptr[static_cast<std::size_t>(row + 1)]);
-    std::sort(entries.begin() + static_cast<std::ptrdiff_t>(begin),
-              entries.begin() + static_cast<std::ptrdiff_t>(end),
-              [](const CsrEntry& lhs, const CsrEntry& rhs) {
-                return lhs.col < rhs.col;
-              });
-
-    for (std::size_t index = begin; index < end; ++index) {
-      const CsrEntry& entry = entries[index];
-      csr.colind[index] = entry.col;
-      csr.values[index] = entry.value;
-      csr.edge_attrs[index] = entry.attr;
-    }
-  }
-  return csr;
+  return filter_device_routing_graph(graph, graph.blocked_node,
+                                     graph.sink_node_stops);
 }
-
 
 void write_csr_graph(const CsrGraph& graph,
                      const std::filesystem::path& output_path) {
@@ -1692,19 +918,20 @@ void write_metadata(const RoutingGraph& graph,
 
   // Edge attributes are aligned exactly with CSR colind/values order. For edge
   // k, csr.colind[k], csr.values[k], and edge_attrs[k] describe one PIP edge.
-  for (const EdgeAttr& attr : csr.edge_attrs) {
-    write_u64(out, attr.tile_string, "edge tile string");
-    write_u64(out, attr.pip_data_index, "edge pip data index");
-  }
+  static_assert(sizeof(EdgeAttr) == 2 * sizeof(std::uint64_t),
+                "EdgeAttr metadata layout changed");
+  write_array(out, csr.edge_attrs, "edge attributes");
 
   // PIP data table stores the wire pair and direction referenced by each edge
   // attribute. tile name lives on EdgeAttr because the same wire pair appears
   // in many tile instances.
+  std::vector<PipDataDisk> pip_data;
+  pip_data.reserve(graph.pip_data.size());
   for (const PipData& data : graph.pip_data) {
-    write_u64(out, data.wire0_string, "pip wire0 string");
-    write_u64(out, data.wire1_string, "pip wire1 string");
-    write_u64(out, data.forward ? 1 : 0, "pip forward flag");
+    pip_data.push_back(
+        {data.wire0_string, data.wire1_string, data.forward ? 1ULL : 0ULL});
   }
+  write_array(out, pip_data, "pip data");
 
   // Sink site-pin node attributes, matching NetworkX's node attribute "sp".
   for (const SitePinNode& attr : graph.site_pin_attrs) {
@@ -1792,44 +1019,39 @@ double mib(std::uint64_t bytes) {
   return static_cast<double>(bytes) / (1024.0 * 1024.0);
 }
 
+template <typename Container>
+void release_storage(Container& container) {
+  Container empty;
+  container.swap(empty);
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
   try {
-    // Parse inputs first so the rest of main reads as the converter pipeline:
-    // DeviceResources -> LogicalNetlist -> PhysicalNetlist -> CSR + metadata
-    // sidecar.
     const Options options = parse_options(argc, argv);
 
-    std::cout << "device: " << options.device_path << "\n";
+    std::cout << "device_graph: " << options.device_graph_path << "\n";
     std::cout << "physical_netlist: " << options.phys_path << "\n";
     std::cout << "logical_netlist: " << options.logical_path << "\n";
-    std::cout << "bounds: X" << options.bounds.min_x << "..X"
-              << options.bounds.max_x << ", Y" << options.bounds.min_y
-              << "..Y" << options.bounds.max_y << "\n";
+    RoutingGraph graph(
+        read_device_routing_graph_for_filtering(options.device_graph_path));
+    std::cout << "device_fingerprint: " << graph.device_fingerprint << "\n";
+    std::cout << "bounds: X" << graph.bounds.min_x << "..X"
+              << graph.bounds.max_x << ", Y" << graph.bounds.min_y << "..Y"
+              << graph.bounds.max_y << "\n";
     std::cout << "node_bounds_mode: "
-              << node_bounds_mode_name(options.node_bounds_mode) << "\n";
+              << node_bounds_mode_name(graph.node_bounds_mode) << "\n";
 
-    // Store input paths in the metadata string table. They are not used by the
-    // GPU, but they make sidecar provenance and later routed-.phys generation
-    // much easier to audit.
-    RoutingGraph graph;
-    graph.device_path_string =
-        graph.string_table.intern(options.device_path.string());
+    // Static string IDs are loaded first and remain stable. Benchmark-specific
+    // provenance and net names are appended to that namespace.
     graph.physical_path_string =
         graph.string_table.intern(options.phys_path.string());
     graph.logical_path_string =
         graph.string_table.intern(options.logical_path.string());
 
-    // DeviceResources parsing builds the full fabric graph and all static
-    // lookup tables needed to translate site pins and PIP edges.
-    build_device_routing_graph(options.device_path,
-                               options.bounds,
-                               options.node_bounds_mode,
-                               graph);
-
     std::cout << "imported_nodes: " << graph.node_device_ids.size() << "\n";
-    std::cout << "unique_edges: " << graph.edges.size() << "\n";
+    std::cout << "unique_edges: " << graph.loaded_edges << "\n";
 
     // LogicalNetlist parsing records logical cells/nets/port instances and
     // builds a name index that physical route requests can reference.
@@ -1840,11 +1062,24 @@ int main(int argc, char** argv) {
     // into that exact physical netlist structure.
     parse_physical_netlist(options.phys_path, graph);
 
+    // These indexes exist only to resolve names while parsing the two design
+    // netlists. Release them before allocating the filtered CSR; on a full
+    // device they otherwise overlap several other multi-gigabyte arrays.
+    release_storage(graph.tile_wire_nodes);
+    release_storage(graph.site_pin_nodes);
+    release_storage(graph.string_table.ids);
+    release_storage(graph.logical_net_index_by_name);
+    release_storage(graph.site_pin_attr_by_node);
+
     // CSR is the GPU-facing graph. Metadata is the CPU-facing FPGA context
     // needed to map CSR edges back to tile/wire PIPs and site-pin targets.
     CsrGraph csr = make_outgoing_csr(graph);
-    write_csr_graph(csr, options.output_path);
-    write_metadata(graph, csr, options.metadata_path);
+
+    // Filtering has copied every retained destination and edge attribute.
+    // Drop the immutable base CSR before serializing either design output.
+    release_storage(graph.rowptr);
+    release_storage(graph.colind);
+    release_storage(graph.edge_attrs);
 
     const std::uint64_t rowptr_bytes =
         static_cast<std::uint64_t>(csr.rowptr.size() * sizeof(std::int64_t));
@@ -1855,9 +1090,20 @@ int main(int argc, char** argv) {
     const std::uint64_t attr_bytes =
         static_cast<std::uint64_t>(csr.edge_attrs.size() * sizeof(EdgeAttr));
     const std::uint64_t csr_bytes = rowptr_bytes + colind_bytes + values_bytes;
+    const std::int64_t csr_rows = csr.rows;
+    const std::size_t csr_nnz = csr.values.size();
 
-    std::cout << "csr_rows: " << csr.rows << "\n";
-    std::cout << "csr_nnz: " << csr.values.size() << "\n";
+    write_csr_graph(csr, options.output_path);
+
+    // The metadata sidecar needs edge attributes, but not the three generic
+    // CSR arrays that were just written.
+    release_storage(csr.rowptr);
+    release_storage(csr.colind);
+    release_storage(csr.values);
+    write_metadata(graph, csr, options.metadata_path);
+
+    std::cout << "csr_rows: " << csr_rows << "\n";
+    std::cout << "csr_nnz: " << csr_nnz << "\n";
     std::cout << "csr_total_mib: " << mib(csr_bytes) << "\n";
     std::cout << "csr_rowptr_mib: " << mib(rowptr_bytes) << "\n";
     std::cout << "csr_colind_mib: " << mib(colind_bytes) << "\n";

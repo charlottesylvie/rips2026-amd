@@ -164,11 +164,18 @@ distclean: clean
 PATHFINDER_ROUTER_BIN ?= ./PathFinderFile
 PATHFINDER_SSSP_ENGINE ?= unit-bfs
 PATHFINDER_ARGS ?=
+PATHFINDER_DEVICE_GRAPH ?= xcvu3p.full-poc-base-wire.devicegraph
+
+# DeviceResources preprocessing is deliberately outside Make and benchmark
+# timing. Require the configured artifact, but never generate it implicitly.
+$(PATHFINDER_DEVICE_GRAPH):
+	$(error Missing preprocessed device graph '$@'. Run './device_to_routing_graph xcvu3p.device $@ --full-device' before make)
 
 # Optional profiling applies only to the inner GPU PathFinder process. The
 # outer wrapper remains under `time`, so benchmark wall time is still end to
-# end. Each profiled invocation gets a fresh run/benchmark directory and is
-# forced to rerun even when an older routed .phys already exists.
+# end for the per-test conversion/routing/reconstruction pipeline. Each
+# profiled invocation gets a fresh run/benchmark directory and is forced to
+# rerun even when an older routed .phys already exists.
 PATHFINDER_PROFILE ?= none
 PATHFINDER_PROFILE_ROOT ?= pathfinder-profiles
 ifndef PATHFINDER_PROFILE_RUN
@@ -198,8 +205,8 @@ endif
 .PHONY: pathfinder-profile-force
 pathfinder-profile-force:
 
-%_PathFinderFile.phys: %_unrouted.phys %.netlist xcvu3p.device $(if $(filter-out none,$(PATHFINDER_PROFILE)),pathfinder-profile-force)
-	(time env PATHFINDER_PROFILE_COMMAND='$(PATHFINDER_PROFILE_COMMAND)' $(PATHFINDER_ROUTER_BIN) $< $@ --logical-netlist $*.netlist --device xcvu3p.device --sssp-engine $(PATHFINDER_SSSP_ENGINE) $(PATHFINDER_ARGS)) $(call log_and_or_display,$@.log)
+%_PathFinderFile.phys: %_unrouted.phys %.netlist $(PATHFINDER_DEVICE_GRAPH) $(if $(filter-out none,$(PATHFINDER_PROFILE)),pathfinder-profile-force)
+	(time env PATHFINDER_PROFILE_COMMAND='$(PATHFINDER_PROFILE_COMMAND)' $(PATHFINDER_ROUTER_BIN) $< $@ --logical-netlist $*.netlist --device-graph $(PATHFINDER_DEVICE_GRAPH) --sssp-engine $(PATHFINDER_SSSP_ENGINE) $(PATHFINDER_ARGS)) $(call log_and_or_display,$@.log)
 
 #### END ROUTER RECIPES
 

@@ -13,6 +13,18 @@ make ROUTER=PathFinderFile BENCHMARKS="logicnets_jscl" VERBOSE=1 \
   PATHFINDER_PROFILE_RUN=delta-generic
 ```
 
+Before invoking the benchmark Make target, generate the persistent artifact
+manually:
+
+```bash
+./device_to_routing_graph xcvu3p.device xcvu3p.full-poc-base-wire.devicegraph --full-device
+```
+
+Make assumes this artifact already exists and validates it as a prerequisite;
+it does not run the preprocessor. DeviceResources parsing and static graph
+formatting are therefore not part of the per-test result. Design-specific CSR
+conversion, routing, and route reconstruction remain inside that timing.
+
 The available full-system profile routed all 28,026 nets; it was not the later
 100-net counter experiment. It took 144.435 seconds under `rocprof-sys`.
 Profiler wall time must not be compared directly with an unprofiled benchmark
@@ -255,13 +267,15 @@ All five groups were reported as accepted on the target gfx1151 GPU on
 ### Generate the 100-net run inputs
 
 The profiler consumes the router's binary CSR, not the original FPGA
-Interchange files. Generate the CSR and its metadata sidecar directly from the
-three contest inputs before profiling. Full-device conversion is explicit here;
-no automatic or nxroute bounds are applied:
+Interchange files. First preprocess the raw device once, then generate the CSR
+and metadata sidecar from the reusable device graph and the test case's two
+netlists. Full-device preprocessing is explicit here; no nxroute or custom
+bounds are applied:
 
 ```bash
 cd /opt/workspace
 
+test -x ./device_to_routing_graph
 test -x ./interchange_to_csr
 test -f logicnets_jscl_unrouted.phys
 test -f logicnets_jscl.netlist
@@ -269,13 +283,18 @@ test -f xcvu3p.device
 
 mkdir -p direct-profile-work
 
+./device_to_routing_graph \
+  xcvu3p.device \
+  xcvu3p.full-poc-base-wire.devicegraph \
+  --full-device \
+  2>&1 | tee direct-profile-work/device-to-routing-graph.log
+
 ./interchange_to_csr \
+  xcvu3p.full-poc-base-wire.devicegraph \
   logicnets_jscl_unrouted.phys \
   logicnets_jscl.netlist \
   direct-profile-work/logicnets_jscl.csrbin \
-  --device xcvu3p.device \
   --metadata direct-profile-work/logicnets_jscl.csrbin.ifmeta.bin \
-  --full-device \
   2>&1 | tee direct-profile-work/interchange-to-csr.log
 
 ls -lh \
@@ -283,7 +302,10 @@ ls -lh \
   direct-profile-work/logicnets_jscl.csrbin.ifmeta.bin
 ```
 
-If a `test -f` command fails, locate the corresponding source asset with
+Keep `xcvu3p.full-poc-base-wire.devicegraph` for later test cases that use the
+same device and preprocessing policy; do not rerun the preprocessing command
+for each benchmark. If a `test -f` command fails, locate the corresponding
+source asset with
 `find /opt/workspace -type f -name '<filename>' -print` and substitute its
 absolute path. These outputs cannot be reconstructed from the `pathfinder`
 executable alone.

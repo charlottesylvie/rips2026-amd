@@ -1,16 +1,37 @@
 # GPU profiling the PathFinder benchmark
 
-The benchmark wrapper performs three separate processes:
+The full profiling workflow has a manual one-time device stage followed by
+three Make-driven per-test processes:
 
 ```text
-interchange_to_csr -> pathfinder (HIP) -> routes_to_phys
+xcvu3p.device
+  -> device_to_routing_graph
+     -> shared .devicegraph              (manual persistent prerequisite)
+
+shared .devicegraph + test-case .phys/.netlist
+  -> interchange_to_csr -> pathfinder (HIP) -> routes_to_phys
 ```
 
 Profiling belongs around the inner `pathfinder` process. This keeps conversion
 and route serialization out of GPU traces, while the Makefile's existing
-`time` invocation still measures the complete pipeline. The Makefile passes a
-profiler prefix to `PathFinderFile` through `PATHFINDER_PROFILE_COMMAND`; the
-wrapper applies it only when launching `pathfinder`.
+`time` invocation still measures the complete per-test pipeline. The expensive
+DeviceResources parsing and static graph formatting happen manually before
+Make and are reused across tests. Make assumes the selected device graph exists
+and validates it as a prerequisite; it does not invoke the preprocessor. The
+Makefile passes a profiler prefix to `PathFinderFile` through
+`PATHFINDER_PROFILE_COMMAND`; the wrapper applies it only when launching
+`pathfinder`.
+
+Generate the default persistent artifact manually with:
+
+```bash
+./device_to_routing_graph xcvu3p.device xcvu3p.full-poc-base-wire.devicegraph --full-device
+```
+
+Override `PATHFINDER_DEVICE_GRAPH` to use another manually preprocessed
+artifact. Bounds and `--node-bounds-mode` are preprocessor options; they must
+not be placed in `PATHFINDER_ARGS`. Give every policy a distinct artifact name
+so profiling cannot accidentally consume a differently preprocessed graph.
 
 ## Build with ROCTx ranges
 
@@ -64,10 +85,10 @@ make ... PATHFINDER_SSSP_ENGINE=delta-step \
 ```
 
 For a meaningful general-weight profile, supply a converter with the same CLI
-that emits representative weights through `INTERCHANGE_TO_CSR`, or run a
-prebuilt weighted CSR workload directly under the selected profiler. The
-Makefile integration needs no change once the benchmark pipeline emits those
-weights.
+(including the leading `.devicegraph` positional input) that emits
+representative weights through `INTERCHANGE_TO_CSR`, or run a prebuilt weighted
+CSR workload directly under the selected profiler. The Makefile integration
+needs no change once the benchmark pipeline emits those weights.
 
 The default integration runs:
 
@@ -198,7 +219,8 @@ have stable names and do not overwrite one another.
 Profilers perturb launch timing, synchronization, clocks, and cache state. Use
 profiles to explain behavior, then measure speed with `PATHFINDER_PROFILE=none`
 over several fresh runs. Keep GPU clocks/power mode, worker count, delta,
-benchmark input, and thermal state fixed when comparing versions.
+benchmark input, device-graph artifact and preprocessing policy, and thermal
+state fixed when comparing versions.
 
 ## Algorithm-specific interpretation
 

@@ -4,8 +4,10 @@ FPGA routing prototype for the FPGA24/RWRoute-style benchmarks, with a
 one-shot shortest-path router, FPGA Interchange conversion utilities, and HIP
 kernels for shortest-path experiments.
 
-The current benchmark-facing flow is the C++ `PathFinderFile` wrapper. It
-converts FPGA Interchange inputs into an internal CSR graph, routes nets with a
+The current benchmark-facing flow is the C++ `PathFinderFile` wrapper. A
+one-time preprocessing step converts the FPGA Interchange `DeviceResources`
+file into a reusable device-routing graph. The wrapper combines that graph
+with each benchmark's physical and logical netlists, routes nets with a
 one-shot shortest-path pass, and writes a routed `.phys` file. Overused nodes
 are reported as diagnostics; they do not make the one-shot router fail.
 
@@ -15,8 +17,9 @@ are reported as diagnostics; they do not make the one-shot router fail.
 - Main shortest-path engine: unit-weight HIP BFS in
   `CongestionFreeRouting/unit_bfs`; Delta Stepping remains available for
   comparison.
-- Main interchange flow:
-  `interchange_to_csr -> pathfinder -> routes_to_phys`.
+- Main interchange flow: `device_to_routing_graph` once per device/bounds
+  policy, then `interchange_to_csr -> pathfinder -> routes_to_phys` per test
+  case.
 - Local CPU-only tests are available for routing logic, but full router builds
   require ROCm/HIP, Cap'n Proto C++ support, and FPGA Interchange schema files.
 
@@ -39,14 +42,20 @@ Run the contest-provided Makefile path with:
 ROUTER=PathFinderFile
 PATHFINDER_ROUTER_BIN ?= ./PathFinderFile
 PATHFINDER_SSSP_ENGINE ?= unit-bfs
+PATHFINDER_DEVICE_GRAPH ?= xcvu3p.full-poc-base-wire.devicegraph
 ```
 
 Run a single benchmark through the contest infrastructure with:
 
 ```bash
 make setup BENCHMARKS="boom_med_pb"
+./device_to_routing_graph xcvu3p.device xcvu3p.full-poc-base-wire.devicegraph --full-device
 make ROUTER=PathFinderFile BENCHMARKS="boom_med_pb" VERBOSE=1
 ```
+
+Device preprocessing is deliberately manual. Make assumes the selected
+`PATHFINDER_DEVICE_GRAPH` already exists and validates it as a prerequisite; it
+does not invoke `device_to_routing_graph` automatically.
 
 Forward wrapper or PathFinder tuning options through `PATHFINDER_ARGS`:
 
@@ -56,7 +65,8 @@ make ROUTER=PathFinderFile BENCHMARKS="boom_med_pb" VERBOSE=1 \
 ```
 
 Compare the congestion-free unit-BFS backend against delta-stepping while
-keeping the same benchmark, bounds, route writer, and wrapper path:
+keeping the same benchmark, preprocessed device graph, route writer, and
+wrapper path:
 
 ```bash
 make ROUTER=PathFinderFile BENCHMARKS="boom_med_pb" VERBOSE=1 \
@@ -68,22 +78,32 @@ make ROUTER=PathFinderFile BENCHMARKS="boom_med_pb" VERBOSE=1 \
 For AMD GPU profiling through the same Makefile path, see
 [`CongestionFreeRouting/GPU_PROFILING.md`](CongestionFreeRouting/GPU_PROFILING.md).
 The integration can wrap only the inner GPU router with `rocprofv3`,
-`rocprof-sys`, or `rocprof-compute` while preserving end-to-end Make timing.
+`rocprof-sys`, or `rocprof-compute` while preserving end-to-end per-test Make
+timing.
 
-The Makefile rule supplies the matching `.netlist` and `xcvu3p.device`:
+The Makefile validates the manually generated device graph before entering the
+timed per-test recipe, then supplies that artifact and the matching `.netlist`
+to the wrapper:
 
 ```make
-%_PathFinderFile.phys: %_unrouted.phys %.netlist xcvu3p.device
-	(/usr/bin/time $(PATHFINDER_ROUTER_BIN) $< $@ \
-	  --logical-netlist $*.netlist --device xcvu3p.device $(PATHFINDER_ARGS)) ...
+%_PathFinderFile.phys: %_unrouted.phys %.netlist $(PATHFINDER_DEVICE_GRAPH)
+	(time $(PATHFINDER_ROUTER_BIN) $< $@ \
+	  --logical-netlist $*.netlist \
+	  --device-graph $(PATHFINDER_DEVICE_GRAPH) $(PATHFINDER_ARGS)) ...
 ```
 
 ## Routing Pipeline
 
-The C++ benchmark wrapper orchestrates this flow:
+The complete manual-preprocessing and benchmark-wrapper workflow is:
 
 ```text
-<benchmark>_unrouted.phys + <benchmark>.netlist + xcvu3p.device
+Manual one-time prerequisite (outside Make and per-test timing):
+xcvu3p.device
+  -> device_to_routing_graph
+     -> xcvu3p.full-poc-base-wire.devicegraph
+
+Per test case (inside the PathFinderFile timing):
+<benchmark>_unrouted.phys + <benchmark>.netlist + the shared .devicegraph
   -> interchange_to_csr
      -> <benchmark>.csrbin
      -> <benchmark>.csrbin.ifmeta.bin
@@ -103,7 +123,9 @@ the generated `.csrbin`, metadata, and routes files for debugging.
 
 | Path | Purpose |
 | --- | --- |
-| `CongestionFreeRouting/interchange_to_csr.cpp` | Converts FPGA Interchange `.phys`, `.netlist`, and `.device` inputs into the router CSR graph and metadata sidecar. |
+| `CongestionFreeRouting/device_to_routing_graph.cpp` | Preprocesses invariant `DeviceResources` data into a reusable `.devicegraph` artifact. |
+| `CongestionFreeRouting/interchange/device_routing_graph.cpp` / `.hpp` | Shared device-graph serialization, validation, lookup, and per-design filtering support. |
+| `CongestionFreeRouting/interchange_to_csr.cpp` | Combines a preprocessed `.devicegraph` with one benchmark's `.phys` and `.netlist` inputs to produce the router CSR graph and metadata sidecar. |
 | `CongestionFreeRouting/pathfinder.cpp` / `CongestionFreeRouting/pathfinder.hpp` | Implements the current one-shot source-to-sink shortest-path router over CSR input. |
 | `CongestionFreeRouting/routes_to_phys.cpp` | Reconstructs a routed FPGA Interchange `PhysicalNetlist` from route JSONL output. |
 | `CongestionFreeRouting/pathfinder_router.cpp` | Benchmark-facing C++ wrapper that runs the full conversion, routing, and reconstruction pipeline. |
@@ -150,8 +172,15 @@ Assuming generated FPGA Interchange C++ schema files are available in
 SCHEMA_DIR=fpga-interchange-schema/interchange
 
 g++ -std=c++17 -O3 -I"$SCHEMA_DIR" \
-  CongestionFreeRouting/interchange_to_csr.cpp \
+  CongestionFreeRouting/device_to_routing_graph.cpp \
+  CongestionFreeRouting/interchange/device_routing_graph.cpp \
   "$SCHEMA_DIR"/DeviceResources.capnp.c++ \
+  "$SCHEMA_DIR"/References.capnp.c++ \
+  -lcapnp -lkj -lz -o device_to_routing_graph
+
+g++ -std=c++17 -O3 -I"$SCHEMA_DIR" \
+  CongestionFreeRouting/interchange_to_csr.cpp \
+  CongestionFreeRouting/interchange/device_routing_graph.cpp \
   "$SCHEMA_DIR"/PhysicalNetlist.capnp.c++ \
   "$SCHEMA_DIR"/LogicalNetlist.capnp.c++ \
   "$SCHEMA_DIR"/References.capnp.c++ \
@@ -181,44 +210,55 @@ If the helper binaries are not in the repository root, point the wrapper at
 them with options or environment variables:
 
 ```bash
+DEVICE_ROUTING_GRAPH=/path/to/xcvu3p.full-poc-base-wire.devicegraph \
 INTERCHANGE_TO_CSR=/path/to/interchange_to_csr \
 PATHFINDER_BIN=/path/to/pathfinder \
 ROUTES_TO_PHYS=/path/to/routes_to_phys \
 ./PathFinderFile input_unrouted.phys output_routed.phys \
-  --logical-netlist input.netlist --device xcvu3p.device
+  --logical-netlist input.netlist
 ```
 
 ## Running Components Directly
 
-### `interchange_to_csr`
+### `device_to_routing_graph`
 
-Converts FPGA Interchange inputs into the CSR graph and metadata sidecar:
-
-```bash
-./interchange_to_csr <unrouted.phys> <logical.netlist> <output.csrbin> \
-  --device xcvu3p.device \
-  --metadata <output.csrbin.ifmeta.bin>
-```
-
-It also accepts the device path as the first positional argument:
+Preprocesses the device-wide routing graph once for every combination of raw
+device, tile bounds, and node-bounds policy:
 
 ```bash
-./interchange_to_csr <device.device> <unrouted.phys> <logical.netlist> \
-  <output.csrbin> --metadata <output.csrbin.ifmeta.bin>
+./device_to_routing_graph xcvu3p.device \
+  xcvu3p.full-poc-base-wire.devicegraph --full-device
 ```
 
-Useful options:
+Useful preprocessing options:
 
 | Option | Meaning |
 | --- | --- |
 | `--bounds <minX> <maxX> <minY> <maxY>` | Import a tile-coordinate subset. |
 | `--nxroute-bounds` | Import the older proof-of-concept subset: `X36..X90`, `Y60..Y239`. |
 | `--node-bounds-mode <mode>` | Select `poc-base-wire`, `fully-contained`, or `intersects`. |
-| `--full-device` | Import every tile that has XY coordinates. |
+| `--full-device` | Import every tile that has XY coordinates (default). |
 
-The converter and `PathFinderFile` wrapper import the full device by default.
-Use `--nxroute-bounds` only for an explicit comparison with the older
-proof-of-concept flow.
+Bounds and node-bounds mode are properties of the `.devicegraph`, not
+per-benchmark converter or wrapper options. Use a different artifact name for
+each policy, then select that prebuilt artifact with
+`PATHFINDER_DEVICE_GRAPH`.
+
+### `interchange_to_csr`
+
+Combines a preprocessed device graph with one test case to produce its CSR
+graph and metadata sidecar:
+
+```bash
+./interchange_to_csr <device.devicegraph> <unrouted.phys> \
+  <logical.netlist> <output.csrbin> \
+  --metadata <output.csrbin.ifmeta.bin>
+```
+
+The expensive parsing, coordinate extraction, PIP construction, and base-CSR
+formatting have already happened in `device_to_routing_graph`. This stage
+loads the two design netlists, extracts route requests and blockages, filters
+the shared graph, and writes design-specific CSR and metadata outputs.
 
 ### `pathfinder`
 
@@ -267,13 +307,14 @@ Runs the full benchmark-facing C++ pipeline:
 ```bash
 ./PathFinderFile <input_unrouted.phys> <output_routed.phys> \
   --logical-netlist <input.netlist> \
-  --device xcvu3p.device
+  --device-graph xcvu3p.full-poc-base-wire.devicegraph
 ```
 
 Useful wrapper options:
 
 | Option | Meaning |
 | --- | --- |
+| `--device-graph <path>` | Reusable device-routing graph. Default: `xcvu3p.full-poc-base-wire.devicegraph`. Env: `DEVICE_ROUTING_GRAPH`. |
 | `--work-dir <path>` | Directory for temporary CSR, metadata, and routes files. Provided work directories are kept. |
 | `--keep-work-dir` | Keep automatically allocated temporary files. |
 | `--interchange-to-csr <path>` | Override converter executable. Env: `INTERCHANGE_TO_CSR`. |
@@ -281,7 +322,6 @@ Useful wrapper options:
 | `--routes-to-phys <path>` | Override route reconstructor. Env: `ROUTES_TO_PHYS`. |
 | `--sssp-engine`, `--use-delta-step`, `--delta`, `--max-sssp-iters`, `--parallel-net-workers`, `--capacity` | Forwarded to `pathfinder`. |
 | `--max-pathfinder-iters`, `--present-factor`, `--present-multiplier`, `--history-factor`, `--route-batch-size` | Compatibility-only; forwarded to `pathfinder` and ignored. |
-| `--full-device`, `--nxroute-bounds`, `--bounds`, `--node-bounds-mode` | Forwarded to `interchange_to_csr`; full-device conversion is the default. |
 
 ## File Formats And Artifacts
 
@@ -290,6 +330,7 @@ Useful wrapper options:
 | `<benchmark>_unrouted.phys` | Contest setup | Unrouted FPGA Interchange physical netlist. |
 | `<benchmark>.netlist` | Contest setup | Matching logical netlist. |
 | `xcvu3p.device` | RapidWright | FPGA Interchange device resources for the target part. |
+| `.devicegraph` | `device_to_routing_graph` | Persistent device-wide CSR, node/PIP metadata, and lookup tables for one device/bounds policy. |
 | `.csrbin` | `interchange_to_csr` | Internal CSR routing graph. |
 | `.csrbin.ifmeta.bin` | `interchange_to_csr` | Metadata sidecar with string table, node coordinate ranges, tile/wire type IDs, PIP data, site pins, logical summaries, and route requests. |
 | `.routes.jsonl` | `pathfinder` | One JSON object per net containing sources, sinks, and selected PIP edges. |
@@ -302,6 +343,18 @@ CSR orientation is outgoing-edge: row `u`, column `v` represents directed edge
 `colind`; node coordinate ranges and tile/wire type metadata stay in the sidecar.
 
 ## Testing
+
+Device-graph serialization, lookup, masked filtering, and edge-attribute
+alignment test:
+
+```bash
+g++ -std=c++17 -O2 \
+  CongestionFreeRouting/tests/device_routing_graph_test.cpp \
+  CongestionFreeRouting/interchange/device_routing_graph.cpp \
+  -o /tmp/device_routing_graph_test
+
+/tmp/device_routing_graph_test
+```
 
 CPU-only PathFinder logic test:
 
@@ -395,9 +448,10 @@ output, and computes the benchmark score.
   `routes_to_phys.cpp`.
 - PathFinder routes against internal route requests from the metadata sidecar.
   Use `--routes-out` and `--keep-work-dir` when debugging route-tree output.
-- Full-device conversion is the default. Use `--nxroute-bounds` or explicit
-  `--bounds` only for intentionally bounded experiments, and validate that the
-  selected region covers every source and sink being benchmarked.
+- Full-device preprocessing is the default. Pass `--nxroute-bounds` or
+  explicit `--bounds` to `device_to_routing_graph` only for intentionally
+  bounded experiments, give each policy a distinct `.devicegraph` name, and
+  validate that the selected region covers every benchmark source and sink.
 - On macOS, prefer CPU-stub tests unless ROCm/HIP headers and runtime are
   available through a container or remote machine.
 - Generated benchmark assets, routed outputs, logs, and temporary work
@@ -408,8 +462,11 @@ output, and computes the benchmark score.
 
 - `xcvu3p.device` is not stored in this repository; the benchmark Makefile or
   RapidWright normally generates it.
-- `routes_to_phys.cpp` and `interchange_to_csr.cpp` cannot compile without the
-  generated FPGA Interchange Cap'n Proto C++ files.
+- The benchmark Makefile does not generate `.devicegraph` files. Run
+  `device_to_routing_graph` manually before a `PathFinderFile` benchmark.
+- `device_to_routing_graph.cpp`, `interchange_to_csr.cpp`, and
+  `routes_to_phys.cpp` cannot compile without their generated FPGA Interchange
+  Cap'n Proto C++ files.
 - `pathfinder` and most HIP kernel tests require ROCm/HIP and `hipcc`; CPU-only
   tests use the fake HIP headers in `Routing/tests/fake_hip`.
 - Temporary files and downloaded reference files should be removed after tests.

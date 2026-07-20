@@ -24,7 +24,8 @@ struct Options {
   std::filesystem::path input_phys;
   std::filesystem::path output_phys;
   std::filesystem::path logical_netlist;
-  std::filesystem::path device = "xcvu3p.device";
+  std::filesystem::path device_graph =
+      "xcvu3p.full-poc-base-wire.devicegraph";
   std::filesystem::path work_dir;
   bool work_dir_was_provided = false;
   bool keep_work_dir = false;
@@ -34,7 +35,6 @@ struct Options {
   std::string routes_to_phys = "./routes_to_phys";
   std::string pathfinder_profile_command;
 
-  std::vector<std::string> converter_args;
   std::vector<std::string> pathfinder_args;
   bool allow_unrouted = true;
 };
@@ -141,7 +141,8 @@ void print_usage(const char* program) {
       << "  " << program << " <input_unrouted.phys> <output_routed.phys> [options]\n\n"
       << "Options:\n"
       << "  --logical-netlist <path>       Override inferred .netlist path.\n"
-      << "  --device <path>                DeviceResources input. Default: xcvu3p.device\n"
+      << "  --device-graph <path>          Precomputed routing graph. Env: DEVICE_ROUTING_GRAPH\n"
+      << "                                 Default: xcvu3p.full-poc-base-wire.devicegraph\n"
       << "  --work-dir <path>              Directory for temporary CSR/metadata/routes.\n"
       << "  --keep-work-dir                Do not remove temporary files.\n"
       << "  --interchange-to-csr <path>    Converter executable. Env: INTERCHANGE_TO_CSR\n"
@@ -162,12 +163,7 @@ void print_usage(const char* program) {
       << "  --route-batch-size <count>     Compatibility-only; accepted by pathfinder and ignored.\n"
       << "  --present-factor <float>       Compatibility-only; accepted by pathfinder and ignored.\n"
       << "  --present-multiplier <float>   Compatibility-only; accepted by pathfinder and ignored.\n"
-      << "  --history-factor <float>       Compatibility-only; accepted by pathfinder and ignored.\n"
-      << "  --full-device                  Import the whole device (default).\n"
-      << "  --nxroute-bounds               Import X36..X90, Y60..Y239 for nxroute-poc comparisons.\n"
-      << "  --bounds <minX> <maxX> <minY> <maxY>\n"
-      << "                                 Forwarded to interchange_to_csr.\n"
-      << "  --node-bounds-mode <mode>      Forwarded to interchange_to_csr.\n";
+      << "  --history-factor <float>       Compatibility-only; accepted by pathfinder and ignored.\n";
 }
 
 Options parse_args(int argc, char** argv) {
@@ -184,6 +180,8 @@ Options parse_args(int argc, char** argv) {
   Options options;
   options.input_phys = argv[1];
   options.output_phys = argv[2];
+  options.device_graph = env_or_default(
+      "DEVICE_ROUTING_GRAPH", "xcvu3p.full-poc-base-wire.devicegraph");
   options.interchange_to_csr = env_or_default("INTERCHANGE_TO_CSR", "./interchange_to_csr");
   options.pathfinder = env_or_default("PATHFINDER_BIN", "./pathfinder");
   options.routes_to_phys = env_or_default("ROUTES_TO_PHYS", "./routes_to_phys");
@@ -201,8 +199,8 @@ Options parse_args(int argc, char** argv) {
 
     if (option == "--logical-netlist") {
       options.logical_netlist = require_value("--logical-netlist");
-    } else if (option == "--device") {
-      options.device = require_value("--device");
+    } else if (option == "--device-graph") {
+      options.device_graph = require_value("--device-graph");
     } else if (option == "--work-dir") {
       options.work_dir = require_value("--work-dir");
       options.work_dir_was_provided = true;
@@ -232,18 +230,6 @@ Options parse_args(int argc, char** argv) {
                option == "--history-factor") {
       options.pathfinder_args.push_back(option);
       options.pathfinder_args.push_back(require_value(option.c_str()));
-    } else if (option == "--full-device") {
-      options.converter_args.push_back(option);
-    } else if (option == "--nxroute-bounds") {
-      options.converter_args.push_back(option);
-    } else if (option == "--bounds") {
-      options.converter_args.push_back(option);
-      for (int j = 0; j < 4; ++j) {
-        options.converter_args.push_back(require_value("--bounds"));
-      }
-    } else if (option == "--node-bounds-mode") {
-      options.converter_args.push_back(option);
-      options.converter_args.push_back(require_value("--node-bounds-mode"));
     } else {
       throw std::runtime_error("unknown option: " + option);
     }
@@ -270,7 +256,7 @@ int main(int argc, char** argv) {
     Options options = parse_args(argc, argv);
     require_file(options.input_phys, "input physical netlist");
     require_file(options.logical_netlist, "logical netlist");
-    require_file(options.device, "device resources");
+    require_file(options.device_graph, "device routing graph");
 
     work_dir = make_work_dir(options);
     std::filesystem::create_directories(work_dir);
@@ -287,17 +273,13 @@ int main(int argc, char** argv) {
 
     std::vector<std::string> convert_cmd = {
         options.interchange_to_csr,
+        options.device_graph.string(),
         options.input_phys.string(),
         options.logical_netlist.string(),
         csr_path.string(),
-        "--device",
-        options.device.string(),
         "--metadata",
         metadata_path.string(),
     };
-    convert_cmd.insert(convert_cmd.end(),
-                       options.converter_args.begin(),
-                       options.converter_args.end());
     run_command(convert_cmd, "convert FPGAIF to CSR");
     print_progress(1, 3, "CSR conversion complete");
 
