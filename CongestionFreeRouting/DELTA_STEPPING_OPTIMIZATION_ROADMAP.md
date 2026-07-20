@@ -40,6 +40,16 @@ The generic path currently has these important properties:
   lazy. At 28,226,432 vertices this is approximately 1.26 GiB per worker.
   Forced-legacy or compact-map allocation fallback still grows to about 60
   bytes per vertex (1.58 GiB).
+- Explicit `run_distances()` calls now instantiate the same generic scheduler
+  with parent publication compiled out and release mutable parent, target, and
+  path buffers. Its core scratch is approximately 40 bytes per vertex. A
+  `kDistancesOnly` graph/workspace also omits the 4-byte-per-edge edge-source
+  map; path-output calls on that storage are rejected.
+- PathFinder can deliberately select the generic scheduler with
+  `--delta-force-generic`, synthesize deterministic all-light/all-heavy/seeded
+  mixed weight families, and emit one aggregate telemetry JSON record with
+  `--delta-telemetry`. These controls establish reproducible experiments, but
+  no target-AMD timing baseline has been recorded in this repository.
 - Device CSR row offsets and legacy predecessor edges are always 64-bit.
 
 Two previously listed tasks are already complete for automatic vector-target
@@ -65,7 +75,7 @@ heterogeneous weighted workload.
 | 3 | Add degree-aware, edge-balanced expansion | High on general or skewed graphs; modest on uniformly short rows | High | Retain thread-per-row for short rows, but add packed-wave, wave-per-row, and CTA/edge-balanced paths for longer rows. |
 | 4 | Aggregate competing candidates by destination before global updates | High when frontier destinations collide | High | Start with wave-local aggregation after edge balancing; use block/global sort-reduce only when telemetry justifies it. |
 | 5 | Remove the generic host-controlled inner loop | High for many small closure rounds or buckets | High | Keep scheduler state on the device. Evaluate persistent/cooperative execution or HIP Graph capture only after data dependencies no longer require host decisions. |
-| 6 | Add a distances-only execution mode | High for competitive SSSP benchmarks; low for routing calls that require paths | Low--Medium | Make predecessor output optional and omit `parent_key`, `edge_source`, predecessor storage, and path extraction when unused. |
+| 6 | Add a distances-only execution mode | High for competitive SSSP benchmarks; low for routing calls that require paths | Low--Medium | **Implemented; AMD validation pending.** `run_distances()` compiles out all parent access and releases mutable path state; strict storage also omits `edge_source`. |
 | 7 | Validate and tune automatic delta selection | Medium--High and workload-dependent | Low | PathFinder resolution, numeric override, multiplier, runtime wave size, destination-cost helper, and numeric edge-case clamps are implemented. Weighted GPU sweeps and workspace-integrated refresh after value/cost updates remain. |
 | 8 | Batch independent searches in one launch | High throughput upside when one search underfills the GPU | Very high | Pursue only after per-search state is smaller and the single-query scheduler is stable. |
 | 9 | Prepartition static light/heavy adjacency | Medium--High only on fixed-weight mixed rows | High | Conditional fallback for classic Delta-Stepping. Destination vertex-cost updates can invalidate the partition. |
@@ -84,10 +94,12 @@ Create a benchmark matrix that actually exercises the generic algorithm:
 3. routing graphs with non-unit edge weights; and
 4. routing graphs with destination vertex costs enabled and updated.
 
-For each search record attempted and successful relaxations, light and heavy
-edge visits, light-closure rounds, absolute bucket span, queue peaks, live and
-stale pending entries, reached-row degree histograms, duplicate destination
-rate, atomic retries, device/host synchronization time, and reset time. Report
+For each search, the landed opt-in telemetry records attempted and successful
+relaxations, light and heavy edge examinations, light-closure rounds, queue
+peaks, stale pending/frontier entries, atomic retries, and logical controller
+round trips. Reached-row degree histograms, duplicate-destination rate,
+absolute bucket span, device/host synchronization time, and reset time remain
+to be instrumented. Report
 single-source distance-only latency separately from multi-source/multi-target
 path-producing routing.
 
@@ -102,7 +114,9 @@ path-producing routing.
    workspace refresh remains future work.
 3. **Controls implemented; GPU sweep pending:** test multipliers such as
    `0.25`, `0.5`, `1`, `2`, and `4` around the seed.
-4. Add a distances-only result mode and allocate parent/path state lazily.
+4. **Implemented; AMD validation pending:** use the explicit distances-only
+   result mode and optional distances-only graph storage to omit parent/path
+   state and the compact edge-source map.
 5. Instantiate eligible 32-bit device row offsets while retaining public
    64-bit edge identities and a forced-wide A/B path.
 6. **Implemented:** stop allocating legacy `pred_node` and `pred_edge` arrays

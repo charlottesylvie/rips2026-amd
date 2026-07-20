@@ -21,6 +21,13 @@ Manual run:
 
     python3 CongestionFreeRouting/pathfinder_benchmark.py vtr_mcml_unrouted.phys \
       vtr_mcml_pathfinder.phys --net-limit 100
+
+Forced-generic weighted benchmark run:
+
+    python3 CongestionFreeRouting/pathfinder_benchmark.py vtr_mcml_unrouted.phys \
+      vtr_mcml_pathfinder.phys --sssp-engine delta-step --delta 1 \
+      --delta-force-generic --delta-benchmark-weights mixed \
+      --delta-benchmark-weight-seed 123
 """
 
 from __future__ import annotations
@@ -89,6 +96,20 @@ def positive_float_arg(value: str) -> float:
         raise argparse.ArgumentTypeError("value must be finite and positive") from exc
     if not math.isfinite(numeric) or numeric <= 0.0:
         raise argparse.ArgumentTypeError("value must be finite and positive")
+    return numeric
+
+
+def nonnegative_int_arg(value: str) -> int:
+    try:
+        numeric = int(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(
+            "value must be an unsigned 64-bit integer"
+        ) from exc
+    if numeric < 0 or numeric > (1 << 64) - 1:
+        raise argparse.ArgumentTypeError(
+            "value must be an unsigned 64-bit integer"
+        )
     return numeric
 
 
@@ -164,9 +185,29 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         help="positive sweep multiplier used with --delta auto",
     )
     parser.add_argument(
+        "--delta-force-generic",
+        action="store_true",
+        help="force generic delta-stepping even when exact-unit specialization is eligible",
+    )
+    parser.add_argument(
+        "--delta-telemetry",
+        action="store_true",
+        help="emit opt-in delta-stepping runtime telemetry",
+    )
+    parser.add_argument(
         "--delta-force-legacy-parent",
         action="store_true",
         help="force legacy generic-delta predecessor recovery",
+    )
+    parser.add_argument(
+        "--delta-benchmark-weights",
+        choices=("unit", "all-light", "all-heavy", "mixed"),
+        help="reproducible benchmark edge-weight family forwarded to PathFinder",
+    )
+    parser.add_argument(
+        "--delta-benchmark-weight-seed",
+        type=nonnegative_int_arg,
+        help="uint64 seed for mixed reproducible benchmark edge weights",
     )
     parser.add_argument(
         "--max-pathfinder-iters",
@@ -215,19 +256,58 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         action="store_true",
         help="write any stubs not covered by PathFinder back to the output netlist",
     )
-    return parser.parse_args(argv)
+    args = parser.parse_args(argv)
+
+    delta_selected = args.use_delta_step or args.sssp_engine == "delta-step"
+    delta_specific_controls = (
+        args.delta is not None
+        or args.delta_multiplier is not None
+        or args.delta_force_generic
+        or args.delta_force_legacy_parent
+        or args.delta_telemetry
+        or args.delta_benchmark_weights is not None
+        or args.delta_benchmark_weight_seed is not None
+    )
+    if delta_specific_controls and not delta_selected:
+        parser.error(
+            "delta-specific options require --sssp-engine delta-step or "
+            "--use-delta-step"
+        )
+    if args.delta_multiplier is not None and args.delta != "auto":
+        parser.error("--delta-multiplier requires --delta auto")
+    if args.delta_benchmark_weights is not None and (
+        args.delta is None or args.delta == "auto"
+    ):
+        parser.error(
+            "--delta-benchmark-weights requires an explicit numeric --delta"
+        )
+    if (
+        args.delta_benchmark_weight_seed is not None
+        and args.delta_benchmark_weights != "mixed"
+    ):
+        parser.error(
+            "--delta-benchmark-weight-seed requires "
+            "--delta-benchmark-weights mixed"
+        )
+    return args
 
 
 def pathfinder_args(args: argparse.Namespace) -> list[str]:
     forwarded: list[str] = []
     if args.use_delta_step:
         forwarded.append("--use-delta-step")
+    if args.delta_force_generic:
+        forwarded.append("--delta-force-generic")
+    if args.delta_telemetry:
+        forwarded.append("--delta-telemetry")
     if args.delta_force_legacy_parent:
         forwarded.append("--delta-force-legacy-parent")
     for attr, option in (
         ("sssp_engine", "--sssp-engine"),
         ("delta", "--delta"),
         ("delta_multiplier", "--delta-multiplier"),
+        ("delta_benchmark_weights", "--delta-benchmark-weights"),
+        ("delta_benchmark_weight_seed", "--delta-benchmark-weight-seed"),
         ("max_pathfinder_iters", "--max-pathfinder-iters"),
         ("max_sssp_iters", "--max-sssp-iters"),
         ("capacity", "--capacity"),

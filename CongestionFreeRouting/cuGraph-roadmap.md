@@ -43,6 +43,23 @@ Stage A is **in progress**. The repository has landed these low-risk pieces:
   `{distance_bits, original_edge_id}` parents and extract exact original edge
   IDs without predecessor-row recovery. The wide/allocation-fallback path is
   retained.
+- `--delta-force-generic` now bypasses only the exact-unit dispatch while
+  preserving the graph's weights, destination-cost semantics, numeric/auto
+  delta, and compact-versus-legacy parent policy. Deterministic `unit`,
+  `all-light`, `all-heavy`, and seeded `mixed` benchmark weight families are
+  available through the direct CLI and both benchmark wrappers.
+- `--delta-telemetry` opts each workspace invocation into compile-time
+  instrumented kernels and emits one aggregate JSON record after all
+  PathFinder workers join. It reports execution-path counts, bucket/light/heavy
+  scheduler work, edge examinations, distance atomics and CAS retries, queue
+  insertions/peaks, stale entries, reached vertices, controller round trips,
+  and compact-parent fallback. Disabled launches use separate uninstrumented
+  template instantiations.
+- `DeltaSteppingCsrWorkspace::run_distances()` now uses a compile-time
+  no-parent generic specialization and releases retained mutable parent/target/
+  path buffers. `DeltaSteppingCsrStorageMode::kDistancesOnly` additionally
+  omits the immutable 4-byte-per-edge edge-source map and rejects path-output
+  calls. The generic core is approximately 40 bytes per vertex.
 
 Host validation covers the automatic-threshold formula, runtime wave32/wave64
 scaling, destination costs, numeric edge cases, CLI parsing, numeric override,
@@ -51,13 +68,13 @@ regression also covers compact-only scratch transitioning to the exact-unit
 specialization, but the current changes have not yet been compiled or executed
 on an AMD ROCm host.
 
-The following Stage A requirements remain open:
+The following Stage A requirements remain open or partial:
 
-- reproducible weighted GPU performance families and recorded baselines;
-- opt-in queue, degree, collision, stale-entry, atomic, and synchronization
-  telemetry;
-- a true distances-only execution specialization that omits all parent/path
-  state and the shared edge-source map;
+- recorded weighted AMD GPU performance baselines and multiplier sweeps (the
+  reproducible CLI families and forced-generic control are implemented);
+- reached-row degree histograms, unique-destination/collision ratios, and
+  device-time/reset/synchronization attribution (the opt-in exact counter set
+  above is implemented);
 - eligible 32-bit device row offsets with a forced-wide A/B mode; and
 - automatic threshold refresh inside mutable low-level workspaces after
   `update_values()` or `update_vertex_costs()`. Today callers must invoke the
@@ -171,16 +188,17 @@ not provide a safe convergent collective.
 cuGraph can discard predecessor output. A competitive SSSP interface should
 offer the same choice.
 
-The current compact path-producing mode avoids legacy predecessor allocation,
-but it still allocates the compact parent key, shared edge-source map, and path
-extraction state. Full-distance APIs also still publish parent candidates.
-Therefore lazy legacy buffers are only a partial completion of this item, not a
-distances-only specialization.
+The explicit `run_distances()` mode now compiles parent publication out,
+releases retained mutable parent/path storage, and returns only full distances.
+A graph or owned workspace constructed with
+`DeltaSteppingCsrStorageMode::kDistancesOnly` also omits the shared edge-source
+map. Existing path-producing APIs retain their compact parent and legacy
+fallback behavior.
 
-Distances-only mode should omit:
+The landed distances-only mode omits:
 
 - the compact parent key;
-- the shared edge-to-source map;
+- in strict `kDistancesOnly` storage, the shared edge-to-source map;
 - legacy predecessor node/edge arrays;
 - path-measurement and path-fill buffers; and
 - predecessor/path extraction kernels.
@@ -201,25 +219,28 @@ edge IDs are unavailable.
 | One thread serially scans every active row | Degree-aware, edge-balanced expansion | High on skewed graphs | High |
 | One global update sequence per candidate edge | Hierarchical reduction by destination | High when destinations collide | Medium--High to High |
 | Host-visible count and bucket transitions | Device-resident scheduler control | High on deep/small-frontier searches | High |
-| Legacy predecessor arrays are lazy for compact paths, but parent key/map and path state remain | Optional distances-only specialization | High for standard SSSP measurement | Low--Medium |
+| Path-producing state remains available by default; explicit runs can use a 40-byte/V no-parent core and omit the 4-byte/E map | Continue validating the landed distances-only specialization on AMD hardware | High for standard SSSP measurement | Low--Medium |
 | Always-64-bit row offsets | Eligible 32-bit device CSR specialization | Medium memory/cache benefit | Medium |
 
 ## Implementation roadmap
 
 ### Stage A: measurement and cheap specializations
 
-1. **Partial:** weighted CPU-Dijkstra correctness coverage exists, including
-   all-light, all-heavy, mixed, zero-weight, random, and destination-cost
-   cases. Reproducible weighted performance families and baselines are still
-   missing.
-2. **Not started:** add opt-in queue, degree, collision, stale-entry, atomic,
-   and synchronization telemetry.
+1. **Partial:** weighted CPU-Dijkstra correctness coverage and reproducible
+   `unit`, `all-light`, `all-heavy`, and seeded `mixed` CLI families are
+   implemented, together with an explicit forced-generic A/B mode. Recorded
+   AMD GPU baselines are still missing.
+2. **Partial:** opt-in per-workspace telemetry now reports exact scheduler,
+   edge-examination, relaxation, stale-entry, queue, CAS-retry, fallback, and
+   controller-round-trip counters and aggregates them after parallel workers.
+   Reached-degree histograms, unique-destination ratios, and time attribution
+   remain open.
 3. **Partial:** PathFinder `delta=auto`, the multiplier, explicit override,
    runtime wave query, host effective-weight helper, and host regressions are
    implemented. Weighted AMD GPU sweeps and mutable-workspace refresh remain.
-4. **Partial:** legacy predecessor arrays are lazy for eligible compact-parent
-   searches. Add true distances-only execution and make the compact parent
-   key, edge-source map, and path buffers optional.
+4. **Implemented; AMD validation pending:** `run_distances()` is a true
+   compile-time no-parent specialization, releases mutable parent/path state,
+   and strict distances-only graph/workspace storage omits the edge-source map.
 5. **Not started:** add eligible 32-bit device row offsets and a forced-wide
    A/B mode.
 

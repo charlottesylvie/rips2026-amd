@@ -2,13 +2,15 @@
 
 ## Benchmark configuration
 
-The main profile discussed here was produced for `logicnets_jscl` with the
-generic delta-stepping path forced by a finite maximum-iteration argument:
+The archived profile discussed here was produced for `logicnets_jscl` before
+the explicit generic-dispatch control existed and used the former forcing
+workaround. For every new or reproduction run, use
+`--delta-force-generic`:
 
 ```bash
 make ROUTER=PathFinderFile BENCHMARKS="logicnets_jscl" VERBOSE=1 \
   PATHFINDER_SSSP_ENGINE=delta-step \
-  PATHFINDER_ARGS="--max-sssp-iters 2147483647" \
+  PATHFINDER_ARGS="--delta 1 --delta-force-generic" \
   PATHFINDER_PROFILE=rocprofv3 \
   PATHFINDER_PROFILE_RUN=delta-generic
 ```
@@ -30,6 +32,48 @@ The available full-system profile routed all 28,026 nets; it was not the later
 Profiler wall time must not be compared directly with an unprofiled benchmark
 because tracing substantially perturbs this launch- and synchronization-heavy
 workload.
+
+## Reproducible weighted and telemetry runs
+
+The current router can replace loaded CSR weights deterministically in memory.
+For an exact-unit-versus-generic differential run, keep every edge at one and
+select the implementation explicitly:
+
+```bash
+make ROUTER=PathFinderFile BENCHMARKS="logicnets_jscl" VERBOSE=1 \
+  PATHFINDER_SSSP_ENGINE=delta-step \
+  PATHFINDER_ARGS="--delta 1 --delta-force-generic \
+    --delta-benchmark-weights unit" \
+  PATHFINDER_PROFILE=none
+```
+
+For genuinely mixed effective weights with a reproducible seed:
+
+```bash
+make ROUTER=PathFinderFile BENCHMARKS="logicnets_jscl" VERBOSE=1 \
+  PATHFINDER_SSSP_ENGINE=delta-step \
+  PATHFINDER_ARGS="--delta 2 --delta-force-generic \
+    --delta-benchmark-weights mixed --delta-benchmark-weight-seed 123" \
+  PATHFINDER_PROFILE=none
+```
+
+The other families are `all-light = delta/4` and `all-heavy = 4*delta`;
+`mixed` chooses per original CSR edge index from
+`{0, delta/4, delta, 4*delta}`. A family requires an explicitly supplied
+numeric delta, and the seed is accepted only for `mixed`. The transformation
+does not rewrite the `.csrbin`.
+
+Add `--delta-telemetry` only to a separate diagnostic run. It selects
+instrumented kernels and emits one aggregate JSON line after every worker has
+joined, not one record per worker or net. Counter values are sums over actual
+SSSP queries, while queue high-water values are maxima. Keep telemetry disabled
+for wall-time and PMC baselines. Precise counter definitions are in
+[`CongestionFreeRouting/GPU_PROFILING.md`](CongestionFreeRouting/GPU_PROFILING.md#opt-in-algorithm-telemetry).
+
+These new force, weighted-family, telemetry, and distances-only paths have not
+yet been rerun in the production HIP regression suite or benchmarked on an AMD
+GPU in this checkout. The commands here define the outstanding validation;
+they are not new measurements.
 
 ## Worker-count follow-up
 
@@ -89,6 +133,14 @@ GPU execution, more than relaxation itself. Avoiding, fusing, or amortizing
 that state-management work is therefore at least as important as tuning the
 relaxation kernel.
 
+This archive measured the legacy predecessor/materialization path. Current
+automatic generic vector-target runs use a compact winning edge ID when the
+shared graph has its edge-to-source map. Use
+`--delta-force-legacy-parent` only to reproduce the old parent-policy side of
+an A/B comparison. The percentages above are historical evidence, not the cost
+of the current compact path; reprofile before transferring them to current
+code.
+
 ### Memory and CPU/GPU communication
 
 The input CSR contains 28,226,432 nodes and 125,423,075 edges and is about
@@ -111,6 +163,28 @@ The distinction matters: GPU utilization and allocated-memory telemetry alone
 cannot classify the hot kernels, while the later counter data can rule out
 arithmetic-throughput and low-residency limits.
 
+### Low-level distances-only memory baseline
+
+PathFinder needs reconstructed routes, so it cannot exercise the new
+`DeltaSteppingCsrWorkspace::run_distances` specialization. A distance-only
+comparison requires a dedicated low-level harness using identical sources,
+numeric delta, edge weights, and destination costs. Constructing the shared
+graph with `DeltaSteppingCsrStorageMode::kDistancesOnly` also removes the
+compact-parent edge-to-source map; separate graph-upload measurements from
+traversal time.
+
+The code-layout estimate is `40 B/V` of generic mutable state. For this
+28,226,432-vertex, 125,423,075-edge input, that saves about `215.35 MiB` per
+workspace versus compact generic's extra `8 B/V`, or `538.38 MiB` versus
+legacy generic's extra `20 B/V`. Strict distances-only graph storage saves an
+additional `478.45 MiB` (`4 B/E`) once per shared graph, for approximately
+`693.80 MiB` versus one compact workspace plus map or `1,016.83 MiB` versus
+one legacy workspace plus map. These figures exclude target/path capacity,
+small scalars, sources, optional vertex costs, and allocator overhead; they are
+layout calculations that assume the eligible edge map is allocated, not
+measured allocations. Real AMD HIP validation and measurement remain
+outstanding.
+
 ### Trace limitations
 
 The detailed trace buffer overflowed around 112 seconds into the 144-second
@@ -125,11 +199,12 @@ CPU-cache metrics.
 
 1. Use dedicated Unit-BFS for this production input rather than forcing
    generic Delta-Stepping. The full-device CSR has 28,226,432 rows, above the
-   Delta exact-unit specialization's `2^24`-row guard, so merely removing the
-   finite iteration option does not activate that specialization here.
-2. Publish a compact winning edge ID in the atomic parent state and remove the
-   predecessor row-recovery scan, which is now measured at 24.1% of kernel
-   time.
+   Delta exact-unit specialization's `2^24`-row guard. The generic path is
+   therefore automatic on this graph, but the force flag records experimental
+   intent and remains correct on smaller inputs.
+2. Reprofile the landed compact winning-edge parent mode on AMD hardware. It
+   removes the legacy predecessor row-recovery scan, but the historical 24.1%
+   materialization result cannot quantify the new path without measurement.
 3. Reduce sparse-reset writes, specializing state cleanup for the compiled
    mode before evaluating generation-stamped state. Reset is 28.9% of kernel
    time.
@@ -149,11 +224,12 @@ CPU-cache metrics.
 
 The Radeon 8060S/Strix Halo (`gfx1151`, 40 CUs, wave32) was profiled with
 `rocprof-compute` System SOL (`-b 2 --no-roof --no-native-tool`) using one
-worker and the first 100 `logicnets_jscl` nets. The finite maximum-iteration
-argument forced the generic all-edges-light Delta-Stepping path, so this is not
-an exact-unit or genuinely mixed-weight profile. Moreover, this CSR has
-28,226,432 rows, so its current Delta exact-unit specialization cannot activate
-even without the finite limit: the implementation guards that path at
+worker and the first 100 `logicnets_jscl` nets. The archived invocation
+predates `--delta-force-generic` and selected the generic all-edges-light path
+with the former workaround; current reproductions must use the force flag. This
+is not an exact-unit or genuinely mixed-weight profile. Moreover, this CSR has
+28,226,432 rows, so its Delta exact-unit specialization cannot activate even
+with automatic execution: the implementation guards that path at
 `2^24 = 16,777,216` rows to preserve exact float depth values.
 
 Four profiler replay passes were stable: aggregate kernel time ranged from
@@ -207,8 +283,11 @@ of physical peak memory bandwidth or a MALL hit rate.
 
 The ten largest searches account for 72.4% of reset time and 69.0% of
 materialization time. Launch size and duration correlate at 0.995 and 0.997,
-respectively. The next instrumented run should attach net identity, reached
-vertices, relaxed edges, frontier maxima, and light-round counts to each search.
+respectively. The new aggregate telemetry supplies reached-vertex sums,
+successful relaxations, frontier/queue work and queue maxima, light rounds,
+CAS retries, and controller reads. Its CLI JSON intentionally has no net
+identity or per-search distribution, so correlating the worst searches still
+requires a dedicated per-invocation harness or trace annotation.
 
 ### Remaining targeted counter experiment
 
@@ -338,7 +417,7 @@ rocprofv3 \
     --routes-out direct-profile-work/routes-pmc.jsonl \
     --allow-unrouted \
     --sssp-engine delta-step \
-    --max-sssp-iters 2147483647 \
+    --delta-force-generic \
     --parallel-net-workers 1 \
     --net-limit 100 \
   > delta-pmc-minimal.log 2>&1

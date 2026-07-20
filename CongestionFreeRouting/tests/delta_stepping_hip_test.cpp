@@ -45,6 +45,17 @@ void require(bool condition, const std::string& message) {
   }
 }
 
+template <typename Function>
+void require_invalid_argument(const std::string& label, Function&& function) {
+  bool rejected = false;
+  try {
+    function();
+  } catch (const std::invalid_argument&) {
+    rejected = true;
+  }
+  require(rejected, label + ": expected std::invalid_argument");
+}
+
 void record_progress(const DeltaSteppingCsrProgress& progress,
                      void* user_data) {
   auto* records =
@@ -247,6 +258,70 @@ void validate_full_distances(const std::string& label,
                               expected[vertex],
                               result.dist[vertex]));
   }
+}
+
+void validate_distances_only_result(
+    const std::string& label,
+    const std::vector<float>& expected,
+    const DeltaSteppingCsrResult& result) {
+  validate_full_distances(label, expected, result);
+  require(result.pred_node.empty(),
+          label + ": distances-only result contains predecessor nodes");
+  require(result.pred_edge.empty(),
+          label + ": distances-only result contains predecessor edges");
+  require(result.target_distances.empty(),
+          label + ": distances-only result contains target distances");
+  require(result.target_sources.empty(),
+          label + ": distances-only result contains target sources");
+  require(result.target_path_offsets.empty(),
+          label + ": distances-only result contains target path offsets");
+  require(result.target_edge_offsets.empty(),
+          label + ": distances-only result contains target edge offsets");
+  require(result.target_path_nodes.empty(),
+          label + ": distances-only result contains target path nodes");
+  require(result.target_path_edges.empty(),
+          label + ": distances-only result contains target path edges");
+  require(std::isinf(result.target_distance) &&
+              !std::signbit(result.target_distance),
+          label + ": distances-only result changed the scalar target distance");
+  require(!result.target_reached,
+          label + ": distances-only result reports a reached target");
+  require(!result.stopped_on_target,
+          label + ": distances-only result reports a target stop");
+}
+
+void require_no_mutable_path_storage(
+    const std::string& label,
+    const DeltaSteppingCsrWorkspace& workspace) {
+  const DeltaSteppingCsrAllocationState state = workspace.allocation_state();
+  require(!state.parent_key,
+          label + ": workspace retained compact parent keys");
+  require(!state.predecessor_nodes,
+          label + ": workspace retained predecessor nodes");
+  require(!state.predecessor_edges,
+          label + ": workspace retained predecessor edges");
+  require(!state.target_storage,
+          label + ": workspace retained target extraction storage");
+  require(!state.path_nodes,
+          label + ": workspace retained compact path nodes");
+  require(!state.path_edges,
+          label + ": workspace retained compact path edges");
+}
+
+void run_distances_and_check(
+    const std::string& label,
+    DeltaSteppingCsrWorkspace& workspace,
+    const HostCsrF32& graph,
+    const std::vector<int>& sources,
+    float delta,
+    hipStream_t stream,
+    const std::vector<float>* vertex_costs = nullptr) {
+  const std::vector<float> expected =
+      cpu_dijkstra_outgoing_multi_source(graph, sources, vertex_costs);
+  const DeltaSteppingCsrResult result = workspace.run_distances(
+      sources, delta, -1, stream, nullptr, nullptr);
+  validate_distances_only_result(label, expected, result);
+  require_no_mutable_path_storage(label, workspace);
 }
 
 bool contains_source(const std::vector<int>& sources, int vertex) {
@@ -455,6 +530,16 @@ void test_compact_edge_id_eligibility() {
           "graph above the 32-bit edge-ID boundary was eligible");
 }
 
+void test_braced_default_stream_constructor_compatibility() {
+  const HostCsrF32 graph = make_outgoing_csr(1, {});
+  DeltaSteppingCsrGraph shared_graph(graph, {});
+  (void)shared_graph;
+  DeltaSteppingCsrWorkspace workspace(graph, {});
+  require(!workspace.allocation_state().predecessor_nodes &&
+              !workspace.allocation_state().predecessor_edges,
+          "default-stream construction eagerly allocated predecessors");
+}
+
 void validate_single_target_predecessors(
     const std::string& label,
     const HostCsrF32& graph,
@@ -573,6 +658,473 @@ HostCsrF32 make_weighted_corner_graph() {
        {8, 7, 2.0f},
        {10, 11, 1.0f},
        {11, 10, 1.5f}});
+}
+
+void test_distances_only_graph_families(hipStream_t stream) {
+  {
+    const HostCsrF32 graph = make_outgoing_csr(1, {});
+    DeltaSteppingCsrWorkspace workspace(graph, stream);
+    const std::vector<float> expected =
+        cpu_dijkstra_outgoing_multi_source(graph, {0});
+    const DeltaSteppingCsrResult result = workspace.run_distances(
+        0, 1.0f, -1, stream, nullptr, nullptr);
+    validate_distances_only_result(
+        "distances-only zero-edge singleton", expected, result);
+    require_no_mutable_path_storage(
+        "distances-only zero-edge singleton", workspace);
+  }
+
+  {
+    const HostCsrF32 graph = make_outgoing_csr(6, {});
+    DeltaSteppingCsrWorkspace workspace(graph, stream);
+    run_distances_and_check("distances-only isolated vertices",
+                            workspace,
+                            graph,
+                            {0, 4, 0},
+                            0.5f,
+                            stream);
+    run_distances_and_check("distances-only isolated vertices reused",
+                            workspace,
+                            graph,
+                            {2},
+                            2.0f,
+                            stream);
+  }
+
+  {
+    const HostCsrF32 graph = make_outgoing_csr(
+        8,
+        {{0, 1, 1.0f},
+         {0, 2, 1.0f},
+         {1, 3, 1.0f},
+         {2, 3, 1.0f},
+         {3, 4, 1.0f},
+         {4, 5, 1.0f},
+         {6, 5, 1.0f}});
+    DeltaSteppingCsrWorkspace workspace(graph, stream);
+    run_distances_and_check("distances-only unit graph",
+                            workspace,
+                            graph,
+                            {0, 0},
+                            1.0f,
+                            stream);
+    require(std::isinf(cpu_dijkstra_outgoing_multi_source(graph, {0})[6]),
+            "distances-only unit fixture lost its unreachable vertex");
+  }
+
+  {
+    const HostCsrF32 graph = make_weighted_corner_graph();
+    DeltaSteppingCsrWorkspace workspace(graph, stream);
+    // This fixture contains heterogeneous and zero-weight edges, an unsorted
+    // parallel edge pair, self-loops, and isolated/disconnected components.
+    run_distances_and_check(
+        "distances-only weighted zero/parallel graph",
+        workspace,
+        graph,
+        {0, 0},
+        1.0f,
+        stream);
+    run_distances_and_check(
+        "distances-only weighted zero/parallel graph reused",
+        workspace,
+        graph,
+        {8, 10, 8},
+        0.75f,
+        stream);
+
+    const std::vector<float> vertex_costs = {
+        1.0f, 2.0f, 0.5f, 1.5f, 0.0f, 3.0f,
+        0.25f, 2.0f, 1.0f, 1.0f, 1.25f, 0.75f};
+    workspace.update_vertex_costs(vertex_costs, stream);
+    run_distances_and_check(
+        "distances-only destination vertex costs",
+        workspace,
+        graph,
+        {0, 10, 0},
+        1.25f,
+        stream,
+        &vertex_costs);
+  }
+}
+
+void test_distances_only_path_state_transitions(hipStream_t stream) {
+  const HostCsrF32 weighted_graph = make_weighted_corner_graph();
+  HostCsrF32 active_graph = weighted_graph;
+  const std::vector<int> sources = {0, 8, 0};
+  const std::vector<int> targets = {7, 4, 0, 8, 9, 7};
+  DeltaSteppingCsrWorkspace workspace(weighted_graph, stream);
+
+  const std::vector<float> weighted_expected =
+      cpu_dijkstra_outgoing_multi_source(weighted_graph, sources);
+  const DeltaSteppingCsrResult first_path = workspace.run(
+      sources, targets, 1.0f, -1, stream, nullptr, nullptr);
+  validate_compact_target_paths("distances-only transition initial compact",
+                                weighted_graph,
+                                sources,
+                                targets,
+                                weighted_expected,
+                                first_path);
+  {
+    const DeltaSteppingCsrAllocationState state = workspace.allocation_state();
+    require(state.edge_source,
+            "initial compact run did not retain the immutable edge map");
+    require(state.parent_key,
+            "initial compact run did not allocate compact parent keys");
+    require(!state.predecessor_nodes && !state.predecessor_edges,
+            "initial compact run unexpectedly allocated legacy predecessors");
+    require(state.target_storage && state.path_nodes && state.path_edges,
+            "initial compact run did not allocate target/path storage");
+  }
+
+  run_distances_and_check("distances-only after compact path",
+                          workspace,
+                          weighted_graph,
+                          sources,
+                          1.0f,
+                          stream);
+  require(workspace.allocation_state().edge_source,
+          "path-capable distance run released the immutable edge map");
+
+  active_graph.values.assign(active_graph.values.size(), 1.0f);
+  workspace.update_values(active_graph.values, stream);
+  const std::vector<float> unit_expected =
+      cpu_dijkstra_outgoing_multi_source(active_graph, sources);
+  DeltaSteppingCsrTelemetry exact_telemetry;
+  const DeltaSteppingCsrResult exact_path = workspace.run(
+      sources,
+      targets,
+      1.0f,
+      -1,
+      DeltaSteppingCsrRunOptions{&exact_telemetry},
+      stream,
+      nullptr,
+      nullptr);
+  validate_compact_target_paths("distances-only transition exact unit",
+                                active_graph,
+                                sources,
+                                targets,
+                                unit_expected,
+                                exact_path);
+  require(exact_telemetry.collected && exact_telemetry.completed &&
+              exact_telemetry.execution_path ==
+                  DeltaSteppingCsrExecutionPath::kExactUnit,
+          "path after distances-only did not re-enter the exact-unit path");
+  {
+    const DeltaSteppingCsrAllocationState state = workspace.allocation_state();
+    require(!state.parent_key,
+            "exact-unit transition unexpectedly allocated parent keys");
+    require(state.predecessor_nodes && state.predecessor_edges,
+            "exact-unit transition did not reallocate predecessors");
+    require(state.target_storage && state.path_nodes && state.path_edges,
+            "exact-unit transition did not reallocate target/path storage");
+  }
+
+  DeltaSteppingCsrTelemetry distances_telemetry;
+  const DeltaSteppingCsrResult unit_distances = workspace.run_distances(
+      sources,
+      1.0f,
+      -1,
+      DeltaSteppingCsrRunOptions{&distances_telemetry},
+      stream,
+      nullptr,
+      nullptr);
+  validate_distances_only_result("distances-only after exact unit",
+                                 unit_expected,
+                                 unit_distances);
+  require_no_mutable_path_storage(
+      "distances-only after exact unit", workspace);
+  require(distances_telemetry.collected && distances_telemetry.completed,
+          "distances-only telemetry was not collected and completed");
+  require(distances_telemetry.execution_path ==
+              DeltaSteppingCsrExecutionPath::kGenericDistancesOnly,
+          "distances-only telemetry reported the wrong execution path");
+  require(std::string(delta_stepping_execution_path_name(
+              distances_telemetry.execution_path)) ==
+              "generic_distances_only",
+          "distances-only execution-path name is unstable");
+  require(close_enough(1.0f, distances_telemetry.resolved_delta),
+          "distances-only telemetry reported the wrong delta");
+  require(!distances_telemetry.force_legacy_parent,
+          "distances-only telemetry reported forced legacy parents");
+  require(distances_telemetry.wavefront_size == 32 ||
+              distances_telemetry.wavefront_size == 64,
+          "distances-only telemetry reported an unsupported wavefront size");
+
+  workspace.update_values(weighted_graph.values, stream);
+  const DeltaSteppingCsrResult restored_path = workspace.run(
+      sources, targets, 1.0f, -1, stream, nullptr, nullptr);
+  validate_compact_target_paths("distances-only transition restored compact",
+                                weighted_graph,
+                                sources,
+                                targets,
+                                weighted_expected,
+                                restored_path);
+  {
+    const DeltaSteppingCsrAllocationState state = workspace.allocation_state();
+    require(state.parent_key && state.target_storage && state.path_nodes &&
+                state.path_edges,
+            "compact path state was not reallocated after distances-only");
+    require(!state.predecessor_nodes && !state.predecessor_edges,
+            "restored compact run unexpectedly retained exact-unit predecessors");
+  }
+  run_distances_and_check("distances-only after restored compact",
+                          workspace,
+                          weighted_graph,
+                          {10},
+                          0.75f,
+                          stream);
+}
+
+void test_distances_only_strict_storage_and_validation(hipStream_t stream) {
+  const HostCsrF32 graph = make_weighted_corner_graph();
+  const std::vector<int> sources = {0, 8, 0};
+  const std::vector<int> targets = {4, 7};
+  const std::vector<float> expected =
+      cpu_dijkstra_outgoing_multi_source(graph, sources);
+
+  DeltaSteppingCsrWorkspace owned(
+      graph, stream, DeltaSteppingCsrStorageMode::kDistancesOnly);
+  require_no_mutable_path_storage("strict owned initial storage", owned);
+  require(!owned.allocation_state().edge_source,
+          "strict owned workspace retained the immutable edge map");
+
+  DeltaSteppingCsrTelemetry telemetry;
+  const DeltaSteppingCsrResult first = owned.run_distances(
+      sources,
+      1.25f,
+      -1,
+      DeltaSteppingCsrRunOptions{&telemetry},
+      stream,
+      nullptr,
+      nullptr);
+  validate_distances_only_result("strict owned distances", expected, first);
+  require_no_mutable_path_storage("strict owned distances", owned);
+  require(!owned.allocation_state().edge_source,
+          "strict owned run allocated the immutable edge map");
+  require(telemetry.collected && telemetry.completed &&
+              telemetry.execution_path ==
+                  DeltaSteppingCsrExecutionPath::kGenericDistancesOnly,
+          "strict owned run reported the wrong telemetry mode");
+
+  const std::vector<float> vertex_costs = {
+      1.0f, 2.0f, 0.5f, 1.5f, 0.0f, 3.0f,
+      0.25f, 2.0f, 1.0f, 1.0f, 1.25f, 0.75f};
+  owned.update_vertex_costs(vertex_costs, stream);
+  run_distances_and_check("strict owned destination costs reused",
+                          owned,
+                          graph,
+                          {10},
+                          0.75f,
+                          stream,
+                          &vertex_costs);
+  require(!owned.allocation_state().edge_source,
+          "strict owned reused run allocated the immutable edge map");
+
+  require_invalid_argument("strict owned full path API", [&] {
+    (void)owned.run(sources, -1, 1.25f, -1, stream, nullptr, nullptr);
+  });
+  require_invalid_argument("strict owned scalar-target path API", [&] {
+    (void)owned.run(sources, 7, 1.25f, -1, stream, nullptr, nullptr);
+  });
+  require_invalid_argument("strict owned vector-target path API", [&] {
+    (void)owned.run(sources, targets, 1.25f, -1, stream, nullptr, nullptr);
+  });
+  require_no_mutable_path_storage("strict owned rejected path APIs", owned);
+  require(!owned.allocation_state().edge_source,
+          "strict owned rejected path API allocated the immutable edge map");
+
+  auto strict_graph = std::make_shared<DeltaSteppingCsrGraph>(
+      graph, stream, DeltaSteppingCsrStorageMode::kDistancesOnly);
+  DeltaSteppingCsrWorkspace shared(strict_graph, stream);
+  require_no_mutable_path_storage("strict shared initial storage", shared);
+  require(!shared.allocation_state().edge_source,
+          "strict shared graph retained the immutable edge map");
+  run_distances_and_check("strict shared distances",
+                          shared,
+                          graph,
+                          sources,
+                          1.25f,
+                          stream);
+  require(!shared.allocation_state().edge_source,
+          "strict shared run allocated the immutable edge map");
+  require_invalid_argument("strict shared vector-target path API", [&] {
+    (void)shared.run(sources, targets, 1.25f, -1, stream, nullptr, nullptr);
+  });
+
+  DeltaSteppingCsrWorkspace forced_legacy(
+      graph, stream, DeltaSteppingCsrParentMode::kForceLegacy);
+  require_invalid_argument("distances-only forced legacy", [&] {
+    (void)forced_legacy.run_distances(
+        sources, 1.25f, -1, stream, nullptr, nullptr);
+  });
+  require_no_mutable_path_storage(
+      "distances-only forced legacy rejection", forced_legacy);
+}
+
+void test_runtime_telemetry_modes_and_reset(hipStream_t stream) {
+  const HostCsrF32 unit_graph = make_outgoing_csr(
+      5,
+      {{0, 1, 1.0f},
+       {0, 2, 1.0f},
+       {1, 3, 1.0f},
+       {2, 3, 1.0f},
+       {3, 4, 1.0f}});
+  const std::vector<int> sources = {0};
+  const std::vector<int> targets = {4};
+  const std::vector<float> expected =
+      cpu_dijkstra_outgoing_multi_source(unit_graph, sources);
+
+  DeltaSteppingCsrWorkspace automatic(unit_graph, stream);
+  require(!automatic.allocation_state().telemetry_counters,
+          "disabled telemetry allocated counters at construction");
+  const DeltaSteppingCsrResult disabled = automatic.run(
+      sources, targets, 1.0f, -1, stream, nullptr, nullptr);
+  validate_compact_target_paths("telemetry disabled exact unit",
+                                unit_graph,
+                                sources,
+                                targets,
+                                expected,
+                                disabled);
+  require(!automatic.allocation_state().telemetry_counters,
+          "disabled telemetry allocated device counters");
+
+  DeltaSteppingCsrTelemetry exact;
+  exact.outer_buckets_processed = UINT64_C(9999);
+  exact.stale_frontier_entries = UINT64_C(9999);
+  const DeltaSteppingCsrResult instrumented = automatic.run(
+      sources,
+      targets,
+      1.0f,
+      -1,
+      DeltaSteppingCsrRunOptions{&exact},
+      stream,
+      nullptr,
+      nullptr);
+  validate_compact_target_paths("telemetry exact unit",
+                                unit_graph,
+                                sources,
+                                targets,
+                                expected,
+                                instrumented);
+  require(exact.collected && exact.completed,
+          "exact-unit telemetry did not complete");
+  require(exact.execution_path ==
+              DeltaSteppingCsrExecutionPath::kExactUnit,
+          "exact-unit telemetry reported the wrong path");
+  require(exact.reached_vertices == 5,
+          "exact-unit telemetry reached count mismatch");
+  require(exact.successful_distance_relaxations == 4 &&
+              exact.current_queue_insertions == 4,
+          "exact-unit telemetry relaxation/queue counts mismatch");
+  require(exact.current_queue_high_water == 5,
+          "exact-unit telemetry queue peak mismatch");
+  require(exact.frontier_entries_processed ==
+              exact.active_vertices_processed &&
+              exact.stale_frontier_entries == 0,
+          "exact-unit telemetry frontier accounting mismatch");
+  require(exact.distance_atomic_attempts >=
+              exact.successful_distance_relaxations,
+          "exact-unit telemetry atomic accounting is inconsistent");
+  require(automatic.allocation_state().telemetry_counters,
+          "enabled telemetry did not allocate counters");
+
+  // Reuse the same output record for a zero-traversal source-target query.
+  // Every prior counter must be reset rather than accumulated.
+  exact.light_edge_visits = UINT64_C(8888);
+  const DeltaSteppingCsrResult reset_run = automatic.run(
+      sources,
+      std::vector<int>{0},
+      1.0f,
+      -1,
+      DeltaSteppingCsrRunOptions{&exact},
+      stream,
+      nullptr,
+      nullptr);
+  validate_compact_target_paths("telemetry reset exact unit",
+                                unit_graph,
+                                sources,
+                                std::vector<int>{0},
+                                expected,
+                                reset_run);
+  require(exact.collected && exact.completed &&
+              exact.outer_buckets_processed == 0 &&
+              exact.light_relaxation_rounds == 0 &&
+              exact.frontier_entries_processed == 0 &&
+              exact.light_edge_visits == 0 &&
+              exact.successful_distance_relaxations == 0 &&
+              exact.reached_vertices == 1 &&
+              exact.current_queue_high_water == 1,
+          "reused telemetry record was not reset deterministically");
+
+  DeltaSteppingCsrWorkspace forced_generic(
+      unit_graph,
+      stream,
+      DeltaSteppingCsrWorkspaceOptions{
+          DeltaSteppingCsrParentMode::kAutomatic,
+          DeltaSteppingCsrExecutionMode::kForceGeneric});
+  DeltaSteppingCsrTelemetry generic;
+  const DeltaSteppingCsrResult generic_result = forced_generic.run(
+      sources, targets, 1.0f, -1,
+      DeltaSteppingCsrRunOptions{&generic}, stream, nullptr, nullptr);
+  validate_compact_target_paths("telemetry forced generic",
+                                unit_graph,
+                                sources,
+                                targets,
+                                expected,
+                                generic_result);
+  require(generic.collected && generic.completed && generic.force_generic &&
+              generic.execution_path ==
+                  DeltaSteppingCsrExecutionPath::kCompactGeneric,
+          "forced-generic telemetry reported the wrong mode");
+
+  DeltaSteppingCsrWorkspace forced_legacy(
+      unit_graph, stream, DeltaSteppingCsrParentMode::kForceLegacy);
+  DeltaSteppingCsrTelemetry legacy;
+  const DeltaSteppingCsrResult legacy_result = forced_legacy.run(
+      sources, targets, 1.0f, -1,
+      DeltaSteppingCsrRunOptions{&legacy}, stream, nullptr, nullptr);
+  validate_compact_target_paths("telemetry forced legacy",
+                                unit_graph,
+                                sources,
+                                targets,
+                                expected,
+                                legacy_result);
+  require(legacy.collected && legacy.completed &&
+              legacy.force_legacy_parent &&
+              legacy.execution_path ==
+                  DeltaSteppingCsrExecutionPath::kLegacyGeneric,
+          "forced-legacy telemetry reported the wrong mode");
+
+  const HostCsrF32 weighted = make_outgoing_csr(
+      5,
+      {{0, 1, 0.25f},
+       {0, 2, 4.0f},
+       {1, 2, 0.25f},
+       {1, 3, 3.0f},
+       {2, 3, 0.5f},
+       {3, 4, 2.0f}});
+  const std::vector<float> weighted_expected =
+      cpu_dijkstra_outgoing_multi_source(weighted, sources);
+  DeltaSteppingCsrWorkspace weighted_workspace(weighted, stream);
+  DeltaSteppingCsrTelemetry weighted_record;
+  const DeltaSteppingCsrResult weighted_result = weighted_workspace.run(
+      sources, targets, 1.0f, -1,
+      DeltaSteppingCsrRunOptions{&weighted_record}, stream, nullptr, nullptr);
+  validate_compact_target_paths("telemetry weighted generic",
+                                weighted,
+                                sources,
+                                targets,
+                                weighted_expected,
+                                weighted_result);
+  require(weighted_record.execution_path ==
+              DeltaSteppingCsrExecutionPath::kCompactGeneric &&
+              !weighted_record.all_edges_light &&
+              weighted_record.heavy_edge_phases > 0 &&
+              weighted_record.light_edge_visits > 0 &&
+              weighted_record.heavy_edge_visits > 0 &&
+              weighted_record.distance_atomic_attempts >=
+                  weighted_record.successful_distance_relaxations,
+          "weighted telemetry counters are inconsistent");
 }
 
 void test_generic_compact_parent_modes(hipStream_t stream) {
@@ -1370,6 +1922,12 @@ void test_float_bucket_boundaries_and_saturation(hipStream_t stream) {
          {1, 2, 1.0f},
          {2, 3, 1.0f}});
     DeltaSteppingCsrWorkspace workspace(graph, stream);
+    DeltaSteppingCsrWorkspace forced_generic_workspace(
+        graph,
+        stream,
+        DeltaSteppingCsrWorkspaceOptions{
+            DeltaSteppingCsrParentMode::kAutomatic,
+            DeltaSteppingCsrExecutionMode::kForceGeneric});
     const std::vector<int> sources = {0};
     const std::vector<int> targets = {3};
     const std::vector<float> expected =
@@ -1385,10 +1943,8 @@ void test_float_bucket_boundaries_and_saturation(hipStream_t stream) {
                                   expected,
                                   specialized);
 
-    std::vector<DeltaSteppingCsrProgress> progress;
-    const DeltaSteppingCsrResult generic = workspace.run(
-        sources, targets, kSaturatingDelta, -1, stream,
-        record_progress, &progress);
+    const DeltaSteppingCsrResult generic = forced_generic_workspace.run(
+        sources, targets, kSaturatingDelta, -1, stream, nullptr, nullptr);
     validate_compact_target_paths("unit terminal-bucket generic fallback",
                                   graph,
                                   sources,
@@ -2254,8 +2810,13 @@ void test_seeded_random_graphs(hipStream_t stream) {
 int main() {
   try {
     test_compact_edge_id_eligibility();
+    test_braced_default_stream_constructor_compatibility();
     HipStream stream;
     test_empty_and_singleton_graphs(stream.get());
+    test_distances_only_graph_families(stream.get());
+    test_distances_only_path_state_transitions(stream.get());
+    test_distances_only_strict_storage_and_validation(stream.get());
+    test_runtime_telemetry_modes_and_reset(stream.get());
     test_generic_compact_parent_modes(stream.get());
     test_compact_early_settlement_reset(stream.get());
     test_compact_weight_class_updates(stream.get());

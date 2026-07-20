@@ -16,11 +16,14 @@
 
 #include <fstream>
 #include <queue>
+#include <sstream>
 
 namespace {
 
 std::atomic<int> g_multisource_delta_calls{0};
 std::atomic<int> g_delta_graph_uploads{0};
+std::atomic<int> g_delta_force_generic_calls{0};
+std::atomic<int> g_delta_force_legacy_calls{0};
 std::atomic<int> g_bellman_ford_calls{0};
 std::atomic<int> g_bellman_ford_graph_uploads{0};
 std::atomic<int> g_bellman_ford_workspace_constructions{0};
@@ -167,6 +170,92 @@ void require(bool condition, const char* message) {
   if (!condition) {
     throw std::runtime_error(message);
   }
+}
+
+void populate_stub_delta_telemetry(
+    DeltaSteppingCsrTelemetry& telemetry,
+    DeltaSteppingCsrExecutionPath execution_path,
+    const HostCsrF32& graph,
+    const std::vector<int>& sources,
+    float delta,
+    bool force_generic,
+    bool force_legacy_parent,
+    bool has_vertex_costs) {
+  const std::uint64_t token =
+      sources.empty()
+          ? 1
+          : static_cast<std::uint64_t>(sources.front()) + 1;
+  telemetry.collected = true;
+  telemetry.completed = true;
+  telemetry.execution_path = execution_path;
+  telemetry.resolved_delta = delta;
+  telemetry.wavefront_size = 64;
+  telemetry.force_generic = force_generic;
+  telemetry.force_legacy_parent = force_legacy_parent;
+  telemetry.has_vertex_costs = has_vertex_costs;
+  telemetry.all_edges_light =
+      !has_vertex_costs &&
+      std::all_of(graph.values.begin(), graph.values.end(),
+                  [delta](float value) { return value <= delta; });
+  telemetry.outer_buckets_processed = token;
+  telemetry.light_relaxation_rounds = 2 * token;
+  telemetry.heavy_edge_phases = 3 * token;
+  telemetry.frontier_entries_processed = 4 * token;
+  telemetry.active_vertices_processed = 5 * token;
+  telemetry.stale_frontier_entries = 6 * token;
+  telemetry.light_edge_visits = 7 * token;
+  telemetry.heavy_edge_visits = 8 * token;
+  telemetry.distance_atomic_attempts = 9 * token;
+  telemetry.successful_distance_relaxations = 10 * token;
+  telemetry.distance_cas_retries = 11 * token;
+  telemetry.current_queue_insertions = 12 * token;
+  telemetry.pending_queue_insertions = 13 * token;
+  telemetry.heavy_queue_insertions = 14 * token;
+  telemetry.bucket_insertions = 15 * token;
+  telemetry.pending_entry_examinations = 16 * token;
+  telemetry.stale_pending_entry_examinations = 17 * token;
+  telemetry.reached_vertices = 18 * token;
+  telemetry.current_queue_high_water = 19 * token;
+  telemetry.pending_queue_high_water = 20 * token;
+  telemetry.heavy_queue_high_water = 21 * token;
+  telemetry.controller_round_trips = 22 * token;
+  telemetry.compact_parent_fallback_events = 23 * token;
+}
+
+class ScopedCoutCapture {
+ public:
+  ScopedCoutCapture() : previous_(std::cout.rdbuf(output_.rdbuf())) {}
+
+  ~ScopedCoutCapture() { std::cout.rdbuf(previous_); }
+
+  ScopedCoutCapture(const ScopedCoutCapture&) = delete;
+  ScopedCoutCapture& operator=(const ScopedCoutCapture&) = delete;
+
+  std::string str() const { return output_.str(); }
+
+ private:
+  std::ostringstream output_;
+  std::streambuf* previous_ = nullptr;
+};
+
+std::string single_delta_telemetry_json_line(const std::string& output) {
+  constexpr const char* marker = "{\"type\":\"delta_stepping_telemetry\"";
+  const std::size_t marker_pos = output.find(marker);
+  require(marker_pos != std::string::npos,
+          "telemetry-enabled PathFinder must emit a JSON record");
+  require(output.find(marker, marker_pos + 1) == std::string::npos,
+          "telemetry-enabled PathFinder must emit exactly one JSON record");
+  const std::size_t preceding_newline = output.rfind('\n', marker_pos);
+  const std::size_t line_begin =
+      preceding_newline == std::string::npos ? 0 : preceding_newline + 1;
+  const std::size_t following_newline = output.find('\n', marker_pos);
+  const std::size_t line_end = following_newline == std::string::npos
+                                   ? output.size()
+                                   : following_newline;
+  const std::string json = output.substr(line_begin, line_end - line_begin);
+  require(!json.empty() && json.front() == '{' && json.back() == '}',
+          "PathFinder telemetry must occupy one complete JSON line");
+  return json;
 }
 
 void add_default_node_metadata(routing::RoutingMetadata& metadata) {
@@ -340,6 +429,23 @@ struct DetachedCompactWorkspace {
 
 }  // namespace
 
+const char* delta_stepping_execution_path_name(
+    DeltaSteppingCsrExecutionPath path) noexcept {
+  switch (path) {
+    case DeltaSteppingCsrExecutionPath::kNotRun:
+      return "not_run";
+    case DeltaSteppingCsrExecutionPath::kExactUnit:
+      return "exact_unit";
+    case DeltaSteppingCsrExecutionPath::kCompactGeneric:
+      return "compact_generic";
+    case DeltaSteppingCsrExecutionPath::kLegacyGeneric:
+      return "legacy_generic";
+    case DeltaSteppingCsrExecutionPath::kGenericDistancesOnly:
+      return "generic_distances_only";
+  }
+  return "unknown";
+}
+
 struct BellmanFord10CsrGraph::Impl {
   explicit Impl(const HostCsrF32& adjacency) : graph(adjacency) {}
 
@@ -476,6 +582,7 @@ DeltaSteppingCsrGraph& DeltaSteppingCsrGraph::operator=(
 struct DeltaSteppingCsrWorkspace::Impl {
   HostCsrF32 graph;
   std::vector<float> base_values;
+  bool has_vertex_costs = false;
 };
 
 DeltaSteppingCsrWorkspace::DeltaSteppingCsrWorkspace(const HostCsrF32& adjacency,
@@ -516,6 +623,7 @@ void DeltaSteppingCsrWorkspace::update_vertex_costs(
     const std::vector<float>& vertex_costs,
     hipStream_t stream) {
   (void)stream;
+  impl_->has_vertex_costs = true;
   impl_->graph.values.resize(impl_->base_values.size());
   for (int src = 0; src < impl_->graph.rows; ++src) {
     for (minplus_sparse::Offset edge = impl_->graph.rowptr[static_cast<std::size_t>(src)];
@@ -537,14 +645,27 @@ DeltaSteppingCsrResult DeltaSteppingCsrWorkspace::run(
     hipStream_t stream,
     DeltaSteppingCsrProgressCallback progress_callback,
     void* progress_user_data) {
-  return delta_stepping_minplus_hip_csr(impl_->graph,
-                                        sources,
-                                        target,
-                                        delta,
-                                        max_iters,
-                                        stream,
-                                        progress_callback,
-                                        progress_user_data);
+  DeltaSteppingCsrResult result = delta_stepping_minplus_hip_csr(
+      impl_->graph,
+      sources,
+      target,
+      delta,
+      max_iters,
+      stream,
+      progress_callback,
+      progress_user_data);
+  if (active_telemetry_ != nullptr) {
+    populate_stub_delta_telemetry(
+        *active_telemetry_,
+        DeltaSteppingCsrExecutionPath::kLegacyGeneric,
+        impl_->graph,
+        sources,
+        delta,
+        execution_mode_ == DeltaSteppingCsrExecutionMode::kForceGeneric,
+        parent_mode_ == DeltaSteppingCsrParentMode::kForceLegacy,
+        impl_->has_vertex_costs);
+  }
+  return result;
 }
 
 DeltaSteppingCsrResult DeltaSteppingCsrWorkspace::run(
@@ -555,6 +676,12 @@ DeltaSteppingCsrResult DeltaSteppingCsrWorkspace::run(
     hipStream_t stream,
     DeltaSteppingCsrProgressCallback progress_callback,
     void* progress_user_data) {
+  if (execution_mode_ == DeltaSteppingCsrExecutionMode::kForceGeneric) {
+    ++g_delta_force_generic_calls;
+  }
+  if (parent_mode_ == DeltaSteppingCsrParentMode::kForceLegacy) {
+    ++g_delta_force_legacy_calls;
+  }
   DeltaSteppingCsrResult result =
       delta_stepping_minplus_hip_csr(impl_->graph,
                                      sources,
@@ -572,6 +699,30 @@ DeltaSteppingCsrResult DeltaSteppingCsrWorkspace::run(
   result.dist.clear();
   result.pred_node.clear();
   result.pred_edge.clear();
+  if (active_telemetry_ != nullptr) {
+    const bool exact_unit_path =
+        execution_mode_ == DeltaSteppingCsrExecutionMode::kAutomatic &&
+        parent_mode_ == DeltaSteppingCsrParentMode::kAutomatic &&
+        !impl_->has_vertex_costs && max_iters < 0 &&
+        progress_callback == nullptr &&
+        std::all_of(impl_->graph.values.begin(), impl_->graph.values.end(),
+                    [](float value) { return value == 1.0f; });
+    const DeltaSteppingCsrExecutionPath execution_path =
+        exact_unit_path
+            ? DeltaSteppingCsrExecutionPath::kExactUnit
+            : parent_mode_ == DeltaSteppingCsrParentMode::kAutomatic
+                  ? DeltaSteppingCsrExecutionPath::kCompactGeneric
+                  : DeltaSteppingCsrExecutionPath::kLegacyGeneric;
+    populate_stub_delta_telemetry(
+        *active_telemetry_,
+        execution_path,
+        impl_->graph,
+        sources,
+        delta,
+        execution_mode_ == DeltaSteppingCsrExecutionMode::kForceGeneric,
+        parent_mode_ == DeltaSteppingCsrParentMode::kForceLegacy,
+        impl_->has_vertex_costs);
+  }
   return result;
 }
 
@@ -792,6 +943,10 @@ int main() {
           "default delta-stepping bucket width must be one");
   require(!routing::PathfinderOptions{}.delta_auto,
           "automatic delta must remain an explicit opt-in");
+  require(!routing::PathfinderOptions{}.delta_force_generic,
+          "generic Delta forcing must remain disabled by default");
+  require(!routing::PathfinderOptions{}.delta_telemetry,
+          "Delta telemetry must remain disabled by default");
   const routing::PathfinderOptions legacy_positional_options{
       routing::SsspEngine::kDeltaStep, 2.0f, 7, true, 3, 4, 5};
   require(legacy_positional_options.max_sssp_iterations == 7 &&
@@ -800,7 +955,9 @@ int main() {
               legacy_positional_options.net_limit == 4 &&
               legacy_positional_options.parallel_net_workers == 5 &&
               !legacy_positional_options.delta_auto &&
-              legacy_positional_options.delta_multiplier == 1.0f,
+              legacy_positional_options.delta_multiplier == 1.0f &&
+              !legacy_positional_options.delta_force_generic &&
+              !legacy_positional_options.delta_telemetry,
           "new delta controls must preserve legacy aggregate field positions");
 
   HostCsrF32 delta_stats_graph;
@@ -902,6 +1059,60 @@ int main() {
   require(explicit_multiplier_rejected,
           "a multiplier with explicit delta must not be silently ignored");
 
+  for (const int invalid_control : {0, 1, 2, 3}) {
+    routing::PathfinderOptions invalid_engine_options;
+    if (invalid_control == 0) {
+      invalid_engine_options.delta_force_generic = true;
+    } else if (invalid_control == 1) {
+      invalid_engine_options.delta_force_legacy_parent = true;
+    } else if (invalid_control == 2) {
+      invalid_engine_options.delta_controls_explicit = true;
+    } else {
+      invalid_engine_options.delta_telemetry = true;
+    }
+    bool rejected = false;
+    try {
+      routing::validate_options(invalid_engine_options);
+    } catch (const std::invalid_argument&) {
+      rejected = true;
+    }
+    require(rejected,
+            "a non-Delta engine must reject Delta-specific controls");
+  }
+
+  HostCsrF32 benchmark_weights_graph = make_tree_graph();
+  routing::apply_delta_benchmark_weights(
+      benchmark_weights_graph,
+      routing::DeltaBenchmarkWeights::kAllLight,
+      2.0f,
+      0);
+  require(std::all_of(benchmark_weights_graph.values.begin(),
+                      benchmark_weights_graph.values.end(),
+                      [](float value) { return value == 0.5f; }),
+          "all-light benchmark weights must be derived from numeric delta");
+  routing::apply_delta_benchmark_weights(
+      benchmark_weights_graph,
+      routing::DeltaBenchmarkWeights::kAllHeavy,
+      2.0f,
+      0);
+  require(std::all_of(benchmark_weights_graph.values.begin(),
+                      benchmark_weights_graph.values.end(),
+                      [](float value) { return value == 8.0f; }),
+          "all-heavy benchmark weights must be derived from numeric delta");
+  routing::apply_delta_benchmark_weights(
+      benchmark_weights_graph,
+      routing::DeltaBenchmarkWeights::kMixed,
+      2.0f,
+      17);
+  const std::vector<float> first_mixed_weights = benchmark_weights_graph.values;
+  routing::apply_delta_benchmark_weights(
+      benchmark_weights_graph,
+      routing::DeltaBenchmarkWeights::kMixed,
+      2.0f,
+      17);
+  require(benchmark_weights_graph.values == first_mixed_weights,
+          "mixed benchmark weights must be reproducible for a fixed seed");
+
   const HostCsrF32 graph = make_tree_graph();
   const std::vector<float> dist = cpu_dijkstra_outgoing_csr(graph, 0);
   const std::vector<routing::PathEdge> path =
@@ -951,6 +1162,242 @@ int main() {
   const HostCsrF32 congestion_graph = make_two_net_congestion_graph();
   const routing::RoutingMetadata congestion_metadata =
       make_two_net_metadata(congestion_graph);
+
+  require(std::string(delta_stepping_execution_path_name(
+              DeltaSteppingCsrExecutionPath::kExactUnit)) == "exact_unit" &&
+              std::string(delta_stepping_execution_path_name(
+                  DeltaSteppingCsrExecutionPath::kCompactGeneric)) ==
+                  "compact_generic" &&
+              std::string(delta_stepping_execution_path_name(
+                  DeltaSteppingCsrExecutionPath::kLegacyGeneric)) ==
+                  "legacy_generic" &&
+              std::string(delta_stepping_execution_path_name(
+                  DeltaSteppingCsrExecutionPath::kGenericDistancesOnly)) ==
+                  "generic_distances_only",
+          "Delta execution paths must have stable telemetry names");
+
+  DeltaSteppingCsrWorkspace telemetry_workspace(congestion_graph, nullptr);
+  DeltaSteppingCsrTelemetry disabled_telemetry;
+  disabled_telemetry.collected = true;
+  disabled_telemetry.completed = true;
+  disabled_telemetry.execution_path =
+      DeltaSteppingCsrExecutionPath::kGenericDistancesOnly;
+  disabled_telemetry.outer_buckets_processed = 999;
+  disabled_telemetry.current_queue_high_water = 999;
+  (void)telemetry_workspace.run(std::vector<int>{0},
+                                std::vector<int>{4},
+                                2.5f,
+                                -1,
+                                nullptr,
+                                nullptr,
+                                nullptr);
+  require(disabled_telemetry.collected && disabled_telemetry.completed &&
+              disabled_telemetry.execution_path ==
+                  DeltaSteppingCsrExecutionPath::kGenericDistancesOnly &&
+              disabled_telemetry.outer_buckets_processed == 999 &&
+              disabled_telemetry.current_queue_high_water == 999,
+          "a run without RunOptions must leave unrelated telemetry disabled");
+
+  DeltaSteppingCsrTelemetry low_level_telemetry;
+  low_level_telemetry.outer_buckets_processed = 999;
+  low_level_telemetry.current_queue_high_water = 999;
+  (void)telemetry_workspace.run(
+      std::vector<int>{0},
+      std::vector<int>{4},
+      2.5f,
+      -1,
+      DeltaSteppingCsrRunOptions{&low_level_telemetry},
+      nullptr,
+      nullptr,
+      nullptr);
+  require(low_level_telemetry.collected && low_level_telemetry.completed &&
+              low_level_telemetry.execution_path ==
+                  DeltaSteppingCsrExecutionPath::kExactUnit &&
+              low_level_telemetry.resolved_delta == 2.5f &&
+              low_level_telemetry.wavefront_size == 64 &&
+              !low_level_telemetry.force_generic &&
+              !low_level_telemetry.force_legacy_parent &&
+              !low_level_telemetry.has_vertex_costs &&
+              low_level_telemetry.all_edges_light &&
+              low_level_telemetry.outer_buckets_processed == 1 &&
+              low_level_telemetry.current_queue_high_water == 19,
+          "RunOptions must collect a reset exact-unit telemetry record");
+
+  low_level_telemetry.outer_buckets_processed = 999;
+  low_level_telemetry.pending_queue_high_water = 999;
+  (void)telemetry_workspace.run(
+      std::vector<int>{1},
+      std::vector<int>{5},
+      2.5f,
+      -1,
+      DeltaSteppingCsrRunOptions{&low_level_telemetry},
+      nullptr,
+      nullptr,
+      nullptr);
+  require(low_level_telemetry.outer_buckets_processed == 2 &&
+              low_level_telemetry.pending_queue_high_water == 40,
+          "reused RunOptions telemetry must reset instead of accumulating");
+
+  (void)telemetry_workspace.run(
+      std::vector<int>{0},
+      4,
+      2.5f,
+      -1,
+      DeltaSteppingCsrRunOptions{&low_level_telemetry},
+      nullptr,
+      nullptr,
+      nullptr);
+  require(low_level_telemetry.execution_path ==
+              DeltaSteppingCsrExecutionPath::kLegacyGeneric,
+          "full-distance workspace telemetry must report the legacy path");
+
+  telemetry_workspace.update_vertex_costs(
+      std::vector<float>(static_cast<std::size_t>(congestion_graph.rows),
+                         1.0f),
+      nullptr);
+  (void)telemetry_workspace.run(
+      std::vector<int>{0},
+      std::vector<int>{4},
+      2.5f,
+      -1,
+      DeltaSteppingCsrRunOptions{&low_level_telemetry},
+      nullptr,
+      nullptr,
+      nullptr);
+  require(low_level_telemetry.execution_path ==
+              DeltaSteppingCsrExecutionPath::kCompactGeneric &&
+              low_level_telemetry.has_vertex_costs &&
+              !low_level_telemetry.all_edges_light,
+          "vertex costs must be represented in generic-path telemetry");
+
+  DeltaSteppingCsrWorkspace forced_compact_workspace(
+      congestion_graph,
+      nullptr,
+      DeltaSteppingCsrWorkspaceOptions{
+          DeltaSteppingCsrParentMode::kAutomatic,
+          DeltaSteppingCsrExecutionMode::kForceGeneric});
+  (void)forced_compact_workspace.run(
+      std::vector<int>{0},
+      std::vector<int>{4},
+      2.5f,
+      -1,
+      DeltaSteppingCsrRunOptions{&low_level_telemetry},
+      nullptr,
+      nullptr,
+      nullptr);
+  require(low_level_telemetry.execution_path ==
+              DeltaSteppingCsrExecutionPath::kCompactGeneric &&
+              low_level_telemetry.force_generic &&
+              !low_level_telemetry.force_legacy_parent,
+          "force-generic must be visible in compact telemetry");
+
+  DeltaSteppingCsrWorkspace forced_legacy_workspace(
+      congestion_graph,
+      nullptr,
+      DeltaSteppingCsrWorkspaceOptions{
+          DeltaSteppingCsrParentMode::kForceLegacy,
+          DeltaSteppingCsrExecutionMode::kForceGeneric});
+  (void)forced_legacy_workspace.run(
+      std::vector<int>{0},
+      std::vector<int>{4},
+      2.5f,
+      -1,
+      DeltaSteppingCsrRunOptions{&low_level_telemetry},
+      nullptr,
+      nullptr,
+      nullptr);
+  require(low_level_telemetry.execution_path ==
+              DeltaSteppingCsrExecutionPath::kLegacyGeneric &&
+              low_level_telemetry.force_generic &&
+              low_level_telemetry.force_legacy_parent,
+          "forced legacy parent selection must be visible in telemetry");
+
+  const std::array<DeltaSteppingCsrExecutionPath, 4> aggregate_paths = {
+      DeltaSteppingCsrExecutionPath::kExactUnit,
+      DeltaSteppingCsrExecutionPath::kCompactGeneric,
+      DeltaSteppingCsrExecutionPath::kLegacyGeneric,
+      DeltaSteppingCsrExecutionPath::kGenericDistancesOnly};
+  std::vector<DeltaSteppingCsrTelemetry> aggregate_records;
+  for (std::size_t i = 0; i < aggregate_paths.size(); ++i) {
+    DeltaSteppingCsrTelemetry record;
+    populate_stub_delta_telemetry(record,
+                                  aggregate_paths[i],
+                                  congestion_graph,
+                                  std::vector<int>{static_cast<int>(i)},
+                                  2.5f,
+                                  false,
+                                  false,
+                                  false);
+    aggregate_records.push_back(record);
+  }
+  aggregate_records[1].completed = false;
+  DeltaSteppingCsrTelemetry ignored_record;
+  ignored_record.outer_buckets_processed = 100000;
+  ignored_record.current_queue_high_water = 100000;
+  aggregate_records.push_back(ignored_record);
+
+  const routing::DeltaTelemetryTotals telemetry_totals =
+      routing::aggregate_delta_telemetry(aggregate_records);
+  require(telemetry_totals.queries == 4 &&
+              telemetry_totals.completed_queries == 3 &&
+              telemetry_totals.path_counts ==
+                  std::array<std::uint64_t, 4>{1, 1, 1, 1},
+          "telemetry aggregation must count collected, completed, and path records");
+  const DeltaSteppingCsrTelemetry& telemetry_sums = telemetry_totals.sums;
+  require(telemetry_sums.outer_buckets_processed == 10 &&
+              telemetry_sums.light_relaxation_rounds == 20 &&
+              telemetry_sums.heavy_edge_phases == 30 &&
+              telemetry_sums.frontier_entries_processed == 40 &&
+              telemetry_sums.active_vertices_processed == 50 &&
+              telemetry_sums.stale_frontier_entries == 60 &&
+              telemetry_sums.light_edge_visits == 70 &&
+              telemetry_sums.heavy_edge_visits == 80 &&
+              telemetry_sums.distance_atomic_attempts == 90 &&
+              telemetry_sums.successful_distance_relaxations == 100 &&
+              telemetry_sums.distance_cas_retries == 110 &&
+              telemetry_sums.current_queue_insertions == 120 &&
+              telemetry_sums.pending_queue_insertions == 130 &&
+              telemetry_sums.heavy_queue_insertions == 140 &&
+              telemetry_sums.bucket_insertions == 150 &&
+              telemetry_sums.pending_entry_examinations == 160 &&
+              telemetry_sums.stale_pending_entry_examinations == 170 &&
+              telemetry_sums.reached_vertices == 180 &&
+              telemetry_sums.controller_round_trips == 220 &&
+              telemetry_sums.compact_parent_fallback_events == 230,
+          "telemetry aggregation must sum every counter and ignore empty slots");
+  require(telemetry_totals.current_queue_high_water == 76 &&
+              telemetry_totals.pending_queue_high_water == 80 &&
+              telemetry_totals.heavy_queue_high_water == 84,
+          "telemetry aggregation must take maxima instead of summing peaks");
+
+  routing::PathfinderOptions aggregate_json_options;
+  aggregate_json_options.sssp_engine = routing::SsspEngine::kDeltaStep;
+  aggregate_json_options.delta_auto = true;
+  aggregate_json_options.delta_multiplier = 0.25f;
+  aggregate_json_options.delta_force_generic = true;
+  aggregate_json_options.delta_force_legacy_parent = true;
+  const std::string aggregate_json = routing::delta_telemetry_aggregate_json(
+      aggregate_records, aggregate_json_options, 2.5f, 64, 3);
+  require(aggregate_json.find('\n') == std::string::npos &&
+              aggregate_json.find("\"queries\":4") != std::string::npos &&
+              aggregate_json.find("\"completed_queries\":3") !=
+                  std::string::npos &&
+              aggregate_json.find(
+                  "\"execution_paths\":{\"exact_unit\":1,"
+                  "\"compact_generic\":1,\"legacy_generic\":1,"
+                  "\"generic_distances_only\":1}") != std::string::npos &&
+              aggregate_json.find(
+                  "\"maxima\":{\"current_queue_high_water\":76,"
+                  "\"pending_queue_high_water\":80,"
+                  "\"heavy_queue_high_water\":84}") != std::string::npos,
+          "aggregate telemetry JSON must preserve stable counts and maxima");
+  const std::filesystem::path aggregate_telemetry_path =
+      "/tmp/pathfinder_delta_telemetry_aggregate.json";
+  std::ofstream aggregate_telemetry_file(aggregate_telemetry_path);
+  aggregate_telemetry_file << aggregate_json << '\n';
+  require(static_cast<bool>(aggregate_telemetry_file),
+          "aggregate telemetry JSON fixture must be writable");
+
   routing::PathfinderOptions congestion_options;
   congestion_options.delta = 1.0f;
   routing::PathfinderResult congestion_result =
@@ -1046,6 +1493,72 @@ int main() {
                           explicit_deltas.end(),
                           [](float value) { return value == 2.5f; }),
           "an explicit numeric delta must reach every worker unchanged");
+
+  routing::PathfinderOptions parallel_telemetry_options =
+      parallel_delta_options;
+  parallel_telemetry_options.delta_telemetry = true;
+  routing::PathfinderResult parallel_telemetry_result;
+  std::string parallel_telemetry_stdout;
+  {
+    ScopedCoutCapture capture;
+    parallel_telemetry_result =
+        routing::run_pathfinder(congestion_graph,
+                                congestion_metadata,
+                                parallel_telemetry_options,
+                                nullptr);
+    parallel_telemetry_stdout = capture.str();
+  }
+  require(parallel_telemetry_result.routed,
+          "telemetry collection must not change parallel routing results");
+  const std::string parallel_telemetry_json =
+      single_delta_telemetry_json_line(parallel_telemetry_stdout);
+  require(parallel_telemetry_json.find("\"queries\":2") !=
+                  std::string::npos &&
+              parallel_telemetry_json.find("\"completed_queries\":2") !=
+                  std::string::npos &&
+              parallel_telemetry_json.find("\"resolved_delta\":2.5") !=
+                  std::string::npos &&
+              parallel_telemetry_json.find("\"wavefront_size\":64") !=
+                  std::string::npos &&
+              parallel_telemetry_json.find("\"parallel_workers\":2") !=
+                  std::string::npos &&
+              parallel_telemetry_json.find(
+                  "\"execution_paths\":{\"exact_unit\":2,"
+                  "\"compact_generic\":0,\"legacy_generic\":0,"
+                  "\"generic_distances_only\":0}") != std::string::npos &&
+              parallel_telemetry_json.find(
+                  "\"outer_buckets_processed\":3") != std::string::npos &&
+              parallel_telemetry_json.find(
+                  "\"controller_round_trips\":66") != std::string::npos &&
+              parallel_telemetry_json.find(
+                  "\"maxima\":{\"current_queue_high_water\":38,"
+                  "\"pending_queue_high_water\":40,"
+                  "\"heavy_queue_high_water\":42}") != std::string::npos,
+          "parallel telemetry must aggregate isolated per-net slots once");
+  const std::filesystem::path parallel_telemetry_path =
+      "/tmp/pathfinder_delta_telemetry.json";
+  std::ofstream parallel_telemetry_file(parallel_telemetry_path);
+  parallel_telemetry_file << parallel_telemetry_json << '\n';
+  require(static_cast<bool>(parallel_telemetry_file),
+          "PathFinder telemetry JSON fixture must be writable");
+
+  routing::PathfinderOptions forced_generic_options =
+      parallel_delta_options;
+  forced_generic_options.delta_force_generic = true;
+  forced_generic_options.delta_force_legacy_parent = true;
+  g_delta_force_generic_calls = 0;
+  g_delta_force_legacy_calls = 0;
+  const routing::PathfinderResult forced_generic_result =
+      routing::run_pathfinder(congestion_graph,
+                              congestion_metadata,
+                              forced_generic_options,
+                              nullptr);
+  require(forced_generic_result.routed,
+          "forced generic/legacy Delta routing must preserve results");
+  require(g_delta_force_generic_calls == 2,
+          "force-generic must reach every parallel Delta worker");
+  require(g_delta_force_legacy_calls == 2,
+          "force-legacy must reach every parallel Delta worker");
 
   routing::PathfinderOptions graph_aware_delta_options =
       parallel_delta_options;

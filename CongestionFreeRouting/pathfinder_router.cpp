@@ -186,9 +186,15 @@ void print_usage(const char* program) {
       << "  --sssp-engine <unit-bfs|delta-step|bellman-ford>\n"
       << "                                 Forwarded to pathfinder. Default: unit-bfs\n"
       << "  --use-delta-step               Forwarded to pathfinder for comparison.\n"
+      << "  --delta-force-generic          Force generic Delta-Stepping even for exact-unit weights.\n"
+      << "  --delta-telemetry              Forward opt-in Delta-Stepping runtime telemetry.\n"
       << "  --delta-force-legacy-parent    Forwarded for generic Delta parent-path A/B comparison.\n"
       << "  --delta <float|auto>           Forwarded to pathfinder.\n"
       << "  --delta-multiplier <float>     Forwarded for an automatic-delta sweep.\n"
+      << "  --delta-benchmark-weights <unit|all-light|all-heavy|mixed>\n"
+      << "                                 Forward a reproducible benchmark weight family.\n"
+      << "  --delta-benchmark-weight-seed <nonnegative-int>\n"
+      << "                                 Forward a seed; valid only with mixed weights.\n"
       << "  --max-sssp-iters <int>         Forwarded to pathfinder.\n"
       << "  --net-limit <count>            Forwarded to pathfinder.\n"
       << "  --parallel-net-workers <count> Forwarded to pathfinder; 0 enables engine-dependent auto-selection.\n"
@@ -221,6 +227,9 @@ Options parse_args(int argc, char** argv) {
   options.routes_to_phys = env_or_default("ROUTES_TO_PHYS", "./routes_to_phys");
   options.pathfinder_profile_command =
       env_or_default("PATHFINDER_PROFILE_COMMAND", "");
+  std::string delta_benchmark_weights;
+  bool delta_benchmark_weight_seed_provided = false;
+  bool delta_telemetry = false;
 
   for (int i = 3; i < argc; ++i) {
     const std::string option = argv[i];
@@ -249,8 +258,24 @@ Options parse_args(int argc, char** argv) {
     } else if (option == "--strict-routing") {
       options.allow_unrouted = false;
     } else if (option == "--use-delta-step" ||
+               option == "--delta-force-generic" ||
                option == "--delta-force-legacy-parent") {
       options.pathfinder_args.push_back(option);
+    } else if (option == "--delta-telemetry") {
+      if (!delta_telemetry) {
+        options.pathfinder_args.push_back(option);
+        delta_telemetry = true;
+      }
+    } else if (option == "--delta-benchmark-weights") {
+      delta_benchmark_weights = require_value("--delta-benchmark-weights");
+      options.pathfinder_args.push_back(option);
+      options.pathfinder_args.push_back(delta_benchmark_weights);
+    } else if (option == "--delta-benchmark-weight-seed") {
+      const std::string seed =
+          require_value("--delta-benchmark-weight-seed");
+      delta_benchmark_weight_seed_provided = true;
+      options.pathfinder_args.push_back(option);
+      options.pathfinder_args.push_back(seed);
     } else if (option == "--sssp-engine" ||
                option == "--delta" ||
                option == "--delta-multiplier" ||
@@ -273,6 +298,12 @@ Options parse_args(int argc, char** argv) {
   if (options.logical_netlist.empty()) {
     options.logical_netlist = infer_logical_netlist(options.input_phys);
   }
+  if (delta_benchmark_weight_seed_provided &&
+      delta_benchmark_weights != "mixed") {
+    throw std::runtime_error(
+        "--delta-benchmark-weight-seed requires "
+        "--delta-benchmark-weights mixed");
+  }
   return options;
 }
 
@@ -284,6 +315,7 @@ void require_file(const std::filesystem::path& path, const char* label) {
 
 }  // namespace
 
+#ifndef PATHFINDER_ROUTER_NO_MAIN
 int main(int argc, char** argv) {
   std::filesystem::path work_dir;
   bool cleanup_work_dir = false;
@@ -362,3 +394,4 @@ int main(int argc, char** argv) {
     return 1;
   }
 }
+#endif

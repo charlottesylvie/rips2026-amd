@@ -61,6 +61,7 @@ Forward wrapper or PathFinder tuning options through `PATHFINDER_ARGS`:
 
 ```bash
 make ROUTER=PathFinderFile BENCHMARKS="boom_med_pb" VERBOSE=1 \
+  PATHFINDER_SSSP_ENGINE=delta-step \
   PATHFINDER_ARGS="--delta 2 --max-pathfinder-iters 20 --keep-work-dir"
 ```
 
@@ -82,6 +83,27 @@ multiplier while retaining numeric widths as explicit overrides:
 make ROUTER=PathFinderFile BENCHMARKS="boom_med_pb" VERBOSE=1 \
   PATHFINDER_SSSP_ENGINE=delta-step \
   PATHFINDER_ARGS="--delta auto --delta-multiplier 0.5"
+```
+
+Use the explicit force control for an exact-unit versus generic A/B run on the
+same graph. It changes dispatch only; it does not rewrite weights or delta:
+
+```bash
+make ROUTER=PathFinderFile BENCHMARKS="boom_med_pb" VERBOSE=1 \
+  PATHFINDER_SSSP_ENGINE=delta-step \
+  PATHFINDER_ARGS="--delta 1 --delta-force-generic"
+```
+
+Synthetic weighted runs are reproducible without rebuilding the CSR. This
+example uses a fixed mixed-family seed and emits one aggregate telemetry JSON
+line after all net workers join:
+
+```bash
+make ROUTER=PathFinderFile BENCHMARKS="boom_med_pb" VERBOSE=1 \
+  PATHFINDER_SSSP_ENGINE=delta-step \
+  PATHFINDER_ARGS="--delta 2 --delta-force-generic \
+    --delta-benchmark-weights mixed --delta-benchmark-weight-seed 17 \
+    --delta-telemetry"
 ```
 
 For AMD GPU profiling through the same Makefile path, see
@@ -145,7 +167,8 @@ the generated `.csrbin`, metadata, and routes files for debugging.
 
 | Path | Purpose |
 | --- | --- |
-| `HIP_kernel/delta_stepping` | Target-aware Delta Stepping implementation used by PathFinder. |
+| `CongestionFreeRouting/delta_stepping` | Production outgoing-CSR Delta-Stepping implementation used by PathFinder. |
+| `HIP_kernel/delta_stepping` | Legacy incoming-CSR Delta-Stepping experiment; it is not used by PathFinder. |
 | `HIP_kernel/bellman_ford` | Bellman-Ford experiments and correctness tests. Result metadata has target fields, but Bellman-Ford does not currently target-early-stop like Delta Stepping. |
 | `HIP_kernel/minplus_mm` | Dense and sparse min-plus matrix multiplication experiments. |
 | `HIP_kernel/faster_GPU_algo` | Additional GPU SSSP experiments and porting attempts. |
@@ -285,21 +308,52 @@ Tuning options:
 
 | Option | Default | Meaning |
 | --- | --- | --- |
-| `--sssp-engine <unit-bfs\|delta-step>` | `unit-bfs` | Shortest-path backend. |
+| `--sssp-engine <unit-bfs\|delta-step\|bellman-ford\|bf10>` | `unit-bfs` | Shortest-path backend; `bf8`, `bf9`, and `bf10` are Bellman-Ford compatibility aliases. |
 | `--use-delta-step` | unset | Shorthand for `--sssp-engine delta-step`. |
 | `--delta <float\|auto>` | `1` | Explicit Delta-Stepping bucket width, or a graph-aware seed based on runtime wavefront size, average edge weight, and average out-degree. |
 | `--delta-multiplier <float>` | `1` | Positive multiplier for sweeping around `--delta auto`; rejected with an explicit numeric width. |
-| `--max-sssp-iters <int>` | `-1` | Delta-step bucket rounds or unit-BFS depth cap; `-1` uses the default. |
+| `--delta-force-generic` | unset | Bypass only the exact-unit Delta dispatch while preserving weights, delta, destination costs, and automatic compact-parent selection. |
+| `--delta-force-legacy-parent` | unset | Select legacy predecessor recovery for generic vector-target Delta runs; combine with force-generic for a parent-policy A/B test. |
+| `--delta-telemetry` | unset | Emit one aggregate Delta-Stepping telemetry JSON record after all net workers join. |
+| `--delta-benchmark-weights <unit\|all-light\|all-heavy\|mixed>` | unset | Deterministically replace in-memory CSR weights for a benchmark; requires an explicit numeric delta. |
+| `--delta-benchmark-weight-seed <uint>` | `0` | Seed the `mixed` family; rejected for every other family. |
+| `--max-sssp-iters <int>` | `-1` | Delta buckets, unit-BFS depth, or Bellman-Ford rounds; `-1` uses the default. |
 | `--capacity <int>` | `1` | Capacity used only for overuse diagnostics. |
 | `--net-limit <count>` | unset | Route only the first `count` requests. |
-| `--parallel-net-workers <count>` | `0` | Independent net workers; `0` auto-selects up to 8 from available GPU memory. Both engines share one immutable CSR across worker-private search state. |
+| `--parallel-net-workers <count>` | `0` | Independent net workers; `0` enables engine-dependent auto-selection. Workers share one immutable CSR across worker-private search state. |
 | `--routes-out <path>` | unset | Write routed PIP tree data as JSONL. |
 | `--max-pathfinder-iters`, `--present-factor`, `--present-multiplier`, `--history-factor`, `--route-batch-size` | ignored | Compatibility-only options accepted by the one-shot router. |
 
-The converter emits exact unit weights. For unlimited multi-target calls with
-no vertex-cost override or progress callback, the delta backend automatically
-uses its equivalent append-only unit-weight specialization; weighted and
-limited-iteration calls retain generic delta-stepping.
+Every Delta-specific control requires `--sssp-engine delta-step` or
+`--use-delta-step`; other engines reject rather than ignore it. Force-generic
+works with numeric or automatic delta. The multiplier requires automatic
+delta, benchmark weight families require an explicit numeric delta, and the
+seed is valid only with `mixed`. Force-generic and force-legacy-parent may be
+combined: the first chooses generic execution and the second chooses its
+parent representation. Force-legacy-parent by itself also makes the fixed
+exact-unit parent path ineligible, so use force-generic with automatic parents
+for a clean execution-path A/B comparison.
+
+The converter emits exact unit weights. An automatic vector-target Delta
+workspace uses its append-only exact-unit specialization only when the graph
+has at most `2^24` rows, every edge weight is exactly `1`, destination costs
+are absent, the iteration limit is negative, no progress callback is installed,
+and execution and parent modes remain automatic. `--delta-force-generic`
+bypasses only that dispatch; it does not rewrite weights, delta,
+destination-cost semantics, or compact-versus-legacy parent policy. A finite
+iteration limit or nonnull low-level callback also makes the call generic, but
+those controls change execution semantics and should not be used as benchmark
+forcing tricks.
+
+Benchmark families are applied after loading and change only the in-memory
+graph; the `.csrbin` file remains unchanged:
+
+| Family | Replacement edge weights |
+| --- | --- |
+| `unit` | Every edge is `1`. |
+| `all-light` | Every edge is `0.25 * delta`. |
+| `all-heavy` | Every edge is `4 * delta`. |
+| `mixed` | Each original CSR edge index makes a seeded deterministic choice from `{0, 0.25, 1, 4} * delta`. |
 
 Automatic delta is resolved once before worker dispatch, so every worker uses
 the same numeric width. Its graph-statistics scan is reported separately as
@@ -309,6 +363,73 @@ also accepts destination vertex costs and computes the exact mean of
 dynamic vertex-cost state and therefore resolves from immutable edge weights.
 Low-level callers that update edge values or vertex costs must resolve a new
 numeric width from the updated host data before the next run.
+
+#### Delta-Stepping telemetry
+
+Telemetry is disabled by default. Disabled dispatch uses separate
+uninstrumented kernel instantiations and does not allocate, reset, or copy the
+device counter buffer. `--delta-telemetry` selects instrumented kernels and is
+intended for diagnosis, not clean wall-time measurement. After a successful
+worker join, PathFinder writes one JSON line to standard output with
+`type="delta_stepping_telemetry"` and `schema_version=1`; filter mixed logs on
+that type. `queries` counts actual collected net searches, counter fields are
+sums across searches, and queue fields under `maxima` are per-search maxima
+combined with `max`, not sums. Execution-path counts distinguish exact-unit,
+compact generic, legacy generic, and generic distances-only work.
+
+The counters measure bucket/light/heavy rounds, frontier and edge visits,
+distance atomic attempts/successes/CAS retries, logical queue insertions and
+peaks, repeated pending-token examinations, unique reached vertices,
+controller status round trips, and compact-parent fallbacks. In particular,
+pending examinations may count one retained token in multiple scheduler scans,
+edge visits are phase examinations rather than unique light/heavy edges, queue
+peaks are entries rather than bytes, and controller round trips are counted
+algorithmic status reads rather than all HIP calls. The precise field-by-field
+definitions and limitations are in
+[`CongestionFreeRouting/GPU_PROFILING.md`](CongestionFreeRouting/GPU_PROFILING.md#opt-in-algorithm-telemetry).
+
+Low-level code requests a per-invocation record by passing
+`DeltaSteppingCsrRunOptions{&telemetry}`. The workspace zero-resets the record
+before dispatch, leaves `completed=false` on an exception, and requires
+distinct records for concurrent workspaces.
+
+#### Low-level distances-only API
+
+Callers that need a complete distance vector without routes can omit all
+parent work explicitly:
+
+```cpp
+auto graph = std::make_shared<DeltaSteppingCsrGraph>(
+    adjacency, stream, DeltaSteppingCsrStorageMode::kDistancesOnly);
+DeltaSteppingCsrWorkspace workspace(graph, stream);
+DeltaSteppingCsrTelemetry telemetry;
+auto result = workspace.run_distances(
+    sources, delta, -1, DeltaSteppingCsrRunOptions{&telemetry}, stream);
+```
+
+`run_distances` is a compile-time no-parent generic specialization. Only
+`result.dist` is populated; predecessor, target, and compact-path vectors stay
+empty. Source distances remain zero, unreachable distances remain positive
+infinity, and destination costs retain the effective-weight rule
+`edge_weight(u,v) * vertex_cost(v)`. Forced legacy-parent mode is incompatible
+and rejected.
+
+The generic mutable core is approximately `40 B/V`, excluding small
+scalar/source buffers, the immutable CSR, returned host output, telemetry, and
+an optional `4 B/V` destination-cost array. This saves `8 B/V` against compact
+generic parents (`48 B/V`) or `20 B/V` against legacy generic parents
+(`60 B/V`) before variable target/path buffers. A strict `kDistancesOnly`
+graph also omits the eligible compact-parent edge-to-source map, saving
+`4 B/E` once per shared graph, and rejects every path-producing `run` overload.
+Calling `run_distances` on an ordinary path-capable workspace is valid and
+releases retained mutable path state, but that graph keeps its edge map so a
+later path run can lazily rebuild the workspace buffers. `allocation_state()`
+exposes the retained path-buffer state for tests and diagnostics.
+
+PathFinder itself requires paths and does not use `run_distances`. Host tests
+cover CLI forwarding and telemetry aggregation, and the HIP regression source
+covers the new execution/allocation contracts. That HIP suite and performance
+measurements on an AMD GPU remain unexecuted in this checkout.
 
 ### `routes_to_phys`
 
@@ -342,7 +463,7 @@ Useful wrapper options:
 | `--interchange-to-csr <path>` | Override converter executable. Env: `INTERCHANGE_TO_CSR`. |
 | `--pathfinder <path>` | Override PathFinder executable. Env: `PATHFINDER_BIN`. |
 | `--routes-to-phys <path>` | Override route reconstructor. Env: `ROUTES_TO_PHYS`. |
-| `--sssp-engine`, `--use-delta-step`, `--delta`, `--delta-multiplier`, `--max-sssp-iters`, `--parallel-net-workers`, `--capacity` | Forwarded to `pathfinder`. |
+| `--sssp-engine`, `--use-delta-step`, `--delta`, `--delta-multiplier`, `--delta-force-generic`, `--delta-force-legacy-parent`, `--delta-telemetry`, `--delta-benchmark-weights`, `--delta-benchmark-weight-seed`, `--max-sssp-iters`, `--net-limit`, `--parallel-net-workers`, `--capacity` | Forwarded to `pathfinder`. |
 | `--max-pathfinder-iters`, `--present-factor`, `--present-multiplier`, `--history-factor`, `--route-batch-size` | Compatibility-only; forwarded to `pathfinder` and ignored. |
 
 ## File Formats And Artifacts
@@ -393,10 +514,20 @@ g++ -std=c++17 -O2 -pthread \
 /tmp/pathfinder_bf10_cpu_stub_test
 ```
 
-Automatic-delta benchmark argument parsing/forwarding test:
+Delta benchmark argument parsing/forwarding test:
 
 ```bash
 python3 CongestionFreeRouting/tests/pathfinder_benchmark_args_test.py
+```
+
+C++ router forwarding test:
+
+```bash
+g++ -std=c++17 -O2 -Wall -Wextra -Wpedantic \
+  CongestionFreeRouting/tests/pathfinder_router_args_test.cpp \
+  -o /tmp/pathfinder_router_args_test
+
+/tmp/pathfinder_router_args_test
 ```
 
 Unit-BFS compact-offset and batched-level correctness test (requires an AMD HIP

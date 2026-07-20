@@ -31,7 +31,9 @@
 //   ./congestion_free_pathfinder design.csrbin design.csrbin.ifmeta.bin --net-limit 10
 
 #include <algorithm>
+#include <array>
 #include <atomic>
+#include <cerrno>
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
@@ -143,7 +145,18 @@ void validate_csr(const HostCsrF32& graph) {
 }
 
 void validate_options(const PathfinderOptions& options) {
-  if (options.sssp_engine == SsspEngine::kDeltaStep) {
+  if (options.sssp_engine != SsspEngine::kDeltaStep) {
+    if (options.delta_force_generic ||
+        options.delta_force_legacy_parent ||
+        options.delta_telemetry ||
+        options.delta_auto ||
+        options.delta_multiplier != 1.0f ||
+        options.delta_controls_explicit) {
+      throw std::invalid_argument(
+          "Delta-Stepping controls require --sssp-engine delta-step or "
+          "--use-delta-step");
+    }
+  } else {
     if (!(options.delta_multiplier > 0.0f) ||
         !std::isfinite(options.delta_multiplier)) {
       throw std::invalid_argument(
@@ -381,6 +394,51 @@ bool attach_path_if_single_parent_tree(
 }
 
 template <typename SsspWorkspace>
+auto run_sssp_with_optional_delta_telemetry(
+    SsspWorkspace& workspace,
+    const std::vector<int>& sources,
+    const std::vector<int>& targets,
+    float delta,
+    int max_iterations,
+    hipStream_t stream,
+    DeltaSteppingCsrTelemetry*) {
+  return workspace.run(sources,
+                       targets,
+                       delta,
+                       max_iterations,
+                       stream,
+                       nullptr,
+                       nullptr);
+}
+
+DeltaSteppingCsrResult run_sssp_with_optional_delta_telemetry(
+    DeltaSteppingCsrWorkspace& workspace,
+    const std::vector<int>& sources,
+    const std::vector<int>& targets,
+    float delta,
+    int max_iterations,
+    hipStream_t stream,
+    DeltaSteppingCsrTelemetry* telemetry) {
+  if (telemetry == nullptr) {
+    return workspace.run(sources,
+                         targets,
+                         delta,
+                         max_iterations,
+                         stream,
+                         nullptr,
+                         nullptr);
+  }
+  return workspace.run(sources,
+                       targets,
+                       delta,
+                       max_iterations,
+                       DeltaSteppingCsrRunOptions{telemetry},
+                       stream,
+                       nullptr,
+                       nullptr);
+}
+
+template <typename SsspWorkspace>
 RoutedNet route_net(const HostCsrF32& graph,
                     SsspWorkspace& workspace,
                     const RouteRequest& request,
@@ -389,7 +447,8 @@ RoutedNet route_net(const HostCsrF32& graph,
                     std::vector<std::uint32_t>& parent_seen,
                     std::uint32_t tree_stamp,
                     const PathfinderOptions& options,
-                    hipStream_t stream) {
+                    hipStream_t stream,
+                    DeltaSteppingCsrTelemetry* delta_telemetry = nullptr) {
   PATHFINDER_PROFILE_RANGE("pathfinder.route_net");
   RoutedNet net;
   net.net_string = request.net_string;
@@ -440,13 +499,14 @@ RoutedNet route_net(const HostCsrF32& graph,
   if (!targets.empty()) {
     auto sssp = [&]() {
       PATHFINDER_PROFILE_RANGE("pathfinder.sssp");
-      return workspace.run(source_candidates,
-                           targets,
-                           options.delta,
-                           options.max_sssp_iterations,
-                           stream,
-                           nullptr,
-                           nullptr);
+      return run_sssp_with_optional_delta_telemetry(
+          workspace,
+          source_candidates,
+          targets,
+          options.delta,
+          options.max_sssp_iterations,
+          stream,
+          delta_telemetry);
     }();
 
     const bool has_compact_target_paths =
@@ -890,7 +950,14 @@ void route_all_nets_with_workspace(const HostCsrF32& base_graph,
                                    std::size_t route_request_count,
                                    std::size_t progress_interval,
                                    std::vector<RoutedNet>& nets,
-                                   WorkspaceFactory workspace_factory) {
+                                   WorkspaceFactory workspace_factory,
+                                   std::vector<DeltaSteppingCsrTelemetry>*
+                                       delta_telemetry_records = nullptr) {
+  if (delta_telemetry_records != nullptr &&
+      delta_telemetry_records->size() != route_request_count) {
+    throw std::invalid_argument(
+        "Delta telemetry record count must match route request count");
+  }
   std::size_t worker_count =
       std::min<std::size_t>(options.parallel_net_workers,
                             std::max<std::size_t>(1, route_request_count));
@@ -919,7 +986,10 @@ void route_all_nets_with_workspace(const HostCsrF32& base_graph,
                       route_parent_seen,
                       tree_stamp,
                       options,
-                      stream);
+                      stream,
+                      delta_telemetry_records == nullptr
+                          ? nullptr
+                          : &(*delta_telemetry_records)[net_index]);
       } catch (const std::exception& error) {
         throw std::runtime_error(
             "route request " + std::to_string(net_index) + " failed: " +
@@ -992,7 +1062,10 @@ void route_all_nets_with_workspace(const HostCsrF32& base_graph,
                         route_parent_seen,
                         tree_stamp,
                         options,
-                        local_stream);
+                        local_stream,
+                        delta_telemetry_records == nullptr
+                            ? nullptr
+                            : &(*delta_telemetry_records)[net_index]);
         } catch (const std::exception& error) {
           throw std::runtime_error(
               "route request " + std::to_string(net_index) + " failed: " +
@@ -1040,6 +1113,157 @@ void route_all_nets_with_workspace(const HostCsrF32& base_graph,
   }
 }
 
+struct DeltaTelemetryTotals {
+  std::uint64_t queries = 0;
+  std::uint64_t completed_queries = 0;
+  std::array<std::uint64_t, 4> path_counts{};
+  DeltaSteppingCsrTelemetry sums;
+  std::uint64_t current_queue_high_water = 0;
+  std::uint64_t pending_queue_high_water = 0;
+  std::uint64_t heavy_queue_high_water = 0;
+};
+
+DeltaTelemetryTotals aggregate_delta_telemetry(
+    const std::vector<DeltaSteppingCsrTelemetry>& records) {
+  DeltaTelemetryTotals totals;
+  for (const DeltaSteppingCsrTelemetry& record : records) {
+    if (!record.collected) continue;
+    ++totals.queries;
+    if (record.completed) ++totals.completed_queries;
+    switch (record.execution_path) {
+      case DeltaSteppingCsrExecutionPath::kExactUnit:
+        ++totals.path_counts[0];
+        break;
+      case DeltaSteppingCsrExecutionPath::kCompactGeneric:
+        ++totals.path_counts[1];
+        break;
+      case DeltaSteppingCsrExecutionPath::kLegacyGeneric:
+        ++totals.path_counts[2];
+        break;
+      case DeltaSteppingCsrExecutionPath::kGenericDistancesOnly:
+        ++totals.path_counts[3];
+        break;
+      case DeltaSteppingCsrExecutionPath::kNotRun:
+        break;
+    }
+    totals.sums.outer_buckets_processed +=
+        record.outer_buckets_processed;
+    totals.sums.light_relaxation_rounds +=
+        record.light_relaxation_rounds;
+    totals.sums.heavy_edge_phases += record.heavy_edge_phases;
+    totals.sums.frontier_entries_processed +=
+        record.frontier_entries_processed;
+    totals.sums.active_vertices_processed +=
+        record.active_vertices_processed;
+    totals.sums.stale_frontier_entries +=
+        record.stale_frontier_entries;
+    totals.sums.light_edge_visits += record.light_edge_visits;
+    totals.sums.heavy_edge_visits += record.heavy_edge_visits;
+    totals.sums.distance_atomic_attempts +=
+        record.distance_atomic_attempts;
+    totals.sums.successful_distance_relaxations +=
+        record.successful_distance_relaxations;
+    totals.sums.distance_cas_retries += record.distance_cas_retries;
+    totals.sums.current_queue_insertions +=
+        record.current_queue_insertions;
+    totals.sums.pending_queue_insertions +=
+        record.pending_queue_insertions;
+    totals.sums.heavy_queue_insertions +=
+        record.heavy_queue_insertions;
+    totals.sums.bucket_insertions += record.bucket_insertions;
+    totals.sums.pending_entry_examinations +=
+        record.pending_entry_examinations;
+    totals.sums.stale_pending_entry_examinations +=
+        record.stale_pending_entry_examinations;
+    totals.sums.reached_vertices += record.reached_vertices;
+    totals.sums.controller_round_trips +=
+        record.controller_round_trips;
+    totals.sums.compact_parent_fallback_events +=
+        record.compact_parent_fallback_events;
+    totals.current_queue_high_water =
+        std::max(totals.current_queue_high_water,
+                 record.current_queue_high_water);
+    totals.pending_queue_high_water =
+        std::max(totals.pending_queue_high_water,
+                 record.pending_queue_high_water);
+    totals.heavy_queue_high_water =
+        std::max(totals.heavy_queue_high_water,
+                 record.heavy_queue_high_water);
+  }
+  return totals;
+}
+
+std::string delta_telemetry_aggregate_json(
+    const std::vector<DeltaSteppingCsrTelemetry>& records,
+    const PathfinderOptions& options,
+    float resolved_delta,
+    int wavefront_size,
+    std::size_t worker_count) {
+  const DeltaTelemetryTotals totals = aggregate_delta_telemetry(records);
+  const DeltaSteppingCsrTelemetry& sums = totals.sums;
+  std::ostringstream out;
+  out.precision(std::numeric_limits<float>::max_digits10);
+  out << "{\"type\":\"delta_stepping_telemetry\""
+      << ",\"schema_version\":1"
+      << ",\"scope\":\"pathfinder_run\""
+      << ",\"queries\":" << totals.queries
+      << ",\"completed_queries\":" << totals.completed_queries
+      << ",\"resolved_delta\":" << resolved_delta
+      << ",\"wavefront_size\":" << wavefront_size
+      << ",\"parallel_workers\":" << worker_count
+      << ",\"delta_auto\":" << (options.delta_auto ? "true" : "false")
+      << ",\"delta_multiplier\":" << options.delta_multiplier
+      << ",\"force_generic\":"
+      << (options.delta_force_generic ? "true" : "false")
+      << ",\"force_legacy_parent\":"
+      << (options.delta_force_legacy_parent ? "true" : "false")
+      << ",\"execution_paths\":{"
+      << "\"exact_unit\":" << totals.path_counts[0]
+      << ",\"compact_generic\":" << totals.path_counts[1]
+      << ",\"legacy_generic\":" << totals.path_counts[2]
+      << ",\"generic_distances_only\":" << totals.path_counts[3]
+      << "},\"counters\":{"
+      << "\"outer_buckets_processed\":" << sums.outer_buckets_processed
+      << ",\"light_relaxation_rounds\":" << sums.light_relaxation_rounds
+      << ",\"heavy_edge_phases\":" << sums.heavy_edge_phases
+      << ",\"frontier_entries_processed\":"
+      << sums.frontier_entries_processed
+      << ",\"active_vertices_processed\":"
+      << sums.active_vertices_processed
+      << ",\"stale_frontier_entries\":" << sums.stale_frontier_entries
+      << ",\"light_edge_visits\":" << sums.light_edge_visits
+      << ",\"heavy_edge_visits\":" << sums.heavy_edge_visits
+      << ",\"distance_atomic_attempts\":"
+      << sums.distance_atomic_attempts
+      << ",\"successful_distance_relaxations\":"
+      << sums.successful_distance_relaxations
+      << ",\"distance_cas_retries\":" << sums.distance_cas_retries
+      << ",\"current_queue_insertions\":"
+      << sums.current_queue_insertions
+      << ",\"pending_queue_insertions\":"
+      << sums.pending_queue_insertions
+      << ",\"heavy_queue_insertions\":"
+      << sums.heavy_queue_insertions
+      << ",\"bucket_insertions\":" << sums.bucket_insertions
+      << ",\"pending_entry_examinations\":"
+      << sums.pending_entry_examinations
+      << ",\"stale_pending_entry_examinations\":"
+      << sums.stale_pending_entry_examinations
+      << ",\"reached_vertices\":" << sums.reached_vertices
+      << ",\"controller_round_trips\":"
+      << sums.controller_round_trips
+      << ",\"compact_parent_fallback_events\":"
+      << sums.compact_parent_fallback_events
+      << "},\"maxima\":{"
+      << "\"current_queue_high_water\":"
+      << totals.current_queue_high_water
+      << ",\"pending_queue_high_water\":"
+      << totals.pending_queue_high_water
+      << ",\"heavy_queue_high_water\":"
+      << totals.heavy_queue_high_water << "}}";
+  return out.str();
+}
+
 }  // namespace
 
 std::filesystem::path default_metadata_path(const std::filesystem::path& csr_path) {
@@ -1080,16 +1304,113 @@ float parse_float_arg(const char* text, const char* name) {
   return value;
 }
 
+std::uint64_t parse_u64_arg(const char* text, const char* name) {
+  if (text[0] == '-') {
+    throw std::runtime_error(std::string("invalid ") + name + ": " + text);
+  }
+  char* end = nullptr;
+  errno = 0;
+  const unsigned long long value = std::strtoull(text, &end, 10);
+  if (end == text || *end != '\0' || errno == ERANGE) {
+    throw std::runtime_error(std::string("invalid ") + name + ": " + text);
+  }
+  return static_cast<std::uint64_t>(value);
+}
+
+enum class DeltaBenchmarkWeights {
+  kOriginal,
+  kUnit,
+  kAllLight,
+  kAllHeavy,
+  kMixed,
+};
+
+DeltaBenchmarkWeights parse_delta_benchmark_weights_arg(const char* text) {
+  const std::string value(text);
+  if (value == "unit") return DeltaBenchmarkWeights::kUnit;
+  if (value == "all-light") return DeltaBenchmarkWeights::kAllLight;
+  if (value == "all-heavy") return DeltaBenchmarkWeights::kAllHeavy;
+  if (value == "mixed") return DeltaBenchmarkWeights::kMixed;
+  throw std::runtime_error(
+      "invalid delta-benchmark-weights: " + value +
+      " (expected unit, all-light, all-heavy, or mixed)");
+}
+
+const char* delta_benchmark_weights_name(DeltaBenchmarkWeights mode) {
+  switch (mode) {
+    case DeltaBenchmarkWeights::kOriginal:
+      return "original";
+    case DeltaBenchmarkWeights::kUnit:
+      return "unit";
+    case DeltaBenchmarkWeights::kAllLight:
+      return "all-light";
+    case DeltaBenchmarkWeights::kAllHeavy:
+      return "all-heavy";
+    case DeltaBenchmarkWeights::kMixed:
+      return "mixed";
+  }
+  return "unknown";
+}
+
+std::uint64_t splitmix64(std::uint64_t value) {
+  value += UINT64_C(0x9e3779b97f4a7c15);
+  value = (value ^ (value >> 30)) * UINT64_C(0xbf58476d1ce4e5b9);
+  value = (value ^ (value >> 27)) * UINT64_C(0x94d049bb133111eb);
+  return value ^ (value >> 31);
+}
+
+void apply_delta_benchmark_weights(HostCsrF32& graph,
+                                   DeltaBenchmarkWeights mode,
+                                   float delta,
+                                   std::uint64_t seed) {
+  if (mode == DeltaBenchmarkWeights::kOriginal) return;
+  if (!(delta > 0.0f) || !std::isfinite(delta)) {
+    throw std::invalid_argument(
+        "delta benchmark weights require a finite positive numeric delta");
+  }
+  const float light = delta * 0.25f;
+  const float heavy = delta * 4.0f;
+  if (!std::isfinite(light) || !std::isfinite(heavy)) {
+    throw std::invalid_argument(
+        "numeric delta is too large for the benchmark weight family");
+  }
+  for (std::size_t edge = 0; edge < graph.values.size(); ++edge) {
+    switch (mode) {
+      case DeltaBenchmarkWeights::kOriginal:
+        break;
+      case DeltaBenchmarkWeights::kUnit:
+        graph.values[edge] = 1.0f;
+        break;
+      case DeltaBenchmarkWeights::kAllLight:
+        graph.values[edge] = light;
+        break;
+      case DeltaBenchmarkWeights::kAllHeavy:
+        graph.values[edge] = heavy;
+        break;
+      case DeltaBenchmarkWeights::kMixed: {
+        constexpr float kFactors[] = {0.0f, 0.25f, 1.0f, 4.0f};
+        const std::uint64_t hash =
+            splitmix64(static_cast<std::uint64_t>(edge) ^ seed);
+        graph.values[edge] =
+            delta * kFactors[static_cast<std::size_t>(hash & 3U)];
+        break;
+      }
+    }
+  }
+}
+
 void parse_delta_arg(const char* text, PathfinderOptions* options) {
   if (options == nullptr) {
     throw std::invalid_argument("delta option destination must not be null");
   }
   if (std::string(text) == "auto") {
     options->delta_auto = true;
+    options->delta_controls_explicit = true;
     return;
   }
   options->delta = parse_float_arg(text, "delta");
   options->delta_auto = false;
+  options->delta_controls_explicit = true;
 }
 
 SsspEngine parse_sssp_engine_arg(const char* text) {
@@ -1131,7 +1452,13 @@ void print_usage(const char* program) {
       << "  --delta <float|auto>            Delta-stepping bucket width. Default: 1\n"
       << "  --delta-multiplier <float>      Positive sweep multiplier for --delta auto. Default: 1\n"
       << "  --max-sssp-iters <int>          Delta rounds, BFS depth, or Bellman-Ford rounds; -1 for default.\n"
+      << "  --delta-force-generic           Bypass exact-unit specialization; retain weights and delta.\n"
       << "  --delta-force-legacy-parent     Force generic Delta predecessor recovery for A/B comparison.\n"
+      << "  --delta-telemetry               Emit one aggregate Delta-Stepping telemetry JSON record.\n"
+      << "  --delta-benchmark-weights <unit|all-light|all-heavy|mixed>\n"
+      << "                                  Replace CSR weights deterministically for numeric-delta benchmarks.\n"
+      << "  --delta-benchmark-weight-seed <uint>\n"
+      << "                                  Seed for the mixed benchmark family. Default: 0\n"
       << "  --capacity <int>                Capacity used only for overuse diagnostics. Default: 1\n"
       << "  --net-limit <count>             Route only the first count requests.\n"
       << "  --parallel-net-workers <count>  Independent net workers. Default: 0 (engine-dependent auto).\n"
@@ -1426,9 +1753,12 @@ PathfinderResult run_pathfinder(const HostCsrF32& base_graph,
   int automatic_delta_wavefront_size = 0;
   float resolved_automatic_delta = options.delta;
   if (options.sssp_engine == SsspEngine::kDeltaStep &&
+      (options.delta_auto || options.delta_telemetry)) {
+    automatic_delta_wavefront_size = current_device_wavefront_size();
+  }
+  if (options.sssp_engine == SsspEngine::kDeltaStep &&
       options.delta_auto) {
     PATHFINDER_PROFILE_RANGE("pathfinder.delta_auto_stats");
-    automatic_delta_wavefront_size = current_device_wavefront_size();
     // The resolver performs the same complete CSR validation while it gathers
     // the weight statistics. Avoid a second O(V + E) validation pass on large
     // device graphs.
@@ -1507,6 +1837,8 @@ PathfinderResult run_pathfinder(const HostCsrF32& base_graph,
           std::make_shared<DeltaSteppingCsrGraph>(base_graph, stream);
       if (delta_options.parallel_net_workers == 0) {
         const bool uses_unit_specialization =
+            !delta_options.delta_force_generic &&
+            !delta_options.delta_force_legacy_parent &&
             delta_options.max_sssp_iterations < 0 &&
             base_graph.rows <=
                 (static_cast<minplus_sparse::Offset>(1) <<
@@ -1521,13 +1853,25 @@ PathfinderResult run_pathfinder(const HostCsrF32& base_graph,
                   << delta_options.parallel_net_workers
                   << " delta-step worker(s)\n";
       }
-      const DeltaSteppingCsrParentMode parent_mode =
+      const DeltaSteppingCsrWorkspaceOptions workspace_options{
           delta_options.delta_force_legacy_parent
               ? DeltaSteppingCsrParentMode::kForceLegacy
-              : DeltaSteppingCsrParentMode::kAutomatic;
-      if (parent_mode == DeltaSteppingCsrParentMode::kForceLegacy) {
+              : DeltaSteppingCsrParentMode::kAutomatic,
+          delta_options.delta_force_generic
+              ? DeltaSteppingCsrExecutionMode::kForceGeneric
+              : DeltaSteppingCsrExecutionMode::kAutomatic};
+      if (workspace_options.execution_mode ==
+          DeltaSteppingCsrExecutionMode::kForceGeneric) {
+        std::cout << "[pathfinder] selected forced generic delta execution\n";
+      }
+      if (workspace_options.parent_mode ==
+          DeltaSteppingCsrParentMode::kForceLegacy) {
         std::cout << "[pathfinder] selected forced legacy parent mode for "
                      "generic vector-target delta runs\n";
+      }
+      std::vector<DeltaSteppingCsrTelemetry> delta_telemetry_records;
+      if (delta_options.delta_telemetry) {
+        delta_telemetry_records.resize(route_request_count);
       }
       route_all_nets_with_workspace(
           base_graph,
@@ -1537,10 +1881,26 @@ PathfinderResult run_pathfinder(const HostCsrF32& base_graph,
           route_request_count,
           progress_interval,
           result.nets,
-          [shared_graph, parent_mode](hipStream_t worker_stream) {
+          [shared_graph, workspace_options](hipStream_t worker_stream) {
             return DeltaSteppingCsrWorkspace(shared_graph, worker_stream,
-                                             parent_mode);
-          });
+                                             workspace_options);
+          },
+          delta_options.delta_telemetry ? &delta_telemetry_records : nullptr);
+      if (delta_options.delta_telemetry) {
+        const std::size_t actual_worker_count =
+            stream != nullptr
+                ? 1
+                : std::min<std::size_t>(
+                      delta_options.parallel_net_workers,
+                      std::max<std::size_t>(1, route_request_count));
+        std::cout << delta_telemetry_aggregate_json(
+                         delta_telemetry_records,
+                         delta_options,
+                         delta_options.delta,
+                         automatic_delta_wavefront_size,
+                         actual_worker_count)
+                  << '\n';
+      }
       break;
     }
     case SsspEngine::kBellmanFord: {
@@ -1734,6 +2094,13 @@ int main(int argc, char** argv) {
     std::filesystem::path routes_out_path;
     routing::PathfinderOptions options;
     bool allow_unrouted_routes = false;
+    bool sssp_engine_control_seen = false;
+    bool delta_option_seen = false;
+    bool delta_benchmark_weights_seen = false;
+    bool delta_benchmark_weight_seed_seen = false;
+    routing::DeltaBenchmarkWeights delta_benchmark_weights =
+        routing::DeltaBenchmarkWeights::kOriginal;
+    std::uint64_t delta_benchmark_weight_seed = 0;
 
     int arg = 2;
     if (arg < argc && std::string(argv[arg]).rfind("--", 0) != 0) {
@@ -1756,15 +2123,27 @@ int main(int argc, char** argv) {
         return 0;
       }
       if (option == "--sssp-engine") {
+        if (sssp_engine_control_seen) {
+          throw std::runtime_error(
+              "--sssp-engine and --use-delta-step are mutually exclusive");
+        }
+        sssp_engine_control_seen = true;
         options.sssp_engine =
             routing::parse_sssp_engine_arg(require_value("--sssp-engine"));
       } else if (option == "--use-delta-step") {
+        if (sssp_engine_control_seen) {
+          throw std::runtime_error(
+              "--sssp-engine and --use-delta-step are mutually exclusive");
+        }
+        sssp_engine_control_seen = true;
         options.sssp_engine = routing::SsspEngine::kDeltaStep;
       } else if (option == "--delta") {
         routing::parse_delta_arg(require_value("--delta"), &options);
+        delta_option_seen = true;
       } else if (option == "--delta-multiplier") {
         options.delta_multiplier = routing::parse_float_arg(
             require_value("--delta-multiplier"), "delta-multiplier");
+        options.delta_controls_explicit = true;
       } else if (option == "--max-pathfinder-iters") {
         (void)routing::parse_int_arg(require_value("--max-pathfinder-iters"),
                                      "max-pathfinder-iters");
@@ -1773,6 +2152,20 @@ int main(int argc, char** argv) {
             routing::parse_int_arg(require_value("--max-sssp-iters"), "max-sssp-iters");
       } else if (option == "--delta-force-legacy-parent") {
         options.delta_force_legacy_parent = true;
+      } else if (option == "--delta-force-generic") {
+        options.delta_force_generic = true;
+      } else if (option == "--delta-telemetry") {
+        options.delta_telemetry = true;
+      } else if (option == "--delta-benchmark-weights") {
+        delta_benchmark_weights =
+            routing::parse_delta_benchmark_weights_arg(
+                require_value("--delta-benchmark-weights"));
+        delta_benchmark_weights_seen = true;
+      } else if (option == "--delta-benchmark-weight-seed") {
+        delta_benchmark_weight_seed = routing::parse_u64_arg(
+            require_value("--delta-benchmark-weight-seed"),
+            "delta-benchmark-weight-seed");
+        delta_benchmark_weight_seed_seen = true;
       } else if (option == "--capacity") {
         options.capacity = routing::parse_int_arg(require_value("--capacity"), "capacity");
       } else if (option == "--present-factor") {
@@ -1801,10 +2194,42 @@ int main(int argc, char** argv) {
       }
     }
 
+    if (delta_benchmark_weights_seen) {
+      if (options.sssp_engine != routing::SsspEngine::kDeltaStep) {
+        throw std::runtime_error(
+            "--delta-benchmark-weights requires --sssp-engine delta-step "
+            "or --use-delta-step");
+      }
+      if (!delta_option_seen || options.delta_auto) {
+        throw std::runtime_error(
+            "--delta-benchmark-weights requires an explicit numeric --delta");
+      }
+    }
+    if (delta_benchmark_weight_seed_seen &&
+        delta_benchmark_weights !=
+            routing::DeltaBenchmarkWeights::kMixed) {
+      throw std::runtime_error(
+          "--delta-benchmark-weight-seed requires "
+          "--delta-benchmark-weights mixed");
+    }
+    routing::validate_options(options);
+
     HostCsrF32 graph = [&]() {
       PATHFINDER_PROFILE_RANGE("pathfinder.load_csr");
       return routing::load_csrbin(csr_path);
     }();
+    if (delta_benchmark_weights_seen) {
+      routing::apply_delta_benchmark_weights(
+          graph,
+          delta_benchmark_weights,
+          options.delta,
+          delta_benchmark_weight_seed);
+      std::cout << "[pathfinder] applied deterministic delta benchmark "
+                << "weights="
+                << routing::delta_benchmark_weights_name(
+                       delta_benchmark_weights)
+                << " seed=" << delta_benchmark_weight_seed << "\n";
+    }
 
     routing::RoutingMetadata metadata = [&]() {
       PATHFINDER_PROFILE_RANGE("pathfinder.load_metadata");

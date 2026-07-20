@@ -103,6 +103,12 @@ struct PathfinderOptions {
   // option field. A numeric delta remains an explicit override.
   bool delta_auto = false;
   float delta_multiplier = 1.0f;
+  // Appended controls preserve positional aggregate compatibility.
+  bool delta_force_generic = false;
+  // Set by CLI/configuration adapters when --delta or --delta-multiplier was
+  // explicitly supplied, so non-Delta engines cannot silently ignore it.
+  bool delta_controls_explicit = false;
+  bool delta_telemetry = false;
 };
 
 struct PathfinderResult {
