@@ -971,12 +971,27 @@ void route_all_nets_with_workspace(const HostCsrF32& base_graph,
 
   std::vector<std::thread> workers;
   workers.reserve(worker_count);
-  for (std::size_t i = 0; i < worker_count; ++i) {
-    workers.emplace_back(worker);
+  auto join_workers = [&workers]() {
+    for (std::thread& thread : workers) {
+      if (thread.joinable()) {
+        thread.join();
+      }
+    }
+  };
+  try {
+    for (std::size_t i = 0; i < worker_count; ++i) {
+      workers.emplace_back(worker);
+    }
+  } catch (...) {
+    // If std::thread construction fails after one or more workers have
+    // started, those joinable threads must be stopped and joined before the
+    // vector is destroyed. Otherwise std::thread::~thread calls terminate()
+    // instead of allowing the construction error to reach the caller.
+    failed.store(true, std::memory_order_relaxed);
+    join_workers();
+    throw;
   }
-  for (std::thread& thread : workers) {
-    thread.join();
-  }
+  join_workers();
   if (first_exception) {
     std::rethrow_exception(first_exception);
   }

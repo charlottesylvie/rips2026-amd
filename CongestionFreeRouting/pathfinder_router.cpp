@@ -10,13 +10,19 @@
 // Example compile command:
 //   g++ -std=c++17 -O2 CongestionFreeRouting/pathfinder_router.cpp -o PathFinderFile
 
+#include <cerrno>
 #include <cstdlib>
+#include <cstring>
 #include <filesystem>
 #include <iostream>
 #include <sstream>
 #include <stdexcept>
 #include <string>
 #include <vector>
+
+#if defined(__unix__) || defined(__APPLE__)
+#include <sys/wait.h>
+#endif
 
 namespace {
 
@@ -107,11 +113,38 @@ void run_command(const std::vector<std::string>& argv,
     std::cout << "[pathfinder-router] profiler command: " << command << "\n"
               << std::flush;
   }
+  errno = 0;
   const int status = std::system(command.c_str());
+  const int system_errno = errno;
   if (status != 0) {
     std::ostringstream out;
-    out << label << " failed with status " << status
-        << " while running " << command;
+    out << label << " failed: ";
+    if (status == -1) {
+      out << "could not start the command";
+      if (system_errno != 0) {
+        out << ": " << std::strerror(system_errno);
+      }
+#if defined(__unix__) || defined(__APPLE__)
+    } else if (WIFEXITED(status)) {
+      out << "exited with status " << WEXITSTATUS(status);
+    } else if (WIFSIGNALED(status)) {
+      out << "terminated by signal " << WTERMSIG(status);
+#if defined(WCOREDUMP)
+      if (WCOREDUMP(status)) {
+        out << " (core dumped)";
+      }
+#endif
+    } else {
+      out << "returned unrecognized wait status " << status;
+#else
+    } else {
+      // The C++ standard leaves system()'s nonzero return value
+      // implementation-defined. On POSIX it is a wait status (decoded
+      // above); retain the native value on other platforms.
+      out << "returned status " << status;
+#endif
+    }
+    out << " while running " << command;
     throw std::runtime_error(out.str());
   }
 }

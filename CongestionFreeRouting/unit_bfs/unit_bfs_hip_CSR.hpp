@@ -43,7 +43,7 @@ class UnitBfsCsrGraph {
   bool uses_32_bit_offsets() const noexcept;
 
  private:
-  std::unique_ptr<Impl> impl_;
+  std::shared_ptr<Impl> impl_;
   friend class UnitBfsCsrWorkspace;
 };
 
@@ -51,6 +51,9 @@ class UnitBfsCsrWorkspace {
  public:
   struct Impl;
 
+  // A workspace is bound to its construction stream and HIP device. Every run
+  // must use that same stream; independent streams require independent
+  // workspaces, while the immutable UnitBfsCsrGraph may still be shared.
   explicit UnitBfsCsrWorkspace(const HostCsrF32& adjacency,
                                hipStream_t stream = nullptr);
   UnitBfsCsrWorkspace(const HostCsrF32& adjacency,

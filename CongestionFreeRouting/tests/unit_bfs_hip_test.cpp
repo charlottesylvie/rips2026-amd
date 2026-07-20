@@ -519,7 +519,7 @@ HostCsrF32 make_divergent_claim_graph() {
 }
 
 constexpr int kDeepWideLevels = 12;
-constexpr int kDeepWideWidth = 257;
+constexpr int kDeepWideWidth = 4097;
 constexpr int kDeepWideTarget = kDeepWideLevels * kDeepWideWidth;
 constexpr int kDeepWideIsolated = kDeepWideTarget + 1;
 static_assert(kDeepWideLevels > 8, "deep regression must exceed eight levels");
@@ -527,11 +527,11 @@ static_assert(kDeepWideWidth > 256,
               "wide regression must cross a 256-thread boundary");
 
 HostCsrF32 make_deep_wide_layered_graph() {
-  // Layer one fans out past both a 256-thread block and four 64-lane waves.
-  // Every later layer keeps all 257 lanes live while preserving a unique
+  // Layer one fans out past sixteen 256-thread blocks and sixty-four 64-lane
+  // waves. Every later layer keeps all 4097 lanes live while preserving a unique
   // predecessor for each vertex:
   //
-  //   0 -> layer[1][0..256] -> ... -> layer[12][0..256]
+  //   0 -> layer[1][0..4096] -> ... -> layer[12][0..4096]
   //
   // The last lane is the reachable target and one extra row is isolated.  This
   // compact shape crosses three four-level controller batches on the default
@@ -607,6 +607,12 @@ ExpectedTarget reached_on_chain(int target) {
 void collect_progress(const UnitBfsCsrProgress& progress, void* user_data) {
   auto* trace = static_cast<std::vector<UnitBfsCsrProgress>*>(user_data);
   trace->push_back(progress);
+}
+
+struct ProgressCallbackFailure {};
+
+void throw_from_progress(const UnitBfsCsrProgress&, void*) {
+  throw ProgressCallbackFailure{};
 }
 
 void validate_progress_trace(const std::vector<UnitBfsCsrProgress>& trace,
@@ -835,6 +841,92 @@ void run_batching_suite(UnitBfsCsrOffsetMode mode,
   }
 }
 
+void run_workspace_affinity_and_ownership_suite() {
+  const HostCsrF32 graph = make_unique_path_graph();
+  HostCsrF32 near_unit_graph = graph;
+  near_unit_graph.values.front() = std::nextafter(1.0f, 2.0f);
+  bool rejected_near_unit_weight = false;
+  try {
+    UnitBfsCsrGraph invalid_graph(near_unit_graph);
+    (void)invalid_graph;
+  } catch (const std::invalid_argument&) {
+    rejected_near_unit_weight = true;
+  }
+  require(rejected_near_unit_weight,
+          "unit BFS must reject every edge weight not exactly 1.0f");
+
+  auto shared_graph = std::make_shared<UnitBfsCsrGraph>(graph);
+  HipStream stream;
+  UnitBfsCsrWorkspace workspace(shared_graph, stream.get());
+
+  bool rejected_mismatched_stream = false;
+  try {
+    (void)workspace.run(std::vector<int>{0},
+                        std::vector<int>{3},
+                        1.0f,
+                        -1,
+                        nullptr,
+                        nullptr,
+                        nullptr);
+  } catch (const std::invalid_argument&) {
+    rejected_mismatched_stream = true;
+  }
+  require(rejected_mismatched_stream,
+          "stream-affine workspace must reject a mismatched run stream");
+
+  const ExpectedRun expected{
+      3,
+      true,
+      true,
+      true,
+      {reached(3, 3.0f, 0, {0, 1, 2, 3}, {0, 2, 3})}};
+  UnitBfsCsrResult before_move = workspace.run(std::vector<int>{0},
+                                               std::vector<int>{3},
+                                               1.0f,
+                                               -1,
+                                               stream.get(),
+                                               nullptr,
+                                               nullptr);
+  validate_result(graph,
+                  before_move,
+                  expected,
+                  "stream-affine workspace before graph move");
+
+  bool callback_exception_propagated = false;
+  try {
+    (void)workspace.run(std::vector<int>{0},
+                        std::vector<int>{3},
+                        1.0f,
+                        -1,
+                        stream.get(),
+                        throw_from_progress,
+                        nullptr);
+  } catch (const ProgressCallbackFailure&) {
+    callback_exception_propagated = true;
+  }
+  require(callback_exception_propagated,
+          "progress callback exception must propagate after scratch cleanup");
+
+  // A workspace retains the immutable backing allocation rather than reaching
+  // back through the movable public graph wrapper.
+  UnitBfsCsrGraph moved_graph(std::move(*shared_graph));
+  require(!shared_graph->uses_32_bit_offsets(),
+          "moved-from graph wrapper must report no compact backing");
+  require(moved_graph.uses_32_bit_offsets(),
+          "moved-to graph wrapper must retain compact backing");
+  UnitBfsCsrResult after_move = workspace.run(std::vector<int>{0},
+                                              std::vector<int>{3},
+                                              1.0f,
+                                              -1,
+                                              stream.get(),
+                                              nullptr,
+                                              nullptr);
+  validate_result(graph,
+                  after_move,
+                  expected,
+                  "stream-affine workspace after graph move");
+}
+
 void run_parallel_workspace_suite() {
   const HostCsrF32 graph = make_divergent_claim_graph();
   auto shared_graph = std::make_shared<UnitBfsCsrGraph>(graph, nullptr);
@@ -890,9 +982,12 @@ void run_parallel_workspace_suite() {
   }
 }
 
-void run_parallel_deep_wide_explicit_stream_suite() {
+void run_parallel_deep_wide_explicit_stream_suite(
+    UnitBfsCsrOffsetMode mode,
+    const std::string& mode_label) {
   const HostCsrF32 graph = make_deep_wide_layered_graph();
-  auto shared_graph = std::make_shared<UnitBfsCsrGraph>(graph, nullptr);
+  auto shared_graph =
+      std::make_shared<UnitBfsCsrGraph>(graph, nullptr, mode);
   int device = 0;
   check_hip(hipGetDevice(&device), "hipGetDevice");
 
@@ -910,7 +1005,7 @@ void run_parallel_deep_wide_explicit_stream_suite() {
       {unreachable(kDeepWideIsolated)}};
 
   // Construct all private workspaces first, then release their first queries
-  // together.  The 257-wide, twelve-level reachable traversal and thirteen-
+  // together.  The 4097-wide, twelve-level reachable traversal and thirteen-
   // level exhaustion exercise PathFinder's eight nonblocking-stream scheduling
   // without the former 2^18-row allocation or thousands of shallow queries.
   constexpr int kWorkers = 8;
@@ -944,7 +1039,7 @@ void run_parallel_deep_wide_explicit_stream_suite() {
               graph,
               reached_result,
               deep_target,
-              "parallel deep-wide target worker " +
+              mode_label + ": parallel deep-wide target worker " +
                   std::to_string(worker) + " reuse " +
                   std::to_string(repetition));
 
@@ -960,7 +1055,7 @@ void run_parallel_deep_wide_explicit_stream_suite() {
               graph,
               exhausted_result,
               deep_exhausted,
-              "parallel deep-wide exhaustion worker " +
+              mode_label + ": parallel deep-wide exhaustion worker " +
                   std::to_string(worker) + " reuse " +
                   std::to_string(repetition));
         }
@@ -1025,8 +1120,14 @@ int main() {
                        "auto/32-bit batching");
     run_batching_suite(UnitBfsCsrOffsetMode::kForce64Bit,
                        "forced-64-bit batching");
+    run_workspace_affinity_and_ownership_suite();
     run_parallel_workspace_suite();
-    run_parallel_deep_wide_explicit_stream_suite();
+    run_parallel_deep_wide_explicit_stream_suite(
+        UnitBfsCsrOffsetMode::kAuto,
+        "auto/32-bit explicit host controller");
+    run_parallel_deep_wide_explicit_stream_suite(
+        UnitBfsCsrOffsetMode::kForce64Bit,
+        "forced-64-bit explicit host controller");
 
     // The representation cutoff is compile-time production logic.  A giant CSR
     // fixture would be unsafe, and no public pure selection helper is exposed;

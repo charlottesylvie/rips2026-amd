@@ -187,11 +187,13 @@ g++ -std=c++17 -O3 -I"$SCHEMA_DIR" \
   "$SCHEMA_DIR"/References.capnp.c++ \
   -lcapnp -lkj -lz -o interchange_to_csr
 
-hipcc -std=c++17 -O3 -x hip \
+hipcc -std=c++17 -O3 -x hip -DBF10_NO_MAIN \
   -I HIP_kernel/bellman_ford/src \
+  -I CongestionFreeRouting/bellman_ford \
   -I CongestionFreeRouting/delta_stepping \
   -I CongestionFreeRouting/unit_bfs \
   CongestionFreeRouting/pathfinder.cpp \
+  CongestionFreeRouting/bellman_ford/bf10.cpp \
   CongestionFreeRouting/delta_stepping/delta_stepping_hip_CSR.cpp \
   CongestionFreeRouting/unit_bfs/unit_bfs_hip_CSR.cpp \
   -pthread -o pathfinder

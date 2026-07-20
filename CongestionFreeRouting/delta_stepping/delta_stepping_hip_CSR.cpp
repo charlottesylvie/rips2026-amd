@@ -7,6 +7,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <exception>
 #include <limits>
 #include <sstream>
 #include <stdexcept>
@@ -52,6 +53,12 @@ inline void hip_check(hipError_t status, const char* expr, const char* file, int
 #define DS_DELTA_HIP_CHECK(expr) \
   ::ds_delta_detail::hip_check((expr), #expr, __FILE__, __LINE__)
 
+inline int current_hip_device() {
+  int device = 0;
+  DS_DELTA_HIP_CHECK(hipGetDevice(&device));
+  return device;
+}
+
 template <typename T>
 class DeviceBuffer {
  public:
@@ -73,9 +80,12 @@ class DeviceBuffer {
 
   void reset(std::size_t count) {
     release();
-    count_ = count;
-    if (count_ != 0) {
-      DS_DELTA_HIP_CHECK(hipMalloc(reinterpret_cast<void**>(&ptr_), count_ * sizeof(T)));
+    if (count != 0) {
+      T* candidate = nullptr;
+      DS_DELTA_HIP_CHECK(
+          hipMalloc(reinterpret_cast<void**>(&candidate), count * sizeof(T)));
+      ptr_ = candidate;
+      count_ = count;
     }
   }
 
@@ -261,16 +271,30 @@ struct DeltaSteppingScratch {
   }
 
   void ensure_target_capacity(std::size_t target_count) {
+    const std::size_t capacity =
+        grown_capacity(targets.size(), target_count);
     if (targets.size() < target_count) {
-      const std::size_t capacity =
-          grown_capacity(targets.size(), target_count);
       targets.reset(capacity);
+    }
+    if (target_settled.size() < target_count) {
       target_settled.reset(capacity);
+    }
+    if (target_distances.size() < target_count) {
       target_distances.reset(capacity);
+    }
+    if (target_path_lengths.size() < target_count) {
       target_path_lengths.reset(capacity);
+    }
+    if (target_sources.size() < target_count) {
       target_sources.reset(capacity);
+    }
+    if (target_path_status.size() < target_count) {
       target_path_status.reset(capacity);
+    }
+    if (target_node_offsets.size() < target_count + 1) {
       target_node_offsets.reset(capacity + 1);
+    }
+    if (target_edge_offsets.size() < target_count + 1) {
       target_edge_offsets.reset(capacity + 1);
     }
   }
@@ -486,6 +510,12 @@ inline T copy_scalar_to_host(const T* d_value,
 
 inline void reset_int_zero_async(int* d_value, hipStream_t stream) {
   DS_DELTA_HIP_CHECK(hipMemsetAsync(d_value, 0, sizeof(int), stream));
+}
+
+inline void synchronize_explicit_stream(hipStream_t stream) {
+  if (stream != nullptr) {
+    DS_DELTA_HIP_CHECK(hipStreamSynchronize(stream));
+  }
 }
 
 __device__ inline float atomic_min_float_nonnegative(float* addr, float value) {
@@ -761,6 +791,50 @@ __global__ void initialize_unit_sources_kernel(const int* sources,
   }
 }
 
+__device__ inline void expand_unit_frontier_range(
+    int frontier_begin,
+    int frontier_end,
+    int next_depth,
+    const Offset* out_rowptr,
+    const Index* out_colind,
+    float* dist,
+    int* pred_node,
+    Offset* pred_edge,
+    int* frontier_queue,
+    int* queue_tail,
+    int* found_count,
+    const int* target_multiplicity) {
+  const float next_distance = static_cast<float>(next_depth);
+  const unsigned int infinity_bits = __float_as_uint(INFINITY);
+  const unsigned int next_distance_bits = __float_as_uint(next_distance);
+  for (int i = frontier_begin + blockIdx.x * blockDim.x + threadIdx.x;
+       i < frontier_end;
+       i += blockDim.x * gridDim.x) {
+    const int u = frontier_queue[i];
+    for (Offset edge = out_rowptr[u]; edge < out_rowptr[u + 1]; ++edge) {
+      const int v = static_cast<int>(out_colind[edge]);
+      auto* const distance_bits =
+          reinterpret_cast<unsigned int*>(&dist[v]);
+      const bool claimed =
+          *distance_bits == infinity_bits &&
+          atomicCAS(distance_bits, infinity_bits, next_distance_bits) ==
+              infinity_bits;
+      if (claimed) {
+        pred_node[v] = u;
+        pred_edge[v] = edge;
+      }
+      const int pos = append_position(claimed, queue_tail);
+      if (claimed) {
+        frontier_queue[pos] = v;
+        const int multiplicity = target_multiplicity[v];
+        if (multiplicity > 0) {
+          atomicAdd(found_count, multiplicity);
+        }
+      }
+    }
+  }
+}
+
 __global__ void expand_unit_frontier_kernel(const Offset* out_rowptr,
                                             const Index* out_colind,
                                             float* dist,
@@ -783,40 +857,30 @@ __global__ void expand_unit_frontier_kernel(const Offset* out_rowptr,
   }
   __syncthreads();
   if (controller[0] == 0) return;
-  const int frontier_begin = controller[1];
-  const int frontier_end = controller[2];
-  const int depth = controller[3];
+  expand_unit_frontier_range(
+      controller[1], controller[2], controller[3] + 1, out_rowptr,
+      out_colind, dist, pred_node, pred_edge, frontier_queue,
+      status + kUnitStatusQueueTail, status + kUnitStatusFoundCount,
+      target_multiplicity);
+}
 
-  const float next_distance = static_cast<float>(depth + 1);
-  const unsigned int infinity_bits = __float_as_uint(INFINITY);
-  const unsigned int next_distance_bits = __float_as_uint(next_distance);
-  for (int i = frontier_begin + blockIdx.x * blockDim.x + threadIdx.x;
-       i < frontier_end;
-       i += blockDim.x * gridDim.x) {
-    const int u = frontier_queue[i];
-    for (Offset edge = out_rowptr[u]; edge < out_rowptr[u + 1]; ++edge) {
-      const int v = static_cast<int>(out_colind[edge]);
-      auto* const distance_bits =
-          reinterpret_cast<unsigned int*>(&dist[v]);
-      const bool claimed =
-          *distance_bits == infinity_bits &&
-          atomicCAS(distance_bits, infinity_bits, next_distance_bits) ==
-              infinity_bits;
-      if (claimed) {
-        pred_node[v] = u;
-        pred_edge[v] = edge;
-      }
-      const int pos =
-          append_position(claimed, status + kUnitStatusQueueTail);
-      if (claimed) {
-        frontier_queue[pos] = v;
-        const int multiplicity = target_multiplicity[v];
-        if (multiplicity > 0) {
-          atomicAdd(status + kUnitStatusFoundCount, multiplicity);
-        }
-      }
-    }
-  }
+__global__ void expand_unit_frontier_host_controlled_kernel(
+    int frontier_begin,
+    int frontier_end,
+    int next_depth,
+    const Offset* out_rowptr,
+    const Index* out_colind,
+    float* dist,
+    int* pred_node,
+    Offset* pred_edge,
+    int* frontier_queue,
+    int* queue_tail,
+    int* found_count,
+    const int* target_multiplicity) {
+  expand_unit_frontier_range(
+      frontier_begin, frontier_end, next_depth, out_rowptr, out_colind, dist,
+      pred_node, pred_edge, frontier_queue, queue_tail, found_count,
+      target_multiplicity);
 }
 
 __global__ void advance_unit_frontier_kernel(int* status,
@@ -925,6 +989,7 @@ __global__ void mark_settled_targets_kernel(const int* targets,
 __global__ void measure_target_paths_kernel(const int* targets,
                                             int target_count,
                                             Offset rows,
+                                            const int* target_settled,
                                             const float* dist,
                                             const int* pred_node,
                                             float* target_distances,
@@ -935,6 +1000,13 @@ __global__ void measure_target_paths_kernel(const int* targets,
        i < target_count;
        i += blockDim.x * gridDim.x) {
     const int target = targets[i];
+    if (target_settled != nullptr && target_settled[i] == 0) {
+      target_distances[i] = INFINITY;
+      path_lengths[i] = 0;
+      path_sources[i] = -1;
+      path_status[i] = 0;
+      continue;
+    }
     const float target_distance = dist[target];
     target_distances[i] = target_distance;
     path_lengths[i] = 0;
@@ -992,10 +1064,12 @@ __global__ void measure_unit_target_paths_kernel(const int* targets,
 __global__ void fill_target_paths_kernel(const int* targets,
                                          int target_count,
                                          Offset rows,
+                                         const Offset* rowptr,
+                                         const Index* colind,
                                          const int* pred_node,
                                          const Offset* pred_edge,
                                          const int* path_lengths,
-                                         const int* path_status,
+                                         int* path_status,
                                          int* path_sources,
                                          const int* node_offsets,
                                          const int* edge_offsets,
@@ -1024,12 +1098,21 @@ __global__ void fill_target_paths_kernel(const int* targets,
         path_valid = false;
         break;
       }
-      path_edges[edge_begin + j - 1] = pred_edge[current];
+      const Offset edge = pred_edge[current];
+      if (edge < rowptr[pred] || edge >= rowptr[pred + 1] ||
+          static_cast<int>(colind[edge]) != current) {
+        path_valid = false;
+        break;
+      }
+      path_edges[edge_begin + j - 1] = edge;
       current = pred;
       path_nodes[node_begin + j - 1] = current;
     }
-    if (path_valid) {
+    if (path_valid && pred_node[current] == current) {
       path_sources[i] = current;
+    } else {
+      path_status[i] = 0;
+      path_sources[i] = -1;
     }
   }
 }
@@ -1096,6 +1179,7 @@ __global__ void measure_edge_parent_target_paths_kernel(
     const float* values,
     const float* vertex_costs,
     const std::uint32_t* edge_source,
+    const int* target_settled,
     const float* dist,
     const unsigned long long* parent_key,
     float* target_distances,
@@ -1106,6 +1190,13 @@ __global__ void measure_edge_parent_target_paths_kernel(
        i < target_count;
        i += blockDim.x * gridDim.x) {
     const int target = targets[i];
+    if (target_settled != nullptr && target_settled[i] == 0) {
+      target_distances[i] = INFINITY;
+      path_lengths[i] = 0;
+      path_sources[i] = -1;
+      path_status[i] = 0;
+      continue;
+    }
     const float target_distance = dist[target];
     target_distances[i] = target_distance;
     path_lengths[i] = 0;
@@ -1586,6 +1677,10 @@ DeviceCsrOwner copy_host_csr_to_device(const HostCsrF32& h,
     if (allocation_status == hipSuccess) {
       d.edge_source_available = true;
       if (nnz != 0) {
+        // edge_source consumes rowptr in a later dispatch.  Explicit worker
+        // streams on gfx1151 require a real completion boundary for dependent
+        // dispatches.
+        synchronize_explicit_stream(stream);
         build_edge_source_kernel<<<grid_for_items(h.rows), kBlockSize, 0, stream>>>(
             h.rows, d.rowptr.get(), d.edge_source.get());
         DS_DELTA_HIP_CHECK(hipGetLastError());
@@ -1614,6 +1709,7 @@ DeviceCsrOwner copy_host_csr_to_device(const HostCsrF32& h,
 void validate_device_csr_contents(const minplus_sparse::DeviceCsrF32& g, hipStream_t stream) {
   DeviceBuffer<int> d_invalid(1);
   DS_DELTA_HIP_CHECK(hipMemsetAsync(d_invalid.get(), 0, sizeof(int), stream));
+  synchronize_explicit_stream(stream);
   validate_device_csr_kernel<<<grid_for_items(g.rows), kBlockSize, 0, stream>>>(
       g.rows, g.cols, g.nnz, g.rowptr, g.colind, g.values, d_invalid.get());
   DS_DELTA_HIP_CHECK(hipGetLastError());
@@ -1660,6 +1756,9 @@ void initialize_unit_scratch_storage_once(DeltaSteppingScratch& scratch,
   DS_DELTA_HIP_CHECK(hipGetLastError());
   scratch.unit_initialized = true;
   scratch.legacy_predecessors_initialized = true;
+  // Only the first query has initialization work to publish. Reused explicit
+  // workspaces must not pay an empty host synchronization on every route.
+  synchronize_explicit_stream(stream);
 }
 
 void prepare_delta_scratch(DeltaSteppingScratch& scratch,
@@ -1690,6 +1789,9 @@ void reset_touched_vertices(DeltaSteppingScratch& scratch,
           : copy_scalar_to_host(scratch.touched_count.get(),
                                 stream,
                                 scratch.host_scalar.get());
+  if (touched_count < 0 || static_cast<Offset>(touched_count) > scratch.rows) {
+    throw std::runtime_error("delta touched-vertex count is outside graph bounds");
+  }
   if (touched_count > 0) {
     reset_touched_vertices_kernel<<<grid_for_items(touched_count), kBlockSize, 0, stream>>>(
         scratch.touched_queue.get(), touched_count, inf, scratch.dist.get(),
@@ -1709,6 +1811,10 @@ void reset_compact_parent_touched_vertices(DeltaSteppingScratch& scratch,
   if (touched_count < 0) {
     throw std::logic_error(
         "compact-parent reset requires an already-known touched count");
+  }
+  if (static_cast<Offset>(touched_count) > scratch.rows) {
+    throw std::runtime_error(
+        "delta compact-parent touched count is outside graph bounds");
   }
   if (touched_count > 0) {
     if (reset_heavy_membership) {
@@ -1771,6 +1877,10 @@ int materialize_predecessors_from_keys(
   // original CSR edge from the winning predecessor's normally short row.
   const int touched_count = copy_scalar_to_host(
       scratch.touched_count.get(), stream, scratch.host_scalar.get());
+  if (touched_count < 0 || static_cast<Offset>(touched_count) > graph.rows) {
+    throw std::runtime_error(
+        "delta predecessor touched count is outside graph bounds");
+  }
   if (touched_count == 0) {
     return touched_count;
   }
@@ -1781,6 +1891,7 @@ int materialize_predecessors_from_keys(
           scratch.parent_key.get(), scratch.pred_node.get(),
           scratch.pred_edge.get());
   DS_DELTA_HIP_CHECK(hipGetLastError());
+  synchronize_explicit_stream(stream);
   return touched_count;
 }
 
@@ -1798,7 +1909,8 @@ void extract_target_paths_to_result(
     const float* vertex_costs,
     const std::uint32_t* edge_source,
     const std::vector<int>& targets,
-    hipStream_t stream) {
+    hipStream_t stream,
+    const int* target_settled = nullptr) {
   PATHFINDER_PROFILE_RANGE(
       ParentMode == TargetPathParentMode::kCompactEdge
           ? "delta_step.compact_edge_path_extraction"
@@ -1815,14 +1927,15 @@ void extract_target_paths_to_result(
         <<<grid_for_items(target_count), kBlockSize, 0, stream>>>(
             scratch.targets.get(), target_count, scratch.rows, graph.nnz,
             graph.rowptr, graph.colind, graph.values, vertex_costs,
-            edge_source, scratch.dist.get(), scratch.parent_key.get(),
+            edge_source, target_settled, scratch.dist.get(),
+            scratch.parent_key.get(),
             scratch.target_distances.get(), scratch.target_path_lengths.get(),
             scratch.target_sources.get(), scratch.target_path_status.get());
   } else {
     measure_target_paths_kernel
         <<<grid_for_items(target_count), kBlockSize, 0, stream>>>(
             scratch.targets.get(), target_count, scratch.rows,
-            scratch.dist.get(), scratch.pred_node.get(),
+            target_settled, scratch.dist.get(), scratch.pred_node.get(),
             scratch.target_distances.get(), scratch.target_path_lengths.get(),
             scratch.target_sources.get(), scratch.target_path_status.get());
   }
@@ -1857,6 +1970,13 @@ void extract_target_paths_to_result(
   for (std::size_t i = 0; i < targets.size(); ++i) {
     result.target_path_offsets[i] = static_cast<int>(total_nodes);
     result.target_edge_offsets[i] = static_cast<int>(total_edges);
+    if (std::isfinite(result.target_distances[i]) &&
+        (path_status[i] == 0 || path_lengths[i] <= 0)) {
+      throw std::runtime_error(
+          "delta predecessor path failed device validation during "
+          "measurement for target index " +
+          std::to_string(i));
+    }
     if (path_status[i] == 0 || path_lengths[i] <= 0 ||
         !std::isfinite(result.target_distances[i])) {
       all_targets_reached = false;
@@ -1877,20 +1997,21 @@ void extract_target_paths_to_result(
     return;
   }
 
-  DS_DELTA_HIP_CHECK(hipMemcpyAsync(scratch.target_node_offsets.get(),
-                                    result.target_path_offsets.data(),
-                                    (targets.size() + 1) * sizeof(int),
-                                    hipMemcpyHostToDevice,
-                                    stream));
-  DS_DELTA_HIP_CHECK(hipMemcpyAsync(scratch.target_edge_offsets.get(),
-                                    result.target_edge_offsets.data(),
-                                    (targets.size() + 1) * sizeof(int),
-                                    hipMemcpyHostToDevice,
-                                    stream));
-
   result.target_path_nodes.resize(total_nodes);
   result.target_path_edges.resize(total_edges);
   if (total_nodes != 0) {
+    DS_DELTA_HIP_CHECK(hipMemcpyAsync(scratch.target_node_offsets.get(),
+                                      result.target_path_offsets.data(),
+                                      (targets.size() + 1) * sizeof(int),
+                                      hipMemcpyHostToDevice,
+                                      stream));
+    DS_DELTA_HIP_CHECK(hipMemcpyAsync(scratch.target_edge_offsets.get(),
+                                      result.target_edge_offsets.data(),
+                                      (targets.size() + 1) * sizeof(int),
+                                      hipMemcpyHostToDevice,
+                                      stream));
+    synchronize_explicit_stream(stream);
+
     scratch.ensure_compact_path_capacity(total_nodes, total_edges);
     if constexpr (ParentMode == TargetPathParentMode::kCompactEdge) {
       fill_edge_parent_target_paths_kernel
@@ -1908,6 +2029,7 @@ void extract_target_paths_to_result(
       fill_target_paths_kernel
           <<<grid_for_items(target_count), kBlockSize, 0, stream>>>(
               scratch.targets.get(), target_count, scratch.rows,
+              graph.rowptr, graph.colind,
               scratch.pred_node.get(), scratch.pred_edge.get(),
               scratch.target_path_lengths.get(),
               scratch.target_path_status.get(), scratch.target_sources.get(),
@@ -1935,7 +2057,21 @@ void extract_target_paths_to_result(
                                     targets.size() * sizeof(int),
                                     hipMemcpyDeviceToHost,
                                     stream));
+  if (total_nodes != 0) {
+    DS_DELTA_HIP_CHECK(hipMemcpyAsync(path_status.data(),
+                                      scratch.target_path_status.get(),
+                                      targets.size() * sizeof(int),
+                                      hipMemcpyDeviceToHost,
+                                      stream));
+  }
   DS_DELTA_HIP_CHECK(hipStreamSynchronize(stream));
+  for (std::size_t i = 0; i < targets.size(); ++i) {
+    if (path_lengths[i] > 0 && path_status[i] == 0) {
+      throw std::runtime_error(
+          "delta predecessor path failed device validation for target index " +
+          std::to_string(i));
+    }
+  }
   result.target_reached = all_targets_reached;
 }
 
@@ -1952,6 +2088,7 @@ DeltaSteppingCsrResult run_unit_weight_specialization(
   // removes bucket scans, light-closure bookkeeping, and the O(E) predecessor
   // rebuild while preserving original CSR edge IDs.
   std::vector<int> deduplicated_sources;
+  std::unordered_set<int> source_set;
   const std::vector<int>* effective_sources = &sources;
   int initially_found = 0;
   if (sources.size() == 1) {
@@ -1961,7 +2098,6 @@ DeltaSteppingCsrResult run_unit_weight_specialization(
       }
     }
   } else {
-    std::unordered_set<int> source_set;
     source_set.reserve(sources.size());
     deduplicated_sources.reserve(sources.size());
     for (const int source : sources) {
@@ -1976,6 +2112,11 @@ DeltaSteppingCsrResult run_unit_weight_specialization(
       }
     }
   }
+  const auto is_effective_source = [&](int candidate) {
+    return sources.size() == 1
+               ? candidate == sources.front()
+               : source_set.find(candidate) != source_set.end();
+  };
 
   const int source_count = static_cast<int>(effective_sources->size());
   const int target_count = static_cast<int>(targets.size());
@@ -1995,6 +2136,7 @@ DeltaSteppingCsrResult run_unit_weight_specialization(
                                     targets.size() * sizeof(int),
                                     hipMemcpyHostToDevice,
                                     stream));
+  synchronize_explicit_stream(stream);
   mark_unit_target_multiplicity_kernel
       <<<grid_for_items(target_count), kBlockSize, 0, stream>>>(
           scratch.targets.get(),
@@ -2014,97 +2156,206 @@ DeltaSteppingCsrResult run_unit_weight_specialization(
           scratch.current_queue.get(),
           scratch.unit_status.get());
   DS_DELTA_HIP_CHECK(hipGetLastError());
+  synchronize_explicit_stream(stream);
 
+  int frontier_begin = 0;
+  int frontier_end = source_count;
   int queue_tail = source_count;
   int current_count = source_count;
   int found_count = initially_found;
-  int bucket_rounds = 1;
+  int bucket = 0;
+  // Source initialization alone is not a processed bucket.  This matters when
+  // every requested target is already a source and traversal stops at depth 0.
+  int bucket_rounds = initially_found >= target_count ? 0 : 1;
   DeltaSteppingCsrResult result;
   result.target = -1;
+  const bool use_device_controller = stream == nullptr;
 
   while (current_count > 0 && found_count < target_count &&
          result.iterations_used < vertex_count) {
-    // As with weighted closure, check the first expansion immediately.  The
-    // default stream may then amortize status synchronization across four
-    // device-controlled BFS levels.  Keep every explicit stream at one level
-    // per copy.  This inserts a host-visible boundary before another expansion
-    // after observed controller-state inconsistencies when several nonblocking
-    // streams batch dependent kernels concurrently.
-    const bool batch_levels =
-        stream == nullptr && result.iterations_used != 0;
-    const int rounds_to_enqueue = batch_levels ? 4 : 1;
-    const int launch_blocks =
-        rounds_to_enqueue == 1
-            ? grid_for_frontier(current_count)
-            : std::min(grid_for_items(graph.rows),
-                       std::max(grid_for_frontier(current_count), 32));
-    for (int round = 0; round < rounds_to_enqueue; ++round) {
-      expand_unit_frontier_kernel
-          <<<launch_blocks, kBlockSize, 0, stream>>>(
-              graph.rowptr,
-              graph.colind,
-              scratch.dist.get(),
-              scratch.pred_node.get(),
-              scratch.pred_edge.get(),
-              scratch.current_queue.get(),
-              scratch.unit_status.get(),
+    const int previous_queue_tail = queue_tail;
+    const int previous_found_count = found_count;
+    const int previous_frontier_end = frontier_end;
+    const int previous_depth = result.iterations_used;
+
+    if (!use_device_controller) {
+      // Explicit streams are used by parallel PathFinder workers.  Keep their
+      // frontier bounds and depth on the host so there is no dependent
+      // expansion -> controller-advance dispatch.  gfx1151 has repeatedly made
+      // the expansion's queue updates visible without the following advance,
+      // despite both kernels being submitted to the same stream.
+      expand_unit_frontier_host_controlled_kernel
+          <<<grid_for_frontier(current_count), kBlockSize, 0, stream>>>(
+              frontier_begin, frontier_end, previous_depth + 1, graph.rowptr,
+              graph.colind, scratch.dist.get(), scratch.pred_node.get(),
+              scratch.pred_edge.get(), scratch.current_queue.get(),
+              scratch.unit_status.get() + kUnitStatusQueueTail,
+              scratch.unit_status.get() + kUnitStatusFoundCount,
               scratch.in_pending.get());
       DS_DELTA_HIP_CHECK(hipGetLastError());
-      advance_unit_frontier_kernel<<<1, 1, 0, stream>>>(
-          scratch.unit_status.get(), delta, target_count, vertex_count);
-      DS_DELTA_HIP_CHECK(hipGetLastError());
-    }
-    DS_DELTA_HIP_CHECK(hipMemcpyAsync(scratch.host_unit_status.get(),
-                                      scratch.unit_status.get(),
-                                      kUnitStatusCount * sizeof(int),
-                                      hipMemcpyDeviceToHost,
-                                      stream));
-    DS_DELTA_HIP_CHECK(hipStreamSynchronize(stream));
-    queue_tail = scratch.host_unit_status.get()[kUnitStatusQueueTail];
-    found_count = scratch.host_unit_status.get()[kUnitStatusFoundCount];
-    const int frontier_begin =
-        scratch.host_unit_status.get()[kUnitStatusFrontierBegin];
-    const int frontier_end =
-        scratch.host_unit_status.get()[kUnitStatusFrontierEnd];
-    const int completed_depth =
-        scratch.host_unit_status.get()[kUnitStatusCompletedDepth];
-    const int active =
-        scratch.host_unit_status.get()[kUnitStatusActive];
-    if (queue_tail < 0 || queue_tail > vertex_count || frontier_begin < 0 ||
-        frontier_end < frontier_begin || frontier_end != queue_tail ||
-        found_count < 0 || found_count > target_count ||
-        completed_depth < 0 || completed_depth > vertex_count ||
-        (active != 0 && active != 1)) {
-      std::ostringstream message;
-      message << "delta unit-weight device frontier state is inconsistent"
-              << " (queue_tail=" << queue_tail
-              << ", frontier_begin=" << frontier_begin
-              << ", frontier_end=" << frontier_end
-              << ", found_count=" << found_count
-              << ", completed_depth="
-              << completed_depth
-              << ", active=" << active
-              << ", rows=" << vertex_count
-              << ", sources=" << source_count
-              << ", targets=" << target_count << ')';
-      throw std::runtime_error(message.str());
+      DS_DELTA_HIP_CHECK(hipMemcpyAsync(scratch.host_unit_status.get(),
+                                        scratch.unit_status.get(),
+                                        kUnitStatusCount * sizeof(int),
+                                        hipMemcpyDeviceToHost, stream));
+      DS_DELTA_HIP_CHECK(hipStreamSynchronize(stream));
+
+      const int observed_queue_tail =
+          scratch.host_unit_status.get()[kUnitStatusQueueTail];
+      const int observed_found_count =
+          scratch.host_unit_status.get()[kUnitStatusFoundCount];
+      if (frontier_begin < 0 || frontier_end < frontier_begin ||
+          frontier_end != previous_queue_tail ||
+          current_count != frontier_end - frontier_begin ||
+          observed_queue_tail < previous_queue_tail ||
+          observed_queue_tail > vertex_count ||
+          observed_found_count < previous_found_count ||
+          observed_found_count > target_count) {
+        std::ostringstream message;
+        message << "delta unit-weight host-controlled frontier state is inconsistent"
+                << " (queue_tail=" << observed_queue_tail
+                << ", previous_queue_tail=" << previous_queue_tail
+                << ", frontier_begin=" << frontier_begin
+                << ", frontier_end=" << frontier_end
+                << ", found_count=" << observed_found_count
+                << ", previous_found_count=" << previous_found_count
+                << ", completed_depth=" << previous_depth + 1
+                << ", rows=" << vertex_count
+                << ", sources=" << source_count
+                << ", targets=" << target_count << ')';
+        throw std::runtime_error(message.str());
+      }
+
+      queue_tail = observed_queue_tail;
+      found_count = observed_found_count;
+      frontier_begin = previous_frontier_end;
+      frontier_end = queue_tail;
+      result.iterations_used = previous_depth + 1;
+      if (queue_tail > previous_queue_tail) {
+        const int discovered_bucket =
+            bucket_index_host(static_cast<float>(result.iterations_used), delta);
+        if (discovered_bucket != bucket) {
+          bucket = discovered_bucket;
+          ++bucket_rounds;
+        }
+      }
+    } else {
+      // Preserve null-stream controller batching, which has not exhibited the
+      // multi-stream dispatch failure and amortizes status transfers.
+      const int rounds_to_enqueue = previous_depth == 0 ? 1 : 4;
+      const int launch_blocks =
+          rounds_to_enqueue == 1
+              ? grid_for_frontier(current_count)
+              : std::min(grid_for_items(graph.rows),
+                         std::max(grid_for_frontier(current_count), 32));
+      for (int round = 0; round < rounds_to_enqueue; ++round) {
+        expand_unit_frontier_kernel
+            <<<launch_blocks, kBlockSize, 0, stream>>>(
+                graph.rowptr, graph.colind, scratch.dist.get(),
+                scratch.pred_node.get(), scratch.pred_edge.get(),
+                scratch.current_queue.get(), scratch.unit_status.get(),
+                scratch.in_pending.get());
+        DS_DELTA_HIP_CHECK(hipGetLastError());
+        advance_unit_frontier_kernel<<<1, 1, 0, stream>>>(
+            scratch.unit_status.get(), delta, target_count, vertex_count);
+        DS_DELTA_HIP_CHECK(hipGetLastError());
+      }
+      DS_DELTA_HIP_CHECK(hipMemcpyAsync(scratch.host_unit_status.get(),
+                                        scratch.unit_status.get(),
+                                        kUnitStatusCount * sizeof(int),
+                                        hipMemcpyDeviceToHost, stream));
+      DS_DELTA_HIP_CHECK(hipStreamSynchronize(stream));
+      queue_tail = scratch.host_unit_status.get()[kUnitStatusQueueTail];
+      found_count = scratch.host_unit_status.get()[kUnitStatusFoundCount];
+      frontier_begin =
+          scratch.host_unit_status.get()[kUnitStatusFrontierBegin];
+      frontier_end =
+          scratch.host_unit_status.get()[kUnitStatusFrontierEnd];
+      result.iterations_used =
+          scratch.host_unit_status.get()[kUnitStatusCompletedDepth];
+      bucket = scratch.host_unit_status.get()[kUnitStatusBucket];
+      bucket_rounds =
+          scratch.host_unit_status.get()[kUnitStatusBucketRounds];
+      const int expected_active =
+          frontier_begin < frontier_end && found_count < target_count &&
+          result.iterations_used < vertex_count;
+      const int active = scratch.host_unit_status.get()[kUnitStatusActive];
+      if (queue_tail < previous_queue_tail || queue_tail > vertex_count ||
+          frontier_begin < previous_frontier_end ||
+          frontier_end < frontier_begin || frontier_end != queue_tail ||
+          found_count < previous_found_count || found_count > target_count ||
+          active != expected_active ||
+          result.iterations_used <= previous_depth ||
+          result.iterations_used > previous_depth + rounds_to_enqueue ||
+          bucket < 0 || bucket >= kNoBucket || bucket_rounds < 1 ||
+          bucket_rounds > result.iterations_used + 1) {
+        std::ostringstream message;
+        message << "delta unit-weight device frontier state is inconsistent"
+                << " (queue_tail=" << queue_tail
+                << ", previous_queue_tail=" << previous_queue_tail
+                << ", frontier_begin=" << frontier_begin
+                << ", frontier_end=" << frontier_end
+                << ", previous_frontier_end=" << previous_frontier_end
+                << ", found_count=" << found_count
+                << ", previous_found_count=" << previous_found_count
+                << ", completed_depth=" << result.iterations_used
+                << ", previous_depth=" << previous_depth
+                << ", rounds_enqueued=" << rounds_to_enqueue
+                << ", active=" << active
+                << ", expected_active=" << expected_active
+                << ", bucket=" << bucket
+                << ", bucket_rounds=" << bucket_rounds
+                << ", rows=" << vertex_count
+                << ", sources=" << source_count
+                << ", targets=" << target_count << ')';
+        throw std::runtime_error(message.str());
+      }
     }
     current_count = frontier_end - frontier_begin;
-    result.iterations_used = completed_depth;
-    bucket_rounds =
-        scratch.host_unit_status.get()[kUnitStatusBucketRounds];
   }
 
   result.stopped_on_target = found_count >= target_count;
   result.converged = !result.stopped_on_target && current_count == 0;
-  clear_unit_target_multiplicity_kernel
-      <<<grid_for_items(target_count), kBlockSize, 0, stream>>>(
-          scratch.targets.get(),
-          target_count,
-          scratch.in_pending.get());
-  DS_DELTA_HIP_CHECK(hipGetLastError());
-  extract_target_paths_to_result<TargetPathParentMode::kUnitWeight>(
-      result, scratch, graph, nullptr, nullptr, targets, stream);
+  try {
+    clear_unit_target_multiplicity_kernel
+        <<<grid_for_items(target_count), kBlockSize, 0, stream>>>(
+            scratch.targets.get(),
+            target_count,
+            scratch.in_pending.get());
+    DS_DELTA_HIP_CHECK(hipGetLastError());
+    extract_target_paths_to_result<TargetPathParentMode::kUnitWeight>(
+        result, scratch, graph, nullptr, nullptr, targets, stream);
+    for (std::size_t i = 0; i < result.target_distances.size(); ++i) {
+      if (std::isfinite(result.target_distances[i]) &&
+          !is_effective_source(result.target_sources[i])) {
+        throw std::runtime_error(
+            "delta unit-weight target path root is not a requested source "
+            "for target index " +
+            std::to_string(i));
+      }
+    }
+  } catch (...) {
+    const std::exception_ptr extraction_exception = std::current_exception();
+    DS_DELTA_HIP_CHECK(hipStreamSynchronize(stream));
+    clear_unit_target_multiplicity_kernel
+        <<<grid_for_items(target_count), kBlockSize, 0, stream>>>(
+            scratch.targets.get(),
+            target_count,
+            scratch.in_pending.get());
+    DS_DELTA_HIP_CHECK(hipGetLastError());
+    if (queue_tail > 0) {
+      reset_unit_visited_kernel
+          <<<grid_for_items(queue_tail), kBlockSize, 0, stream>>>(
+              scratch.current_queue.get(),
+              queue_tail,
+              inf,
+              scratch.dist.get(),
+              scratch.pred_node.get(),
+              scratch.pred_edge.get());
+      DS_DELTA_HIP_CHECK(hipGetLastError());
+    }
+    DS_DELTA_HIP_CHECK(hipStreamSynchronize(stream));
+    std::rethrow_exception(extraction_exception);
+  }
 
   // Report distinct nonempty delta buckets rather than BFS expansion depth.
   // Tracking transitions on the device also handles float bucket collisions
@@ -2122,6 +2373,9 @@ DeltaSteppingCsrResult run_unit_weight_specialization(
             scratch.pred_edge.get());
     DS_DELTA_HIP_CHECK(hipGetLastError());
   }
+  // Runs reuse this sparse state immediately.  Do not let the next query's
+  // source initialization race a queued reset on an explicit worker stream.
+  DS_DELTA_HIP_CHECK(hipStreamSynchronize(stream));
   return result;
 }
 
@@ -2141,6 +2395,7 @@ int find_min_pending_bucket(const int* d_pending_queue,
                                     sizeof(int),
                                     hipMemcpyHostToDevice,
                                     stream));
+  synchronize_explicit_stream(stream);
   reduce_min_pending_bucket_kernel<<<launch_blocks, kBlockSize, 0, stream>>>(
       d_pending_queue, d_pending_count, current_bucket, delta, d_dist,
       d_in_pending, d_min_bucket);
@@ -2182,18 +2437,23 @@ DeltaSteppingCsrResult run_delta_stepping_impl(
 
   const Offset n = d_adjacency.rows;
   std::vector<int> deduplicated_sources;
+  std::unordered_set<int> source_set;
   const std::vector<int>* effective_sources = &sources;
   if (sources.size() > 1) {
-    std::unordered_set<int> seen;
-    seen.reserve(sources.size());
+    source_set.reserve(sources.size());
     deduplicated_sources.reserve(sources.size());
     for (const int source : sources) {
-      if (seen.insert(source).second) {
+      if (source_set.insert(source).second) {
         deduplicated_sources.push_back(source);
       }
     }
     effective_sources = &deduplicated_sources;
   }
+  const auto is_effective_source = [&](int candidate) {
+    return sources.size() == 1
+               ? candidate == sources.front()
+               : source_set.find(candidate) != source_set.end();
+  };
   const int source_count = static_cast<int>(effective_sources->size());
   const bool use_target_set = targets != nullptr;
   if constexpr (UseEdgeParent) {
@@ -2205,10 +2465,25 @@ DeltaSteppingCsrResult run_delta_stepping_impl(
     }
   }
   const int target_count = use_target_set ? static_cast<int>(targets->size()) : 0;
+  // A source target is settled before any bucket is processed, including when
+  // max_iters is zero.  Keep this host storage alive for the duration of the
+  // run because its copies are submitted asynchronously on the workspace
+  // stream.
+  std::vector<int> initial_target_settled;
+  int initial_settled_target_count = 0;
+  if (use_target_set) {
+    initial_target_settled.assign(static_cast<std::size_t>(target_count), 0);
+    for (int i = 0; i < target_count; ++i) {
+      const int candidate = (*targets)[static_cast<std::size_t>(i)];
+      if (is_effective_source(candidate)) {
+        initial_target_settled[static_cast<std::size_t>(i)] = 1;
+        ++initial_settled_target_count;
+      }
+    }
+  }
   const float inf = std::numeric_limits<float>::infinity();
   const bool target_is_source =
-      !use_target_set &&
-      target >= 0 && std::find(sources.begin(), sources.end(), target) != sources.end();
+      !use_target_set && target >= 0 && is_effective_source(target);
 
   scratch.ensure_source_capacity(effective_sources->size());
   // Generic state is lazy because exact-unit workers never need it. Allocate
@@ -2222,15 +2497,21 @@ DeltaSteppingCsrResult run_delta_stepping_impl(
     DS_DELTA_HIP_CHECK(hipMemcpyAsync(scratch.targets.get(), targets->data(),
                                       static_cast<std::size_t>(target_count) * sizeof(int),
                                       hipMemcpyHostToDevice, stream));
-    DS_DELTA_HIP_CHECK(hipMemsetAsync(scratch.target_settled.get(),
-                                      0,
-                                      static_cast<std::size_t>(target_count) * sizeof(int),
-                                      stream));
-    reset_int_zero_async(scratch.settled_target_count.get(), stream);
+    DS_DELTA_HIP_CHECK(hipMemcpyAsync(
+        scratch.target_settled.get(), initial_target_settled.data(),
+        static_cast<std::size_t>(target_count) * sizeof(int),
+        hipMemcpyHostToDevice, stream));
+    DS_DELTA_HIP_CHECK(hipMemcpyAsync(
+        scratch.settled_target_count.get(), &initial_settled_target_count,
+        sizeof(int), hipMemcpyHostToDevice, stream));
   }
   DS_DELTA_HIP_CHECK(hipMemcpyAsync(scratch.sources.get(), effective_sources->data(),
                                     static_cast<std::size_t>(source_count) * sizeof(int),
                                     hipMemcpyHostToDevice, stream));
+  // The source kernel consumes the uploaded list and the state initialized or
+  // reset above.  Complete both producers before launching it on an explicit
+  // worker stream.
+  synchronize_explicit_stream(stream);
   initialize_delta_sources_kernel<!UseEdgeParent>
       <<<grid_for_items(source_count), kBlockSize, 0, stream>>>(
           scratch.sources.get(), source_count, scratch.dist.get(),
@@ -2239,6 +2520,7 @@ DeltaSteppingCsrResult run_delta_stepping_impl(
           scratch.pred_edge.get(), scratch.touched_queue.get(),
           scratch.touched_count.get());
   DS_DELTA_HIP_CHECK(hipGetLastError());
+  synchronize_explicit_stream(stream);
 
   int* current_queue = scratch.current_queue.get();
   int* next_queue = scratch.next_queue.get();
@@ -2255,18 +2537,60 @@ DeltaSteppingCsrResult run_delta_stepping_impl(
   const int device_count_blocks = std::min(grid_for_items(n), 256);
   DeltaSteppingCsrResult result;
   result.target = target;
+  if (use_target_set && initial_settled_target_count == target_count) {
+    // Every requested target is already a source.  This is a complete target
+    // stop even when max_iters is zero; no bucket work is necessary.
+    result.target_reached = true;
+    result.stopped_on_target = true;
+  }
   if (target_is_source) {
     result.target_distance = 0.0f;
     result.target_reached = true;
     result.stopped_on_target = true;
-    copy_predecessors_to_result(result, d_adjacency, scratch.pred_node.get(),
-                                scratch.pred_edge.get(), stream);
-    result.dist = copy_dist_to_host(scratch.dist.get(), n, stream);
+    try {
+      copy_predecessors_to_result(result, d_adjacency,
+                                  scratch.pred_node.get(),
+                                  scratch.pred_edge.get(), stream);
+      result.dist = copy_dist_to_host(scratch.dist.get(), n, stream);
+    } catch (...) {
+      const std::exception_ptr materialization_exception =
+          std::current_exception();
+      DS_DELTA_HIP_CHECK(hipStreamSynchronize(stream));
+      reset_touched_vertices(scratch, inf, stream, source_count);
+      DS_DELTA_HIP_CHECK(hipStreamSynchronize(stream));
+      std::rethrow_exception(materialization_exception);
+    }
     reset_touched_vertices(scratch, inf, stream);
+    DS_DELTA_HIP_CHECK(hipStreamSynchronize(stream));
     return result;
   }
 
-  for (int iter = 0; iter < max_iters; ++iter) {
+  auto report_progress = [&](const DeltaSteppingCsrProgress& progress) {
+    try {
+      progress_callback(progress, progress_user_data);
+    } catch (...) {
+      // A callback is allowed to abort a run, but it must not poison this
+      // reusable workspace.  Capture the original exception before cleanup so
+      // a successful reset preserves its exact dynamic type and payload.
+      const std::exception_ptr callback_exception = std::current_exception();
+      const int touched_count = copy_scalar_to_host(
+          scratch.touched_count.get(), stream, scratch.host_scalar.get());
+      if constexpr (UseEdgeParent) {
+        // Exception cleanup is cold; clear heavy membership unconditionally so
+        // it remains correct regardless of which callback site was reached.
+        reset_compact_parent_touched_vertices(
+            scratch, inf, stream, touched_count, true);
+      } else {
+        reset_touched_vertices(scratch, inf, stream, touched_count);
+      }
+      DS_DELTA_HIP_CHECK(hipStreamSynchronize(stream));
+      std::rethrow_exception(callback_exception);
+    }
+  };
+
+  for (int iter = 0;
+       iter < max_iters && !result.stopped_on_target;
+       ++iter) {
     reset_int_zero_async(scratch.heavy_count.get(), stream);
 
     int light_rounds = 0;
@@ -2294,6 +2618,10 @@ DeltaSteppingCsrResult run_delta_stepping_impl(
                 current_queue, current_count_device,
                 scratch.in_current.get());
         DS_DELTA_HIP_CHECK(hipGetLastError());
+        // next_count and the frontier membership flags are both consumed by
+        // the relaxation kernel.  An explicit-stream completion boundary is
+        // required before that dependent dispatch on the affected runtime.
+        synchronize_explicit_stream(stream);
 
         const bool terminal_bucket = current_bucket == kNoBucket - 1;
         if (terminal_bucket && vertex_costs != nullptr) {
@@ -2323,6 +2651,10 @@ DeltaSteppingCsrResult run_delta_stepping_impl(
       }
       current_count = copy_scalar_to_host(
           current_count_device, stream, scratch.host_scalar.get());
+      if (current_count < 0 || static_cast<Offset>(current_count) > n) {
+        throw std::runtime_error(
+            "delta light-closure frontier count is outside graph bounds");
+      }
     }
 
     if (!skip_heavy_edges && current_bucket != kNoBucket - 1) {
@@ -2334,6 +2666,12 @@ DeltaSteppingCsrResult run_delta_stepping_impl(
         launch_relax_heavy_edges<UseEdgeParent, false>(
             d_adjacency, scratch, nullptr, device_count_blocks,
             current_bucket, delta, pending_queue, stream);
+      }
+      // Vector-target settlement is the only immediate device consumer here.
+      // Scalar target copies synchronize on their D2H transfer, while the
+      // minimum-bucket helper synchronizes its H2D initializer before reduce.
+      if (use_target_set) {
+        synchronize_explicit_stream(stream);
       }
     }
 
@@ -2351,7 +2689,7 @@ DeltaSteppingCsrResult run_delta_stepping_impl(
           progress.max_iters = max_iters;
           progress.convergence_checked = true;
           progress.changed = true;
-          progress_callback(progress, progress_user_data);
+          report_progress(progress);
         }
         break;
       }
@@ -2370,7 +2708,7 @@ DeltaSteppingCsrResult run_delta_stepping_impl(
           progress.max_iters = max_iters;
           progress.convergence_checked = true;
           progress.changed = true;
-          progress_callback(progress, progress_user_data);
+          report_progress(progress);
         }
         break;
       }
@@ -2383,13 +2721,18 @@ DeltaSteppingCsrResult run_delta_stepping_impl(
                                 scratch.min_pending_bucket.get(),
                                 scratch.host_scalar.get(), stream);
     const bool changed = (next_bucket != kNoBucket);
+    if (changed &&
+        (next_bucket <= current_bucket || next_bucket >= kNoBucket)) {
+      throw std::runtime_error(
+          "delta pending-bucket reduction returned an invalid successor");
+    }
     if (progress_callback) {
       DeltaSteppingCsrProgress progress;
       progress.iteration = result.iterations_used;
       progress.max_iters = max_iters;
       progress.convergence_checked = true;
       progress.changed = changed;
-      progress_callback(progress, progress_user_data);
+      report_progress(progress);
     }
     if (!changed) {
       result.converged = true;
@@ -2403,6 +2746,7 @@ DeltaSteppingCsrResult run_delta_stepping_impl(
     next_count_device = scratch.next_count.get();
     reset_int_zero_async(scratch.current_count.get(), stream);
     reset_int_zero_async(scratch.new_pending_count.get(), stream);
+    synchronize_explicit_stream(stream);
 
     compact_pending_to_current_bucket_kernel<<<device_count_blocks, kBlockSize, 0, stream>>>(
         pending_queue, scratch.pending_count.get(), current_bucket, delta,
@@ -2413,53 +2757,90 @@ DeltaSteppingCsrResult run_delta_stepping_impl(
 
     current_count = copy_scalar_to_host(
         scratch.current_count.get(), stream, scratch.host_scalar.get());
+    if (current_count < 0 || static_cast<Offset>(current_count) > n) {
+      throw std::runtime_error(
+          "delta compacted frontier count is outside graph bounds");
+    }
     DS_DELTA_HIP_CHECK(hipMemcpyAsync(scratch.pending_count.get(),
                                       scratch.new_pending_count.get(),
                                       sizeof(int),
                                       hipMemcpyDeviceToDevice,
                                       stream));
+    // The next bucket appends to this count and consumes the compacted queue.
+    synchronize_explicit_stream(stream);
     std::swap(pending_queue, pending_scratch);
   }
 
   int touched_count_for_reset = -1;
-  if constexpr (UseEdgeParent) {
-    // Extraction already synchronizes for compact path sizes and output. Stage
-    // the touched count before it so reduced reset adds no host synchronization.
-    DS_DELTA_HIP_CHECK(hipMemcpyAsync(scratch.host_scalar.get(),
-                                      scratch.touched_count.get(),
-                                      sizeof(int),
-                                      hipMemcpyDeviceToHost,
-                                      stream));
-    extract_target_paths_to_result<TargetPathParentMode::kCompactEdge>(
-        result, scratch, d_adjacency, vertex_costs, edge_source, *targets,
-        stream);
-    touched_count_for_reset = *scratch.host_scalar.get();
-  } else {
-    if (use_target_set || target >= 0) {
-      touched_count_for_reset = materialize_predecessors_from_keys(
-          d_adjacency, scratch, vertex_costs, stream);
+  try {
+    const int* const settled_target_filter =
+        use_target_set && !result.converged && !result.stopped_on_target
+            ? scratch.target_settled.get()
+            : nullptr;
+    if constexpr (UseEdgeParent) {
+      // Extraction already synchronizes for compact path sizes and output.
+      // Stage the touched count before it so reduced reset adds no host
+      // synchronization.
+      DS_DELTA_HIP_CHECK(hipMemcpyAsync(scratch.host_scalar.get(),
+                                        scratch.touched_count.get(),
+                                        sizeof(int),
+                                        hipMemcpyDeviceToHost,
+                                        stream));
+      extract_target_paths_to_result<TargetPathParentMode::kCompactEdge>(
+          result, scratch, d_adjacency, vertex_costs, edge_source, *targets,
+          stream, settled_target_filter);
+      touched_count_for_reset = *scratch.host_scalar.get();
+    } else {
+      if (use_target_set || target >= 0) {
+        touched_count_for_reset = materialize_predecessors_from_keys(
+            d_adjacency, scratch, vertex_costs, stream);
+      }
+      if (use_target_set) {
+        extract_target_paths_to_result<
+            TargetPathParentMode::kLegacyPredecessor>(
+            result, scratch, d_adjacency, vertex_costs, nullptr, *targets,
+            stream, settled_target_filter);
+      } else if (target >= 0) {
+        copy_predecessors_to_result(result, d_adjacency,
+                                    scratch.pred_node.get(),
+                                    scratch.pred_edge.get(), stream);
+      }
     }
     if (use_target_set) {
-      extract_target_paths_to_result<
-          TargetPathParentMode::kLegacyPredecessor>(
-          result, scratch, d_adjacency, vertex_costs, nullptr, *targets,
-          stream);
+      for (std::size_t i = 0; i < result.target_distances.size(); ++i) {
+        if (std::isfinite(result.target_distances[i]) &&
+            !is_effective_source(result.target_sources[i])) {
+          throw std::runtime_error(
+              "delta target path root is not a requested source for target "
+              "index " +
+              std::to_string(i));
+        }
+      }
+      result.target = -1;
     } else if (target >= 0) {
-      copy_predecessors_to_result(result, d_adjacency,
-                                  scratch.pred_node.get(),
-                                  scratch.pred_edge.get(), stream);
+      result.dist = copy_dist_to_host(scratch.dist.get(), n, stream);
+      result.target_distance = result.dist[static_cast<std::size_t>(target)];
+      result.target_reached =
+          !std::isinf(result.target_distance) &&
+          (result.target_reached || result.converged);
+    } else {
+      result.dist = copy_dist_to_host(scratch.dist.get(), n, stream);
     }
-  }
-  if (use_target_set) {
-    result.target = -1;
-  } else if (target >= 0) {
-    result.dist = copy_dist_to_host(scratch.dist.get(), n, stream);
-    result.target_distance = result.dist[static_cast<std::size_t>(target)];
-    result.target_reached =
-        !std::isinf(result.target_distance) &&
-        (result.target_reached || result.converged);
-  } else {
-    result.dist = copy_dist_to_host(scratch.dist.get(), n, stream);
+  } catch (...) {
+    // Counts are still trusted here: traversal completed successfully and the
+    // failure arose only while materializing host-visible results.
+    const std::exception_ptr extraction_exception = std::current_exception();
+    DS_DELTA_HIP_CHECK(hipStreamSynchronize(stream));
+    const int touched_count = copy_scalar_to_host(
+        scratch.touched_count.get(), stream, scratch.host_scalar.get());
+    if constexpr (UseEdgeParent) {
+      reset_compact_parent_touched_vertices(
+          scratch, inf, stream, touched_count, true);
+    } else {
+      reset_touched_vertices(scratch, inf, stream, touched_count);
+    }
+    DS_DELTA_HIP_CHECK(hipStreamSynchronize(stream));
+    std::rethrow_exception(extraction_exception);
   }
   if constexpr (UseEdgeParent) {
     reset_compact_parent_touched_vertices(
@@ -2467,24 +2848,27 @@ DeltaSteppingCsrResult run_delta_stepping_impl(
   } else {
     reset_touched_vertices(scratch, inf, stream, touched_count_for_reset);
   }
+  // Sparse cleanup is part of the run's completion contract.  Parallel
+  // PathFinder workers immediately reuse this workspace for another query, so
+  // returning with reset kernels still queued can race the next source setup.
+  DS_DELTA_HIP_CHECK(hipStreamSynchronize(stream));
   return result;
 }
 
 }  // namespace ds_delta_detail
 
 struct DeltaSteppingCsrGraph::Impl {
+  int device = 0;
   ds_delta_detail::DeviceCsrOwner adjacency;
   float max_edge_value = 0.0f;
   bool has_exact_unit_edge_values = false;
-  int device = 0;
 
   Impl(const HostCsrF32& host, hipStream_t stream)
-      : adjacency(ds_delta_detail::copy_host_csr_to_device(host, stream, true)),
+      : device(ds_delta_detail::current_hip_device()),
+        adjacency(ds_delta_detail::copy_host_csr_to_device(host, stream, true)),
         max_edge_value(ds_delta_detail::max_edge_value(host.values)),
         has_exact_unit_edge_values(
-            ds_delta_detail::has_exact_unit_edge_values(host.values)) {
-    DS_DELTA_HIP_CHECK(hipGetDevice(&device));
-  }
+            ds_delta_detail::has_exact_unit_edge_values(host.values)) {}
 };
 
 DeltaSteppingCsrGraph::DeltaSteppingCsrGraph(const HostCsrF32& adjacency,
@@ -2518,6 +2902,7 @@ struct DeltaSteppingCsrWorkspace::Impl {
   bool has_exact_unit_edge_values = false;
   bool has_vertex_costs = false;
   hipStream_t stream = nullptr;
+  int device = 0;
 
   Impl(const HostCsrF32& host, hipStream_t stream)
       : owned_adjacency(std::make_unique<ds_delta_detail::DeviceCsrOwner>(
@@ -2526,7 +2911,8 @@ struct DeltaSteppingCsrWorkspace::Impl {
         max_edge_value(ds_delta_detail::max_edge_value(host.values)),
         has_exact_unit_edge_values(
             ds_delta_detail::has_exact_unit_edge_values(host.values)),
-        stream(stream) {}
+        stream(stream),
+        device(ds_delta_detail::current_hip_device()) {}
 
   static std::shared_ptr<const DeltaSteppingCsrGraph::Impl>
   require_shared_graph(
@@ -2544,10 +2930,9 @@ struct DeltaSteppingCsrWorkspace::Impl {
         scratch(shared_graph->adjacency.view.rows),
         max_edge_value(shared_graph->max_edge_value),
         has_exact_unit_edge_values(shared_graph->has_exact_unit_edge_values),
-        stream(stream) {
-    int current_device = 0;
-    DS_DELTA_HIP_CHECK(hipGetDevice(&current_device));
-    if (current_device != shared_graph->device) {
+        stream(stream),
+        device(shared_graph->device) {
+    if (ds_delta_detail::current_hip_device() != device) {
       throw std::invalid_argument(
           "delta-stepping shared graph belongs to a different HIP device");
     }
@@ -2568,10 +2953,14 @@ struct DeltaSteppingCsrWorkspace::Impl {
     return *owned_adjacency;
   }
 
-  void require_stream(hipStream_t candidate) const {
+  void require_run_context(hipStream_t candidate) const {
     if (candidate != stream) {
       throw std::invalid_argument(
           "DeltaSteppingCsrWorkspace is stream-affine; use its construction stream");
+    }
+    if (ds_delta_detail::current_hip_device() != device) {
+      throw std::invalid_argument(
+          "DeltaSteppingCsrWorkspace is running on a different HIP device");
     }
   }
 };
@@ -2608,7 +2997,7 @@ void DeltaSteppingCsrWorkspace::update_values(const std::vector<float>& values,
   if (!impl_) {
     throw std::runtime_error("DeltaSteppingCsrWorkspace has no implementation");
   }
-  impl_->require_stream(stream);
+  impl_->require_run_context(stream);
   DeviceCsrOwner& adjacency = impl_->mutable_adjacency();
   if (values.size() != static_cast<std::size_t>(adjacency.view.nnz)) {
     throw std::invalid_argument("updated CSR values size does not match workspace nnz");
@@ -2631,6 +3020,9 @@ void DeltaSteppingCsrWorkspace::update_values(const std::vector<float>& values,
                                     values.size() * sizeof(float),
                                     hipMemcpyHostToDevice,
                                     stream));
+  // The caller retains ownership of values and may have passed a temporary.
+  // Complete the upload before that storage can be destroyed or reused.
+  DS_DELTA_HIP_CHECK(hipStreamSynchronize(stream));
 }
 
 void DeltaSteppingCsrWorkspace::update_vertex_costs(
@@ -2641,7 +3033,7 @@ void DeltaSteppingCsrWorkspace::update_vertex_costs(
   if (!impl_) {
     throw std::runtime_error("DeltaSteppingCsrWorkspace has no implementation");
   }
-  impl_->require_stream(stream);
+  impl_->require_run_context(stream);
   const DeviceCsrOwner& adjacency = impl_->adjacency();
   if (vertex_costs.size() != static_cast<std::size_t>(adjacency.view.rows)) {
     throw std::invalid_argument("vertex cost size does not match workspace rows");
@@ -2659,6 +3051,9 @@ void DeltaSteppingCsrWorkspace::update_vertex_costs(
                                     vertex_costs.size() * sizeof(float),
                                     hipMemcpyHostToDevice,
                                     stream));
+  // Match update_values(): this API does not require callers to keep the host
+  // vector alive after it returns.
+  DS_DELTA_HIP_CHECK(hipStreamSynchronize(stream));
   impl_->has_vertex_costs = true;
 }
 
@@ -2674,7 +3069,7 @@ DeltaSteppingCsrResult DeltaSteppingCsrWorkspace::run(
   if (!impl_) {
     throw std::runtime_error("DeltaSteppingCsrWorkspace has no implementation");
   }
-  impl_->require_stream(stream);
+  impl_->require_run_context(stream);
   const DeviceCsrOwner& adjacency = impl_->adjacency();
   validate_device_csr_shape(adjacency.view, sources, target, delta);
   PATHFINDER_PROFILE_RANGE("delta_step.generic");
@@ -2697,7 +3092,7 @@ DeltaSteppingCsrResult DeltaSteppingCsrWorkspace::run(
   if (!impl_) {
     throw std::runtime_error("DeltaSteppingCsrWorkspace has no implementation");
   }
-  impl_->require_stream(stream);
+  impl_->require_run_context(stream);
   const DeviceCsrOwner& adjacency = impl_->adjacency();
   validate_device_csr_shape(adjacency.view, sources, -1, delta);
   validate_target_list_common_shape(adjacency.view.rows, targets);

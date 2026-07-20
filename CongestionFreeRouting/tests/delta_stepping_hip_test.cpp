@@ -52,6 +52,26 @@ void record_progress(const DeltaSteppingCsrProgress& progress,
   records->push_back(progress);
 }
 
+class ExpectedProgressCallbackError : public std::runtime_error {
+ public:
+  ExpectedProgressCallbackError()
+      : std::runtime_error("expected delta progress callback failure") {}
+};
+
+struct ThrowingProgressState {
+  int calls = 0;
+  int throw_on_call = 1;
+};
+
+void throw_progress_on_selected_call(const DeltaSteppingCsrProgress&,
+                                     void* user_data) {
+  auto* state = static_cast<ThrowingProgressState*>(user_data);
+  ++state->calls;
+  if (state->calls == state->throw_on_call) {
+    throw ExpectedProgressCallbackError();
+  }
+}
+
 void check_hip(hipError_t status, const char* operation) {
   if (status != hipSuccess) {
     throw std::runtime_error(std::string(operation) + ": " +
@@ -815,17 +835,17 @@ HostCsrF32 make_mixed_claim_unit_graph() {
 }
 
 constexpr int kDeepWideLevels = 12;
-constexpr int kDeepWideWidth = 257;
+constexpr int kDeepWideWidth = 4097;
 constexpr int kDeepWideTarget = kDeepWideLevels * kDeepWideWidth;
 constexpr int kDeepWideIsolated = kDeepWideTarget + 1;
 static_assert(kDeepWideLevels > 8, "deep regression must exceed eight levels");
-static_assert(kDeepWideWidth > 256,
-              "wide regression must cross a 256-thread boundary");
+static_assert(kDeepWideWidth > 4096,
+              "wide regression must span many 256-thread blocks");
 
 HostCsrF32 make_deep_wide_layered_graph(float edge_weight) {
-  // Keep 257 vertices live across twelve levels.  This crosses block and wave
-  // boundaries, reaches three four-round batches on the default stream, and
-  // remains only 3,086 rows / 3,084 edges so eight private workspaces are cheap.
+  // Keep 4,097 vertices live across twelve levels.  This spans seventeen
+  // 256-thread blocks per level, reaches three four-round batches on the
+  // default stream, and remains small enough for eight private workspaces.
   std::vector<EdgeSpec> edges;
   edges.reserve(static_cast<std::size_t>(kDeepWideLevels) * kDeepWideWidth);
   for (int lane = 0; lane < kDeepWideWidth; ++lane) {
@@ -927,19 +947,26 @@ void test_default_stream_deep_wide_batching() {
 void test_parallel_deep_wide_explicit_streams() {
   const HostCsrF32 unit_graph = make_deep_wide_layered_graph(1.0f);
   const HostCsrF32 closure_graph = make_deep_wide_layered_graph(0.0f);
+  const HostCsrF32 heavy_graph = make_deep_wide_layered_graph(2.0f);
   auto shared_unit_graph =
       std::make_shared<DeltaSteppingCsrGraph>(unit_graph, nullptr);
   auto shared_closure_graph =
       std::make_shared<DeltaSteppingCsrGraph>(closure_graph, nullptr);
+  auto shared_heavy_graph =
+      std::make_shared<DeltaSteppingCsrGraph>(heavy_graph, nullptr);
   const std::vector<float> unit_expected =
       cpu_dijkstra_outgoing_multi_source(unit_graph, {0});
   const std::vector<float> closure_expected =
       cpu_dijkstra_outgoing_multi_source(closure_graph, {0});
+  const std::vector<float> heavy_expected =
+      cpu_dijkstra_outgoing_multi_source(heavy_graph, {0});
   int device = 0;
   check_hip(hipGetDevice(&device), "hipGetDevice");
 
   constexpr int kWorkers = 8;
   constexpr int kRunsPerWorker = 4;
+  constexpr int kForceGenericMaxIterations =
+      std::numeric_limits<int>::max();
   std::promise<void> start_promise;
   const std::shared_future<void> start = start_promise.get_future().share();
   std::atomic<int> ready{0};
@@ -955,6 +982,8 @@ void test_parallel_deep_wide_explicit_streams() {
                                                  stream.get());
         DeltaSteppingCsrWorkspace closure_workspace(shared_closure_graph,
                                                     stream.get());
+        DeltaSteppingCsrWorkspace heavy_workspace(shared_heavy_graph,
+                                                  stream.get());
         ready.fetch_add(1, std::memory_order_release);
         readiness_reported = true;
         start.wait();
@@ -987,6 +1016,33 @@ void test_parallel_deep_wide_explicit_streams() {
                                  stream.get(),
                                  nullptr,
                                  nullptr));
+          // A finite cap bypasses the exact-unit specialization.  With
+          // delta=1 every 4,097-wide level crosses the pending-minimum and
+          // compaction handoffs used by the production-sized generic graph.
+          validate_deep_wide_result(
+              prefix + ": generic unit-weight target",
+              unit_graph,
+              unit_expected,
+              kDeepWideTarget,
+              unit_workspace.run({0},
+                                 std::vector<int>{kDeepWideTarget},
+                                 1.0f,
+                                 kForceGenericMaxIterations,
+                                 stream.get(),
+                                 nullptr,
+                                 nullptr));
+          validate_deep_wide_result(
+              prefix + ": generic unit-weight exhaustion",
+              unit_graph,
+              unit_expected,
+              kDeepWideIsolated,
+              unit_workspace.run({0},
+                                 std::vector<int>{kDeepWideIsolated},
+                                 1.0f,
+                                 kForceGenericMaxIterations,
+                                 stream.get(),
+                                 nullptr,
+                                 nullptr));
           validate_deep_wide_result(
               prefix + ": generic closure target",
               closure_graph,
@@ -1011,6 +1067,34 @@ void test_parallel_deep_wide_explicit_streams() {
                                     stream.get(),
                                     nullptr,
                                     nullptr));
+          // Weight 2 with delta 1 forces every useful relaxation through the
+          // once-per-bucket heavy queue before pending-minimum reduction and
+          // compaction. Run it concurrently to cover the remaining explicit-
+          // stream producer/consumer chain.
+          validate_deep_wide_result(
+              prefix + ": generic heavy target",
+              heavy_graph,
+              heavy_expected,
+              kDeepWideTarget,
+              heavy_workspace.run({0},
+                                  std::vector<int>{kDeepWideTarget},
+                                  1.0f,
+                                  -1,
+                                  stream.get(),
+                                  nullptr,
+                                  nullptr));
+          validate_deep_wide_result(
+              prefix + ": generic heavy exhaustion",
+              heavy_graph,
+              heavy_expected,
+              kDeepWideIsolated,
+              heavy_workspace.run({0},
+                                  std::vector<int>{kDeepWideIsolated},
+                                  1.0f,
+                                  -1,
+                                  stream.get(),
+                                  nullptr,
+                                  nullptr));
         }
       } catch (...) {
         if (!readiness_reported) {
@@ -1046,6 +1130,22 @@ void test_unit_weight_specialization(hipStream_t stream) {
   DeltaSteppingCsrWorkspace workspace(graph, stream);
   const std::vector<float> unit_expected =
       cpu_dijkstra_outgoing_multi_source(graph, {0, 8, 0});
+
+  const DeltaSteppingCsrResult all_source_targets = workspace.run(
+      {0, 8, 0}, std::vector<int>{0, 8, 0}, 4.0f, -1,
+      stream, nullptr, nullptr);
+  validate_compact_target_paths("unit specialization all-source targets",
+                                graph,
+                                {0, 8, 0},
+                                {0, 8, 0},
+                                unit_expected,
+                                all_source_targets);
+  require(all_source_targets.iterations_used == 0 &&
+              all_source_targets.target_reached &&
+              all_source_targets.stopped_on_target &&
+              !all_source_targets.converged,
+          "unit specialization all-source stop is inconsistent");
+
   const std::vector<int> lazy_unit_targets = {4, 7, 7};
   const DeltaSteppingCsrResult lazy_unit_first = workspace.run(
       {0, 8, 0}, lazy_unit_targets, 4.0f, -1, stream, nullptr, nullptr);
@@ -1426,6 +1526,151 @@ void test_batched_closure_and_iteration_fallback(hipStream_t stream) {
   }
 }
 
+void test_capped_tentative_target_filtering(hipStream_t stream) {
+  // Bucket zero discovers a valid but non-shortest direct path to vertex two
+  // through a heavy edge.  The shorter path is not settled until later buckets.
+  // A one-bucket cap must not expose the tentative distance/path as a reached
+  // target.  A source target remains settled even when the cap is zero.
+  const HostCsrF32 graph = make_outgoing_csr(
+      3,
+      {{0, 2, 10.0f}, {0, 1, 1.0f}, {1, 2, 1.0f}});
+  const std::vector<float> expected =
+      cpu_dijkstra_outgoing_multi_source(graph, {0});
+
+  auto exercise = [&](const std::string& label,
+                      DeltaSteppingCsrWorkspace& workspace) {
+    std::vector<float> zero_iteration_expected(
+        static_cast<std::size_t>(graph.rows), kInf);
+    zero_iteration_expected[0] = 0.0f;
+
+    const std::vector<int> all_source_targets = {0, 0};
+    const DeltaSteppingCsrResult all_sources = workspace.run(
+        std::vector<int>{0}, all_source_targets, 1.0f, 0,
+        stream, nullptr, nullptr);
+    validate_compact_target_paths(label + ": all targets are sources",
+                                  graph,
+                                  {0},
+                                  all_source_targets,
+                                  zero_iteration_expected,
+                                  all_sources);
+    require(all_sources.iterations_used == 0 &&
+                all_sources.target_reached &&
+                all_sources.stopped_on_target &&
+                !all_sources.converged,
+            label + ": all-source target stop is inconsistent at zero cap");
+
+    const std::vector<int> zero_iteration_targets = {0, 2};
+    const DeltaSteppingCsrResult zero_iterations = workspace.run(
+        std::vector<int>{0}, zero_iteration_targets, 1.0f, 0,
+        stream, nullptr, nullptr);
+    validate_compact_target_paths(label + ": zero-iteration source target",
+                                  graph,
+                                  {0},
+                                  zero_iteration_targets,
+                                  zero_iteration_expected,
+                                  zero_iterations);
+    require(zero_iterations.iterations_used == 0 &&
+                !zero_iterations.converged &&
+                !zero_iterations.stopped_on_target,
+            label + ": zero-iteration result did not preserve its cap");
+    require(zero_iterations.target_distances[0] == 0.0f &&
+                std::isinf(zero_iterations.target_distances[1]),
+            label + ": zero-iteration settled mask lost its source target");
+
+    std::vector<float> capped_expected(
+        static_cast<std::size_t>(graph.rows), kInf);
+    const DeltaSteppingCsrResult capped = workspace.run(
+        std::vector<int>{0}, std::vector<int>{2}, 1.0f, 1,
+        stream, nullptr, nullptr);
+    validate_compact_target_paths(label + ": tentative heavy target",
+                                  graph,
+                                  {0},
+                                  {2},
+                                  capped_expected,
+                                  capped);
+    require(capped.iterations_used == 1 && !capped.target_reached &&
+                !capped.stopped_on_target && !capped.converged,
+            label + ": finite cap exposed an unsettled target");
+
+    const DeltaSteppingCsrResult completed = workspace.run(
+        std::vector<int>{0}, std::vector<int>{2}, 1.0f, -1,
+        stream, nullptr, nullptr);
+    validate_compact_target_paths(label + ": reuse after capped cleanup",
+                                  graph,
+                                  {0},
+                                  {2},
+                                  expected,
+                                  completed);
+    require(completed.stopped_on_target && !completed.converged,
+            label + ": completed rerun did not settle the target");
+  };
+
+  DeltaSteppingCsrWorkspace automatic(graph, stream);
+  DeltaSteppingCsrWorkspace legacy(
+      graph, stream, DeltaSteppingCsrParentMode::kForceLegacy);
+  exercise("automatic compact parents", automatic);
+  exercise("forced legacy parents", legacy);
+}
+
+void test_callback_exception_cleanup(hipStream_t stream) {
+  // The forward query reaches its target in the second bucket.  Throw once at
+  // the first next-bucket callback (with live pending membership), and once at
+  // the later target-stop callback (with every vertex touched).  The reverse
+  // recovery query changes the source; stale distances, flags, or predecessor
+  // state from either aborted run would produce an immediately wrong path.
+  const HostCsrF32 graph = make_outgoing_csr(
+      4,
+      {{0, 1, 0.75f},
+       {1, 0, 0.75f},
+       {1, 2, 1.25f},
+       {2, 1, 1.25f},
+       {2, 3, 0.5f},
+       {3, 2, 0.5f}});
+  const std::vector<float> reverse_expected =
+      cpu_dijkstra_outgoing_multi_source(graph, {3});
+
+  auto exercise = [&](const std::string& label,
+                      DeltaSteppingCsrWorkspace& workspace) {
+    for (const int throw_on_call : {1, 2}) {
+      ThrowingProgressState throwing_state;
+      throwing_state.throw_on_call = throw_on_call;
+      bool caught_original = false;
+      try {
+        (void)workspace.run(std::vector<int>{0}, std::vector<int>{3}, 1.0f,
+                            -1, stream, throw_progress_on_selected_call,
+                            &throwing_state);
+      } catch (const ExpectedProgressCallbackError&) {
+        caught_original = true;
+      } catch (const std::exception& error) {
+        fail(label + ": callback cleanup replaced the original exception: " +
+             error.what());
+      }
+      require(caught_original && throwing_state.calls == throw_on_call,
+              label + ": selected callback exception was not preserved");
+
+      const DeltaSteppingCsrResult recovered = workspace.run(
+          std::vector<int>{3}, std::vector<int>{0}, 1.0f, -1,
+          stream, nullptr, nullptr);
+      const std::string recovery_label =
+          label + ": reuse after callback " + std::to_string(throw_on_call);
+      validate_compact_target_paths(recovery_label,
+                                    graph,
+                                    {3},
+                                    {0},
+                                    reverse_expected,
+                                    recovered);
+      require(recovered.stopped_on_target && !recovered.converged,
+              recovery_label + ": workspace state was not restored");
+    }
+  };
+
+  DeltaSteppingCsrWorkspace automatic(graph, stream);
+  DeltaSteppingCsrWorkspace legacy(
+      graph, stream, DeltaSteppingCsrParentMode::kForceLegacy);
+  exercise("automatic callback cleanup", automatic);
+  exercise("forced-legacy callback cleanup", legacy);
+}
+
 void test_wave_boundary_contention(hipStream_t stream) {
   constexpr int kFrontierSize = 257;
   {
@@ -1765,7 +2010,9 @@ void test_workspace_reuse_and_updates(hipStream_t stream) {
             : 0.35f + old_weight *
                           (0.5f + 0.25f * static_cast<float>(edge % 5));
   }
-  workspace.update_values(current.values, stream);
+  // Exercise the update API's host-lifetime contract: the temporary is gone
+  // before the following run begins.
+  workspace.update_values(std::vector<float>(current.values), stream);
   legacy_workspace.update_values(current.values, stream);
   run_full_and_target_checks("updated edge values",
                              workspace,
@@ -1791,7 +2038,7 @@ void test_workspace_reuse_and_updates(hipStream_t stream) {
     vertex_costs[vertex] =
         0.5f + 0.375f * static_cast<float>((vertex * 7) % 6);
   }
-  workspace.update_vertex_costs(vertex_costs, stream);
+  workspace.update_vertex_costs(std::vector<float>(vertex_costs), stream);
   legacy_workspace.update_vertex_costs(vertex_costs, stream);
   run_full_and_target_checks("destination vertex costs",
                              workspace,
@@ -1985,6 +2232,8 @@ int main() {
     test_zero_weight_scc_predecessors(stream.get());
     test_float_bucket_boundaries_and_saturation(stream.get());
     test_batched_closure_and_iteration_fallback(stream.get());
+    test_capped_tentative_target_filtering(stream.get());
+    test_callback_exception_cleanup(stream.get());
     test_wave_boundary_contention(stream.get());
     test_shared_graph_workspaces(stream.get());
     test_parallel_divergent_workspaces(stream.get());

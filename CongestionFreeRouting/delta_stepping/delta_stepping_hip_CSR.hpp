@@ -64,8 +64,9 @@ class DeltaSteppingCsrWorkspace {
  public:
   struct Impl;
 
-  // A workspace is stream-affine: construction, updates, and every run must
-  // use the same stream handle. Separate workspaces may use separate streams.
+  // A workspace is stream- and device-affine: construction, updates, and
+  // every run must use the same stream handle while its construction device is
+  // current. Separate workspaces may use separate streams.
   explicit DeltaSteppingCsrWorkspace(const HostCsrF32& adjacency,
                                      hipStream_t stream = nullptr);
   DeltaSteppingCsrWorkspace(const HostCsrF32& adjacency,
