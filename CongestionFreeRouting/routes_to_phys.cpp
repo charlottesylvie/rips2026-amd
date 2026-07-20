@@ -23,6 +23,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cerrno>
 #include <cctype>
 #include <cstdint>
 #include <cstring>
@@ -611,16 +612,48 @@ void write_gzip_file(const std::filesystem::path& path,
                      kj::ArrayPtr<const kj::byte> bytes) {
   gzFile file = gzopen(path.string().c_str(), "wb6");
   if (!file) throw std::runtime_error("could not open output file: " + path.string());
-  const int written =
-      gzwrite(file, bytes.begin(), static_cast<unsigned int>(bytes.size()));
-  if (written != static_cast<int>(bytes.size())) {
-    int zlib_error = 0;
-    const char* message = gzerror(file, &zlib_error);
-    gzclose(file);
-    throw std::runtime_error("failed while writing " + path.string() + ": " +
-                             (message ? message : "zlib error"));
+
+  // gzwrite takes an unsigned length but reports the byte count as int.  One
+  // call cannot safely represent a multi-gigabyte flattened PhysicalNetlist.
+  // Bounded chunks also make every return value unambiguous on all zlib builds.
+  constexpr std::size_t kWriteChunkBytes = 64ULL * 1024ULL * 1024ULL;
+  std::size_t offset = 0;
+  while (offset < bytes.size()) {
+    const unsigned int chunk_size = static_cast<unsigned int>(
+        std::min<std::size_t>(bytes.size() - offset, kWriteChunkBytes));
+    const int written = gzwrite(file, bytes.begin() + offset, chunk_size);
+    if (written != static_cast<int>(chunk_size)) {
+      int zlib_error = Z_OK;
+      const char* raw_message = gzerror(file, &zlib_error);
+      // gzerror's pointer belongs to the gzFile and becomes invalid at close.
+      std::string message = raw_message == nullptr ? std::string() : raw_message;
+      const int saved_errno = errno;
+      (void)gzclose(file);
+      if (message.empty()) {
+        message = zlib_error == Z_ERRNO
+                      ? std::strerror(saved_errno)
+                      : zError(zlib_error);
+      }
+      if (message.empty()) {
+        message = "zlib write error " + std::to_string(zlib_error);
+      }
+      throw std::runtime_error("failed while writing " + path.string() + ": " +
+                               message);
+    }
+    offset += static_cast<std::size_t>(written);
   }
-  gzclose(file);
+
+  const int close_status = gzclose(file);
+  if (close_status != Z_OK) {
+    const int saved_errno = errno;
+    const char* zlib_message = zError(close_status);
+    const std::string message =
+        close_status == Z_ERRNO
+            ? std::strerror(saved_errno)
+            : (zlib_message == nullptr ? "zlib error" : zlib_message);
+    throw std::runtime_error("failed while closing " + path.string() + ": " +
+                             message);
+  }
 }
 
 std::vector<std::string> copy_string_list(
