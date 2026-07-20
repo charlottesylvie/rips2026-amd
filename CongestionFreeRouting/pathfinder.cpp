@@ -449,29 +449,39 @@ RoutedNet route_net(const HostCsrF32& graph,
 
       if (has_compact_target_paths) {
         const float distance = sssp.target_distances[target_pos];
+        const int reported_source = sssp.target_sources[target_pos];
         const int node_begin = sssp.target_path_offsets[target_pos];
         const int node_end = sssp.target_path_offsets[target_pos + 1];
         const int edge_begin = sssp.target_edge_offsets[target_pos];
         const int edge_end = sssp.target_edge_offsets[target_pos + 1];
         if (!std::isfinite(distance) ||
-            !valid_node(sssp.target_sources[target_pos], graph.rows) ||
+            !valid_node(reported_source, graph.rows) ||
+            !tree_contains(tree_seen, tree_stamp, reported_source) ||
             node_begin < 0 ||
             node_end <= node_begin ||
             edge_begin < 0 ||
             edge_end < edge_begin ||
             static_cast<std::size_t>(node_end) > sssp.target_path_nodes.size() ||
-            static_cast<std::size_t>(edge_end) > sssp.target_path_edges.size()) {
+            static_cast<std::size_t>(edge_end) > sssp.target_path_edges.size() ||
+            sssp.target_path_nodes[static_cast<std::size_t>(node_begin)] !=
+                reported_source) {
           reached_all = false;
           continue;
         }
 
         std::size_t tree_start = 0;
+        bool found_tree_intersection = false;
         for (int node_index = node_begin; node_index < node_end; ++node_index) {
           const int path_node =
               sssp.target_path_nodes[static_cast<std::size_t>(node_index)];
           if (tree_contains(tree_seen, tree_stamp, path_node)) {
+            found_tree_intersection = true;
             tree_start = static_cast<std::size_t>(node_index - node_begin);
           }
+        }
+        if (!found_tree_intersection) {
+          reached_all = false;
+          continue;
         }
 
         routed_sink.source =

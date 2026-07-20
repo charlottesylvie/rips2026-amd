@@ -296,6 +296,36 @@ routing::RoutingMetadata make_two_net_metadata(const HostCsrF32& graph) {
   return metadata;
 }
 
+struct DetachedCompactWorkspace {
+  UnitBfsCsrResult run(const std::vector<int>& sources,
+                       const std::vector<int>& targets,
+                       float delta,
+                       int max_depth,
+                       hipStream_t stream,
+                       UnitBfsCsrProgressCallback progress_callback,
+                       void* progress_user_data) {
+    (void)sources;
+    (void)targets;
+    (void)delta;
+    (void)max_depth;
+    (void)stream;
+    (void)progress_callback;
+    (void)progress_user_data;
+
+    UnitBfsCsrResult result;
+    result.target_distances = {1.0f};
+    result.target_sources = {1};
+    result.target_path_offsets = {0, 2};
+    result.target_edge_offsets = {0, 1};
+    result.target_path_nodes = {1, 2};
+    result.target_path_edges = {2};
+    result.target_reached = true;
+    result.stopped_on_target = true;
+    result.converged = true;
+    return result;
+  }
+};
+
 }  // namespace
 
 struct BellmanFord10CsrGraph::Impl {
@@ -750,6 +780,34 @@ int main() {
   require(path.size() == 2, "expected two edges in 0->2 reconstructed path");
   require(path[0].from == 0 && path[0].to == 1, "first path edge should be 0->1");
   require(path[1].from == 1 && path[1].to == 2, "second path edge should be 1->2");
+
+  routing::RouteRequest detached_request;
+  detached_request.sources.push_back({0, 0, 0});
+  detached_request.sinks.push_back({2, 0, 0});
+  DetachedCompactWorkspace detached_workspace;
+  std::vector<std::uint32_t> detached_tree_seen(
+      static_cast<std::size_t>(graph.rows), 0);
+  std::vector<int> detached_parent_by_child(
+      static_cast<std::size_t>(graph.rows), -1);
+  std::vector<std::uint32_t> detached_parent_seen(
+      static_cast<std::size_t>(graph.rows), 0);
+  routing::PathfinderOptions detached_options;
+  const routing::RoutedNet detached_net = routing::route_net(
+      graph,
+      detached_workspace,
+      detached_request,
+      detached_tree_seen,
+      detached_parent_by_child,
+      detached_parent_seen,
+      1,
+      detached_options,
+      nullptr);
+  require(!detached_net.reached_all_sinks,
+          "compact path rooted outside the submitted source tree must be rejected");
+  require(detached_net.sinks.size() == 1 &&
+              !detached_net.sinks.front().reached &&
+              detached_net.sinks.front().edges.empty(),
+          "rejected detached compact path must not leak route edges");
 
   const HostCsrF32 self_loop_graph = make_self_loop_predecessor_graph();
   const std::vector<float> self_loop_dist =

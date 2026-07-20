@@ -625,6 +625,8 @@ __global__ void fill_target_paths_kernel(const int* targets,
                                          int* path_sources,
                                          const int* node_offsets,
                                          const int* edge_offsets,
+                                         int path_node_capacity,
+                                         int path_edge_capacity,
                                          int* path_nodes,
                                          Offset* path_edges) {
   for (int i = blockIdx.x * blockDim.x + threadIdx.x;
@@ -635,7 +637,17 @@ __global__ void fill_target_paths_kernel(const int* targets,
     }
     const int length = path_lengths[i];
     const int node_begin = node_offsets[i];
+    const int node_end = node_offsets[i + 1];
     const int edge_begin = edge_offsets[i];
+    const int edge_end = edge_offsets[i + 1];
+    if (node_begin < 0 || node_end < node_begin ||
+        node_end > path_node_capacity || node_end - node_begin != length ||
+        edge_begin < 0 || edge_end < edge_begin ||
+        edge_end > path_edge_capacity ||
+        edge_end - edge_begin != length - 1) {
+      path_status[i] = 0;
+      continue;
+    }
     int current = targets[i];
     bool path_valid = true;
     path_nodes[node_begin + length - 1] = current;
@@ -778,6 +790,11 @@ void reset_visited_levels(UnitBfsScratch& scratch,
 
 std::array<int, kStatusCount> copy_status_to_host(UnitBfsScratch& scratch,
                                                   hipStream_t stream) {
+  // A D2H copy can use a different hardware engine from the producing kernel.
+  // On the target gfx1151 runtime, synchronizing only after enqueueing the copy
+  // has allowed it to observe the previous dispatch's status.  Complete the
+  // producer first, matching AMD_SERIALIZE_COPY's before-enqueue guarantee.
+  synchronize_explicit_stream(stream);
   UNIT_BFS_HIP_CHECK(hipMemcpyAsync(scratch.host_status.get(),
                                     scratch.status.get(),
                                     kStatusCount * sizeof(int),
@@ -808,6 +825,11 @@ void extract_target_paths_to_result(UnitBfsCsrResult& result,
       scratch.target_sources.get(),
       scratch.target_path_status.get());
   UNIT_BFS_HIP_CHECK(hipGetLastError());
+  // Host path lengths determine both the compact allocation size and the
+  // offsets consumed by fill_target_paths_kernel.  If the copies below race
+  // ahead of measurement, stale lengths can undersize the device buffers and
+  // turn the fill into an out-of-bounds GPU write.
+  synchronize_explicit_stream(stream);
 
   result.target_distances.resize(targets.size());
   result.target_sources.assign(targets.size(), -1);
@@ -888,9 +910,14 @@ void extract_target_paths_to_result(UnitBfsCsrResult& result,
             scratch.target_sources.get(),
             scratch.target_node_offsets.get(),
             scratch.target_edge_offsets.get(),
+            static_cast<int>(total_nodes),
+            static_cast<int>(total_edges),
             scratch.compact_path_nodes.get(),
             scratch.compact_path_edges.get());
     UNIT_BFS_HIP_CHECK(hipGetLastError());
+    // Do not let the copy engine read a prior route's compact buffers before
+    // the current fill has completed.
+    synchronize_explicit_stream(stream);
     UNIT_BFS_HIP_CHECK(hipMemcpyAsync(result.target_path_nodes.data(),
                                       scratch.compact_path_nodes.get(),
                                       total_nodes * sizeof(int),
@@ -1204,6 +1231,24 @@ UnitBfsCsrResult run_unit_bfs_with_offsets(
                                    targets,
                                    queue_tail,
                                    stream);
+    for (std::size_t i = 0; i < targets.size(); ++i) {
+      if (!std::isfinite(result.target_distances[i])) {
+        continue;
+      }
+      const int path_source = result.target_sources[i];
+      const bool belongs_to_current_sources =
+          effective_sources->size() == 1
+              ? path_source == effective_sources->front()
+              : std::find(effective_sources->begin(),
+                          effective_sources->end(),
+                          path_source) != effective_sources->end();
+      if (!belongs_to_current_sources) {
+        throw std::runtime_error(
+            "unit BFS predecessor path is detached from the current source set "
+            "for target index " +
+            std::to_string(i));
+      }
+    }
   } catch (...) {
     // Result allocation and predecessor validation are host-visible failure
     // points after traversal has completed. Restore the reusable sparse state
