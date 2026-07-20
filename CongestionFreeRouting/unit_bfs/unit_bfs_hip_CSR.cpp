@@ -325,7 +325,10 @@ __device__ inline void count_target_if_reached(int v,
 
 __device__ inline int wave_append_position(bool append, int* queue_tail) {
   const unsigned long long mask = __ballot(append);
-  if (!append) {
+  // Keep every lane that participated in the ballot together through the
+  // shuffle. Returning non-appending lanes before the wave-wide collective
+  // makes the leader's queue-base broadcast undefined.
+  if (mask == 0) {
     return -1;
   }
 
@@ -336,6 +339,9 @@ __device__ inline int wave_append_position(bool append, int* queue_tail) {
     base = atomicAdd(queue_tail, __popcll(mask));
   }
   base = __shfl(base, leader);
+  if (!append) {
+    return -1;
+  }
   const unsigned long long lower_lanes =
       lane == 0 ? 0ULL : mask & ((1ULL << lane) - 1ULL);
   return base + __popcll(lower_lanes);

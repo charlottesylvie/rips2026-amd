@@ -550,7 +550,10 @@ __device__ inline int bucket_index(float distance, float delta) {
 
 __device__ inline int wave_append_position(bool append, int* queue_tail) {
   const unsigned long long mask = __ballot(append);
-  if (!append) {
+  // Every active lane that participated in the ballot must also participate
+  // in the shuffle. Returning false-predicate lanes before the collective
+  // makes the leader's queue-base broadcast undefined.
+  if (mask == 0) {
     return -1;
   }
 
@@ -561,6 +564,9 @@ __device__ inline int wave_append_position(bool append, int* queue_tail) {
     base = atomicAdd(queue_tail, __popcll(mask));
   }
   base = __shfl(base, leader);
+  if (!append) {
+    return -1;
+  }
   const unsigned long long lower_lanes =
       lane == 0 ? 0ULL : mask & ((1ULL << lane) - 1ULL);
   return base + __popcll(lower_lanes);

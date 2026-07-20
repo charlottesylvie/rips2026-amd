@@ -788,6 +788,26 @@ void test_empty_and_singleton_graphs(hipStream_t stream) {
   }
 }
 
+HostCsrF32 make_mixed_claim_unit_graph() {
+  // A full frontier wave alternates failed and successful claims, followed by
+  // 32 lanes contending for one fresh vertex.  The isolated final vertex makes
+  // it possible to alternate early-stop and exhausted unit-weight searches.
+  std::vector<EdgeSpec> edges;
+  edges.reserve(128);
+  for (int destination = 1; destination <= 64; ++destination) {
+    edges.push_back({0, destination, 1.0f});
+  }
+  for (int vertex = 1; vertex <= 64; ++vertex) {
+    const int lane = vertex - 1;
+    edges.push_back(
+        {vertex, lane % 2 == 0 ? 0 : 65 + lane / 2, 1.0f});
+  }
+  for (int vertex = 65; vertex <= 96; ++vertex) {
+    edges.push_back({vertex, 97, 1.0f});
+  }
+  return make_outgoing_csr(99, edges);
+}
+
 void test_unit_weight_specialization(hipStream_t stream) {
   HostCsrF32 graph = make_outgoing_csr(
       10,
@@ -845,6 +865,55 @@ void test_unit_weight_specialization(hipStream_t stream) {
           "delta target-stop result should not report full convergence");
   require(early_stop.iterations_used == 1,
           "unit specialization did not report the expected delta bucket round");
+
+  const HostCsrF32 mixed_graph = make_mixed_claim_unit_graph();
+  DeltaSteppingCsrWorkspace mixed_workspace(mixed_graph, stream);
+  const std::vector<float> mixed_expected =
+      cpu_dijkstra_outgoing_multi_source(mixed_graph, {0});
+  // A finite cap bypasses the small-graph exact-unit specialization and
+  // exercises the generic Delta-Stepping queues used by the production graph,
+  // whose row count is above the specialization's 2^24 cutoff.
+  constexpr int kForceGenericMaxIterations =
+      std::numeric_limits<int>::max();
+  constexpr int kMixedClaimReuseRuns = 64;
+  for (int repetition = 0; repetition < kMixedClaimReuseRuns; ++repetition) {
+    const std::string suffix = " reuse " + std::to_string(repetition);
+    const DeltaSteppingCsrResult mixed_early = mixed_workspace.run(
+        {0},
+        std::vector<int>{65},
+        4.0f,
+        kForceGenericMaxIterations,
+        stream,
+        nullptr,
+        nullptr);
+    validate_compact_target_paths(
+        "generic mixed-claim early stop" + suffix,
+        mixed_graph,
+        {0},
+        {65},
+        mixed_expected,
+        mixed_early);
+    require(mixed_early.stopped_on_target && !mixed_early.converged,
+            "generic mixed-claim reachable target did not stop early" + suffix);
+
+    const DeltaSteppingCsrResult mixed_exhausted = mixed_workspace.run(
+        {0},
+        std::vector<int>{98},
+        4.0f,
+        kForceGenericMaxIterations,
+        stream,
+        nullptr,
+        nullptr);
+    validate_compact_target_paths(
+        "generic mixed-claim exhaustion" + suffix,
+        mixed_graph,
+        {0},
+        {98},
+        mixed_expected,
+        mixed_exhausted);
+    require(mixed_exhausted.converged && !mixed_exhausted.stopped_on_target,
+            "generic mixed-claim unreachable target did not exhaust" + suffix);
+  }
 
   graph.values.front() = 2.5f;
   workspace.update_values(graph.values, stream);

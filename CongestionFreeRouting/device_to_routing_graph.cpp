@@ -9,6 +9,7 @@
 //     CongestionFreeRouting/device_to_routing_graph.cpp \
 //     CongestionFreeRouting/interchange/device_routing_graph.cpp \
 //     <generated-schema-dir>/DeviceResources.capnp.c++ \
+//     <generated-schema-dir>/LogicalNetlist.capnp.c++ \
 //     <generated-schema-dir>/References.capnp.c++ \
 //     -lcapnp -lkj -lz -o device_to_routing_graph
 //

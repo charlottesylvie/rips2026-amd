@@ -447,6 +447,41 @@ HostCsrF32 make_wide_layered_graph() {
   return graph;
 }
 
+HostCsrF32 make_mixed_claim_graph() {
+  // The second BFS level contains a full wave whose lanes alternate between
+  // an already-visited destination and a fresh destination.  The third level
+  // then has 32 lanes contend for one fresh vertex.  Both levels exercise
+  // mixed true/false wave appends; vertex 98 remains isolated.
+  //
+  //   0 -> 1..64
+  //   1,3,...,63 -> 0
+  //   2,4,...,64 -> 65..96 -> 97    98 (isolated)
+  constexpr int kRows = 99;
+  HostCsrF32 graph;
+  graph.rows = kRows;
+  graph.cols = kRows;
+  graph.rowptr.resize(kRows + 1);
+  for (int v = 0; v < kRows; ++v) {
+    graph.rowptr[static_cast<std::size_t>(v)] =
+        static_cast<Offset>(graph.colind.size());
+    if (v == 0) {
+      for (int dst = 1; dst <= 64; ++dst) {
+        graph.colind.push_back(dst);
+      }
+    } else if (v >= 1 && v <= 64) {
+      const int lane = v - 1;
+      graph.colind.push_back(
+          lane % 2 == 0 ? 0 : 65 + lane / 2);
+    } else if (v >= 65 && v <= 96) {
+      graph.colind.push_back(97);
+    }
+  }
+  graph.rowptr.back() = static_cast<Offset>(graph.colind.size());
+  graph.nnz = static_cast<Offset>(graph.colind.size());
+  graph.values.assign(graph.colind.size(), 1.0f);
+  return graph;
+}
+
 ExpectedTarget reached_on_chain(int target) {
   std::vector<int> nodes;
   std::vector<Offset> edges;
@@ -648,6 +683,36 @@ void run_batching_suite(UnitBfsCsrOffsetMode mode,
            -1,
            wide_exhausted,
            mode_label + ": wide frontier exhaustion");
+
+  const HostCsrF32 mixed_graph = make_mixed_claim_graph();
+  UnitBfsCsrWorkspace mixed_workspace(mixed_graph, nullptr, mode);
+  const ExpectedRun mixed_early_stop{
+      2,
+      true,
+      true,
+      true,
+      {reached(65, 2.0f, 0, {0, 2, 65}, {1, 65})}};
+  const ExpectedRun mixed_exhausted{
+      4, true, false, false, {unreachable(98)}};
+  constexpr int kMixedClaimReuseRuns = 64;
+  for (int repetition = 0; repetition < kMixedClaimReuseRuns; ++repetition) {
+    const std::string suffix =
+        " reuse " + std::to_string(repetition);
+    run_case(mixed_workspace,
+             mixed_graph,
+             {0},
+             {65},
+             -1,
+             mixed_early_stop,
+             mode_label + ": mixed-claim early stop" + suffix);
+    run_case(mixed_workspace,
+             mixed_graph,
+             {0},
+             {98},
+             -1,
+             mixed_exhausted,
+             mode_label + ": mixed-claim exhaustion" + suffix);
+  }
 }
 
 }  // namespace

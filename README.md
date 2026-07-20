@@ -175,6 +175,7 @@ g++ -std=c++17 -O3 -I"$SCHEMA_DIR" \
   CongestionFreeRouting/device_to_routing_graph.cpp \
   CongestionFreeRouting/interchange/device_routing_graph.cpp \
   "$SCHEMA_DIR"/DeviceResources.capnp.c++ \
+  "$SCHEMA_DIR"/LogicalNetlist.capnp.c++ \
   "$SCHEMA_DIR"/References.capnp.c++ \
   -lcapnp -lkj -lz -o device_to_routing_graph
 
