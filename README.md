@@ -363,19 +363,20 @@ CPU-only PathFinder logic test:
 g++ -std=c++17 -O2 -pthread \
   -I Routing/tests/fake_hip \
   -I HIP_kernel/bellman_ford/src \
+  -I CongestionFreeRouting/bellman_ford \
   -I CongestionFreeRouting/delta_stepping \
   -I CongestionFreeRouting/unit_bfs \
-  CongestionFreeRouting/tests/pathfinder_cpu_stub_test.cpp \
-  -o /tmp/congestion_free_pathfinder_cpu_stub_test
+  CongestionFreeRouting/tests/pathfinder_bf10_cpu_stub_test.cpp \
+  -o /tmp/pathfinder_bf10_cpu_stub_test
 
-/tmp/congestion_free_pathfinder_cpu_stub_test
+/tmp/pathfinder_bf10_cpu_stub_test
 ```
 
 Unit-BFS compact-offset and batched-level correctness test (requires an AMD HIP
 system):
 
 ```bash
-hipcc -std=c++17 -O2 -x hip \
+hipcc -std=c++17 -O2 -pthread -x hip \
   -I HIP_kernel/bellman_ford/src \
   -I CongestionFreeRouting/unit_bfs \
   CongestionFreeRouting/tests/unit_bfs_hip_test.cpp \

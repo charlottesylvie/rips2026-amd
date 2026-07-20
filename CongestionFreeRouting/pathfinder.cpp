@@ -866,16 +866,22 @@ void route_all_nets_with_workspace(const HostCsrF32& base_graph,
       const RouteRequest& request = metadata.route_requests[net_index];
       const std::uint32_t tree_stamp =
           next_tree_stamp(route_tree_seen, &route_tree_stamp);
-      nets[net_index] =
-          route_net(base_graph,
-                    sssp_workspace,
-                    request,
-                    route_tree_seen,
-                    route_parent_by_child,
-                    route_parent_seen,
-                    tree_stamp,
-                    options,
-                    stream);
+      try {
+        nets[net_index] =
+            route_net(base_graph,
+                      sssp_workspace,
+                      request,
+                      route_tree_seen,
+                      route_parent_by_child,
+                      route_parent_seen,
+                      tree_stamp,
+                      options,
+                      stream);
+      } catch (const std::exception& error) {
+        throw std::runtime_error(
+            "route request " + std::to_string(net_index) + " failed: " +
+            error.what());
+      }
 
       if ((net_index + 1) == route_request_count ||
           (net_index + 1) % progress_interval == 0) {
@@ -896,6 +902,12 @@ void route_all_nets_with_workspace(const HostCsrF32& base_graph,
 
   auto report_progress = [&](std::size_t completed) {
     std::lock_guard<std::mutex> lock(progress_mutex);
+    // Completion counters are assigned atomically, but workers can reach this
+    // mutex out of order. Never move last_reported backwards (or underflow the
+    // unsigned subtraction below).
+    if (completed <= last_reported) {
+      return;
+    }
     if (completed == route_request_count ||
         completed - last_reported >= progress_interval) {
       last_reported = completed;
@@ -927,16 +939,22 @@ void route_all_nets_with_workspace(const HostCsrF32& base_graph,
         const RouteRequest& request = metadata.route_requests[net_index];
         const std::uint32_t tree_stamp =
             next_tree_stamp(route_tree_seen, &route_tree_stamp);
-        nets[net_index] =
-            route_net(base_graph,
-                      sssp_workspace,
-                      request,
-                      route_tree_seen,
-                      route_parent_by_child,
-                      route_parent_seen,
-                      tree_stamp,
-                      options,
-                      local_stream);
+        try {
+          nets[net_index] =
+              route_net(base_graph,
+                        sssp_workspace,
+                        request,
+                        route_tree_seen,
+                        route_parent_by_child,
+                        route_parent_seen,
+                        tree_stamp,
+                        options,
+                        local_stream);
+        } catch (const std::exception& error) {
+          throw std::runtime_error(
+              "route request " + std::to_string(net_index) + " failed: " +
+              error.what());
+        }
 
         const std::size_t completed =
             completed_nets.fetch_add(1, std::memory_order_relaxed) + 1;

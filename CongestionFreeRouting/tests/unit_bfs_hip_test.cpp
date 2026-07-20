@@ -1,7 +1,7 @@
 #include "../unit_bfs/unit_bfs_hip_CSR.hpp"
 
 // AMD build/run from the repository root:
-//   hipcc -std=c++17 -O2 -x hip \
+//   hipcc -std=c++17 -O2 -pthread -x hip \
 //     -I HIP_kernel/bellman_ford/src \
 //     -I CongestionFreeRouting/unit_bfs \
 //     CongestionFreeRouting/tests/unit_bfs_hip_test.cpp \
@@ -10,6 +10,7 @@
 
 #include <cmath>
 #include <cstdint>
+#include <future>
 #include <iostream>
 #include <limits>
 #include <memory>
@@ -37,6 +38,34 @@ void require(bool condition, const std::string& message) {
     fail(message);
   }
 }
+
+void check_hip(hipError_t status, const char* operation) {
+  if (status != hipSuccess) {
+    fail(std::string(operation) + ": " + hipGetErrorString(status));
+  }
+}
+
+class HipStream {
+ public:
+  HipStream() {
+    check_hip(hipStreamCreateWithFlags(&stream_, hipStreamNonBlocking),
+              "hipStreamCreateWithFlags");
+  }
+
+  ~HipStream() {
+    if (stream_ != nullptr) {
+      (void)hipStreamDestroy(stream_);
+    }
+  }
+
+  HipStream(const HipStream&) = delete;
+  HipStream& operator=(const HipStream&) = delete;
+
+  hipStream_t get() const { return stream_; }
+
+ private:
+  hipStream_t stream_ = nullptr;
+};
 
 template <typename T>
 void require_equal(const T& actual,
@@ -447,16 +476,17 @@ HostCsrF32 make_wide_layered_graph() {
   return graph;
 }
 
-HostCsrF32 make_mixed_claim_graph() {
-  // The second BFS level contains a full wave whose lanes alternate between
-  // an already-visited destination and a fresh destination.  The third level
-  // then has 32 lanes contend for one fresh vertex.  Both levels exercise
-  // mixed true/false wave appends; vertex 98 remains isolated.
+HostCsrF32 make_divergent_claim_graph() {
+  // The second BFS level contains a full wave whose rows have zero through six
+  // outgoing edges. Every nonempty row first claims a unique fresh vertex and
+  // then revisits the source; lanes therefore execute different numbers of
+  // queue-reservation calls with mixed true/false predicates. The third level
+  // contends for one fresh vertex, and vertex 130 remains isolated.
   //
   //   0 -> 1..64
-  //   1,3,...,63 -> 0
-  //   2,4,...,64 -> 65..96 -> 97    98 (isolated)
-  constexpr int kRows = 99;
+  //   v -> 64+v, then 0 repeated, with degree v%7
+  //   65..128 -> 129                 130 (isolated)
+  constexpr int kRows = 131;
   HostCsrF32 graph;
   graph.rows = kRows;
   graph.cols = kRows;
@@ -469,11 +499,15 @@ HostCsrF32 make_mixed_claim_graph() {
         graph.colind.push_back(dst);
       }
     } else if (v >= 1 && v <= 64) {
-      const int lane = v - 1;
-      graph.colind.push_back(
-          lane % 2 == 0 ? 0 : 65 + lane / 2);
-    } else if (v >= 65 && v <= 96) {
-      graph.colind.push_back(97);
+      const int degree = v % 7;
+      if (degree > 0) {
+        graph.colind.push_back(64 + v);
+        for (int edge = 1; edge < degree; ++edge) {
+          graph.colind.push_back(0);
+        }
+      }
+    } else if (v >= 65 && v <= 128) {
+      graph.colind.push_back(129);
     }
   }
   graph.rowptr.back() = static_cast<Offset>(graph.colind.size());
@@ -684,16 +718,16 @@ void run_batching_suite(UnitBfsCsrOffsetMode mode,
            wide_exhausted,
            mode_label + ": wide frontier exhaustion");
 
-  const HostCsrF32 mixed_graph = make_mixed_claim_graph();
+  const HostCsrF32 mixed_graph = make_divergent_claim_graph();
   UnitBfsCsrWorkspace mixed_workspace(mixed_graph, nullptr, mode);
   const ExpectedRun mixed_early_stop{
       2,
       true,
       true,
       true,
-      {reached(65, 2.0f, 0, {0, 2, 65}, {1, 65})}};
+      {reached(65, 2.0f, 0, {0, 1, 65}, {0, 64})}};
   const ExpectedRun mixed_exhausted{
-      4, true, false, false, {unreachable(98)}};
+      4, true, false, false, {unreachable(130)}};
   constexpr int kMixedClaimReuseRuns = 64;
   for (int repetition = 0; repetition < kMixedClaimReuseRuns; ++repetition) {
     const std::string suffix =
@@ -708,10 +742,65 @@ void run_batching_suite(UnitBfsCsrOffsetMode mode,
     run_case(mixed_workspace,
              mixed_graph,
              {0},
-             {98},
+             {130},
              -1,
              mixed_exhausted,
              mode_label + ": mixed-claim exhaustion" + suffix);
+  }
+}
+
+void run_parallel_workspace_suite() {
+  const HostCsrF32 graph = make_divergent_claim_graph();
+  auto shared_graph = std::make_shared<UnitBfsCsrGraph>(graph, nullptr);
+  int device = 0;
+  check_hip(hipGetDevice(&device), "hipGetDevice");
+
+  const ExpectedRun early_stop{
+      2,
+      true,
+      true,
+      true,
+      {reached(65, 2.0f, 0, {0, 1, 65}, {0, 64})}};
+  const ExpectedRun exhausted{
+      4, true, false, false, {unreachable(130)}};
+  constexpr int kWorkers = 8;
+  constexpr int kRunsPerWorker = 16;
+  std::vector<std::future<void>> workers;
+  workers.reserve(kWorkers);
+  for (int worker = 0; worker < kWorkers; ++worker) {
+    workers.push_back(std::async(std::launch::async, [&, worker]() {
+      check_hip(hipSetDevice(device), "hipSetDevice");
+      HipStream stream;
+      UnitBfsCsrWorkspace workspace(shared_graph, stream.get());
+      for (int repetition = 0; repetition < kRunsPerWorker; ++repetition) {
+        const std::string label =
+            "parallel worker " + std::to_string(worker) + " reuse " +
+            std::to_string(repetition);
+        UnitBfsCsrResult early = workspace.run(
+            std::vector<int>{0},
+            std::vector<int>{65},
+            1.0f,
+            -1,
+            stream.get(),
+            nullptr,
+            nullptr);
+        validate_result(
+            graph, early, early_stop, label + ": mixed-claim early stop");
+        UnitBfsCsrResult full = workspace.run(
+            std::vector<int>{0},
+            std::vector<int>{130},
+            1.0f,
+            -1,
+            stream.get(),
+            nullptr,
+            nullptr);
+        validate_result(
+            graph, full, exhausted, label + ": mixed-claim exhaustion");
+      }
+    }));
+  }
+  for (std::future<void>& worker : workers) {
+    worker.get();
   }
 }
 
@@ -759,6 +848,7 @@ int main() {
                        "auto/32-bit batching");
     run_batching_suite(UnitBfsCsrOffsetMode::kForce64Bit,
                        "forced-64-bit batching");
+    run_parallel_workspace_suite();
 
     // The representation cutoff is compile-time production logic.  A giant CSR
     // fixture would be unsafe, and no public pure selection helper is exposed;

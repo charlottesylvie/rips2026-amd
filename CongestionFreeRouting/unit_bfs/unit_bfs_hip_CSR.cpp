@@ -323,28 +323,12 @@ __device__ inline void count_target_if_reached(int v,
   }
 }
 
-__device__ inline int wave_append_position(bool append, int* queue_tail) {
-  const unsigned long long mask = __ballot(append);
-  // Keep every lane that participated in the ballot together through the
-  // shuffle. Returning non-appending lanes before the wave-wide collective
-  // makes the leader's queue-base broadcast undefined.
-  if (mask == 0) {
-    return -1;
-  }
-
-  const int lane = static_cast<int>(threadIdx.x % warpSize);
-  const int leader = __ffsll(mask) - 1;
-  int base = 0;
-  if (lane == leader) {
-    base = atomicAdd(queue_tail, __popcll(mask));
-  }
-  base = __shfl(base, leader);
-  if (!append) {
-    return -1;
-  }
-  const unsigned long long lower_lanes =
-      lane == 0 ? 0ULL : mask & ((1ULL << lane) - 1ULL);
-  return base + __popcll(lower_lanes);
+__device__ inline int append_position(bool append, int* queue_tail) {
+  // This helper is called from adjacency loops whose trip counts differ by
+  // lane. A ballot/shuffle reservation is invalid there because lanes do not
+  // reach the same dynamic collective calls. One atomic per successful claim
+  // preserves the append-only queue invariant for arbitrary row degrees.
+  return append ? atomicAdd(queue_tail, 1) : -1;
 }
 
 __global__ void initialize_bfs_arrays_kernel(Offset rows,
@@ -433,10 +417,10 @@ __global__ void expand_frontier_kernel(const EdgeOffset* out_rowptr,
         pred_node[v] = u;
         pred_edge[v] = edge;
       }
-      // Reserve queue positions once per active GPU wave instead of forcing
-      // every discovered vertex through the same global atomic counter.
+      // Each successful claim reserves one queue position. This call is inside
+      // a variable-trip adjacency loop, so it must not use a wave collective.
       const int pos =
-          wave_append_position(claimed, status + kStatusQueueTail);
+          append_position(claimed, status + kStatusQueueTail);
       if (claimed) {
         frontier_queue[pos] = v;
         count_target_if_reached(
@@ -912,8 +896,22 @@ UnitBfsCsrResult run_unit_bfs_with_offsets(
     result.iterations_used = status[kStatusCompletedDepth];
     if (queue_tail < 0 || queue_tail > n_int || frontier_begin < 0 ||
         frontier_end < frontier_begin || frontier_end != queue_tail ||
+        found_count < 0 || found_count > target_count ||
+        (status[kStatusActive] != 0 && status[kStatusActive] != 1) ||
         result.iterations_used < 0 || result.iterations_used > max_depth) {
-      throw std::runtime_error("unit BFS device frontier state is inconsistent");
+      std::ostringstream message;
+      message << "unit BFS device frontier state is inconsistent"
+              << " (queue_tail=" << queue_tail
+              << ", frontier_begin=" << frontier_begin
+              << ", frontier_end=" << frontier_end
+              << ", found_count=" << found_count
+              << ", completed_depth=" << result.iterations_used
+              << ", active=" << status[kStatusActive]
+              << ", rows=" << n_int
+              << ", sources=" << source_count
+              << ", targets=" << target_count
+              << ", max_depth=" << max_depth << ')';
+      throw std::runtime_error(message.str());
     }
     current_count = frontier_end - frontier_begin;
 

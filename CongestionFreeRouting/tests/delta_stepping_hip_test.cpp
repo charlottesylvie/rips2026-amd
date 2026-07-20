@@ -789,23 +789,27 @@ void test_empty_and_singleton_graphs(hipStream_t stream) {
 }
 
 HostCsrF32 make_mixed_claim_unit_graph() {
-  // A full frontier wave alternates failed and successful claims, followed by
-  // 32 lanes contending for one fresh vertex.  The isolated final vertex makes
-  // it possible to alternate early-stop and exhausted unit-weight searches.
+  // A full frontier wave has zero through six outgoing edges per lane. Each
+  // nonempty row first claims one fresh vertex and then revisits the source,
+  // exercising differing adjacency-loop trip counts and mixed claim results.
   std::vector<EdgeSpec> edges;
-  edges.reserve(128);
+  edges.reserve(320);
   for (int destination = 1; destination <= 64; ++destination) {
     edges.push_back({0, destination, 1.0f});
   }
   for (int vertex = 1; vertex <= 64; ++vertex) {
-    const int lane = vertex - 1;
-    edges.push_back(
-        {vertex, lane % 2 == 0 ? 0 : 65 + lane / 2, 1.0f});
+    const int degree = vertex % 7;
+    if (degree > 0) {
+      edges.push_back({vertex, 64 + vertex, 1.0f});
+      for (int edge = 1; edge < degree; ++edge) {
+        edges.push_back({vertex, 0, 1.0f});
+      }
+    }
   }
-  for (int vertex = 65; vertex <= 96; ++vertex) {
-    edges.push_back({vertex, 97, 1.0f});
+  for (int vertex = 65; vertex <= 128; ++vertex) {
+    edges.push_back({vertex, 129, 1.0f});
   }
-  return make_outgoing_csr(99, edges);
+  return make_outgoing_csr(131, edges);
 }
 
 void test_unit_weight_specialization(hipStream_t stream) {
@@ -898,7 +902,7 @@ void test_unit_weight_specialization(hipStream_t stream) {
 
     const DeltaSteppingCsrResult mixed_exhausted = mixed_workspace.run(
         {0},
-        std::vector<int>{98},
+        std::vector<int>{130},
         4.0f,
         kForceGenericMaxIterations,
         stream,
@@ -908,7 +912,7 @@ void test_unit_weight_specialization(hipStream_t stream) {
         "generic mixed-claim exhaustion" + suffix,
         mixed_graph,
         {0},
-        {98},
+        {130},
         mixed_expected,
         mixed_exhausted);
     require(mixed_exhausted.converged && !mixed_exhausted.stopped_on_target,
@@ -1221,8 +1225,8 @@ void test_wave_boundary_contention(hipStream_t stream) {
         make_outgoing_csr(kFrontierSize * 2, edges);
     DeltaSteppingCsrWorkspace workspace(graph, stream);
     // 257 frontier threads discover distinct children together, exercising
-    // full- and partial-wave coalesced reservations. Every vertex is touched.
-    run_full_and_target_checks("wave-coalesced distinct appends",
+    // full and partial wave boundaries. Every vertex is touched.
+    run_full_and_target_checks("wave-boundary distinct appends",
                                workspace,
                                graph,
                                sources,
@@ -1402,6 +1406,71 @@ void test_shared_graph_workspaces(hipStream_t construction_stream) {
   require(retained_graph_result.stopped_on_target &&
               !retained_graph_result.converged,
           "shared workspace followed a replacement graph wrapper");
+}
+
+void test_parallel_divergent_workspaces(hipStream_t construction_stream) {
+  const HostCsrF32 graph = make_mixed_claim_unit_graph();
+  auto shared_graph =
+      std::make_shared<DeltaSteppingCsrGraph>(graph, construction_stream);
+  const std::vector<float> expected =
+      cpu_dijkstra_outgoing_multi_source(graph, {0});
+  int device = 0;
+  check_hip(hipGetDevice(&device), "hipGetDevice");
+
+  constexpr int kWorkers = 8;
+  constexpr int kRunsPerWorker = 16;
+  constexpr int kForceGenericMaxIterations =
+      std::numeric_limits<int>::max();
+  std::vector<std::future<void>> workers;
+  workers.reserve(kWorkers);
+  for (int worker = 0; worker < kWorkers; ++worker) {
+    workers.push_back(std::async(std::launch::async, [&, worker]() {
+      check_hip(hipSetDevice(device), "hipSetDevice");
+      HipStream stream;
+      DeltaSteppingCsrWorkspace workspace(shared_graph, stream.get());
+      for (int repetition = 0; repetition < kRunsPerWorker; ++repetition) {
+        const std::string label =
+            "parallel divergent worker " + std::to_string(worker) +
+            " reuse " + std::to_string(repetition);
+        const DeltaSteppingCsrResult early = workspace.run(
+            std::vector<int>{0},
+            std::vector<int>{65},
+            4.0f,
+            kForceGenericMaxIterations,
+            stream.get(),
+            nullptr,
+            nullptr);
+        validate_compact_target_paths(label + ": reachable",
+                                      graph,
+                                      {0},
+                                      {65},
+                                      expected,
+                                      early);
+        require(early.stopped_on_target && !early.converged,
+                label + ": reachable target did not stop early");
+
+        const DeltaSteppingCsrResult exhausted = workspace.run(
+            std::vector<int>{0},
+            std::vector<int>{130},
+            4.0f,
+            kForceGenericMaxIterations,
+            stream.get(),
+            nullptr,
+            nullptr);
+        validate_compact_target_paths(label + ": exhausted",
+                                      graph,
+                                      {0},
+                                      {130},
+                                      expected,
+                                      exhausted);
+        require(exhausted.converged && !exhausted.stopped_on_target,
+                label + ": unreachable target did not exhaust");
+      }
+    }));
+  }
+  for (std::future<void>& worker : workers) {
+    worker.get();
+  }
 }
 
 void test_stream_affinity(hipStream_t construction_stream) {
@@ -1700,6 +1769,7 @@ int main() {
     test_batched_closure_and_iteration_fallback(stream.get());
     test_wave_boundary_contention(stream.get());
     test_shared_graph_workspaces(stream.get());
+    test_parallel_divergent_workspaces(stream.get());
     test_workspace_reuse_and_updates(stream.get());
     test_compact_legacy_mode_alternation(stream.get());
     test_seeded_random_graphs(stream.get());

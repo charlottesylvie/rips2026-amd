@@ -10,11 +10,11 @@ work below; implementation status alone is not a performance claim.
 
 The code audit also confirmed the pre-roadmap baseline: outgoing CSR is uploaded
 once and shared by memory-aware parallel workers; traversal uses one append-only
-frontier/visited queue, wave-coalesced reservations, a non-atomic visited
-precheck before the authoritative CAS, pinned status transfers, direct source
-initialization, sparse reset, and one predecessor-chain traversal for compact
-path extraction. Frontier bounds, completed depth, target progress, and the
-stopping condition now remain device-resident between batched status checks.
+frontier/visited queue, per-successful-claim atomic reservations, a non-atomic
+visited precheck before the authoritative CAS, pinned status transfers, direct
+source initialization, sparse reset, and one predecessor-chain traversal for
+compact path extraction. Frontier bounds, completed depth, target progress, and
+the stopping condition now remain device-resident between batched status checks.
 
 Percentages below are unmeasured engineering estimates for the unit-BFS routing
 portion. They are workload-dependent and are not additive.
@@ -56,7 +56,7 @@ Delta-Stepping is not automatically transferable to Unit-BFS.
 | 14 | Add a safe spatially bounded or A*-like mode | 1.5--10x on suitable nets | High | High |
 | 15 | Partition independent nets across multiple GPUs | Up to near-linear throughput scaling | Medium | High |
 | 16 | Tune block size, launch bounds, architecture, and compiler flags | 0--10% | Low | Low |
-| 17 | Add block-level queue reservation beyond wave aggregation | 0--10% | Medium | Medium |
+| 17 | Add safe per-thread or block-level buffered queue reservation | 0--10% | Medium | Medium |
 | 18 | Remove duplicate CSR validation | 1--5% startup | Low | Low |
 | 19 | Skip or lazily load unused node metadata | 2--15% full wrapper | Medium | Medium |
 | 20 | Cache tile-coordinate parsing during conversion | 2--10% full wrapper | Low | Low |

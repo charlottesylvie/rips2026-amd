@@ -20,10 +20,15 @@ The code audit confirmed the completed exact-unit specialization and four-level
 status batching; shared immutable CSR with lazy 24-byte unit scratch and
 memory-aware workers; four-round generic light-closure batching; device-counted
 heavy and pending scans; compile-time relaxation modes; thread-per-short-row
-relaxation; wave-coalesced queue reservations; removal of overflow and touched
-membership synchronization/state; pinned scalar transfers with device-final
-pending reduction; float-correct same-bucket closure and terminal saturation;
-and race-safe parent publication with sparse exact-edge recovery.
+relaxation; per-successful-append atomic queue reservations; removal of overflow
+and touched membership synchronization/state; pinned scalar transfers with
+device-final pending reduction; float-correct same-bucket closure and terminal
+saturation; and race-safe parent publication with sparse exact-edge recovery.
+
+A later correctness audit removed wave-coalesced reservation from irregular
+adjacency loops because lanes can reach different dynamic collective calls.
+The completion percentages above are historical; a safe buffered reservation
+replacement remains future work.
 
 ## Target-GPU profiling update (2026-07-17)
 

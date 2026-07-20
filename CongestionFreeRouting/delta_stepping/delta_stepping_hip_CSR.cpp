@@ -548,28 +548,11 @@ __device__ inline int bucket_index(float distance, float delta) {
   return static_cast<int>(bucket_f);
 }
 
-__device__ inline int wave_append_position(bool append, int* queue_tail) {
-  const unsigned long long mask = __ballot(append);
-  // Every active lane that participated in the ballot must also participate
-  // in the shuffle. Returning false-predicate lanes before the collective
-  // makes the leader's queue-base broadcast undefined.
-  if (mask == 0) {
-    return -1;
-  }
-
-  const int lane = static_cast<int>(threadIdx.x % warpSize);
-  const int leader = __ffsll(mask) - 1;
-  int base = 0;
-  if (lane == leader) {
-    base = atomicAdd(queue_tail, __popcll(mask));
-  }
-  base = __shfl(base, leader);
-  if (!append) {
-    return -1;
-  }
-  const unsigned long long lower_lanes =
-      lane == 0 ? 0ULL : mask & ((1ULL << lane) - 1ULL);
-  return base + __popcll(lower_lanes);
+__device__ inline int append_position(bool append, int* queue_tail) {
+  // Callers include divergent adjacency loops, where different lanes execute
+  // different numbers of iterations. Wave collectives are not valid at those
+  // call sites, so reserve each successful append independently.
+  return append ? atomicAdd(queue_tail, 1) : -1;
 }
 
 __global__ void validate_device_csr_kernel(Offset rows,
@@ -780,7 +763,7 @@ __global__ void expand_unit_frontier_kernel(const Offset* out_rowptr,
         pred_node[v] = u;
         pred_edge[v] = edge;
       }
-      const int pos = wave_append_position(claimed, status);
+      const int pos = append_position(claimed, status);
       if (claimed) {
         frontier_queue[pos] = v;
         const int multiplicity = target_multiplicity[v];
@@ -1185,7 +1168,7 @@ __global__ void relax_light_edges_kernel(const int* frontier,
     if constexpr (CollectHeavy) {
       const bool append_heavy =
           active && atomicCAS(&in_heavy[u], 0, 1) == 0;
-      const int heavy_pos = wave_append_position(append_heavy, heavy_count);
+      const int heavy_pos = append_position(append_heavy, heavy_count);
       if (append_heavy) {
         heavy_queue[heavy_pos] = u;
       }
@@ -1221,22 +1204,21 @@ __global__ void relax_light_edges_kernel(const int* frontier,
           publish_parent_candidate<UseEdgeParent>(&parent_key[v], u, e, nd);
           const int b = candidate_bucket;
           if (b == current_bucket) {
-            // If v had previously been discovered in a later bucket, the new
-            // distance has moved it back into the current bucket.  Clear the
-            // pending flag so stale pending-queue entries cannot affect later
-            // bucket selection.
-            atomicExch(&in_pending[v], 0);
+            // Keep any existing pending token marked until compaction/reset.
+            // Clearing it here lets a delayed, already-successful relaxation
+            // set the flag again and append a second token for v. The pending
+            // reduction ignores tokens whose live distance is in this bucket.
             append_current = atomicCAS(&in_current[v], 0, 1) == 0;
           } else if (b > current_bucket && b < kNoBucket) {
             append_pending = atomicCAS(&in_pending[v], 0, 1) == 0;
           }
         }
         const int touched_pos =
-            wave_append_position(append_touched, touched_count);
+            append_position(append_touched, touched_count);
         const int current_pos =
-            wave_append_position(append_current, next_count);
+            append_position(append_current, next_count);
         const int pending_pos =
-            wave_append_position(append_pending, pending_count);
+            append_position(append_pending, pending_count);
         if (append_touched) touched_queue[touched_pos] = v;
         if (append_current) next_frontier[current_pos] = v;
         if (append_pending) pending_queue[pending_pos] = v;
@@ -1295,9 +1277,9 @@ __global__ void relax_heavy_edges_kernel(const int* heavy_vertices,
           }
         }
         const int touched_pos =
-            wave_append_position(append_touched, touched_count);
+            append_position(append_touched, touched_count);
         const int pending_pos =
-            wave_append_position(append_pending, pending_count);
+            append_position(append_pending, pending_count);
         if (append_touched) touched_queue[touched_pos] = v;
         if (append_pending) pending_queue[pending_pos] = v;
       }
@@ -1493,9 +1475,9 @@ __global__ void compact_pending_to_current_bucket_kernel(const int* pending_in,
       atomicExch(&in_pending[v], 0);
     }
     const int current_pos =
-        wave_append_position(append_current, current_count);
+        append_position(append_current, current_count);
     const int pending_pos =
-        wave_append_position(keep_pending, new_pending_count);
+        append_position(keep_pending, new_pending_count);
     if (append_current) current_queue[current_pos] = v;
     if (keep_pending) pending_out[pending_pos] = v;
   }
