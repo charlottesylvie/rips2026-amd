@@ -145,6 +145,8 @@ struct UnitBfsPathDiagnostic {
   std::size_t worker_count = 0;
   int cpu_original_distance = -1;
   int cpu_expanded_tree_distance = -1;
+  // Historical schema name; now records the routed per-sink query from the
+  // exact tree state after all preceding sinks have been attached.
   UnitBfsPathObservation raw_batched;
   UnitBfsPathObservation fresh_original;
   UnitBfsPathObservation fresh_expanded_tree;

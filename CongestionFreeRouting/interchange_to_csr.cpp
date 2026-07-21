@@ -49,13 +49,11 @@
 #include "LogicalNetlist.capnp.h"
 #include "PhysicalNetlist.capnp.h"
 #include "interchange/device_routing_graph.hpp"
+#include "interchange/gzip_io.hpp"
 
 #include <capnp/serialize.h>
 #include <kj/array.h>
-#include <zlib.h>
-
 #include <algorithm>
-#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
@@ -107,6 +105,7 @@ using routing::interchange::kNoLogicalNetIndex;
 using routing::interchange::kNoStringIndex;
 using routing::interchange::node_bounds_mode_name;
 using routing::interchange::read_device_routing_graph_for_filtering;
+using routing::interchange::read_gzip_or_plain_chunks;
 
 // FPGAIF stores most names as integer indexes into strList. This cache turns
 // those indexes into std::string once, avoiding repeated Cap'n Proto text copies
@@ -286,12 +285,6 @@ Options parse_options(int argc, char** argv) {
 // compressed or already-decompressed inputs.
 std::vector<std::uint8_t> read_gzip_or_plain_file(
     const std::filesystem::path& path) {
-  gzFile file = gzopen(path.string().c_str(), "rb");
-  if (!file) {
-    throw std::runtime_error("could not open input file: " + path.string());
-  }
-  (void)gzbuffer(file, 1 << 20);
-
   std::vector<std::uint8_t> bytes;
   std::error_code size_error;
   const std::uintmax_t encoded_size =
@@ -300,32 +293,16 @@ std::vector<std::uint8_t> read_gzip_or_plain_file(
       encoded_size <= std::numeric_limits<std::size_t>::max()) {
     bytes.reserve(static_cast<std::size_t>(encoded_size));
   }
-  std::array<std::uint8_t, 1 << 20> buffer{};
-
-  while (true) {
-    const int read_count =
-        gzread(file, buffer.data(), static_cast<unsigned int>(buffer.size()));
-    if (read_count > 0) {
-      const std::size_t old_size = bytes.size();
-      bytes.resize(old_size + static_cast<std::size_t>(read_count));
-      std::memcpy(bytes.data() + old_size,
-                  buffer.data(),
-                  static_cast<std::size_t>(read_count));
-      continue;
-    }
-
-    if (read_count == 0) {
-      break;
-    }
-
-    int zlib_error = 0;
-    const char* message = gzerror(file, &zlib_error);
-    gzclose(file);
-    throw std::runtime_error("failed while reading " + path.string() + ": " +
-                             (message ? message : "zlib error"));
-  }
-
-  gzclose(file);
+  read_gzip_or_plain_chunks(
+      path, [&](const std::uint8_t* data, std::size_t byte_count) {
+        if (byte_count > bytes.max_size() - bytes.size()) {
+          throw std::runtime_error("decoded input is too large: " +
+                                   path.string());
+        }
+        const std::size_t old_size = bytes.size();
+        bytes.resize(old_size + byte_count);
+        std::memcpy(bytes.data() + old_size, data, byte_count);
+      });
 
   if (bytes.empty()) {
     throw std::runtime_error("input file is empty: " + path.string());
@@ -334,12 +311,19 @@ std::vector<std::uint8_t> read_gzip_or_plain_file(
   return bytes;
 }
 
-// Cap'n Proto's FlatArrayMessageReader expects word-aligned storage. The file
-// is byte-oriented, so this copies it into a padded vector<capnp::word>.
+// Cap'n Proto's FlatArrayMessageReader expects exact word-aligned storage.
+// Copy only after rejecting a partial final word instead of hiding it with
+// zero-padding.
 std::vector<capnp::word> bytes_to_words(
-    const std::vector<std::uint8_t>& bytes) {
+    const std::vector<std::uint8_t>& bytes,
+    const std::filesystem::path& path) {
   const std::size_t word_size = sizeof(capnp::word);
-  const std::size_t word_count = (bytes.size() + word_size - 1) / word_size;
+  if (bytes.size() % word_size != 0) {
+    throw std::runtime_error(
+        "decoded Cap'n Proto input is not word-aligned: " + path.string() +
+        " has " + std::to_string(bytes.size()) + " bytes");
+  }
+  const std::size_t word_count = bytes.size() / word_size;
   std::vector<capnp::word> words(word_count);
   std::memcpy(words.data(), bytes.data(), bytes.size());
   return words;
@@ -485,7 +469,7 @@ void parse_logical_netlist(const std::filesystem::path& logical_path,
   // port instances. It does not contain routing wires or PIPs, but preserving
   // it lets later tools relate physical route results back to logical nets.
   std::vector<std::uint8_t> bytes = read_gzip_or_plain_file(logical_path);
-  std::vector<capnp::word> words = bytes_to_words(bytes);
+  std::vector<capnp::word> words = bytes_to_words(bytes, logical_path);
   graph.logical_netlist_bytes = std::move(bytes);
 
   capnp::ReaderOptions reader_options;
@@ -609,7 +593,7 @@ void parse_physical_netlist(const std::filesystem::path& phys_path,
   // legal source site pins, and already-occupied routing from fixed or
   // pre-routed nets.
   std::vector<std::uint8_t> bytes = read_gzip_or_plain_file(phys_path);
-  std::vector<capnp::word> words = bytes_to_words(bytes);
+  std::vector<capnp::word> words = bytes_to_words(bytes, phys_path);
   graph.physical_netlist_bytes = std::move(bytes);
 
   capnp::ReaderOptions reader_options;

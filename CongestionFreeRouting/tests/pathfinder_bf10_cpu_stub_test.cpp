@@ -1808,25 +1808,95 @@ int main() {
                 std::vector<int>({0, 1, 2}),
             "counterexample first sink should establish the expanded tree");
     require(cached_result.nets[0].sinks[1].nodes ==
-                std::vector<int>({0, 3, 4}),
-            "diagnostic must preserve the current cached adapter behavior");
+                std::vector<int>({2, 4}),
+            "second sink must use the shorter path from the expanded tree");
     require(diagnostic.cpu_original_distance == 2 &&
-                diagnostic.raw_batched.reached &&
-                diagnostic.raw_batched.edge_count == 2 &&
                 diagnostic.fresh_original.edge_count == 2,
-            "raw UnitBFS and CPU reference should agree before tree growth");
+            "fresh UnitBFS and CPU reference should agree before tree growth");
     require(diagnostic.tree_source_count == 3 &&
                 diagnostic.prior_sinks_reached == 1 &&
                 diagnostic.cpu_expanded_tree_distance == 1 &&
+                diagnostic.raw_batched.reached &&
+                diagnostic.raw_batched.edge_count == 1 &&
                 diagnostic.fresh_expanded_tree.reached &&
                 diagnostic.fresh_expanded_tree.edge_count == 1,
-            "fresh UnitBFS should find the one-edge expanded-tree route");
-    require(diagnostic.attached_edge_count == 2 &&
+            "routed and fresh UnitBFS queries should use the expanded tree");
+    require(diagnostic.attached_edge_count == 1 &&
                 diagnostic.classification ==
-                    "pathfinder_cached_multi_sink_path",
-            "diagnostic should classify the stale cached multi-sink path");
-    require(g_unit_bfs_calls == 3,
-            "diagnostic should add exactly two selected-sink reference runs");
+                    "no_mismatch_observed",
+            "diagnostic should confirm the attached expanded-tree path");
+    require(g_unit_bfs_calls == 4,
+            "two routed sinks plus two diagnostic probes should run UnitBFS");
+
+    routing::RoutingMetadata on_path_metadata = cached_metadata;
+    on_path_metadata.route_requests[0].sinks[1].node = 1;
+    g_unit_bfs_calls = 0;
+    const routing::PathfinderResult on_path_result =
+        routing::run_pathfinder(cached_graph,
+                                on_path_metadata,
+                                cached_options,
+                                nullptr);
+    require(on_path_result.nets[0].sinks[1].nodes == std::vector<int>({1}) &&
+                on_path_result.nets[0].sinks[1].distance == 0.0f,
+            "a later sink already in the expanded tree should attach trivially");
+    require(g_unit_bfs_calls == 1,
+            "a sink reached by a prior branch should not launch another search");
+
+    routing::RoutingMetadata parallel_cached_metadata = cached_metadata;
+    while (parallel_cached_metadata.route_requests.size() < 4) {
+      parallel_cached_metadata.route_requests.push_back(
+          cached_metadata.route_requests.front());
+    }
+    routing::PathfinderOptions parallel_cached_options = cached_options;
+    parallel_cached_options.parallel_net_workers = 4;
+    g_unit_bfs_calls = 0;
+    const routing::PathfinderResult parallel_cached_result =
+        routing::run_pathfinder(cached_graph,
+                                parallel_cached_metadata,
+                                parallel_cached_options,
+                                nullptr);
+    require(parallel_cached_result.nets.size() == 4,
+            "parallel counterexample should preserve every net slot");
+    for (const routing::RoutedNet& routed_net : parallel_cached_result.nets) {
+      require(routed_net.sinks[1].nodes == std::vector<int>({2, 4}),
+              "every parallel worker must route from its expanded net tree");
+    }
+    require(g_unit_bfs_calls == 8,
+            "four two-sink nets should issue eight independent UnitBFS queries");
+
+    HostCsrF32 weighted_cached_graph = cached_graph;
+    weighted_cached_graph.values = {1.0f, 3.0f, 1.0f, 1.0f, 3.0f};
+    const routing::RoutingMetadata weighted_cached_metadata =
+        make_cached_multi_sink_counterexample_metadata(weighted_cached_graph);
+    routing::PathfinderOptions cached_delta_options = cached_options;
+    cached_delta_options.sssp_engine = routing::SsspEngine::kDeltaStep;
+    cached_delta_options.delta = 1.0f;
+    cached_delta_options.delta_telemetry = true;
+    g_multisource_delta_calls = 0;
+    routing::PathfinderResult cached_delta_result;
+    std::string cached_delta_stdout;
+    {
+      ScopedCoutCapture capture;
+      cached_delta_result = routing::run_pathfinder(weighted_cached_graph,
+                                                    weighted_cached_metadata,
+                                                    cached_delta_options,
+                                                    nullptr);
+      cached_delta_stdout = capture.str();
+    }
+    require(cached_delta_result.nets[0].sinks[0].nodes ==
+                std::vector<int>({0, 1, 2}) &&
+                cached_delta_result.nets[0].sinks[1].nodes ==
+                    std::vector<int>({2, 4}),
+            "weighted Delta routing must also search from the expanded tree");
+    require(g_multisource_delta_calls == 2,
+            "weighted Delta routing should issue one query per nontrivial sink");
+    const std::string cached_delta_telemetry =
+        single_delta_telemetry_json_line(cached_delta_stdout);
+    require(cached_delta_telemetry.find("\"queries\":2") !=
+                    std::string::npos &&
+                cached_delta_telemetry.find("\"completed_queries\":2") !=
+                    std::string::npos,
+            "Delta telemetry must retain both per-sink query records");
   }
 
   g_multisource_delta_calls = 0;
@@ -1862,8 +1932,8 @@ int main() {
           "route tree should contain nodes 0,1,2,3");
   require(result.occupancy == std::vector<int>({1, 1, 1, 1}),
           "all route tree nodes should be occupied once");
-  require(g_unit_bfs_calls == 1,
-          "PathFinder should call unit BFS once per multi-sink net by default");
+  require(g_unit_bfs_calls == 2,
+          "PathFinder should rerun unit BFS after expanding a multi-sink tree");
   require(g_multisource_delta_calls == 0,
           "default unit BFS path should not call delta-step");
 
@@ -1878,8 +1948,8 @@ int main() {
           "delta-step comparison path should preserve first sink route");
   require(delta_result.nets[0].sinks[1].nodes == std::vector<int>({1, 3}),
           "delta-step comparison path should preserve second sink route");
-  require(g_multisource_delta_calls == 1,
-          "explicit delta-step comparison path should call delta-step");
+  require(g_multisource_delta_calls == 2,
+          "delta-step should rerun after expanding a multi-sink tree");
   require(g_unit_bfs_calls == 0,
           "explicit delta-step comparison path should not call unit BFS");
 

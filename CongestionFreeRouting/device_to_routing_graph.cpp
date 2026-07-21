@@ -19,13 +19,11 @@
 
 #include "DeviceResources.capnp.h"
 #include "interchange/device_routing_graph.hpp"
+#include "interchange/gzip_io.hpp"
 
 #include <capnp/serialize.h>
 #include <kj/array.h>
-#include <zlib.h>
-
 #include <algorithm>
-#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
@@ -55,6 +53,7 @@ using routing::interchange::kNoIndex;
 using routing::interchange::kNoStringIndex;
 using routing::interchange::node_bounds_mode_name;
 using routing::interchange::parse_node_bounds_mode;
+using routing::interchange::read_gzip_or_plain_chunks;
 using routing::interchange::sort_and_deduplicate_static_csr;
 using routing::interchange::write_device_routing_graph;
 
@@ -159,68 +158,43 @@ struct DevicePayload {
 // word vector; avoiding that second multi-gigabyte resident copy matters on a
 // full xcvu3p graph.
 DevicePayload read_device_payload(const std::filesystem::path& path) {
-  gzFile file = gzopen(path.string().c_str(), "rb");
-  if (!file) {
-    throw std::runtime_error("could not open device file: " + path.string());
-  }
-  (void)gzbuffer(file, 1 << 20);
-
   DevicePayload payload;
-  std::array<std::uint8_t, 1 << 20> buffer{};
-  try {
-    while (true) {
-      const int read_count = gzread(
-          file, buffer.data(), static_cast<unsigned int>(buffer.size()));
-      if (read_count == 0) {
-        break;
-      }
-      if (read_count < 0) {
-        int zlib_error = 0;
-        const char* message = gzerror(file, &zlib_error);
-        throw std::runtime_error(
-            "failed while reading " + path.string() + ": " +
-            (message ? message : "zlib error"));
-      }
+  read_gzip_or_plain_chunks(
+      path, [&](const std::uint8_t* data, std::size_t chunk_size) {
+        if (chunk_size > std::numeric_limits<std::size_t>::max() -
+                             payload.decoded_bytes) {
+          throw std::runtime_error(
+              "decoded device is too large for this host");
+        }
+        const std::size_t old_size = payload.decoded_bytes;
+        payload.decoded_bytes += chunk_size;
+        const std::size_t word_count =
+            (payload.decoded_bytes + sizeof(capnp::word) - 1) /
+            sizeof(capnp::word);
+        payload.words.resize(word_count);
+        std::memcpy(reinterpret_cast<std::uint8_t*>(payload.words.data()) +
+                        old_size,
+                    data, chunk_size);
 
-      const std::size_t chunk_size = static_cast<std::size_t>(read_count);
-      if (chunk_size > std::numeric_limits<std::size_t>::max() -
-                           payload.decoded_bytes) {
-        throw std::runtime_error("decoded device is too large for this host");
-      }
-      const std::size_t old_size = payload.decoded_bytes;
-      payload.decoded_bytes += chunk_size;
-      const std::size_t word_count =
-          (payload.decoded_bytes + sizeof(capnp::word) - 1) /
-          sizeof(capnp::word);
-      payload.words.resize(word_count);
-      std::memcpy(reinterpret_cast<std::uint8_t*>(payload.words.data()) +
-                      old_size,
-                  buffer.data(), chunk_size);
-
-      // A word-at-a-time content fingerprint is sufficient for cache identity
-      // and avoids adding a byte-serial hash pass over a multi-gigabyte device.
-      std::size_t offset = 0;
-      while (offset + sizeof(std::uint64_t) <= chunk_size) {
-        std::uint64_t lane = 0;
-        std::memcpy(&lane, buffer.data() + offset, sizeof(lane));
-        payload.fingerprint ^=
-            lane + 0x9e3779b97f4a7c15ULL + old_size + offset;
-        payload.fingerprint *= 0xbf58476d1ce4e5b9ULL;
-        payload.fingerprint = (payload.fingerprint << 27) |
-                              (payload.fingerprint >> (64 - 27));
-        offset += sizeof(lane);
-      }
-      std::uint64_t tail = static_cast<std::uint64_t>(chunk_size - offset)
-                           << 56;
-      std::memcpy(&tail, buffer.data() + offset, chunk_size - offset);
-      payload.fingerprint ^= tail + payload.decoded_bytes;
-      payload.fingerprint *= 0x94d049bb133111ebULL;
-    }
-  } catch (...) {
-    gzclose(file);
-    throw;
-  }
-  gzclose(file);
+        // A word-at-a-time content fingerprint is sufficient for cache identity
+        // and avoids another hash pass over a multi-gigabyte device.
+        std::size_t offset = 0;
+        while (offset + sizeof(std::uint64_t) <= chunk_size) {
+          std::uint64_t lane = 0;
+          std::memcpy(&lane, data + offset, sizeof(lane));
+          payload.fingerprint ^=
+              lane + 0x9e3779b97f4a7c15ULL + old_size + offset;
+          payload.fingerprint *= 0xbf58476d1ce4e5b9ULL;
+          payload.fingerprint = (payload.fingerprint << 27) |
+                                (payload.fingerprint >> (64 - 27));
+          offset += sizeof(lane);
+        }
+        std::uint64_t tail =
+            static_cast<std::uint64_t>(chunk_size - offset) << 56;
+        std::memcpy(&tail, data + offset, chunk_size - offset);
+        payload.fingerprint ^= tail + payload.decoded_bytes;
+        payload.fingerprint *= 0x94d049bb133111ebULL;
+      });
   if (payload.decoded_bytes == 0) {
     throw std::runtime_error("device file is empty: " + path.string());
   }
@@ -452,6 +426,12 @@ void release_storage(Container& container) {
 BuildResult build_device_routing_graph(const Options& options) {
   DevicePayload payload = read_device_payload(options.device_path);
   check_device_payload_size(options.device_path, payload.decoded_bytes);
+  if (payload.decoded_bytes % sizeof(capnp::word) != 0) {
+    throw std::runtime_error(
+        "decoded Cap'n Proto input is not word-aligned: " +
+        options.device_path.string() + " has " +
+        std::to_string(payload.decoded_bytes) + " bytes");
+  }
 
   capnp::ReaderOptions reader_options;
   reader_options.traversalLimitInWords =

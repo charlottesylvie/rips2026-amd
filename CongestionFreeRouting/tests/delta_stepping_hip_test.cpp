@@ -14,6 +14,7 @@
 #include <atomic>
 #include <cmath>
 #include <cstdint>
+#include <cstdlib>
 #include <functional>
 #include <future>
 #include <iostream>
@@ -111,6 +112,19 @@ class HipStream {
  private:
   hipStream_t stream_ = nullptr;
 };
+
+int multi_queue_reuse_runs() {
+  const char* configured = std::getenv("DELTA_MULTI_QUEUE_STRESS_RUNS");
+  if (configured == nullptr || *configured == '\0') {
+    return 32;
+  }
+  char* end = nullptr;
+  const long parsed = std::strtol(configured, &end, 10);
+  require(end != configured && *end == '\0' && parsed > 0 &&
+              parsed <= std::numeric_limits<int>::max(),
+          "DELTA_MULTI_QUEUE_STRESS_RUNS must be a positive integer");
+  return static_cast<int>(parsed);
+}
 
 struct EdgeSpec {
   int from = -1;
@@ -1318,6 +1332,159 @@ void test_forced_generic_increasing_distance_reuse(hipStream_t stream) {
         {6},
         use_long_path ? long_expected : short_expected,
         result);
+  }
+}
+
+void test_forced_generic_multi_queue_reuse() {
+  // Every path is unique. Sources zero and one reach vertex six with sharply
+  // different distances, while source sixteen reaches the deep target through
+  // a separate short edge. Alternating these queries forces sparse reset to
+  // replace smaller distances/parent chains with larger ones and vice versa.
+  // Mixed, duplicate, and unreachable target sets also grow and reinterpret
+  // the compact metadata/offset buffers that cross the GPU copy engine.
+  const HostCsrF32 graph = make_outgoing_csr(
+      17,
+      {{0, 6, 0.25f},
+       {1, 2, 0.25f},
+       {2, 3, 1.75f},
+       {3, 4, 0.25f},
+       {4, 5, 1.75f},
+       {5, 6, 0.25f},
+       {6, 7, 1.75f},
+       {7, 8, 0.25f},
+       {8, 9, 1.75f},
+       {9, 10, 0.25f},
+       {10, 11, 1.75f},
+       {11, 12, 0.25f},
+       {12, 13, 1.75f},
+       {13, 14, 0.25f},
+       {16, 14, 0.5f}});
+  auto shared_graph =
+      std::make_shared<DeltaSteppingCsrGraph>(graph, nullptr);
+  const DeltaSteppingCsrWorkspaceOptions options{
+      DeltaSteppingCsrParentMode::kAutomatic,
+      DeltaSteppingCsrExecutionMode::kForceGeneric};
+
+  const std::vector<int> source_zero{0};
+  const std::vector<int> source_one{1};
+  const std::vector<int> source_sixteen{16};
+  const std::vector<int> mixed_sources{1, 16};
+  const std::vector<float> expected_zero =
+      cpu_dijkstra_outgoing_multi_source(graph, source_zero);
+  const std::vector<float> expected_one =
+      cpu_dijkstra_outgoing_multi_source(graph, source_one);
+  const std::vector<float> expected_sixteen =
+      cpu_dijkstra_outgoing_multi_source(graph, source_sixteen);
+  const std::vector<float> expected_mixed =
+      cpu_dijkstra_outgoing_multi_source(graph, mixed_sources);
+
+  struct Query {
+    const char* name;
+    const std::vector<int>* sources;
+    std::vector<int> targets;
+    const std::vector<float>* expected;
+  };
+  const std::vector<Query> queries{
+      {"short target", &source_zero, {6}, &expected_zero},
+      {"same target longer path", &source_one, {6}, &expected_one},
+      {"different target short path", &source_sixteen, {14},
+       &expected_sixteen},
+      {"capacity growth and exhaustion", &source_zero, {6, 14, 15},
+       &expected_zero},
+      {"multi-source duplicate targets", &mixed_sources, {14, 6, 14},
+       &expected_mixed},
+      {"deep path after duplicate targets", &source_one, {14},
+       &expected_one},
+  };
+
+  int device = 0;
+  check_hip(hipGetDevice(&device), "hipGetDevice");
+  constexpr int kWorkers = 4;
+  const int runs_per_worker = multi_queue_reuse_runs();
+  std::promise<void> start_promise;
+  const std::shared_future<void> start = start_promise.get_future().share();
+  std::atomic<int> ready{0};
+  std::vector<std::future<void>> workers;
+  workers.reserve(kWorkers);
+  for (int worker = 0; worker < kWorkers; ++worker) {
+    workers.push_back(std::async(std::launch::async, [&, worker]() {
+      bool readiness_reported = false;
+      try {
+        check_hip(hipSetDevice(device), "hipSetDevice");
+        HipStream stream;
+        DeltaSteppingCsrWorkspace workspace(
+            shared_graph, stream.get(), options);
+        ready.fetch_add(1, std::memory_order_release);
+        readiness_reported = true;
+        start.wait();
+
+        DeltaSteppingCsrTelemetry telemetry;
+        DeltaSteppingCsrRunOptions telemetry_options;
+        telemetry_options.telemetry = &telemetry;
+        const DeltaSteppingCsrResult instrumented = workspace.run(
+            source_one,
+            std::vector<int>{14},
+            1.0f,
+            -1,
+            telemetry_options,
+            stream.get(),
+            nullptr,
+            nullptr);
+        validate_compact_target_paths(
+            "forced-generic multi-queue instrumented worker " +
+                std::to_string(worker),
+            graph,
+            source_one,
+            {14},
+            expected_one,
+            instrumented);
+        require(telemetry.collected && telemetry.completed &&
+                    telemetry.execution_path ==
+                        DeltaSteppingCsrExecutionPath::kCompactGeneric,
+                "forced-generic multi-queue telemetry used the wrong path");
+
+        for (int repetition = 0; repetition < runs_per_worker;
+             ++repetition) {
+          for (std::size_t query_offset = 0;
+               query_offset < queries.size();
+               ++query_offset) {
+            const Query& query = queries[
+                (query_offset + static_cast<std::size_t>(worker) +
+                 static_cast<std::size_t>(repetition)) %
+                queries.size()];
+            const DeltaSteppingCsrResult result = workspace.run(
+                *query.sources,
+                query.targets,
+                1.0f,
+                -1,
+                stream.get(),
+                nullptr,
+                nullptr);
+            validate_compact_target_paths(
+                "forced-generic multi-queue worker " +
+                    std::to_string(worker) + " reuse " +
+                    std::to_string(repetition) + ": " + query.name,
+                graph,
+                *query.sources,
+                query.targets,
+                *query.expected,
+                result);
+          }
+        }
+      } catch (...) {
+        if (!readiness_reported) {
+          ready.fetch_add(1, std::memory_order_release);
+        }
+        throw;
+      }
+    }));
+  }
+  while (ready.load(std::memory_order_acquire) != kWorkers) {
+    std::this_thread::yield();
+  }
+  start_promise.set_value();
+  for (std::future<void>& worker : workers) {
+    worker.get();
   }
 }
 
@@ -2862,6 +3029,7 @@ int main() {
     test_generic_compact_parent_modes(stream.get());
     test_compact_early_settlement_reset(stream.get());
     test_forced_generic_increasing_distance_reuse(stream.get());
+    test_forced_generic_multi_queue_reuse();
     test_compact_weight_class_updates(stream.get());
     test_compact_to_unit_storage_transition(stream.get());
     test_unit_weight_specialization(stream.get());

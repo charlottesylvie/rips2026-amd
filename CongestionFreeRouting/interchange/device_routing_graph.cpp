@@ -341,6 +341,20 @@ void ensure_parent_directory(const std::filesystem::path& path) {
   }
 }
 
+void finish_output(std::ofstream& out,
+                   const std::filesystem::path& path) {
+  out.flush();
+  if (!out) {
+    throw std::runtime_error("failed while flushing device-routing output: " +
+                             path.string());
+  }
+  out.close();
+  if (!out) {
+    throw std::runtime_error("failed while closing device-routing output: " +
+                             path.string());
+  }
+}
+
 }  // namespace
 
 const char* node_bounds_mode_name(NodeBoundsMode mode) {
@@ -598,6 +612,7 @@ void write_device_routing_graph(const DeviceRoutingGraph& graph,
   write_array(out, graph.colind, "base CSR destinations");
   write_array(out, graph.edge_attrs, "base CSR edge attributes");
   write_static_suffix(out, graph);
+  finish_output(out, path);
 }
 
 void write_device_routing_graph(
@@ -667,6 +682,7 @@ void write_device_routing_graph(
   }
 
   write_static_suffix(out, graph);
+  finish_output(out, path);
 }
 
 void sort_and_deduplicate_static_csr(

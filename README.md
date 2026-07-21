@@ -322,7 +322,7 @@ Tuning options:
 | `--net-limit <count>` | unset | Route only the first `count` requests. |
 | `--parallel-net-workers <count>` | `0` | Independent net workers; `0` enables engine-dependent auto-selection. Workers share one immutable CSR across worker-private search state. |
 | `--diagnose-net <zero-based>` | unset | Replay the route-request prefix through this net and emit one UnitBFS diagnostic JSON record. Requires `--diagnose-sink`. |
-| `--diagnose-sink <zero-based>` | unset | Compare the selected sink's raw batched result, a fresh same-workspace result, and CPU/GPU searches from the exact expanded route tree. |
+| `--diagnose-sink <zero-based>` | unset | Compare the selected sink's routed per-sink result with fresh same-workspace CPU/GPU searches from both the original and exact expanded route trees. |
 | `--routes-out <path>` | unset | Write routed PIP tree data as JSONL. |
 | `--max-pathfinder-iters`, `--present-factor`, `--present-multiplier`, `--history-factor`, `--route-batch-size` | ignored | Compatibility-only options accepted by the one-shot router. |
 
@@ -501,6 +501,16 @@ g++ -std=c++17 -O2 \
 /tmp/device_routing_graph_test
 ```
 
+Gzip/plain FPGAIF input integrity test (including truncated gzip streams):
+
+```bash
+g++ -std=c++17 -O2 \
+  CongestionFreeRouting/tests/gzip_io_test.cpp \
+  -lz -o /tmp/gzip_io_test
+
+/tmp/gzip_io_test
+```
+
 CPU-only PathFinder logic test:
 
 ```bash
@@ -529,10 +539,11 @@ build and an existing CSR/metadata pair):
 
 The diagnostic replays every request through the selected zero-based net so
 the chosen worker has realistic workspace-reuse history, then exits without
-writing routes. Its final JSON line distinguishes a raw UnitBFS mismatch from
-the one-shot PathFinder adapter retaining a cached multi-sink path. Run the
+writing routes. Its final JSON line compares the actual per-sink query from the
+expanded route tree with independent CPU and GPU reference queries. Run the
 same selection with one and four workers to compare the null-stream controller
-with explicit worker streams.
+with explicit worker streams. The JSON key `raw_batched` is retained for
+compatibility, but now contains the routed per-sink query.
 
 Delta benchmark argument parsing/forwarding test:
 

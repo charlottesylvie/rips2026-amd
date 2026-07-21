@@ -16,6 +16,7 @@
 //     -o routes_to_phys
 
 #include "PhysicalNetlist.capnp.h"
+#include "interchange/gzip_io.hpp"
 
 #include <capnp/serialize.h>
 #include <kj/array.h>
@@ -571,38 +572,27 @@ void validate_routes_against_metadata(
 }
 
 std::vector<std::uint8_t> read_gzip_or_plain_file(const std::filesystem::path& path) {
-  gzFile file = gzopen(path.string().c_str(), "rb");
-  if (!file) throw std::runtime_error("could not open input file: " + path.string());
-
   std::vector<std::uint8_t> bytes;
-  std::array<std::uint8_t, 1 << 20> buffer{};
-  while (true) {
-    const int read_count =
-        gzread(file, buffer.data(), static_cast<unsigned int>(buffer.size()));
-    if (read_count > 0) {
-      const std::size_t old_size = bytes.size();
-      bytes.resize(old_size + static_cast<std::size_t>(read_count));
-      std::memcpy(bytes.data() + old_size,
-                  buffer.data(),
-                  static_cast<std::size_t>(read_count));
-      continue;
-    }
-    if (read_count == 0) break;
-
-    int zlib_error = 0;
-    const char* message = gzerror(file, &zlib_error);
-    gzclose(file);
-    throw std::runtime_error("failed while reading " + path.string() + ": " +
-                             (message ? message : "zlib error"));
-  }
-  gzclose(file);
+  routing::interchange::read_gzip_or_plain_chunks(
+      path, [&](const std::uint8_t* data, std::size_t byte_count) {
+        if (byte_count > bytes.max_size() - bytes.size()) {
+          throw std::runtime_error("decoded input is too large: " +
+                                   path.string());
+        }
+        const std::size_t old_size = bytes.size();
+        bytes.resize(old_size + byte_count);
+        std::memcpy(bytes.data() + old_size, data, byte_count);
+      });
   if (bytes.empty()) throw std::runtime_error("input file is empty: " + path.string());
   return bytes;
 }
 
 std::vector<capnp::word> bytes_to_words(const std::vector<std::uint8_t>& bytes) {
-  const std::size_t word_count = (bytes.size() + sizeof(capnp::word) - 1) /
-                                 sizeof(capnp::word);
+  if (bytes.size() % sizeof(capnp::word) != 0) {
+    throw std::runtime_error(
+        "decoded physical netlist is not Cap'n Proto word-aligned");
+  }
+  const std::size_t word_count = bytes.size() / sizeof(capnp::word);
   std::vector<capnp::word> words(word_count);
   std::memcpy(words.data(), bytes.data(), bytes.size());
   return words;

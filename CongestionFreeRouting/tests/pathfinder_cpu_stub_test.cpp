@@ -1006,8 +1006,8 @@ int main() {
           "route tree should contain nodes 0,1,2,3");
   require(result.occupancy == std::vector<int>({1, 1, 1, 1}),
           "all route tree nodes should be occupied once");
-  require(g_unit_bfs_calls == 1,
-          "PathFinder should call unit BFS once per multi-sink net by default");
+  require(g_unit_bfs_calls == 2,
+          "PathFinder should rerun unit BFS after expanding a multi-sink tree");
   require(g_multisource_delta_calls == 0,
           "default unit BFS path should not call delta-step");
 
@@ -1022,8 +1022,8 @@ int main() {
           "delta-step comparison path should preserve first sink route");
   require(delta_result.nets[0].sinks[1].nodes == std::vector<int>({1, 3}),
           "delta-step comparison path should preserve second sink route");
-  require(g_multisource_delta_calls == 1,
-          "explicit delta-step comparison path should call delta-step");
+  require(g_multisource_delta_calls == 2,
+          "delta-step should rerun after expanding a multi-sink tree");
   require(g_unit_bfs_calls == 0,
           "explicit delta-step comparison path should not call unit BFS");
 
