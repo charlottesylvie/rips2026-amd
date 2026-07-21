@@ -969,7 +969,11 @@ __global__ void initialize_unit_sources_kernel(const int* sources,
         status + kUnitStatusFrontierEnd, source_count);
     atomic_store_unit_status(status + kUnitStatusCompletedDepth, 0);
     atomic_store_unit_status(status + kUnitStatusBucket, 0);
-    atomic_store_unit_status(status + kUnitStatusBucketRounds, 1);
+    atomic_store_unit_status(
+        status + kUnitStatusBucketRounds,
+        source_count > 0 && initially_found < target_count && max_depth > 0
+            ? 1
+            : 0);
     __threadfence();
     atomic_store_unit_status(
         status + kUnitStatusActive,
@@ -1270,6 +1274,7 @@ __global__ void measure_target_paths_kernel(const int* targets,
 __global__ void measure_unit_target_paths_kernel(const int* targets,
                                                  int target_count,
                                                  const float* dist,
+                                                 float exclusive_distance_limit,
                                                  float* target_distances,
                                                  int* path_lengths,
                                                  int* path_sources,
@@ -1278,13 +1283,15 @@ __global__ void measure_unit_target_paths_kernel(const int* targets,
        i < target_count;
        i += blockDim.x * gridDim.x) {
     const float target_distance = dist[targets[i]];
-    target_distances[i] = target_distance;
     path_sources[i] = -1;
-    if (!finite_float(target_distance)) {
+    if (!finite_float(target_distance) ||
+        !(target_distance < exclusive_distance_limit)) {
+      target_distances[i] = INFINITY;
       path_lengths[i] = 0;
       path_status[i] = 0;
       continue;
     }
+    target_distances[i] = target_distance;
     // In the unit specialization, distance is exactly the BFS edge depth.
     path_lengths[i] = static_cast<int>(target_distance) + 1;
     path_status[i] = 1;
@@ -1528,6 +1535,7 @@ __global__ void relax_light_edges_kernel(const int* frontier,
                                          const int* frontier_count_ptr,
                                          int current_bucket,
                                          float delta,
+                                         float exclusive_distance_limit,
                                          const Offset* out_rowptr,
                                          const Index* out_colind,
                                          const float* out_values,
@@ -1601,15 +1609,22 @@ __global__ void relax_light_edges_kernel(const int* frontier,
         const float effective_w =
             HasVertexCosts ? w * vertex_costs[v] : w;
         const float candidate = du + effective_w;
+        const bool below_distance_limit =
+            candidate < exclusive_distance_limit;
         int candidate_bucket = kNoBucket;
         // Float addition can place a nominally heavy edge in the current
         // bucket (and all very large distances share the terminal bucket).
         // Such work belongs to light closure or its descendants can be lost.
         bool light = true;
         if constexpr (!AllEdgesLight) {
-          candidate_bucket = bucket_index(candidate, delta);
-          light = effective_w <= delta ||
-                  candidate_bucket == current_bucket;
+          candidate_bucket = below_distance_limit
+                                 ? bucket_index(candidate, delta)
+                                 : kNoBucket;
+          light = below_distance_limit &&
+                  (effective_w <= delta ||
+                   candidate_bucket == current_bucket);
+        } else {
+          light = below_distance_limit;
         }
         const float nd = light ? candidate : INFINITY;
         float old = INFINITY;
@@ -1696,6 +1711,7 @@ __global__ void relax_heavy_edges_kernel(const int* heavy_vertices,
                                          const int* heavy_count_ptr,
                                          int current_bucket,
                                          float delta,
+                                         float exclusive_distance_limit,
                                          const Offset* out_rowptr,
                                          const Index* out_colind,
                                          const float* out_values,
@@ -1735,10 +1751,13 @@ __global__ void relax_heavy_edges_kernel(const int* heavy_vertices,
         const float effective_w =
             HasVertexCosts ? w * vertex_costs[v] : w;
         const float candidate = du + effective_w;
-        const int candidate_bucket = bucket_index(candidate, delta);
+        const bool below_distance_limit =
+            candidate < exclusive_distance_limit;
+        const int candidate_bucket =
+            below_distance_limit ? bucket_index(candidate, delta) : kNoBucket;
         // Same-bucket nominally-heavy edges were already processed by the
         // light-closure kernel. Only future-bucket candidates belong here.
-        const bool heavy = effective_w > delta &&
+        const bool heavy = below_distance_limit && effective_w > delta &&
                            candidate_bucket > current_bucket &&
                            candidate_bucket < kNoBucket;
         const float nd = heavy ? candidate : INFINITY;
@@ -1813,6 +1832,7 @@ void launch_relax_light_edges(
     int launch_blocks,
     int current_bucket,
     float delta,
+    float exclusive_distance_limit,
     int* next_queue,
     int* next_count,
     int* pending_queue,
@@ -1821,6 +1841,7 @@ void launch_relax_light_edges(
                            CollectHeavy, AllEdgesLight, CollectTelemetry>
       <<<launch_blocks, kBlockSize, 0, stream>>>(
           current_queue, current_count, current_bucket, delta,
+          exclusive_distance_limit,
           graph.rowptr, graph.colind, graph.values, vertex_costs,
           scratch.dist.get(), scratch.parent_key.get(),
           scratch.in_current.get(), scratch.in_pending.get(),
@@ -1843,13 +1864,14 @@ void launch_relax_heavy_edges(
     int launch_blocks,
     int current_bucket,
     float delta,
+    float exclusive_distance_limit,
     int* pending_queue,
     hipStream_t stream) {
   relax_heavy_edges_kernel<TrackParents, UseEdgeParent, HasVertexCosts,
                            CollectTelemetry>
       <<<launch_blocks, kBlockSize, 0, stream>>>(
           scratch.heavy_queue.get(), scratch.heavy_count.get(),
-          current_bucket, delta,
+          current_bucket, delta, exclusive_distance_limit,
           graph.rowptr, graph.colind, graph.values, vertex_costs,
           scratch.dist.get(), scratch.parent_key.get(), scratch.in_pending.get(),
           scratch.touched_queue.get(), scratch.touched_count.get(),
@@ -2430,7 +2452,9 @@ void extract_target_paths_to_result(
     const std::uint32_t* edge_source,
     const std::vector<int>& targets,
     hipStream_t stream,
-    const int* target_settled = nullptr) {
+    const int* target_settled = nullptr,
+    float exclusive_distance_limit =
+        std::numeric_limits<float>::infinity()) {
   PATHFINDER_PROFILE_RANGE(
       ParentMode == TargetPathParentMode::kCompactEdge
           ? "delta_step.compact_edge_path_extraction"
@@ -2440,6 +2464,7 @@ void extract_target_paths_to_result(
     measure_unit_target_paths_kernel
         <<<grid_for_items(target_count), kBlockSize, 0, stream>>>(
             scratch.targets.get(), target_count, scratch.dist.get(),
+            exclusive_distance_limit,
             scratch.target_distances.get(), scratch.target_path_lengths.get(),
             scratch.target_sources.get(), scratch.target_path_status.get());
   } else if constexpr (ParentMode == TargetPathParentMode::kCompactEdge) {
@@ -2611,6 +2636,7 @@ DeltaSteppingCsrResult run_unit_weight_specialization(
     const std::vector<int>& sources,
     const std::vector<int>& targets,
     float delta,
+    float exclusive_distance_limit,
     hipStream_t stream,
     DeltaSteppingCsrTelemetry* telemetry) {
   // With identical positive edge weights, delta-stepping and multi-source BFS
@@ -2622,10 +2648,15 @@ DeltaSteppingCsrResult run_unit_weight_specialization(
   std::unordered_set<int> source_set;
   const std::vector<int>* effective_sources = &sources;
   int initially_found = 0;
+  const bool zero_distance_within_limit =
+      !std::isfinite(exclusive_distance_limit) ||
+      0.0f < exclusive_distance_limit;
   if (sources.size() == 1) {
-    for (const int target : targets) {
-      if (target == sources.front()) {
-        ++initially_found;
+    if (zero_distance_within_limit) {
+      for (const int target : targets) {
+        if (target == sources.front()) {
+          ++initially_found;
+        }
       }
     }
   } else {
@@ -2637,9 +2668,11 @@ DeltaSteppingCsrResult run_unit_weight_specialization(
       }
     }
     effective_sources = &deduplicated_sources;
-    for (const int target : targets) {
-      if (source_set.find(target) != source_set.end()) {
-        ++initially_found;
+    if (zero_distance_within_limit) {
+      for (const int target : targets) {
+        if (source_set.find(target) != source_set.end()) {
+          ++initially_found;
+        }
       }
     }
   }
@@ -2652,6 +2685,17 @@ DeltaSteppingCsrResult run_unit_weight_specialization(
   const int source_count = static_cast<int>(effective_sources->size());
   const int target_count = static_cast<int>(targets.size());
   const int vertex_count = static_cast<int>(graph.rows);
+  int max_depth = vertex_count;
+  if (std::isfinite(exclusive_distance_limit)) {
+    if (!(exclusive_distance_limit > 0.0f)) {
+      max_depth = 0;
+    } else {
+      const double largest_allowed_depth =
+          std::ceil(static_cast<double>(exclusive_distance_limit)) - 1.0;
+      max_depth = static_cast<int>(std::min<double>(
+          static_cast<double>(vertex_count), largest_allowed_depth));
+    }
+  }
   const float inf = std::numeric_limits<float>::infinity();
   if constexpr (CollectTelemetry) {
     prepare_device_telemetry(scratch, stream);
@@ -2683,7 +2727,7 @@ DeltaSteppingCsrResult run_unit_weight_specialization(
           source_count,
           initially_found,
           target_count,
-          vertex_count,
+          max_depth,
           scratch.dist.get(),
           scratch.pred_node.get(),
           scratch.pred_edge.get(),
@@ -2700,14 +2744,15 @@ DeltaSteppingCsrResult run_unit_weight_specialization(
   int bucket = 0;
   // Source initialization alone is not a processed bucket.  This matters when
   // every requested target is already a source and traversal stops at depth 0.
-  int bucket_rounds = initially_found >= target_count ? 0 : 1;
+  int bucket_rounds =
+      initially_found >= target_count || max_depth == 0 ? 0 : 1;
   std::uint64_t controller_round_trips = 0;
   DeltaSteppingCsrResult result;
   result.target = -1;
   const bool use_device_controller = stream == nullptr;
 
   while (current_count > 0 && found_count < target_count &&
-         result.iterations_used < vertex_count) {
+         result.iterations_used < max_depth) {
     const int previous_queue_tail = queue_tail;
     const int previous_found_count = found_count;
     const int previous_frontier_end = frontier_end;
@@ -2778,7 +2823,10 @@ DeltaSteppingCsrResult run_unit_weight_specialization(
     } else {
       // Preserve null-stream controller batching, which has not exhibited the
       // multi-stream dispatch failure and amortizes status transfers.
-      const int rounds_to_enqueue = previous_depth == 0 ? 1 : 4;
+      const int rounds_to_enqueue =
+          previous_depth == 0
+              ? 1
+              : std::min(4, max_depth - previous_depth);
       const int launch_blocks =
           rounds_to_enqueue == 1
               ? grid_for_frontier(current_count)
@@ -2794,7 +2842,7 @@ DeltaSteppingCsrResult run_unit_weight_specialization(
                 CollectTelemetry ? scratch.telemetry_counters.get() : nullptr);
         DS_DELTA_HIP_CHECK(hipGetLastError());
         advance_unit_frontier_kernel<<<1, 1, 0, stream>>>(
-            scratch.unit_status.get(), delta, target_count, vertex_count);
+            scratch.unit_status.get(), delta, target_count, max_depth);
         DS_DELTA_HIP_CHECK(hipGetLastError());
       }
       DS_DELTA_HIP_CHECK(hipMemcpyAsync(scratch.host_unit_status.get(),
@@ -2816,7 +2864,7 @@ DeltaSteppingCsrResult run_unit_weight_specialization(
           scratch.host_unit_status.get()[kUnitStatusBucketRounds];
       const int expected_active =
           frontier_begin < frontier_end && found_count < target_count &&
-          result.iterations_used < vertex_count;
+          result.iterations_used < max_depth;
       const int active = scratch.host_unit_status.get()[kUnitStatusActive];
       if (queue_tail < previous_queue_tail || queue_tail > vertex_count ||
           frontier_begin < previous_frontier_end ||
@@ -2853,7 +2901,12 @@ DeltaSteppingCsrResult run_unit_weight_specialization(
   }
 
   result.stopped_on_target = found_count >= target_count;
-  result.converged = !result.stopped_on_target && current_count == 0;
+  result.stopped_on_distance_limit =
+      std::isfinite(exclusive_distance_limit) &&
+      !result.stopped_on_target;
+  result.converged = !result.stopped_on_target &&
+                     !result.stopped_on_distance_limit &&
+                     current_count == 0;
   try {
     clear_unit_target_multiplicity_kernel
         <<<grid_for_items(target_count), kBlockSize, 0, stream>>>(
@@ -2862,7 +2915,8 @@ DeltaSteppingCsrResult run_unit_weight_specialization(
             scratch.in_pending.get());
     DS_DELTA_HIP_CHECK(hipGetLastError());
     extract_target_paths_to_result<TargetPathParentMode::kUnitWeight>(
-        result, scratch, graph, nullptr, nullptr, targets, stream);
+        result, scratch, graph, nullptr, nullptr, targets, stream, nullptr,
+        exclusive_distance_limit);
     for (std::size_t i = 0; i < result.target_distances.size(); ++i) {
       if (std::isfinite(result.target_distances[i]) &&
           !is_effective_source(result.target_sources[i])) {
@@ -2989,6 +3043,7 @@ DeltaSteppingCsrResult run_delta_stepping_impl(
     bool skip_heavy_edges,
     float delta,
     int max_iters,
+    float exclusive_distance_limit,
     hipStream_t stream,
     DeltaSteppingCsrProgressCallback progress_callback,
     void* progress_user_data,
@@ -3016,6 +3071,9 @@ DeltaSteppingCsrResult run_delta_stepping_impl(
   };
   const int source_count = static_cast<int>(effective_sources->size());
   const bool use_target_set = targets != nullptr;
+  const bool zero_distance_within_limit =
+      !std::isfinite(exclusive_distance_limit) ||
+      0.0f < exclusive_distance_limit;
   if constexpr (!TrackParents) {
     if (target >= 0 || use_target_set) {
       throw std::logic_error(
@@ -3043,7 +3101,7 @@ DeltaSteppingCsrResult run_delta_stepping_impl(
     initial_target_settled.assign(static_cast<std::size_t>(target_count), 0);
     for (int i = 0; i < target_count; ++i) {
       const int candidate = (*targets)[static_cast<std::size_t>(i)];
-      if (is_effective_source(candidate)) {
+      if (zero_distance_within_limit && is_effective_source(candidate)) {
         initial_target_settled[static_cast<std::size_t>(i)] = 1;
         ++initial_settled_target_count;
       }
@@ -3054,7 +3112,8 @@ DeltaSteppingCsrResult run_delta_stepping_impl(
     prepare_device_telemetry(scratch, stream);
   }
   const bool target_is_source =
-      !use_target_set && target >= 0 && is_effective_source(target);
+      !use_target_set && target >= 0 && zero_distance_within_limit &&
+      is_effective_source(target);
 
   scratch.ensure_source_capacity(effective_sources->size());
   // Generic state is lazy because exact-unit workers never need it. Allocate
@@ -3103,6 +3162,15 @@ DeltaSteppingCsrResult run_delta_stepping_impl(
   int* pending_queue = scratch.pending_a.get();
   int* pending_scratch = scratch.pending_b.get();
   int current_bucket = 0;
+  const bool has_distance_limit =
+      std::isfinite(exclusive_distance_limit);
+  const int last_allowed_bucket =
+      !has_distance_limit || !(exclusive_distance_limit > 0.0f)
+          ? -1
+          : bucket_index_host(
+                std::nextafter(exclusive_distance_limit,
+                               -std::numeric_limits<float>::infinity()),
+                delta);
   // Sources are deduplicated on the host and initialization writes exactly
   // this many queue entries, so no device round trip is needed here.
   int current_count = source_count;
@@ -3192,6 +3260,10 @@ DeltaSteppingCsrResult run_delta_stepping_impl(
   for (int iter = 0;
        iter < max_iters && !result.stopped_on_target;
        ++iter) {
+    if (has_distance_limit && current_bucket > last_allowed_bucket) {
+      result.stopped_on_distance_limit = true;
+      break;
+    }
     reset_int_zero_async(scratch.heavy_count.get(), stream);
 
     int light_rounds = 0;
@@ -3230,25 +3302,29 @@ DeltaSteppingCsrResult run_delta_stepping_impl(
                                    true, CollectTelemetry>(
               d_adjacency, scratch, vertex_costs, current_queue,
               current_count_device, launch_blocks, current_bucket, delta,
-              next_queue, next_count_device, pending_queue, stream);
+              exclusive_distance_limit, next_queue, next_count_device,
+              pending_queue, stream);
         } else if (terminal_bucket || skip_heavy_edges) {
           launch_relax_light_edges<TrackParents, UseEdgeParent, false, false,
                                    true, CollectTelemetry>(
               d_adjacency, scratch, nullptr, current_queue,
               current_count_device, launch_blocks, current_bucket, delta,
-              next_queue, next_count_device, pending_queue, stream);
+              exclusive_distance_limit, next_queue, next_count_device,
+              pending_queue, stream);
         } else if (vertex_costs != nullptr) {
           launch_relax_light_edges<TrackParents, UseEdgeParent, true, true,
                                    false, CollectTelemetry>(
               d_adjacency, scratch, vertex_costs, current_queue,
               current_count_device, launch_blocks, current_bucket, delta,
-              next_queue, next_count_device, pending_queue, stream);
+              exclusive_distance_limit, next_queue, next_count_device,
+              pending_queue, stream);
         } else {
           launch_relax_light_edges<TrackParents, UseEdgeParent, false, true,
                                    false, CollectTelemetry>(
               d_adjacency, scratch, nullptr, current_queue,
               current_count_device, launch_blocks, current_bucket, delta,
-              next_queue, next_count_device, pending_queue, stream);
+              exclusive_distance_limit, next_queue, next_count_device,
+              pending_queue, stream);
         }
         std::swap(current_queue, next_queue);
         std::swap(current_count_device, next_count_device);
@@ -3270,12 +3346,14 @@ DeltaSteppingCsrResult run_delta_stepping_impl(
         launch_relax_heavy_edges<TrackParents, UseEdgeParent, true,
                                  CollectTelemetry>(
             d_adjacency, scratch, vertex_costs, device_count_blocks,
-            current_bucket, delta, pending_queue, stream);
+            current_bucket, delta, exclusive_distance_limit, pending_queue,
+            stream);
       } else {
         launch_relax_heavy_edges<TrackParents, UseEdgeParent, false,
                                  CollectTelemetry>(
             d_adjacency, scratch, nullptr, device_count_blocks,
-            current_bucket, delta, pending_queue, stream);
+            current_bucket, delta, exclusive_distance_limit, pending_queue,
+            stream);
       }
       // Vector-target settlement is the only immediate device consumer here.
       // Scalar target copies synchronize on their D2H transfer, while the
@@ -3347,7 +3425,16 @@ DeltaSteppingCsrResult run_delta_stepping_impl(
       report_progress(progress);
     }
     if (!changed) {
-      result.converged = true;
+      if (has_distance_limit) {
+        result.stopped_on_distance_limit = true;
+      } else {
+        result.converged = true;
+      }
+      break;
+    }
+
+    if (has_distance_limit && next_bucket > last_allowed_bucket) {
+      result.stopped_on_distance_limit = true;
       break;
     }
 
@@ -3443,11 +3530,29 @@ DeltaSteppingCsrResult run_delta_stepping_impl(
         result.dist = copy_dist_to_host(scratch.dist.get(), n, stream);
         result.target_distance =
             result.dist[static_cast<std::size_t>(target)];
+        if (has_distance_limit &&
+            !(result.target_distance < exclusive_distance_limit)) {
+          result.target_distance = inf;
+        }
         result.target_reached =
             !std::isinf(result.target_distance) &&
             (result.target_reached || result.converged);
       } else if (!use_target_set) {
         result.dist = copy_dist_to_host(scratch.dist.get(), n, stream);
+      }
+    }
+    if (has_distance_limit && !use_target_set) {
+      for (std::size_t node = 0; node < result.dist.size(); ++node) {
+        if (result.dist[node] < exclusive_distance_limit) {
+          continue;
+        }
+        result.dist[node] = inf;
+        if (node < result.pred_node.size()) {
+          result.pred_node[node] = -1;
+        }
+        if (node < result.pred_edge.size()) {
+          result.pred_edge[node] = static_cast<Offset>(-1);
+        }
       }
     }
   } catch (...) {
@@ -3517,6 +3622,7 @@ DeltaSteppingCsrResult dispatch_delta_stepping_impl(
     bool skip_heavy_edges,
     float delta,
     int max_iters,
+    float exclusive_distance_limit,
     hipStream_t stream,
     DeltaSteppingCsrProgressCallback progress_callback,
     void* progress_user_data,
@@ -3524,12 +3630,14 @@ DeltaSteppingCsrResult dispatch_delta_stepping_impl(
   if (telemetry != nullptr) {
     return run_delta_stepping_impl<TrackParents, UseEdgeParent, true>(
         d_adjacency, edge_source, scratch, sources, target, targets,
-        vertex_costs, skip_heavy_edges, delta, max_iters, stream,
+        vertex_costs, skip_heavy_edges, delta, max_iters,
+        exclusive_distance_limit, stream,
         progress_callback, progress_user_data, telemetry);
   }
   return run_delta_stepping_impl<TrackParents, UseEdgeParent, false>(
       d_adjacency, edge_source, scratch, sources, target, targets,
-      vertex_costs, skip_heavy_edges, delta, max_iters, stream,
+      vertex_costs, skip_heavy_edges, delta, max_iters,
+      exclusive_distance_limit, stream,
       progress_callback, progress_user_data, nullptr);
 }
 
@@ -3862,8 +3970,8 @@ DeltaSteppingCsrResult DeltaSteppingCsrWorkspace::run_distances(
   return dispatch_delta_stepping_impl<false, false>(
       adjacency.view, nullptr, impl_->scratch, sources, -1, nullptr,
       impl_->has_vertex_costs ? impl_->vertex_costs.get() : nullptr,
-      skip_heavy_edges, delta, max_iters, stream, progress_callback,
-      progress_user_data, active_telemetry_);
+      skip_heavy_edges, delta, max_iters, active_distance_limit_, stream,
+      progress_callback, progress_user_data, active_telemetry_);
 }
 
 DeltaSteppingCsrResult DeltaSteppingCsrWorkspace::run(
@@ -3897,8 +4005,8 @@ DeltaSteppingCsrResult DeltaSteppingCsrWorkspace::run(
   return dispatch_delta_stepping_impl<true, false>(
       adjacency.view, nullptr, impl_->scratch, sources, target, nullptr,
       impl_->has_vertex_costs ? impl_->vertex_costs.get() : nullptr,
-      skip_heavy_edges, delta, max_iters, stream, progress_callback,
-      progress_user_data, active_telemetry_);
+      skip_heavy_edges, delta, max_iters, active_distance_limit_, stream,
+      progress_callback, progress_user_data, active_telemetry_);
 }
 
 DeltaSteppingCsrResult DeltaSteppingCsrWorkspace::run(
@@ -3935,12 +4043,12 @@ DeltaSteppingCsrResult DeltaSteppingCsrWorkspace::run(
         impl_->max_edge_value <= delta, false);
     if (active_telemetry_ != nullptr) {
       return run_unit_weight_specialization<true>(
-          adjacency.view, impl_->scratch, sources, targets, delta, stream,
-          active_telemetry_);
+          adjacency.view, impl_->scratch, sources, targets, delta,
+          active_distance_limit_, stream, active_telemetry_);
     }
     return run_unit_weight_specialization<false>(
-        adjacency.view, impl_->scratch, sources, targets, delta, stream,
-        nullptr);
+        adjacency.view, impl_->scratch, sources, targets, delta,
+        active_distance_limit_, stream, nullptr);
   }
   PATHFINDER_PROFILE_RANGE("delta_step.generic");
   const float* const vertex_costs =
@@ -3957,7 +4065,8 @@ DeltaSteppingCsrResult DeltaSteppingCsrWorkspace::run(
     return dispatch_delta_stepping_impl<true, true>(
         adjacency.view, adjacency.edge_source.get(), impl_->scratch, sources,
         -1, &targets, vertex_costs, skip_heavy_edges, delta, max_iters,
-        stream, progress_callback, progress_user_data, active_telemetry_);
+        active_distance_limit_, stream, progress_callback, progress_user_data,
+        active_telemetry_);
   }
   const bool compact_parent_fallback =
       parent_mode_ == DeltaSteppingCsrParentMode::kAutomatic &&
@@ -3970,8 +4079,9 @@ DeltaSteppingCsrResult DeltaSteppingCsrWorkspace::run(
       impl_->has_vertex_costs, skip_heavy_edges, compact_parent_fallback);
   return dispatch_delta_stepping_impl<true, false>(
       adjacency.view, nullptr, impl_->scratch, sources, -1, &targets,
-      vertex_costs, skip_heavy_edges, delta, max_iters, stream,
-      progress_callback, progress_user_data, active_telemetry_);
+      vertex_costs, skip_heavy_edges, delta, max_iters,
+      active_distance_limit_, stream, progress_callback, progress_user_data,
+      active_telemetry_);
 }
 
 DeltaSteppingCsrResult DeltaSteppingCsrWorkspace::run(
@@ -4007,8 +4117,8 @@ DeltaSteppingCsrResult delta_stepping_minplus_hip_csr(
   DeltaSteppingScratch scratch(d_adjacency.rows);
   return dispatch_delta_stepping_impl<true, false>(
       d_adjacency, nullptr, scratch, sources, target, nullptr, nullptr, false,
-      delta, max_iters, stream, progress_callback, progress_user_data,
-      nullptr);
+      delta, max_iters, std::numeric_limits<float>::infinity(), stream,
+      progress_callback, progress_user_data, nullptr);
 }
 
 DeltaSteppingCsrResult delta_stepping_minplus_hip_csr(

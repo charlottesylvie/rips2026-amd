@@ -27,6 +27,9 @@ struct BellmanFordCsrResult {
   float target_distance = std::numeric_limits<float>::infinity();
   bool target_reached = false;
   bool stopped_on_target = false;
+  // True when a bounded SSSP run completed every distance bucket below its
+  // exclusive limit and stopped before exploring larger distances.
+  bool stopped_on_distance_limit = false;
 
   std::vector<float> target_distances;
   std::vector<int> target_sources;

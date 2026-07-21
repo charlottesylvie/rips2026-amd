@@ -31,6 +31,9 @@ std::atomic<int> g_unit_bfs_calls{0};
 std::atomic<int> g_unit_bfs_graph_uploads{0};
 std::mutex g_delta_values_mutex;
 std::vector<float> g_delta_values;
+std::mutex g_query_limits_mutex;
+std::vector<float> g_delta_distance_limits;
+std::vector<int> g_unit_depth_limits;
 
 void clear_recorded_deltas() {
   std::lock_guard<std::mutex> lock(g_delta_values_mutex);
@@ -40,6 +43,22 @@ void clear_recorded_deltas() {
 std::vector<float> recorded_deltas() {
   std::lock_guard<std::mutex> lock(g_delta_values_mutex);
   return g_delta_values;
+}
+
+void clear_recorded_query_limits() {
+  std::lock_guard<std::mutex> lock(g_query_limits_mutex);
+  g_delta_distance_limits.clear();
+  g_unit_depth_limits.clear();
+}
+
+std::vector<float> recorded_delta_distance_limits() {
+  std::lock_guard<std::mutex> lock(g_query_limits_mutex);
+  return g_delta_distance_limits;
+}
+
+std::vector<int> recorded_unit_depth_limits() {
+  std::lock_guard<std::mutex> lock(g_query_limits_mutex);
+  return g_unit_depth_limits;
 }
 
 struct CpuSsspResult {
@@ -97,6 +116,67 @@ CpuSsspResult cpu_dijkstra_outgoing_csr_multi(const HostCsrF32& graph,
     }
   }
   return result;
+}
+
+CpuSsspResult cpu_unit_bfs_outgoing_csr_multi(
+    const HostCsrF32& graph,
+    const std::vector<int>& sources,
+    int max_depth) {
+  if (max_depth < 0) {
+    max_depth = static_cast<int>(graph.rows);
+  }
+  constexpr float inf = std::numeric_limits<float>::infinity();
+  CpuSsspResult result;
+  result.dist.assign(static_cast<std::size_t>(graph.rows), inf);
+  result.pred_node.assign(static_cast<std::size_t>(graph.rows), -1);
+  result.pred_edge.assign(static_cast<std::size_t>(graph.rows), -1);
+  std::vector<int> queue;
+  queue.reserve(static_cast<std::size_t>(graph.rows));
+  for (const int source : sources) {
+    if (result.dist[static_cast<std::size_t>(source)] == 0.0f) {
+      continue;
+    }
+    result.dist[static_cast<std::size_t>(source)] = 0.0f;
+    result.pred_node[static_cast<std::size_t>(source)] = source;
+    queue.push_back(source);
+  }
+  for (std::size_t head = 0; head < queue.size(); ++head) {
+    const int u = queue[head];
+    const int depth = static_cast<int>(
+        result.dist[static_cast<std::size_t>(u)]);
+    if (depth >= max_depth) {
+      continue;
+    }
+    for (minplus_sparse::Offset edge =
+             graph.rowptr[static_cast<std::size_t>(u)];
+         edge < graph.rowptr[static_cast<std::size_t>(u + 1)];
+         ++edge) {
+      const int v = graph.colind[static_cast<std::size_t>(edge)];
+      if (std::isfinite(result.dist[static_cast<std::size_t>(v)])) {
+        continue;
+      }
+      result.dist[static_cast<std::size_t>(v)] =
+          static_cast<float>(depth + 1);
+      result.pred_node[static_cast<std::size_t>(v)] = u;
+      result.pred_edge[static_cast<std::size_t>(v)] = edge;
+      queue.push_back(v);
+    }
+  }
+  return result;
+}
+
+void apply_exclusive_distance_limit(CpuSsspResult& result, float limit) {
+  if (!std::isfinite(limit)) {
+    return;
+  }
+  for (std::size_t node = 0; node < result.dist.size(); ++node) {
+    if (result.dist[node] < limit) {
+      continue;
+    }
+    result.dist[node] = std::numeric_limits<float>::infinity();
+    result.pred_node[node] = -1;
+    result.pred_edge[node] = -1;
+  }
 }
 
 std::vector<float> cpu_dijkstra_outgoing_csr(const HostCsrF32& graph,
@@ -293,6 +373,20 @@ HostCsrF32 make_cached_multi_sink_counterexample_graph() {
   return graph;
 }
 
+HostCsrF32 make_accumulated_tree_repair_graph() {
+  // Sink 8 is initially closest through 0->6->8.  The direct 2->8 edge only
+  // becomes preferable after sink 2 is attached; sink 5 is routed in between
+  // so the repair source set must retain additions from more than one branch.
+  HostCsrF32 graph;
+  graph.rows = 9;
+  graph.cols = 9;
+  graph.nnz = 8;
+  graph.rowptr = {0, 3, 4, 5, 6, 7, 7, 8, 8, 8};
+  graph.colind = {1, 3, 6, 2, 8, 4, 5, 8};
+  graph.values.assign(static_cast<std::size_t>(graph.nnz), 1.0f);
+  return graph;
+}
+
 HostCsrF32 make_self_loop_predecessor_graph() {
   HostCsrF32 graph;
   graph.rows = 4;
@@ -369,6 +463,24 @@ routing::RoutingMetadata make_cached_multi_sink_counterexample_metadata(
   request.sources.push_back({0, 0, 0});
   request.sinks.push_back({2, 0, 0});
   request.sinks.push_back({4, 0, 0});
+  metadata.route_requests.push_back(std::move(request));
+  return metadata;
+}
+
+routing::RoutingMetadata make_accumulated_tree_repair_metadata(
+    const HostCsrF32& graph) {
+  routing::RoutingMetadata metadata;
+  metadata.strings = {"accumulated_tree_repair"};
+  metadata.node_device_ids.resize(static_cast<std::size_t>(graph.rows));
+  add_default_node_metadata(metadata);
+  metadata.edge_attrs.resize(static_cast<std::size_t>(graph.nnz));
+
+  routing::RouteRequest request;
+  request.net_string = 0;
+  request.sources.push_back({0, 0, 0});
+  request.sinks.push_back({2, 0, 0});
+  request.sinks.push_back({5, 0, 0});
+  request.sinks.push_back({8, 0, 0});
   metadata.route_requests.push_back(std::move(request));
   return metadata;
 }
@@ -454,6 +566,42 @@ struct DetachedCompactWorkspace {
     result.target_reached = true;
     result.stopped_on_target = true;
     result.converged = true;
+    return result;
+  }
+};
+
+struct TentativeCompactWorkspace {
+  int calls = 0;
+
+  BellmanFordCsrResult run(
+      const std::vector<int>& sources,
+      const std::vector<int>& targets,
+      float delta,
+      int max_iters,
+      hipStream_t stream,
+      BellmanFordCsrProgressCallback progress_callback,
+      void* progress_user_data) {
+    (void)sources;
+    (void)targets;
+    (void)delta;
+    (void)max_iters;
+    (void)stream;
+    (void)progress_callback;
+    (void)progress_user_data;
+    ++calls;
+
+    BellmanFordCsrResult result;
+    result.target_distances = {2.0f};
+    result.target_sources = {0};
+    result.target_path_offsets = {0, 3};
+    result.target_edge_offsets = {0, 2};
+    result.target_path_nodes = {0, 1, 2};
+    result.target_path_edges = {0, 2};
+    result.target_reached = true;
+    // Deliberately neither settled nor converged: BF can expose this finite
+    // candidate when a cheaper route remains beyond its iteration cap.
+    result.stopped_on_target = false;
+    result.converged = false;
     return result;
   }
 };
@@ -676,6 +824,10 @@ DeltaSteppingCsrResult DeltaSteppingCsrWorkspace::run(
     hipStream_t stream,
     DeltaSteppingCsrProgressCallback progress_callback,
     void* progress_user_data) {
+  {
+    std::lock_guard<std::mutex> lock(g_query_limits_mutex);
+    g_delta_distance_limits.push_back(active_distance_limit_);
+  }
   DeltaSteppingCsrResult result = delta_stepping_minplus_hip_csr(
       impl_->graph,
       sources,
@@ -685,6 +837,18 @@ DeltaSteppingCsrResult DeltaSteppingCsrWorkspace::run(
       stream,
       progress_callback,
       progress_user_data);
+  if (std::isfinite(active_distance_limit_)) {
+    CpuSsspResult limited{result.dist, result.pred_node, result.pred_edge};
+    apply_exclusive_distance_limit(limited, active_distance_limit_);
+    result.dist = std::move(limited.dist);
+    result.pred_node = std::move(limited.pred_node);
+    result.pred_edge = std::move(limited.pred_edge);
+    result.target_distance = result.dist[static_cast<std::size_t>(target)];
+    result.target_reached = std::isfinite(result.target_distance);
+    result.stopped_on_target = result.target_reached;
+    result.stopped_on_distance_limit = !result.target_reached;
+    result.converged = false;
+  }
   if (active_telemetry_ != nullptr) {
     populate_stub_delta_telemetry(
         *active_telemetry_,
@@ -707,6 +871,10 @@ DeltaSteppingCsrResult DeltaSteppingCsrWorkspace::run(
     hipStream_t stream,
     DeltaSteppingCsrProgressCallback progress_callback,
     void* progress_user_data) {
+  {
+    std::lock_guard<std::mutex> lock(g_query_limits_mutex);
+    g_delta_distance_limits.push_back(active_distance_limit_);
+  }
   if (execution_mode_ == DeltaSteppingCsrExecutionMode::kForceGeneric) {
     ++g_delta_force_generic_calls;
   }
@@ -726,7 +894,13 @@ DeltaSteppingCsrResult DeltaSteppingCsrWorkspace::run(
   cpu_result.dist = result.dist;
   cpu_result.pred_node = result.pred_node;
   cpu_result.pred_edge = result.pred_edge;
+  apply_exclusive_distance_limit(cpu_result, active_distance_limit_);
   fill_compact_target_paths(impl_->graph, sources, targets, cpu_result, result);
+  if (std::isfinite(active_distance_limit_)) {
+    result.stopped_on_target = result.target_reached;
+    result.stopped_on_distance_limit = !result.target_reached;
+    result.converged = false;
+  }
   result.dist.clear();
   result.pred_node.clear();
   result.pred_edge.clear();
@@ -911,15 +1085,19 @@ UnitBfsCsrResult UnitBfsCsrWorkspace::run(
     UnitBfsCsrProgressCallback progress_callback,
     void* progress_user_data) {
   (void)delta;
-  (void)max_depth;
   (void)stream;
   (void)progress_callback;
   (void)progress_user_data;
   ++g_unit_bfs_calls;
+  {
+    std::lock_guard<std::mutex> lock(g_query_limits_mutex);
+    g_unit_depth_limits.push_back(max_depth);
+  }
 
   UnitBfsCsrResult result;
   const HostCsrF32& graph = impl_->graph->impl_->graph;
-  CpuSsspResult cpu_result = cpu_dijkstra_outgoing_csr_multi(graph, sources);
+  CpuSsspResult cpu_result =
+      cpu_unit_bfs_outgoing_csr_multi(graph, sources, max_depth);
   fill_compact_target_paths(graph, sources, targets, cpu_result, result);
   result.target = -1;
   result.iterations_used = 1;
@@ -1163,22 +1341,48 @@ int main() {
   std::vector<std::uint32_t> detached_parent_seen(
       static_cast<std::size_t>(graph.rows), 0);
   routing::PathfinderOptions detached_options;
-  const routing::RoutedNet detached_net = routing::route_net(
+  bool detached_path_rejected = false;
+  try {
+    (void)routing::route_net(graph,
+                             detached_workspace,
+                             detached_request,
+                             detached_tree_seen,
+                             detached_parent_by_child,
+                             detached_parent_seen,
+                             1,
+                             detached_options,
+                             nullptr);
+  } catch (const std::runtime_error&) {
+    detached_path_rejected = true;
+  }
+  require(detached_path_rejected,
+          "finite compact path rooted outside the submitted source tree must "
+          "be rejected as malformed");
+
+  TentativeCompactWorkspace tentative_workspace;
+  std::vector<std::uint32_t> tentative_tree_seen(
+      static_cast<std::size_t>(graph.rows), 0);
+  std::vector<int> tentative_parent_by_child(
+      static_cast<std::size_t>(graph.rows), -1);
+  std::vector<std::uint32_t> tentative_parent_seen(
+      static_cast<std::size_t>(graph.rows), 0);
+  routing::PathfinderOptions tentative_options;
+  tentative_options.sssp_engine = routing::SsspEngine::kBellmanFord;
+  tentative_options.max_sssp_iterations = 1;
+  const routing::RoutedNet tentative_net = routing::route_net(
       graph,
-      detached_workspace,
+      tentative_workspace,
       detached_request,
-      detached_tree_seen,
-      detached_parent_by_child,
-      detached_parent_seen,
+      tentative_tree_seen,
+      tentative_parent_by_child,
+      tentative_parent_seen,
       1,
-      detached_options,
+      tentative_options,
       nullptr);
-  require(!detached_net.reached_all_sinks,
-          "compact path rooted outside the submitted source tree must be rejected");
-  require(detached_net.sinks.size() == 1 &&
-              !detached_net.sinks.front().reached &&
-              detached_net.sinks.front().edges.empty(),
-          "rejected detached compact path must not leak route edges");
+  require(!tentative_net.reached_all_sinks &&
+              !tentative_net.sinks.front().reached &&
+              tentative_workspace.calls == 2,
+          "capped BF must reject finite targets that are not yet certified");
 
   const HostCsrF32 self_loop_graph = make_self_loop_predecessor_graph();
   const std::vector<float> self_loop_dist =
@@ -1797,6 +2001,7 @@ int main() {
     diagnostic.net_index = 0;
     diagnostic.sink_index = 1;
     g_unit_bfs_calls = 0;
+    clear_recorded_query_limits();
     const routing::PathfinderResult cached_result =
         routing::run_pathfinder(cached_graph,
                                 cached_metadata,
@@ -1817,16 +2022,19 @@ int main() {
                 diagnostic.prior_sinks_reached == 1 &&
                 diagnostic.cpu_expanded_tree_distance == 1 &&
                 diagnostic.raw_batched.reached &&
-                diagnostic.raw_batched.edge_count == 1 &&
+                diagnostic.raw_batched.edge_count == 2 &&
                 diagnostic.fresh_expanded_tree.reached &&
                 diagnostic.fresh_expanded_tree.edge_count == 1,
-            "routed and fresh UnitBFS queries should use the expanded tree");
+            "batched and fresh UnitBFS observations should match their tree epochs");
     require(diagnostic.attached_edge_count == 1 &&
                 diagnostic.classification ==
                     "no_mismatch_observed",
             "diagnostic should confirm the attached expanded-tree path");
     require(g_unit_bfs_calls == 4,
-            "two routed sinks plus two diagnostic probes should run UnitBFS");
+            "one batch, one bounded repair, and two probes should run UnitBFS");
+    require(recorded_unit_depth_limits() ==
+                std::vector<int>({-1, 1, -1, -1}),
+            "UnitBFS repair should stop one level below its two-edge incumbent");
 
     routing::RoutingMetadata on_path_metadata = cached_metadata;
     on_path_metadata.route_requests[0].sinks[1].node = 1;
@@ -1841,6 +2049,64 @@ int main() {
             "a later sink already in the expanded tree should attach trivially");
     require(g_unit_bfs_calls == 1,
             "a sink reached by a prior branch should not launch another search");
+
+    HostCsrF32 capped_graph;
+    capped_graph.rows = 3;
+    capped_graph.cols = 3;
+    capped_graph.nnz = 2;
+    capped_graph.rowptr = {0, 1, 2, 2};
+    capped_graph.colind = {1, 2};
+    capped_graph.values = {1.0f, 1.0f};
+    routing::RoutingMetadata capped_metadata;
+    capped_metadata.strings = {"capped_tree_repair"};
+    capped_metadata.node_device_ids.resize(3);
+    add_default_node_metadata(capped_metadata);
+    capped_metadata.edge_attrs.resize(2);
+    routing::RouteRequest capped_request;
+    capped_request.sources.push_back({0, 0, 0});
+    capped_request.sinks.push_back({1, 0, 0});
+    capped_request.sinks.push_back({2, 0, 0});
+    capped_metadata.route_requests.push_back(std::move(capped_request));
+    routing::PathfinderOptions capped_options = cached_options;
+    capped_options.max_sssp_iterations = 1;
+    g_unit_bfs_calls = 0;
+    clear_recorded_query_limits();
+    const routing::PathfinderResult capped_result =
+        routing::run_pathfinder(capped_graph,
+                                capped_metadata,
+                                capped_options,
+                                nullptr);
+    require(capped_result.nets[0].sinks[0].nodes ==
+                    std::vector<int>({0, 1}) &&
+                capped_result.nets[0].sinks[1].nodes ==
+                    std::vector<int>({1, 2}),
+            "finite-depth UnitBFS must retry a target exposed by tree growth");
+    require(g_unit_bfs_calls == 2 &&
+                recorded_unit_depth_limits() == std::vector<int>({1, 1}),
+            "finite-depth tree repair should preserve the configured cap");
+
+    const HostCsrF32 accumulated_graph =
+        make_accumulated_tree_repair_graph();
+    const routing::RoutingMetadata accumulated_metadata =
+        make_accumulated_tree_repair_metadata(accumulated_graph);
+    g_unit_bfs_calls = 0;
+    clear_recorded_query_limits();
+    const routing::PathfinderResult accumulated_result =
+        routing::run_pathfinder(accumulated_graph,
+                                accumulated_metadata,
+                                cached_options,
+                                nullptr);
+    require(accumulated_result.nets[0].sinks[0].nodes ==
+                    std::vector<int>({0, 1, 2}) &&
+                accumulated_result.nets[0].sinks[1].nodes ==
+                    std::vector<int>({0, 3, 4, 5}) &&
+                accumulated_result.nets[0].sinks[2].nodes ==
+                    std::vector<int>({2, 8}),
+            "tree repair must retain nodes added by every preceding branch");
+    require(g_unit_bfs_calls == 3,
+            "three-sink repair should use one batch and two bounded checks");
+    require(recorded_unit_depth_limits() == std::vector<int>({-1, 2, 1}),
+            "UnitBFS repairs should use each sink's strict incumbent bound");
 
     routing::RoutingMetadata parallel_cached_metadata = cached_metadata;
     while (parallel_cached_metadata.route_requests.size() < 4) {
@@ -1862,7 +2128,7 @@ int main() {
               "every parallel worker must route from its expanded net tree");
     }
     require(g_unit_bfs_calls == 8,
-            "four two-sink nets should issue eight independent UnitBFS queries");
+            "four two-sink nets should each issue one batch and one repair");
 
     HostCsrF32 weighted_cached_graph = cached_graph;
     weighted_cached_graph.values = {1.0f, 3.0f, 1.0f, 1.0f, 3.0f};
@@ -1873,6 +2139,7 @@ int main() {
     cached_delta_options.delta = 1.0f;
     cached_delta_options.delta_telemetry = true;
     g_multisource_delta_calls = 0;
+    clear_recorded_query_limits();
     routing::PathfinderResult cached_delta_result;
     std::string cached_delta_stdout;
     {
@@ -1889,7 +2156,13 @@ int main() {
                     std::vector<int>({2, 4}),
             "weighted Delta routing must also search from the expanded tree");
     require(g_multisource_delta_calls == 2,
-            "weighted Delta routing should issue one query per nontrivial sink");
+            "weighted Delta routing should issue one batch and one repair");
+    const std::vector<float> cached_delta_limits =
+        recorded_delta_distance_limits();
+    require(cached_delta_limits.size() == 2 &&
+                std::isinf(cached_delta_limits[0]) &&
+                cached_delta_limits[1] == 1.0f,
+            "Delta tree repair should receive the incumbent as a strict cutoff");
     const std::string cached_delta_telemetry =
         single_delta_telemetry_json_line(cached_delta_stdout);
     require(cached_delta_telemetry.find("\"queries\":2") !=
@@ -1932,8 +2205,8 @@ int main() {
           "route tree should contain nodes 0,1,2,3");
   require(result.occupancy == std::vector<int>({1, 1, 1, 1}),
           "all route tree nodes should be occupied once");
-  require(g_unit_bfs_calls == 2,
-          "PathFinder should rerun unit BFS after expanding a multi-sink tree");
+  require(g_unit_bfs_calls == 1,
+          "a one-edge trimmed incumbent should need no UnitBFS repair");
   require(g_multisource_delta_calls == 0,
           "default unit BFS path should not call delta-step");
 

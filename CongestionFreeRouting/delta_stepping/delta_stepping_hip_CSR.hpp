@@ -5,6 +5,7 @@
 
 #include <hip/hip_runtime.h>
 
+#include <cmath>
 #include <cstdint>
 #include <limits>
 #include <memory>
@@ -73,6 +74,9 @@ struct DeltaSteppingCsrRunOptions {
   // Null keeps telemetry completely disabled. A nonnull record is reset before
   // dispatch and remains completed=false if the invocation throws.
   DeltaSteppingCsrTelemetry* telemetry = nullptr;
+  // Process exactly the distance buckets that can contain a path strictly
+  // below this value. Infinity preserves an ordinary unbounded run.
+  float exclusive_distance_limit = std::numeric_limits<float>::infinity();
 };
 
 const char* delta_stepping_execution_path_name(
@@ -353,16 +357,24 @@ class DeltaSteppingCsrWorkspace {
       throw std::logic_error(
           "DeltaSteppingCsrWorkspace does not support nested telemetry runs");
     }
+    if (std::isnan(run_options.exclusive_distance_limit) ||
+        run_options.exclusive_distance_limit < 0.0f) {
+      throw std::invalid_argument(
+          "Delta-Stepping distance limit must be nonnegative or infinity");
+    }
     if (run_options.telemetry != nullptr) {
       *run_options.telemetry = DeltaSteppingCsrTelemetry{};
     }
     active_telemetry_ = run_options.telemetry;
+    active_distance_limit_ = run_options.exclusive_distance_limit;
     try {
       DeltaSteppingCsrResult result = run();
       active_telemetry_ = nullptr;
+      active_distance_limit_ = std::numeric_limits<float>::infinity();
       return result;
     } catch (...) {
       active_telemetry_ = nullptr;
+      active_distance_limit_ = std::numeric_limits<float>::infinity();
       throw;
     }
   }
@@ -372,6 +384,7 @@ class DeltaSteppingCsrWorkspace {
   DeltaSteppingCsrExecutionMode execution_mode_ =
       DeltaSteppingCsrExecutionMode::kAutomatic;
   DeltaSteppingCsrTelemetry* active_telemetry_ = nullptr;
+  float active_distance_limit_ = std::numeric_limits<float>::infinity();
   std::unique_ptr<Impl> impl_;
 };
 

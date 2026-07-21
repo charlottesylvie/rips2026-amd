@@ -2323,6 +2323,172 @@ void test_batched_closure_and_iteration_fallback(hipStream_t stream) {
   }
 }
 
+void test_exclusive_distance_limit(hipStream_t stream) {
+  {
+    // Delta is deliberately much wider than the cutoff.  The relaxation
+    // kernels must reject equal/over-limit candidates inside the same bucket,
+    // rather than relying only on a later bucket boundary.
+    const HostCsrF32 graph = make_outgoing_csr(
+        5,
+        {{0, 1, 1.0f},
+         {1, 2, 1.0f},
+         {0, 3, 0.5f},
+         {3, 4, 100.0f}});
+    DeltaSteppingCsrWorkspace workspace(graph, stream);
+    DeltaSteppingCsrRunOptions strict_two;
+    DeltaSteppingCsrTelemetry cutoff_telemetry;
+    strict_two.telemetry = &cutoff_telemetry;
+    strict_two.exclusive_distance_limit = 2.0f;
+    const DeltaSteppingCsrResult equal_pruned = workspace.run(
+        std::vector<int>{0}, std::vector<int>{2}, 10.0f, -1,
+        strict_two, stream, nullptr, nullptr);
+    require(equal_pruned.stopped_on_distance_limit &&
+                !equal_pruned.stopped_on_target &&
+                !equal_pruned.converged &&
+                equal_pruned.target_distances.size() == 1 &&
+                !std::isfinite(equal_pruned.target_distances.front()) &&
+                equal_pruned.target_path_nodes.empty() &&
+                equal_pruned.target_path_edges.empty(),
+            "exclusive Delta limit did not prune an equal-cost target");
+    require(cutoff_telemetry.collected && cutoff_telemetry.completed,
+            "exclusive Delta limit did not compose with telemetry");
+
+    DeltaSteppingCsrRunOptions zero_limit;
+    zero_limit.exclusive_distance_limit = 0.0f;
+    const DeltaSteppingCsrResult source_vector = workspace.run(
+        std::vector<int>{0}, std::vector<int>{0}, 10.0f, -1,
+        zero_limit, stream, nullptr, nullptr);
+    require(source_vector.stopped_on_distance_limit &&
+                !source_vector.stopped_on_target &&
+                source_vector.target_distances.size() == 1 &&
+                !std::isfinite(source_vector.target_distances.front()),
+            "zero strict limit incorrectly admitted a generic source target");
+    const DeltaSteppingCsrResult source_scalar = workspace.run(
+        std::vector<int>{0}, 0, 10.0f, -1,
+        zero_limit, stream, nullptr, nullptr);
+    require(source_scalar.stopped_on_distance_limit &&
+                !source_scalar.stopped_on_target &&
+                !source_scalar.target_reached &&
+                !std::isfinite(source_scalar.target_distance),
+            "zero strict limit incorrectly admitted a scalar source target");
+    const DeltaSteppingCsrResult source_distances = workspace.run_distances(
+        std::vector<int>{0}, 10.0f, -1, zero_limit, stream, nullptr, nullptr);
+    require(source_distances.stopped_on_distance_limit &&
+                std::all_of(source_distances.dist.begin(),
+                            source_distances.dist.end(),
+                            [](float distance) {
+                              return !std::isfinite(distance);
+                            }),
+            "zero strict limit leaked a source through distances-only output");
+
+    DeltaSteppingCsrRunOptions invalid_limit;
+    invalid_limit.exclusive_distance_limit = -1.0f;
+    require_invalid_argument("negative exclusive distance limit", [&] {
+      (void)workspace.run(std::vector<int>{0}, std::vector<int>{2}, 10.0f,
+                          -1, invalid_limit, stream, nullptr, nullptr);
+    });
+    invalid_limit.exclusive_distance_limit =
+        std::numeric_limits<float>::quiet_NaN();
+    require_invalid_argument("NaN exclusive distance limit", [&] {
+      (void)workspace.run(std::vector<int>{0}, std::vector<int>{2}, 10.0f,
+                          -1, invalid_limit, stream, nullptr, nullptr);
+    });
+
+    DeltaSteppingCsrRunOptions above_two;
+    above_two.exclusive_distance_limit = 2.01f;
+    const DeltaSteppingCsrResult improvement = workspace.run(
+        std::vector<int>{0}, std::vector<int>{2}, 10.0f, -1,
+        above_two, stream, nullptr, nullptr);
+    const std::vector<float> expected =
+        cpu_dijkstra_outgoing_multi_source(graph, {0});
+    validate_compact_target_paths("exclusive Delta limit strict improvement",
+                                  graph,
+                                  {0},
+                                  {2},
+                                  expected,
+                                  improvement);
+    require(improvement.stopped_on_target &&
+                !improvement.stopped_on_distance_limit,
+            "exclusive Delta limit rejected a path below the cutoff");
+
+    const DeltaSteppingCsrResult unbounded = workspace.run(
+        std::vector<int>{0}, std::vector<int>{2}, 10.0f, -1,
+        stream, nullptr, nullptr);
+    validate_compact_target_paths("bounded-to-unbounded workspace reuse",
+                                  graph,
+                                  {0},
+                                  {2},
+                                  expected,
+                                  unbounded);
+    require(!unbounded.stopped_on_distance_limit,
+            "bounded run leaked its distance limit into workspace reuse");
+  }
+
+  {
+    const HostCsrF32 graph = make_outgoing_csr(
+        4,
+        {{0, 1, 1.0f}, {1, 2, 1.0f}, {2, 3, 1.0f}});
+    DeltaSteppingCsrWorkspace workspace(graph, stream);
+    DeltaSteppingCsrRunOptions equal_three;
+    equal_three.exclusive_distance_limit = 3.0f;
+    const DeltaSteppingCsrResult pruned = workspace.run(
+        std::vector<int>{0}, std::vector<int>{3}, 1.0f, -1,
+        equal_three, stream, nullptr, nullptr);
+    require(pruned.stopped_on_distance_limit &&
+                !pruned.stopped_on_target &&
+                pruned.target_distances.size() == 1 &&
+                !std::isfinite(pruned.target_distances.front()),
+            "exact-unit specialization did not honor its strict depth limit");
+
+    DeltaSteppingCsrRunOptions zero_limit;
+    zero_limit.exclusive_distance_limit = 0.0f;
+    const DeltaSteppingCsrResult source_pruned = workspace.run(
+        std::vector<int>{0}, std::vector<int>{0}, 1.0f, -1,
+        zero_limit, stream, nullptr, nullptr);
+    require(source_pruned.stopped_on_distance_limit &&
+                !source_pruned.stopped_on_target &&
+                source_pruned.target_distances.size() == 1 &&
+                !std::isfinite(source_pruned.target_distances.front()),
+            "zero strict limit incorrectly admitted an exact-unit source target");
+
+    DeltaSteppingCsrRunOptions above_three;
+    above_three.exclusive_distance_limit = 3.01f;
+    const DeltaSteppingCsrResult reached = workspace.run(
+        std::vector<int>{0}, std::vector<int>{3}, 1.0f, -1,
+        above_three, stream, nullptr, nullptr);
+    require(reached.stopped_on_target &&
+                !reached.stopped_on_distance_limit &&
+                reached.target_distances.size() == 1 &&
+                close_enough(reached.target_distances.front(), 3.0f),
+            "exact-unit specialization pruned a path below its limit");
+  }
+
+  {
+    const HostCsrF32 graph = make_outgoing_csr(
+        3,
+        {{0, 1, 0.0f}, {1, 2, 0.0f}});
+    DeltaSteppingCsrWorkspace workspace(graph, stream);
+    DeltaSteppingCsrRunOptions zero_limit;
+    zero_limit.exclusive_distance_limit = 0.0f;
+    const DeltaSteppingCsrResult no_negative_improvement = workspace.run(
+        std::vector<int>{0}, std::vector<int>{2}, 1.0f, -1,
+        zero_limit, stream, nullptr, nullptr);
+    require(no_negative_improvement.stopped_on_distance_limit &&
+                !no_negative_improvement.target_reached,
+            "zero exclusive limit did not certify no negative path");
+
+    DeltaSteppingCsrRunOptions positive_limit;
+    positive_limit.exclusive_distance_limit = 0.1f;
+    const DeltaSteppingCsrResult zero_path = workspace.run(
+        std::vector<int>{0}, std::vector<int>{2}, 1.0f, -1,
+        positive_limit, stream, nullptr, nullptr);
+    require(zero_path.stopped_on_target &&
+                zero_path.target_distances.size() == 1 &&
+                close_enough(zero_path.target_distances.front(), 0.0f),
+            "positive exclusive limit did not retain a zero-cost path");
+  }
+}
+
 void test_capped_tentative_target_filtering(hipStream_t stream) {
   // Bucket zero discovers a valid but non-shortest direct path to vertex two
   // through a heavy edge.  The shorter path is not settled until later buckets.
@@ -3037,6 +3203,7 @@ int main() {
     test_zero_weight_scc_predecessors(stream.get());
     test_float_bucket_boundaries_and_saturation(stream.get());
     test_batched_closure_and_iteration_fallback(stream.get());
+    test_exclusive_distance_limit(stream.get());
     test_capped_tentative_target_filtering(stream.get());
     test_callback_exception_cleanup(stream.get());
     test_wave_boundary_contention(stream.get());
