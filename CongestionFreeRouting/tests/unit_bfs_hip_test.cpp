@@ -1097,6 +1097,38 @@ void run_parallel_deep_wide_explicit_stream_suite(
               mode_label + ": parallel explicit worker " +
               std::to_string(worker) + " reuse " +
               std::to_string(repetition);
+
+          // Grow the queue high-water mark one level at a time before any
+          // complete traversal primes this workspace. This catches stale
+          // status/metadata handoffs and incomplete sparse cleanup that a
+          // deep-first reuse sequence can mask by pre-populating every slot.
+          for (int target_level = 1;
+               target_level <= kDeepWideLevels;
+               ++target_level) {
+            const int growing_target = target_level * kDeepWideWidth;
+            const ExpectedRun growing_expected{
+                target_level,
+                true,
+                true,
+                true,
+                {reached_between_deep_wide_levels(
+                    graph, 0, target_level)}};
+            UnitBfsCsrResult growing_result = workspace.run(
+                std::vector<int>{0},
+                std::vector<int>{growing_target},
+                1.0f,
+                -1,
+                stream.get(),
+                nullptr,
+                nullptr);
+            validate_result(
+                graph,
+                growing_result,
+                growing_expected,
+                label + ": growing high-water target level " +
+                    std::to_string(target_level));
+          }
+
           UnitBfsCsrResult reached_result = workspace.run(
               std::vector<int>{0},
               std::vector<int>{kDeepWideTarget},

@@ -52,6 +52,7 @@ enum UnitBfsPathStatus : int {
   kPathInvalidEdge = -3,
   kPathInvalidLevel = -4,
   kPathInvalidRoot = -5,
+  kPathInvalidEpoch = -6,
 };
 
 struct TargetPathMetadata {
@@ -59,10 +60,12 @@ struct TargetPathMetadata {
   int length;
   int source;
   int status;
+  std::uint32_t query_epoch;
+  std::uint32_t validation_epoch;
 };
 
-static_assert(sizeof(TargetPathMetadata) == 4 * sizeof(int),
-              "unit BFS target metadata must remain one packed 16-byte record");
+static_assert(sizeof(TargetPathMetadata) == 6 * sizeof(std::uint32_t),
+              "unit BFS target metadata must remain one packed 24-byte record");
 
 const char* path_status_name(int status) noexcept {
   switch (status) {
@@ -80,6 +83,8 @@ const char* path_status_name(int status) noexcept {
       return "predecessor level mismatch";
     case kPathInvalidRoot:
       return "invalid source root";
+    case kPathInvalidEpoch:
+      return "stale query epoch";
     default:
       return "unknown status";
   }
@@ -107,6 +112,20 @@ inline void synchronize_explicit_stream(hipStream_t stream) {
   if (stream != nullptr) {
     UNIT_BFS_HIP_CHECK(hipStreamSynchronize(stream));
   }
+}
+
+inline void copy_control_synchronously(void* destination,
+                                       const void* source,
+                                       std::size_t bytes,
+                                       hipMemcpyKind kind,
+                                       hipStream_t producer_stream) {
+  // The target gfx1151 runtime has returned stale-but-plausible control data
+  // from an asynchronous copy on one hardware queue while other worker queues
+  // remained active.  Finish the producing stream, then use a host-synchronous
+  // copy for the small source/target, frontier-status, metadata, and offset
+  // records.  Large compact paths remain asynchronous.
+  synchronize_explicit_stream(producer_stream);
+  UNIT_BFS_HIP_CHECK(hipMemcpy(destination, source, bytes, kind));
 }
 
 template <typename T>
@@ -263,6 +282,7 @@ struct UnitBfsScratch {
   DeviceBuffer<Offset> compact_path_edges;
   PinnedHostBuffer<int> host_compact_path_nodes;
   PinnedHostBuffer<Offset> host_compact_path_edges;
+  std::uint32_t query_epoch = 0;
   bool initialized = false;
 
   UnitBfsScratch() = default;
@@ -326,6 +346,13 @@ struct UnitBfsScratch {
     if (host_compact_path_edges.size() < edge_count) {
       host_compact_path_edges.reset(edge_count);
     }
+  }
+
+  std::uint32_t begin_query() {
+    if (query_epoch == std::numeric_limits<std::uint32_t>::max()) {
+      throw std::overflow_error("unit BFS workspace query epoch exhausted");
+    }
+    return ++query_epoch;
   }
 };
 
@@ -654,6 +681,7 @@ __global__ void clear_target_multiplicity_kernel(const int* targets,
 __global__ void measure_target_paths_kernel(const int* targets,
                                             int target_count,
                                             const int* level,
+                                            std::uint32_t query_epoch,
                                             TargetPathMetadata* metadata) {
   for (int i = blockIdx.x * blockDim.x + threadIdx.x;
        i < target_count;
@@ -662,21 +690,25 @@ __global__ void measure_target_paths_kernel(const int* targets,
     const int target_level = atomic_load_int(level + target);
     metadata[i].distance =
         target_level == kUnvisited ? INFINITY : static_cast<float>(target_level);
-    metadata[i].length = 0;
+    metadata[i].length =
+        target_level == kUnvisited ? 0 : target_level + 1;
     metadata[i].source = -1;
+    metadata[i].query_epoch = query_epoch;
+    metadata[i].validation_epoch = 0;
     // Measurement establishes only reachability and size. Validation owns the
-    // success transition so a stale success from a prior dispatch is never
-    // accepted for the current route.
+    // success transition. Publish the complete measurement before its status
+    // so a stale or torn record cannot be accepted for the current query.
+    __threadfence_system();
     atomic_store_status(&metadata[i].status, kPathNotValidated);
-    if (target_level == kUnvisited) {
-      continue;
-    }
-    // In unit BFS, the level is exactly the edge count.  The previous
-    // implementation walked the predecessor chain here and then walked it a
-    // second time while filling the path.  Derive the size in O(1) and let the
-    // fill pass perform the only pointer chase.
-    metadata[i].length = target_level + 1;
   }
+}
+
+__device__ inline void publish_path_status(TargetPathMetadata* metadata,
+                                           std::uint32_t query_epoch,
+                                           int status) {
+  metadata->validation_epoch = query_epoch;
+  __threadfence_system();
+  atomic_store_status(&metadata->status, status);
 }
 
 template <typename EdgeOffset>
@@ -689,6 +721,7 @@ __global__ void fill_target_paths_kernel(const int* targets,
                                          const EdgeOffset* pred_edge,
                                          const int* level,
                                          TargetPathMetadata* metadata,
+                                         std::uint32_t query_epoch,
                                          const int* node_offsets,
                                          const int* edge_offsets,
                                          int path_node_capacity,
@@ -698,6 +731,11 @@ __global__ void fill_target_paths_kernel(const int* targets,
   for (int i = blockIdx.x * blockDim.x + threadIdx.x;
        i < target_count;
        i += blockDim.x * gridDim.x) {
+    if (metadata[i].query_epoch != query_epoch) {
+      publish_path_status(
+          &metadata[i], query_epoch, kPathInvalidEpoch);
+      continue;
+    }
     if (metadata[i].length <= 0) {
       continue;
     }
@@ -711,7 +749,8 @@ __global__ void fill_target_paths_kernel(const int* targets,
         edge_begin < 0 || edge_end < edge_begin ||
         edge_end > path_edge_capacity ||
         edge_end - edge_begin != length - 1) {
-      atomic_store_status(&metadata[i].status, kPathInvalidOffsets);
+      publish_path_status(
+          &metadata[i], query_epoch, kPathInvalidOffsets);
       continue;
     }
     int current = targets[i];
@@ -739,17 +778,17 @@ __global__ void fill_target_paths_kernel(const int* targets,
       path_nodes[node_begin + j - 1] = current;
     }
     if (failure_status != kPathValid) {
-      atomic_store_status(&metadata[i].status, failure_status);
+      publish_path_status(&metadata[i], query_epoch, failure_status);
       continue;
     }
     if (atomic_load_int(level + current) != 0 ||
         atomic_load_int(pred_node + current) != current) {
-      atomic_store_status(&metadata[i].status, kPathInvalidRoot);
+      publish_path_status(
+          &metadata[i], query_epoch, kPathInvalidRoot);
       continue;
     }
     metadata[i].source = current;
-    __threadfence();
-    atomic_store_status(&metadata[i].status, kPathValid);
+    publish_path_status(&metadata[i], query_epoch, kPathValid);
   }
 }
 
@@ -867,17 +906,11 @@ void reset_visited_levels(UnitBfsScratch& scratch,
 
 std::array<int, kStatusCount> copy_status_to_host(UnitBfsScratch& scratch,
                                                   hipStream_t stream) {
-  // A D2H copy can use a different hardware engine from the producing kernel.
-  // On the target gfx1151 runtime, synchronizing only after enqueueing the copy
-  // has allowed it to observe the previous dispatch's status.  Complete the
-  // producer first, matching AMD_SERIALIZE_COPY's before-enqueue guarantee.
-  synchronize_explicit_stream(stream);
-  UNIT_BFS_HIP_CHECK(hipMemcpyAsync(scratch.host_status.get(),
-                                    scratch.status.get(),
-                                    kStatusCount * sizeof(int),
-                                    hipMemcpyDeviceToHost,
-                                    stream));
-  UNIT_BFS_HIP_CHECK(hipStreamSynchronize(stream));
+  copy_control_synchronously(scratch.host_status.get(),
+                             scratch.status.get(),
+                             kStatusCount * sizeof(int),
+                             hipMemcpyDeviceToHost,
+                             stream);
   std::array<int, kStatusCount> status{};
   std::copy_n(scratch.host_status.get(), kStatusCount, status.begin());
   return status;
@@ -891,25 +924,21 @@ void extract_target_paths_to_result(UnitBfsCsrResult& result,
                                     const EdgeOffset* pred_edge,
                                     const std::vector<int>& targets,
                                     int visited_count,
+                                    std::uint32_t query_epoch,
                                     hipStream_t stream) {
   const int target_count = static_cast<int>(targets.size());
   measure_target_paths_kernel<<<grid_for_items(target_count), kBlockSize, 0, stream>>>(
       scratch.targets.get(),
       target_count,
       scratch.level.get(),
+      query_epoch,
       scratch.target_metadata.get());
   UNIT_BFS_HIP_CHECK(hipGetLastError());
-  // Copy each target tuple in one pinned transfer rather than separate pageable
-  // operations. Host lengths determine both the compact allocation and the
-  // offsets consumed by fill_target_paths_kernel, so finish measurement before
-  // handing its records to the copy engine on explicit worker streams.
-  synchronize_explicit_stream(stream);
-  UNIT_BFS_HIP_CHECK(hipMemcpyAsync(scratch.host_target_metadata.get(),
-                                    scratch.target_metadata.get(),
-                                    targets.size() * sizeof(TargetPathMetadata),
-                                    hipMemcpyDeviceToHost,
-                                    stream));
-  UNIT_BFS_HIP_CHECK(hipStreamSynchronize(stream));
+  copy_control_synchronously(scratch.host_target_metadata.get(),
+                             scratch.target_metadata.get(),
+                             targets.size() * sizeof(TargetPathMetadata),
+                             hipMemcpyDeviceToHost,
+                             stream);
 
   result.target_distances.resize(targets.size());
   result.target_sources.assign(targets.size(), -1);
@@ -920,6 +949,19 @@ void extract_target_paths_to_result(UnitBfsCsrResult& result,
   std::size_t total_edges = 0;
   for (std::size_t i = 0; i < targets.size(); ++i) {
     const TargetPathMetadata& metadata = scratch.host_target_metadata.get()[i];
+    if (metadata.query_epoch != query_epoch ||
+        metadata.validation_epoch != 0 ||
+        metadata.status != kPathNotValidated) {
+      std::ostringstream message;
+      message << "unit BFS measured stale target metadata"
+              << " (target_index=" << i
+              << ", target=" << targets[i]
+              << ", query_epoch=" << metadata.query_epoch
+              << ", expected_epoch=" << query_epoch
+              << ", validation_epoch=" << metadata.validation_epoch
+              << ", status=" << metadata.status << ')';
+      throw std::runtime_error(message.str());
+    }
     result.target_distances[i] = metadata.distance;
     result.target_path_offsets[i] = static_cast<int>(total_nodes);
     result.target_edge_offsets[i] = static_cast<int>(total_edges);
@@ -947,20 +989,16 @@ void extract_target_paths_to_result(UnitBfsCsrResult& result,
     std::copy(result.target_edge_offsets.begin(),
               result.target_edge_offsets.end(),
               scratch.host_target_edge_offsets.get());
-    UNIT_BFS_HIP_CHECK(hipMemcpyAsync(scratch.target_node_offsets.get(),
-                                      scratch.host_target_node_offsets.get(),
-                                      (targets.size() + 1) * sizeof(int),
-                                      hipMemcpyHostToDevice,
-                                      stream));
-    UNIT_BFS_HIP_CHECK(hipMemcpyAsync(scratch.target_edge_offsets.get(),
-                                      scratch.host_target_edge_offsets.get(),
-                                      (targets.size() + 1) * sizeof(int),
-                                      hipMemcpyHostToDevice,
-                                      stream));
-    // The fill kernel consumes both offset arrays. Keep the null-stream fast
-    // path unchanged, but give nonblocking worker streams a real producer /
-    // consumer boundary on the affected gfx1151 runtime.
-    synchronize_explicit_stream(stream);
+    copy_control_synchronously(scratch.target_node_offsets.get(),
+                               scratch.host_target_node_offsets.get(),
+                               (targets.size() + 1) * sizeof(int),
+                               hipMemcpyHostToDevice,
+                               stream);
+    copy_control_synchronously(scratch.target_edge_offsets.get(),
+                               scratch.host_target_edge_offsets.get(),
+                               (targets.size() + 1) * sizeof(int),
+                               hipMemcpyHostToDevice,
+                               stream);
 
     fill_target_paths_kernel<EdgeOffset>
         <<<grid_for_items(target_count), kBlockSize, 0, stream>>>(
@@ -973,6 +1011,7 @@ void extract_target_paths_to_result(UnitBfsCsrResult& result,
             pred_edge,
             scratch.level.get(),
             scratch.target_metadata.get(),
+            query_epoch,
             scratch.target_node_offsets.get(),
             scratch.target_edge_offsets.get(),
             static_cast<int>(total_nodes),
@@ -980,17 +1019,17 @@ void extract_target_paths_to_result(UnitBfsCsrResult& result,
             scratch.compact_path_nodes.get(),
             scratch.compact_path_edges.get());
     UNIT_BFS_HIP_CHECK(hipGetLastError());
-    // Do not let the copy engine read a prior route's compact buffers before
-    // the current fill has completed.
-    synchronize_explicit_stream(stream);
+    // Validation metadata controls whether the compact path is accepted, so
+    // make that small transfer host-synchronous. The potentially large node
+    // and edge payloads remain asynchronous after the fill is complete.
+    copy_control_synchronously(scratch.host_target_metadata.get(),
+                               scratch.target_metadata.get(),
+                               targets.size() * sizeof(TargetPathMetadata),
+                               hipMemcpyDeviceToHost,
+                               stream);
     UNIT_BFS_HIP_CHECK(hipMemcpyAsync(scratch.host_compact_path_nodes.get(),
                                       scratch.compact_path_nodes.get(),
                                       total_nodes * sizeof(int),
-                                      hipMemcpyDeviceToHost,
-                                      stream));
-    UNIT_BFS_HIP_CHECK(hipMemcpyAsync(scratch.host_target_metadata.get(),
-                                      scratch.target_metadata.get(),
-                                      targets.size() * sizeof(TargetPathMetadata),
                                       hipMemcpyDeviceToHost,
                                       stream));
   }
@@ -1007,6 +1046,27 @@ void extract_target_paths_to_result(UnitBfsCsrResult& result,
   UNIT_BFS_HIP_CHECK(hipStreamSynchronize(stream));
   for (std::size_t i = 0; i < targets.size(); ++i) {
     const TargetPathMetadata& metadata = scratch.host_target_metadata.get()[i];
+    if (metadata.query_epoch != query_epoch) {
+      std::ostringstream message;
+      message << "unit BFS target metadata belongs to a stale query"
+              << " (target_index=" << i
+              << ", target=" << targets[i]
+              << ", query_epoch=" << metadata.query_epoch
+              << ", expected_epoch=" << query_epoch << ')';
+      throw std::runtime_error(message.str());
+    }
+    if (metadata.length > 0 &&
+        metadata.validation_epoch != query_epoch) {
+      std::ostringstream message;
+      message << "unit BFS target validation was not published"
+              << " (target_index=" << i
+              << ", target=" << targets[i]
+              << ", query_epoch=" << metadata.query_epoch
+              << ", validation_epoch=" << metadata.validation_epoch
+              << ", expected_epoch=" << query_epoch
+              << ", status=" << metadata.status << ')';
+      throw std::runtime_error(message.str());
+    }
     if (metadata.length > 0 && metadata.status != kPathValid) {
       std::ostringstream message;
       message << "unit BFS predecessor path failed device validation"
@@ -1015,7 +1075,9 @@ void extract_target_paths_to_result(UnitBfsCsrResult& result,
               << ", status=" << metadata.status
               << " [" << path_status_name(metadata.status) << ']'
               << ", path_length=" << metadata.length
-              << ", distance=" << metadata.distance << ')';
+              << ", distance=" << metadata.distance
+              << ", query_epoch=" << metadata.query_epoch
+              << ", validation_epoch=" << metadata.validation_epoch << ')';
       throw std::runtime_error(message.str());
     }
     if (metadata.length > 0) {
@@ -1084,20 +1146,17 @@ UnitBfsCsrResult run_unit_bfs_with_offsets(
   scratch.ensure_target_capacity(targets.size());
 
   initialize_scratch_once(scratch, scratch.rows, stream);
-  UNIT_BFS_HIP_CHECK(hipMemcpyAsync(scratch.sources.get(),
-                                    effective_sources->data(),
-                                    effective_sources->size() * sizeof(int),
-                                    hipMemcpyHostToDevice,
-                                    stream));
-  UNIT_BFS_HIP_CHECK(hipMemcpyAsync(scratch.targets.get(),
-                                    targets.data(),
-                                    targets.size() * sizeof(int),
-                                    hipMemcpyHostToDevice,
-                                    stream));
-  // The following setup kernels consume these host uploads.  Parallel workers
-  // use nonblocking streams, where dependent dispatch handoffs have proved
-  // unreliable on the target runtime.
-  synchronize_explicit_stream(stream);
+  const std::uint32_t query_epoch = scratch.begin_query();
+  copy_control_synchronously(scratch.sources.get(),
+                             effective_sources->data(),
+                             effective_sources->size() * sizeof(int),
+                             hipMemcpyHostToDevice,
+                             stream);
+  copy_control_synchronously(scratch.targets.get(),
+                             targets.data(),
+                             targets.size() * sizeof(int),
+                             hipMemcpyHostToDevice,
+                             stream);
 
   mark_target_multiplicity_kernel<<<grid_for_items(target_count), kBlockSize, 0, stream>>>(
       scratch.targets.get(),
@@ -1310,6 +1369,7 @@ UnitBfsCsrResult run_unit_bfs_with_offsets(
                                    pred_edge,
                                    targets,
                                    queue_tail,
+                                   query_epoch,
                                    stream);
     for (std::size_t i = 0; i < targets.size(); ++i) {
       if (!std::isfinite(result.target_distances[i])) {

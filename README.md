@@ -321,6 +321,8 @@ Tuning options:
 | `--capacity <int>` | `1` | Capacity used only for overuse diagnostics. |
 | `--net-limit <count>` | unset | Route only the first `count` requests. |
 | `--parallel-net-workers <count>` | `0` | Independent net workers; `0` enables engine-dependent auto-selection. Workers share one immutable CSR across worker-private search state. |
+| `--diagnose-net <zero-based>` | unset | Replay the route-request prefix through this net and emit one UnitBFS diagnostic JSON record. Requires `--diagnose-sink`. |
+| `--diagnose-sink <zero-based>` | unset | Compare the selected sink's raw batched result, a fresh same-workspace result, and CPU/GPU searches from the exact expanded route tree. |
 | `--routes-out <path>` | unset | Write routed PIP tree data as JSONL. |
 | `--max-pathfinder-iters`, `--present-factor`, `--present-multiplier`, `--history-factor`, `--route-batch-size` | ignored | Compatibility-only options accepted by the one-shot router. |
 
@@ -513,6 +515,24 @@ g++ -std=c++17 -O2 -pthread \
 
 /tmp/pathfinder_bf10_cpu_stub_test
 ```
+
+Targeted UnitBFS path diagnostic (requires the normal AMD HIP `pathfinder`
+build and an existing CSR/metadata pair):
+
+```bash
+./pathfinder design.csrbin design.csrbin.ifmeta.bin \
+  --sssp-engine unit-bfs \
+  --parallel-net-workers 4 \
+  --diagnose-net 27825 \
+  --diagnose-sink 0
+```
+
+The diagnostic replays every request through the selected zero-based net so
+the chosen worker has realistic workspace-reuse history, then exits without
+writing routes. Its final JSON line distinguishes a raw UnitBFS mismatch from
+the one-shot PathFinder adapter retaining a cached multi-sink path. Run the
+same selection with one and four workers to compare the null-stream controller
+with explicit worker streams.
 
 Delta benchmark argument parsing/forwarding test:
 

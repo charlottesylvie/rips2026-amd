@@ -596,10 +596,48 @@ inline void synchronize_explicit_stream(hipStream_t stream) {
   }
 }
 
+// Keep the telemetry-disabled relaxation primitive identical to the
+// production implementation that predates opt-in instrumentation. In
+// particular, return the old distance as a scalar so disabled telemetry does
+// not change the ABI/register handoff that controls parent publication.
+__device__ inline float atomic_min_float_nonnegative(float* addr,
+                                                     float value) {
+  auto* addr_as_uint = reinterpret_cast<unsigned int*>(addr);
+  unsigned int old = *addr_as_uint;
+  while (value < __uint_as_float(old)) {
+    const unsigned int assumed = old;
+    old = atomicCAS(addr_as_uint, assumed, __float_as_uint(value));
+    if (old == assumed) break;
+  }
+  return __uint_as_float(old);
+}
+
 struct AtomicMinFloatResult {
   float old_value;
   unsigned int cas_retries;
 };
+
+__device__ inline unsigned int atomic_load_uint(
+    const unsigned int* address) {
+  // Compact extraction consumes state produced by atomic relaxations in an
+  // earlier dispatch. Keep validation reads on the coherent atomic path so a
+  // reused gfx1151 worker cannot combine values from different routes.
+  return atomicCAS(const_cast<unsigned int*>(address), 0U, 0U);
+}
+
+__device__ inline int atomic_load_int(const int* address) {
+  return atomicAdd(const_cast<int*>(address), 0);
+}
+
+__device__ inline unsigned long long atomic_load_parent_key(
+    const unsigned long long* address) {
+  return atomicCAS(const_cast<unsigned long long*>(address), 0ULL, 0ULL);
+}
+
+__device__ inline float atomic_load_float(const float* address) {
+  return __uint_as_float(atomic_load_uint(
+      reinterpret_cast<const unsigned int*>(address)));
+}
 
 template <bool CollectTelemetry>
 __device__ inline AtomicMinFloatResult atomic_min_float_nonnegative(
@@ -1322,7 +1360,7 @@ __device__ inline bool decode_tight_edge_parent(
     unsigned long long key,
     Offset* edge_out,
     int* predecessor_out) {
-  const float current_distance = dist[current];
+  const float current_distance = atomic_load_float(&dist[current]);
   if (key == kNoParentKey ||
       static_cast<unsigned int>(key >> 32) !=
           __float_as_uint(current_distance)) {
@@ -1345,7 +1383,7 @@ __device__ inline bool decode_tight_edge_parent(
     return false;
   }
 
-  const float predecessor_distance = dist[predecessor];
+  const float predecessor_distance = atomic_load_float(&dist[predecessor]);
   if (!finite_float(predecessor_distance) || !finite_float(current_distance)) {
     return false;
   }
@@ -1382,18 +1420,19 @@ __global__ void measure_edge_parent_target_paths_kernel(
        i < target_count;
        i += blockDim.x * gridDim.x) {
     const int target = targets[i];
-    if (target_settled != nullptr && target_settled[i] == 0) {
+    if (target_settled != nullptr &&
+        atomic_load_int(&target_settled[i]) == 0) {
       target_distances[i] = INFINITY;
       path_lengths[i] = 0;
       path_sources[i] = -1;
-      path_status[i] = 0;
+      atomicExch(&path_status[i], 0);
       continue;
     }
-    const float target_distance = dist[target];
+    const float target_distance = atomic_load_float(&dist[target]);
     target_distances[i] = target_distance;
     path_lengths[i] = 0;
     path_sources[i] = -1;
-    path_status[i] = 0;
+    atomicExch(&path_status[i], 0);
     if (!finite_float(target_distance)) {
       continue;
     }
@@ -1401,11 +1440,12 @@ __global__ void measure_edge_parent_target_paths_kernel(
     int current = target;
     int length = 1;
     for (Offset guard = 0; guard < rows; ++guard) {
-      const unsigned long long key = parent_key[current];
+      const unsigned long long key =
+          atomic_load_parent_key(&parent_key[current]);
       if (key == kNoParentKey) {
         path_lengths[i] = length;
         path_sources[i] = current;
-        path_status[i] = 1;
+        atomicExch(&path_status[i], 1);
         break;
       }
 
@@ -1444,7 +1484,7 @@ __global__ void fill_edge_parent_target_paths_kernel(
   for (int i = blockIdx.x * blockDim.x + threadIdx.x;
        i < target_count;
        i += blockDim.x * gridDim.x) {
-    if (path_status[i] == 0) {
+    if (atomic_load_int(&path_status[i]) == 0) {
       continue;
     }
     const int length = path_lengths[i];
@@ -1454,7 +1494,8 @@ __global__ void fill_edge_parent_target_paths_kernel(
     bool path_valid = true;
     path_nodes[node_begin + length - 1] = current;
     for (int j = length - 1; j > 0; --j) {
-      const unsigned long long key = parent_key[current];
+      const unsigned long long key =
+          atomic_load_parent_key(&parent_key[current]);
       Offset edge = 0;
       int predecessor = -1;
       if (!decode_tight_edge_parent(
@@ -1467,10 +1508,11 @@ __global__ void fill_edge_parent_target_paths_kernel(
       current = predecessor;
       path_nodes[node_begin + j - 1] = current;
     }
-    if (path_valid && parent_key[current] == kNoParentKey) {
+    if (path_valid &&
+        atomic_load_parent_key(&parent_key[current]) == kNoParentKey) {
       path_sources[i] = current;
     } else {
-      path_status[i] = 0;
+      atomicExch(&path_status[i], 0);
       path_sources[i] = -1;
     }
   }
@@ -1570,17 +1612,21 @@ __global__ void relax_light_edges_kernel(const int* frontier,
                   candidate_bucket == current_bucket;
         }
         const float nd = light ? candidate : INFINITY;
-        AtomicMinFloatResult atomic_result{INFINITY, 0};
-        if (light) {
-          atomic_result =
-              atomic_min_float_nonnegative<CollectTelemetry>(&dist[v], nd);
-          if constexpr (CollectTelemetry) {
+        float old = INFINITY;
+        if constexpr (CollectTelemetry) {
+          if (light) {
+            const AtomicMinFloatResult atomic_result =
+                atomic_min_float_nonnegative<true>(&dist[v], nd);
+            old = atomic_result.old_value;
             ++telemetry[kTelemetryDistanceAtomicAttempts];
             telemetry[kTelemetryDistanceCasRetries] +=
                 atomic_result.cas_retries;
           }
+        } else {
+          old = light
+                    ? atomic_min_float_nonnegative(&dist[v], nd)
+                    : INFINITY;
         }
-        const float old = atomic_result.old_value;
         const bool decreased = light && nd < old;
         const bool append_touched = decreased && infinite_float(old);
         bool append_current = false;
@@ -1696,17 +1742,21 @@ __global__ void relax_heavy_edges_kernel(const int* heavy_vertices,
                            candidate_bucket > current_bucket &&
                            candidate_bucket < kNoBucket;
         const float nd = heavy ? candidate : INFINITY;
-        AtomicMinFloatResult atomic_result{INFINITY, 0};
-        if (heavy) {
-          atomic_result =
-              atomic_min_float_nonnegative<CollectTelemetry>(&dist[v], nd);
-          if constexpr (CollectTelemetry) {
+        float old = INFINITY;
+        if constexpr (CollectTelemetry) {
+          if (heavy) {
+            const AtomicMinFloatResult atomic_result =
+                atomic_min_float_nonnegative<true>(&dist[v], nd);
+            old = atomic_result.old_value;
             ++telemetry[kTelemetryDistanceAtomicAttempts];
             telemetry[kTelemetryDistanceCasRetries] +=
                 atomic_result.cas_retries;
           }
+        } else {
+          old = heavy
+                    ? atomic_min_float_nonnegative(&dist[v], nd)
+                    : INFINITY;
         }
-        const float old = atomic_result.old_value;
         const bool decreased = heavy && nd < old;
         const bool append_touched = decreased && infinite_float(old);
         bool append_pending = false;
@@ -2410,6 +2460,11 @@ void extract_target_paths_to_result(
             scratch.target_sources.get(), scratch.target_path_status.get());
   }
   DS_DELTA_HIP_CHECK(hipGetLastError());
+  // On nonblocking gfx1151 worker streams, keep the measurement producer
+  // behind a real completion boundary before the copy engine consumes its
+  // status/length/distance tuple. Same-stream enqueue ordering alone has
+  // exposed stale mixed-generation tuples on reused workspaces.
+  synchronize_explicit_stream(stream);
 
   result.target_distances.resize(targets.size());
   result.target_sources.resize(targets.size());
@@ -2509,6 +2564,10 @@ void extract_target_paths_to_result(
               scratch.compact_path_edges.get());
     }
     DS_DELTA_HIP_CHECK(hipGetLastError());
+    // Path status is validated by the fill kernel and copied immediately
+    // below. Publish the complete path and status together on explicit worker
+    // streams before any D2H consumer starts.
+    synchronize_explicit_stream(stream);
     DS_DELTA_HIP_CHECK(hipMemcpyAsync(result.target_path_nodes.data(),
                                       scratch.compact_path_nodes.get(),
                                       total_nodes * sizeof(int),

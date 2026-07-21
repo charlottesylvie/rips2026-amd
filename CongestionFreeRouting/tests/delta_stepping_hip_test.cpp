@@ -1279,6 +1279,48 @@ void test_compact_early_settlement_reset(hipStream_t stream) {
           "all-light compact repeat lost future-bucket pending work");
 }
 
+void test_forced_generic_increasing_distance_reuse(hipStream_t stream) {
+  // Alternate a one-edge path with a five-edge path to the same target. This
+  // makes every other sparse-reset reuse replace a small finite distance and
+  // compact parent chain with a larger one, covering the production pattern
+  // implicated in mixed-generation measurement state on gfx1151 streams.
+  const HostCsrF32 graph = make_outgoing_csr(
+      7,
+      {{0, 6, 1.0f},
+       {1, 2, 1.0f},
+       {2, 3, 1.0f},
+       {3, 4, 1.0f},
+       {4, 5, 1.0f},
+       {5, 6, 1.0f}});
+  const DeltaSteppingCsrWorkspaceOptions options{
+      DeltaSteppingCsrParentMode::kAutomatic,
+      DeltaSteppingCsrExecutionMode::kForceGeneric};
+  DeltaSteppingCsrWorkspace workspace(graph, stream, options);
+  const std::vector<float> short_expected =
+      cpu_dijkstra_outgoing_multi_source(graph, {0});
+  const std::vector<float> long_expected =
+      cpu_dijkstra_outgoing_multi_source(graph, {1});
+
+  constexpr int kReuseRuns = 128;
+  for (int repetition = 0; repetition < kReuseRuns; ++repetition) {
+    const bool use_long_path = (repetition & 1) != 0;
+    const std::vector<int> sources = use_long_path
+                                         ? std::vector<int>{1}
+                                         : std::vector<int>{0};
+    const DeltaSteppingCsrResult result = workspace.run(
+        sources, std::vector<int>{6}, 1.0f, -1,
+        stream, nullptr, nullptr);
+    validate_compact_target_paths(
+        "forced-generic increasing-distance reuse " +
+            std::to_string(repetition),
+        graph,
+        sources,
+        {6},
+        use_long_path ? long_expected : short_expected,
+        result);
+  }
+}
+
 void test_compact_weight_class_updates(hipStream_t stream) {
   HostCsrF32 graph = make_outgoing_csr(
       6,
@@ -2819,6 +2861,7 @@ int main() {
     test_runtime_telemetry_modes_and_reset(stream.get());
     test_generic_compact_parent_modes(stream.get());
     test_compact_early_settlement_reset(stream.get());
+    test_forced_generic_increasing_distance_reuse(stream.get());
     test_compact_weight_class_updates(stream.get());
     test_compact_to_unit_storage_transition(stream.get());
     test_unit_weight_specialization(stream.get());

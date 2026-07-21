@@ -216,6 +216,198 @@ std::vector<int> nodes_from_path(int source, const std::vector<PathEdge>& edges)
   return nodes;
 }
 
+std::uint64_t hash_path_nodes(const std::vector<int>& nodes,
+                              std::size_t begin,
+                              std::size_t end) {
+  if (begin > end || end > nodes.size()) {
+    return 0;
+  }
+  std::uint64_t hash = UINT64_C(1469598103934665603);
+  for (std::size_t i = begin; i < end; ++i) {
+    std::uint32_t value = static_cast<std::uint32_t>(nodes[i]);
+    for (int byte = 0; byte < 4; ++byte) {
+      hash ^= static_cast<std::uint8_t>(value & UINT32_C(0xff));
+      hash *= UINT64_C(1099511628211);
+      value >>= 8;
+    }
+  }
+  return hash;
+}
+
+std::uint64_t hash_path_nodes(const std::vector<int>& nodes) {
+  return hash_path_nodes(nodes, 0, nodes.size());
+}
+
+struct CpuUnitBfsObservation {
+  int distance = -1;
+  int source = -1;
+  std::size_t edge_count = 0;
+  std::uint64_t path_hash = 0;
+};
+
+CpuUnitBfsObservation cpu_unit_bfs_observation(
+    const HostCsrF32& graph,
+    const std::vector<int>& sources,
+    int target) {
+  CpuUnitBfsObservation observation;
+  if (!valid_node(target, graph.rows)) {
+    return observation;
+  }
+
+  const std::size_t row_count = static_cast<std::size_t>(graph.rows);
+  std::vector<int> parent(row_count, -1);
+  std::vector<int> owner(row_count, -1);
+  std::vector<int> distance(row_count, -1);
+  std::vector<int> queue;
+  queue.reserve(row_count);
+  for (const int source : sources) {
+    if (!valid_node(source, graph.rows) ||
+        distance[static_cast<std::size_t>(source)] >= 0) {
+      continue;
+    }
+    const std::size_t index = static_cast<std::size_t>(source);
+    parent[index] = source;
+    owner[index] = source;
+    distance[index] = 0;
+    queue.push_back(source);
+  }
+
+  for (std::size_t head = 0;
+       head < queue.size() && distance[static_cast<std::size_t>(target)] < 0;
+       ++head) {
+    const int u = queue[head];
+    const int next_distance = distance[static_cast<std::size_t>(u)] + 1;
+    for (minplus_sparse::Offset edge = graph.rowptr[static_cast<std::size_t>(u)];
+         edge < graph.rowptr[static_cast<std::size_t>(u + 1)];
+         ++edge) {
+      const int v = graph.colind[static_cast<std::size_t>(edge)];
+      const std::size_t v_index = static_cast<std::size_t>(v);
+      if (distance[v_index] >= 0) {
+        continue;
+      }
+      parent[v_index] = u;
+      owner[v_index] = owner[static_cast<std::size_t>(u)];
+      distance[v_index] = next_distance;
+      queue.push_back(v);
+      if (v == target) {
+        break;
+      }
+    }
+  }
+
+  const std::size_t target_index = static_cast<std::size_t>(target);
+  if (distance[target_index] < 0) {
+    return observation;
+  }
+
+  observation.distance = distance[target_index];
+  observation.source = owner[target_index];
+  observation.edge_count = static_cast<std::size_t>(observation.distance);
+  std::vector<int> reversed;
+  reversed.reserve(observation.edge_count + 1);
+  for (int current = target;;
+       current = parent[static_cast<std::size_t>(current)]) {
+    reversed.push_back(current);
+    if (parent[static_cast<std::size_t>(current)] == current) {
+      break;
+    }
+  }
+  std::reverse(reversed.begin(), reversed.end());
+  observation.path_hash = hash_path_nodes(reversed);
+  return observation;
+}
+
+template <typename SsspResult>
+UnitBfsPathObservation target_observation(const SsspResult& result,
+                                          std::size_t target_position,
+                                          int target) {
+  UnitBfsPathObservation observation;
+  observation.captured = true;
+
+  if (target_position < result.target_distances.size()) {
+    observation.distance = result.target_distances[target_position];
+    observation.reached = std::isfinite(observation.distance);
+    if (target_position < result.target_sources.size()) {
+      observation.source = result.target_sources[target_position];
+    }
+    if (target_position + 1 < result.target_path_offsets.size() &&
+        target_position + 1 < result.target_edge_offsets.size()) {
+      const int node_begin = result.target_path_offsets[target_position];
+      const int node_end = result.target_path_offsets[target_position + 1];
+      const int edge_begin = result.target_edge_offsets[target_position];
+      const int edge_end = result.target_edge_offsets[target_position + 1];
+      if (node_begin >= 0 && node_end >= node_begin && edge_begin >= 0 &&
+          edge_end >= edge_begin &&
+          static_cast<std::size_t>(node_end) <= result.target_path_nodes.size() &&
+          static_cast<std::size_t>(edge_end) <= result.target_path_edges.size()) {
+        observation.edge_count = static_cast<std::size_t>(edge_end - edge_begin);
+        observation.path_hash = hash_path_nodes(
+            result.target_path_nodes,
+            static_cast<std::size_t>(node_begin),
+            static_cast<std::size_t>(node_end));
+      }
+    }
+    return observation;
+  }
+
+  if (valid_node(target, static_cast<minplus_sparse::Offset>(result.dist.size())) &&
+      std::isfinite(result.dist[static_cast<std::size_t>(target)])) {
+    observation.reached = true;
+    observation.distance = result.dist[static_cast<std::size_t>(target)];
+  }
+  return observation;
+}
+
+bool observation_matches_cpu(const UnitBfsPathObservation& observation,
+                             int cpu_distance) {
+  if (!observation.captured) {
+    return false;
+  }
+  if (cpu_distance < 0) {
+    return !observation.reached;
+  }
+  return observation.reached &&
+         observation.distance == static_cast<float>(cpu_distance) &&
+         observation.edge_count == static_cast<std::size_t>(cpu_distance);
+}
+
+void classify_unit_bfs_diagnostic(UnitBfsPathDiagnostic* diagnostic) {
+  if (diagnostic == nullptr) {
+    return;
+  }
+  if (!diagnostic->all_unit_weights) {
+    diagnostic->classification = "unsupported_non_unit_graph";
+  } else if (!diagnostic->raw_batched.captured ||
+             !diagnostic->fresh_original.captured ||
+             !diagnostic->fresh_expanded_tree.captured) {
+    diagnostic->classification = "diagnostic_not_captured";
+  } else if (!observation_matches_cpu(diagnostic->fresh_original,
+                                      diagnostic->cpu_original_distance)) {
+    diagnostic->classification = "unit_bfs_single_target_mismatch";
+  } else if (!observation_matches_cpu(diagnostic->raw_batched,
+                                      diagnostic->cpu_original_distance)) {
+    diagnostic->classification = "unit_bfs_batched_or_reuse_mismatch";
+  } else if (!observation_matches_cpu(
+                 diagnostic->fresh_expanded_tree,
+                 diagnostic->cpu_expanded_tree_distance)) {
+    diagnostic->classification = "unit_bfs_expanded_tree_mismatch";
+  } else if (diagnostic->cpu_expanded_tree_distance < 0) {
+    diagnostic->classification = diagnostic->attached_reached
+                                     ? "pathfinder_attached_unreachable_sink"
+                                     : "unreachable_consistently";
+  } else if (!diagnostic->attached_reached) {
+    diagnostic->classification = "pathfinder_failed_reachable_sink";
+  } else if (diagnostic->attached_edge_count >
+             static_cast<std::size_t>(diagnostic->cpu_expanded_tree_distance)) {
+    diagnostic->classification = "pathfinder_cached_multi_sink_path";
+  } else if (diagnostic->attached_edge_count <
+             static_cast<std::size_t>(diagnostic->cpu_expanded_tree_distance)) {
+    diagnostic->classification = "pathfinder_tree_state_mismatch";
+  } else {
+    diagnostic->classification = "no_mismatch_observed";
+  }
+}
+
 bool tree_contains(const std::vector<std::uint32_t>& tree_seen,
                    std::uint32_t tree_stamp,
                    int node) {
@@ -448,7 +640,8 @@ RoutedNet route_net(const HostCsrF32& graph,
                     std::uint32_t tree_stamp,
                     const PathfinderOptions& options,
                     hipStream_t stream,
-                    DeltaSteppingCsrTelemetry* delta_telemetry = nullptr) {
+                    DeltaSteppingCsrTelemetry* delta_telemetry = nullptr,
+                    UnitBfsPathDiagnostic* unit_bfs_diagnostic = nullptr) {
   PATHFINDER_PROFILE_RANGE("pathfinder.route_net");
   RoutedNet net;
   net.net_string = request.net_string;
@@ -464,9 +657,24 @@ RoutedNet route_net(const HostCsrF32& graph,
   for (const SitePinNode& source : request.sources) {
     add_unique_node(source_candidates, tree_seen, tree_stamp, source.node);
   }
+  std::vector<int> diagnostic_original_sources;
+  if (unit_bfs_diagnostic != nullptr) {
+    diagnostic_original_sources = source_candidates;
+    unit_bfs_diagnostic->target =
+        request.sinks[unit_bfs_diagnostic->sink_index].node;
+    unit_bfs_diagnostic->original_source_count = source_candidates.size();
+    unit_bfs_diagnostic->cpu_original_distance =
+        cpu_unit_bfs_observation(graph,
+                                 diagnostic_original_sources,
+                                 unit_bfs_diagnostic->target)
+            .distance;
+  }
 
   if (source_candidates.empty()) {
     net.reached_all_sinks = false;
+    if (unit_bfs_diagnostic != nullptr) {
+      unit_bfs_diagnostic->classification = "no_valid_sources";
+    }
     return net;
   }
 
@@ -490,6 +698,19 @@ RoutedNet route_net(const HostCsrF32& graph,
       routed_sink.distance = 0.0f;
       routed_sink.reached = true;
       routed_sink.nodes.push_back(sink.node);
+      if (unit_bfs_diagnostic != nullptr &&
+          sink_index == unit_bfs_diagnostic->sink_index) {
+        const std::vector<int> trivial_path{sink.node};
+        const std::uint64_t trivial_hash = hash_path_nodes(trivial_path);
+        unit_bfs_diagnostic->tree_source_count = source_candidates.size();
+        unit_bfs_diagnostic->cpu_expanded_tree_distance = 0;
+        unit_bfs_diagnostic->raw_batched =
+            {true, true, 0.0f, sink.node, 0, trivial_hash};
+        unit_bfs_diagnostic->fresh_original =
+            unit_bfs_diagnostic->raw_batched;
+        unit_bfs_diagnostic->fresh_expanded_tree =
+            unit_bfs_diagnostic->raw_batched;
+      }
       continue;
     }
     targets.push_back(sink.node);
@@ -519,6 +740,42 @@ RoutedNet route_net(const HostCsrF32& graph,
       const std::size_t sink_index = target_sink_indices[target_pos];
       const int target = request.sinks[sink_index].node;
       RoutedSink& routed_sink = net.sinks[sink_index];
+
+      if (unit_bfs_diagnostic != nullptr &&
+          sink_index == unit_bfs_diagnostic->sink_index) {
+        unit_bfs_diagnostic->raw_batched =
+            target_observation(sssp, target_pos, target);
+        unit_bfs_diagnostic->tree_source_count = source_candidates.size();
+        for (std::size_t prior = 0; prior < sink_index; ++prior) {
+          if (net.sinks[prior].reached) {
+            ++unit_bfs_diagnostic->prior_sinks_reached;
+          }
+        }
+
+        const CpuUnitBfsObservation expanded_cpu =
+            cpu_unit_bfs_observation(graph, source_candidates, target);
+        unit_bfs_diagnostic->cpu_expanded_tree_distance = expanded_cpu.distance;
+
+        auto fresh_original = workspace.run(diagnostic_original_sources,
+                                            std::vector<int>{target},
+                                            options.delta,
+                                            options.max_sssp_iterations,
+                                            stream,
+                                            nullptr,
+                                            nullptr);
+        unit_bfs_diagnostic->fresh_original =
+            target_observation(fresh_original, 0, target);
+
+        auto fresh_expanded = workspace.run(source_candidates,
+                                            std::vector<int>{target},
+                                            options.delta,
+                                            options.max_sssp_iterations,
+                                            stream,
+                                            nullptr,
+                                            nullptr);
+        unit_bfs_diagnostic->fresh_expanded_tree =
+            target_observation(fresh_expanded, 0, target);
+      }
 
       if (has_compact_target_paths) {
         const float distance = sssp.target_distances[target_pos];
@@ -659,6 +916,16 @@ RoutedNet route_net(const HostCsrF32& graph,
 
   net.reached_all_sinks = reached_all;
   net.unique_nodes = std::move(source_candidates);
+  if (unit_bfs_diagnostic != nullptr) {
+    const RoutedSink& selected =
+        net.sinks[unit_bfs_diagnostic->sink_index];
+    unit_bfs_diagnostic->attached_reached = selected.reached;
+    unit_bfs_diagnostic->attached_distance = selected.distance;
+    unit_bfs_diagnostic->attached_source = selected.source;
+    unit_bfs_diagnostic->attached_edge_count = selected.edges.size();
+    unit_bfs_diagnostic->attached_path_hash = hash_path_nodes(selected.nodes);
+    classify_unit_bfs_diagnostic(unit_bfs_diagnostic);
+  }
   return net;
 }
 
@@ -952,7 +1219,9 @@ void route_all_nets_with_workspace(const HostCsrF32& base_graph,
                                    std::vector<RoutedNet>& nets,
                                    WorkspaceFactory workspace_factory,
                                    std::vector<DeltaSteppingCsrTelemetry>*
-                                       delta_telemetry_records = nullptr) {
+                                       delta_telemetry_records = nullptr,
+                                   UnitBfsPathDiagnostic*
+                                       unit_bfs_diagnostic = nullptr) {
   if (delta_telemetry_records != nullptr &&
       delta_telemetry_records->size() != route_request_count) {
     throw std::invalid_argument(
@@ -989,7 +1258,11 @@ void route_all_nets_with_workspace(const HostCsrF32& base_graph,
                       stream,
                       delta_telemetry_records == nullptr
                           ? nullptr
-                          : &(*delta_telemetry_records)[net_index]);
+                          : &(*delta_telemetry_records)[net_index],
+                      unit_bfs_diagnostic != nullptr &&
+                              unit_bfs_diagnostic->net_index == net_index
+                          ? unit_bfs_diagnostic
+                          : nullptr);
       } catch (const std::exception& error) {
         throw std::runtime_error(
             "route request " + std::to_string(net_index) + " failed: " +
@@ -1065,7 +1338,11 @@ void route_all_nets_with_workspace(const HostCsrF32& base_graph,
                         local_stream,
                         delta_telemetry_records == nullptr
                             ? nullptr
-                            : &(*delta_telemetry_records)[net_index]);
+                            : &(*delta_telemetry_records)[net_index],
+                        unit_bfs_diagnostic != nullptr &&
+                                unit_bfs_diagnostic->net_index == net_index
+                            ? unit_bfs_diagnostic
+                            : nullptr);
         } catch (const std::exception& error) {
           throw std::runtime_error(
               "route request " + std::to_string(net_index) + " failed: " +
@@ -1462,6 +1739,8 @@ void print_usage(const char* program) {
       << "  --capacity <int>                Capacity used only for overuse diagnostics. Default: 1\n"
       << "  --net-limit <count>             Route only the first count requests.\n"
       << "  --parallel-net-workers <count>  Independent net workers. Default: 0 (engine-dependent auto).\n"
+      << "  --diagnose-net <zero-based>     Replay through one request and emit UnitBFS path diagnostics.\n"
+      << "  --diagnose-sink <zero-based>    Sink within --diagnose-net; both diagnostic options are required.\n"
       << "  --allow-unrouted                Write partial routes even if some sinks are unreached.\n"
       << "  --routes-out <path>             Write routed PIP tree data as JSONL.\n"
       << "\nCompatibility-only options accepted and ignored by this one-shot router:\n"
@@ -1747,7 +2026,8 @@ std::vector<PathEdge> reconstruct_shortest_path(const HostCsrF32& graph,
 PathfinderResult run_pathfinder(const HostCsrF32& base_graph,
                                 const RoutingMetadata& metadata,
                                 const PathfinderOptions& options,
-                                hipStream_t stream) {
+                                hipStream_t stream,
+                                UnitBfsPathDiagnostic* unit_bfs_diagnostic) {
   PATHFINDER_PROFILE_RANGE("pathfinder.run");
   validate_options(options);
   int automatic_delta_wavefront_size = 0;
@@ -1792,6 +2072,36 @@ PathfinderResult run_pathfinder(const HostCsrF32& base_graph,
       options.net_limit == 0
           ? metadata.route_requests.size()
           : std::min(options.net_limit, metadata.route_requests.size());
+  if (unit_bfs_diagnostic != nullptr) {
+    if (options.sssp_engine != SsspEngine::kUnitBfs) {
+      throw std::invalid_argument(
+          "UnitBFS path diagnostics require the unit-bfs engine");
+    }
+    const std::size_t diagnostic_net = unit_bfs_diagnostic->net_index;
+    const std::size_t diagnostic_sink = unit_bfs_diagnostic->sink_index;
+    if (diagnostic_net >= metadata.route_requests.size()) {
+      throw std::out_of_range("diagnostic net index is outside route requests");
+    }
+    if (diagnostic_net >= route_request_count) {
+      throw std::invalid_argument(
+          "diagnostic net is excluded by the configured net limit");
+    }
+    if (diagnostic_sink >=
+        metadata.route_requests[diagnostic_net].sinks.size()) {
+      throw std::out_of_range("diagnostic sink index is outside the request");
+    }
+    *unit_bfs_diagnostic = UnitBfsPathDiagnostic{};
+    unit_bfs_diagnostic->net_index = diagnostic_net;
+    unit_bfs_diagnostic->sink_index = diagnostic_sink;
+    unit_bfs_diagnostic->all_unit_weights =
+        std::all_of(base_graph.values.begin(),
+                    base_graph.values.end(),
+                    [](float value) { return value == 1.0f; });
+    if (!unit_bfs_diagnostic->all_unit_weights) {
+      throw std::invalid_argument(
+          "UnitBFS path diagnostics require exact unit edge weights");
+    }
+  }
   result.nets.resize(route_request_count);
 
   const std::size_t progress_interval =
@@ -1808,6 +2118,14 @@ PathfinderResult run_pathfinder(const HostCsrF32& base_graph,
                   << unit_options.parallel_net_workers
                   << " unit-BFS worker(s)\n";
       }
+      if (unit_bfs_diagnostic != nullptr) {
+        unit_bfs_diagnostic->worker_count =
+            stream != nullptr
+                ? 1
+                : std::min<std::size_t>(
+                      unit_options.parallel_net_workers,
+                      std::max<std::size_t>(1, route_request_count));
+      }
       route_all_nets_with_workspace(
           base_graph,
           metadata,
@@ -1818,7 +2136,9 @@ PathfinderResult run_pathfinder(const HostCsrF32& base_graph,
           result.nets,
           [shared_graph](hipStream_t worker_stream) {
             return UnitBfsCsrWorkspace(shared_graph, worker_stream);
-          });
+          },
+          nullptr,
+          unit_bfs_diagnostic);
       break;
     }
     case SsspEngine::kDeltaStep: {
@@ -1949,6 +2269,71 @@ PathfinderResult run_pathfinder(const HostCsrF32& base_graph,
                           &result.max_occupancy);
   result.routed = all_sinks_reached;
   return result;
+}
+
+std::string unit_bfs_path_diagnostic_json(
+    const UnitBfsPathDiagnostic& diagnostic) {
+  std::ostringstream out;
+  out.precision(std::numeric_limits<float>::max_digits10);
+  auto write_distance = [&out](float distance) {
+    if (std::isfinite(distance)) {
+      out << distance;
+    } else {
+      out << "null";
+    }
+  };
+  auto write_observation = [&out, &write_distance](
+                               const UnitBfsPathObservation& observation) {
+    out << "{\"captured\":" << (observation.captured ? "true" : "false")
+        << ",\"reached\":" << (observation.reached ? "true" : "false")
+        << ",\"distance\":";
+    write_distance(observation.distance);
+    out << ",\"source\":" << observation.source
+        << ",\"edge_count\":" << observation.edge_count
+        << ",\"path_hash\":" << observation.path_hash << '}';
+  };
+
+  out << "{\"type\":\"unit_bfs_path_diagnostic\""
+      << ",\"schema_version\":1"
+      << ",\"net_index\":" << diagnostic.net_index
+      << ",\"sink_index\":" << diagnostic.sink_index
+      << ",\"target\":" << diagnostic.target
+      << ",\"worker_count\":" << diagnostic.worker_count
+      << ",\"all_unit_weights\":"
+      << (diagnostic.all_unit_weights ? "true" : "false")
+      << ",\"original_source_count\":"
+      << diagnostic.original_source_count
+      << ",\"tree_source_count\":" << diagnostic.tree_source_count
+      << ",\"prior_sinks_reached\":" << diagnostic.prior_sinks_reached
+      << ",\"cpu_original_distance\":";
+  if (diagnostic.cpu_original_distance >= 0) {
+    out << diagnostic.cpu_original_distance;
+  } else {
+    out << "null";
+  }
+  out << ",\"cpu_expanded_tree_distance\":";
+  if (diagnostic.cpu_expanded_tree_distance >= 0) {
+    out << diagnostic.cpu_expanded_tree_distance;
+  } else {
+    out << "null";
+  }
+  out << ",\"raw_batched\":";
+  write_observation(diagnostic.raw_batched);
+  out << ",\"fresh_original\":";
+  write_observation(diagnostic.fresh_original);
+  out << ",\"fresh_expanded_tree\":";
+  write_observation(diagnostic.fresh_expanded_tree);
+  out << ",\"attached\":{\"reached\":"
+      << (diagnostic.attached_reached ? "true" : "false")
+      << ",\"distance\":";
+  write_distance(diagnostic.attached_distance);
+  out << ",\"source\":" << diagnostic.attached_source
+      << ",\"edge_count\":" << diagnostic.attached_edge_count
+      << ",\"path_hash\":" << diagnostic.attached_path_hash << '}'
+      << ",\"classification\":";
+  write_json_string(out, diagnostic.classification);
+  out << '}';
+  return out.str();
 }
 
 std::string string_at(const RoutingMetadata& metadata, std::uint64_t index) {
@@ -2098,6 +2483,10 @@ int main(int argc, char** argv) {
     bool delta_option_seen = false;
     bool delta_benchmark_weights_seen = false;
     bool delta_benchmark_weight_seed_seen = false;
+    bool net_limit_seen = false;
+    bool diagnose_net_seen = false;
+    bool diagnose_sink_seen = false;
+    routing::UnitBfsPathDiagnostic unit_bfs_diagnostic;
     routing::DeltaBenchmarkWeights delta_benchmark_weights =
         routing::DeltaBenchmarkWeights::kOriginal;
     std::uint64_t delta_benchmark_weight_seed = 0;
@@ -2178,6 +2567,7 @@ int main(int argc, char** argv) {
       } else if (option == "--net-limit") {
         options.net_limit =
             routing::parse_size_arg(require_value("--net-limit"), "net-limit");
+        net_limit_seen = true;
       } else if (option == "--route-batch-size") {
         (void)routing::parse_size_arg(require_value("--route-batch-size"),
                                       "route-batch-size");
@@ -2185,6 +2575,22 @@ int main(int argc, char** argv) {
         options.parallel_net_workers =
             routing::parse_size_arg(require_value("--parallel-net-workers"),
                                     "parallel-net-workers");
+      } else if (option == "--diagnose-net") {
+        if (diagnose_net_seen) {
+          throw std::runtime_error("--diagnose-net may be specified only once");
+        }
+        diagnose_net_seen = true;
+        unit_bfs_diagnostic.net_index =
+            routing::parse_size_arg(require_value("--diagnose-net"),
+                                    "diagnose-net");
+      } else if (option == "--diagnose-sink") {
+        if (diagnose_sink_seen) {
+          throw std::runtime_error("--diagnose-sink may be specified only once");
+        }
+        diagnose_sink_seen = true;
+        unit_bfs_diagnostic.sink_index =
+            routing::parse_size_arg(require_value("--diagnose-sink"),
+                                    "diagnose-sink");
       } else if (option == "--allow-unrouted") {
         allow_unrouted_routes = true;
       } else if (option == "--routes-out") {
@@ -2212,6 +2618,30 @@ int main(int argc, char** argv) {
           "--delta-benchmark-weight-seed requires "
           "--delta-benchmark-weights mixed");
     }
+    if (diagnose_net_seen != diagnose_sink_seen) {
+      throw std::runtime_error(
+          "--diagnose-net and --diagnose-sink must be specified together");
+    }
+    const bool diagnose_unit_bfs = diagnose_net_seen;
+    if (diagnose_unit_bfs) {
+      if (options.sssp_engine != routing::SsspEngine::kUnitBfs) {
+        throw std::runtime_error(
+            "UnitBFS path diagnostics require --sssp-engine unit-bfs");
+      }
+      if (net_limit_seen) {
+        throw std::runtime_error(
+            "--net-limit cannot be combined with --diagnose-net");
+      }
+      if (!routes_out_path.empty()) {
+        throw std::runtime_error(
+            "--routes-out cannot be combined with UnitBFS diagnostics");
+      }
+      if (unit_bfs_diagnostic.net_index ==
+          std::numeric_limits<std::size_t>::max()) {
+        throw std::overflow_error("diagnostic net index is too large");
+      }
+      options.net_limit = unit_bfs_diagnostic.net_index + 1;
+    }
     routing::validate_options(options);
 
     HostCsrF32 graph = [&]() {
@@ -2237,7 +2667,19 @@ int main(int argc, char** argv) {
     }();
 
     routing::PathfinderResult result =
-        routing::run_pathfinder(graph, metadata, options, nullptr);
+        routing::run_pathfinder(
+            graph,
+            metadata,
+            options,
+            nullptr,
+            diagnose_unit_bfs ? &unit_bfs_diagnostic : nullptr);
+
+    if (diagnose_unit_bfs) {
+      std::cout << routing::unit_bfs_path_diagnostic_json(
+                       unit_bfs_diagnostic)
+                << '\n';
+      return 0;
+    }
 
     if (!routes_out_path.empty()) {
       if (!result.routed && !allow_unrouted_routes) {

@@ -121,6 +121,41 @@ struct PathfinderResult {
   std::vector<RoutedNet> nets;
 };
 
+struct UnitBfsPathObservation {
+  bool captured = false;
+  bool reached = false;
+  float distance = std::numeric_limits<float>::infinity();
+  int source = -1;
+  std::size_t edge_count = 0;
+  std::uint64_t path_hash = 0;
+};
+
+// Opt-in diagnostic state for one UnitBFS sink.  When supplied to
+// run_pathfinder, the selected request is observed inside its real worker and
+// workspace after the preceding request prefix has run.  Normal routing does
+// not allocate or execute any of these probes when the pointer is null.
+struct UnitBfsPathDiagnostic {
+  std::size_t net_index = std::numeric_limits<std::size_t>::max();
+  std::size_t sink_index = std::numeric_limits<std::size_t>::max();
+  int target = -1;
+  bool all_unit_weights = false;
+  std::size_t original_source_count = 0;
+  std::size_t tree_source_count = 0;
+  std::size_t prior_sinks_reached = 0;
+  std::size_t worker_count = 0;
+  int cpu_original_distance = -1;
+  int cpu_expanded_tree_distance = -1;
+  UnitBfsPathObservation raw_batched;
+  UnitBfsPathObservation fresh_original;
+  UnitBfsPathObservation fresh_expanded_tree;
+  bool attached_reached = false;
+  float attached_distance = std::numeric_limits<float>::infinity();
+  int attached_source = -1;
+  std::size_t attached_edge_count = 0;
+  std::uint64_t attached_path_hash = 0;
+  std::string classification;
+};
+
 HostCsrF32 load_csrbin(const std::filesystem::path& path);
 RoutingMetadata load_interchange_metadata(const std::filesystem::path& path);
 
@@ -133,7 +168,11 @@ std::vector<PathEdge> reconstruct_shortest_path(
 PathfinderResult run_pathfinder(const HostCsrF32& base_graph,
                                 const RoutingMetadata& metadata,
                                 const PathfinderOptions& options,
-                                hipStream_t stream = nullptr);
+                                hipStream_t stream = nullptr,
+                                UnitBfsPathDiagnostic* unit_bfs_diagnostic = nullptr);
+
+std::string unit_bfs_path_diagnostic_json(
+    const UnitBfsPathDiagnostic& diagnostic);
 
 std::string string_at(const RoutingMetadata& metadata, std::uint64_t index);
 

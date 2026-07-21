@@ -279,6 +279,20 @@ HostCsrF32 make_tree_graph() {
   return graph;
 }
 
+HostCsrF32 make_cached_multi_sink_counterexample_graph() {
+  // The initial shortest paths are uniquely 0->1->2 and 0->3->4.  Once the
+  // first sink is attached, the exact route tree has a one-edge path 2->4,
+  // which a cached source-0 result cannot discover by trimming its old path.
+  HostCsrF32 graph;
+  graph.rows = 5;
+  graph.cols = 5;
+  graph.nnz = 5;
+  graph.rowptr = {0, 2, 3, 4, 5, 5};
+  graph.colind = {1, 3, 2, 4, 4};
+  graph.values.assign(static_cast<std::size_t>(graph.nnz), 1.0f);
+  return graph;
+}
+
 HostCsrF32 make_self_loop_predecessor_graph() {
   HostCsrF32 graph;
   graph.rows = 4;
@@ -338,6 +352,23 @@ routing::RoutingMetadata make_metadata() {
   request.sources.push_back({0, 1, 2});
   request.sinks.push_back({2, 3, 4});
   request.sinks.push_back({3, 5, 6});
+  metadata.route_requests.push_back(std::move(request));
+  return metadata;
+}
+
+routing::RoutingMetadata make_cached_multi_sink_counterexample_metadata(
+    const HostCsrF32& graph) {
+  routing::RoutingMetadata metadata;
+  metadata.strings = {"cached_counterexample"};
+  metadata.node_device_ids = {0, 1, 2, 3, 4};
+  add_default_node_metadata(metadata);
+  metadata.edge_attrs.resize(static_cast<std::size_t>(graph.nnz));
+
+  routing::RouteRequest request;
+  request.net_string = 0;
+  request.sources.push_back({0, 0, 0});
+  request.sinks.push_back({2, 0, 0});
+  request.sinks.push_back({4, 0, 0});
   metadata.route_requests.push_back(std::move(request));
   return metadata;
 }
@@ -1754,6 +1785,49 @@ int main() {
           "congestion-free default router should call unit BFS once per net");
   require(g_multisource_delta_calls == 0,
           "congestion-free default router should not call delta-step");
+
+  {
+    const HostCsrF32 cached_graph =
+        make_cached_multi_sink_counterexample_graph();
+    const routing::RoutingMetadata cached_metadata =
+        make_cached_multi_sink_counterexample_metadata(cached_graph);
+    routing::PathfinderOptions cached_options;
+    cached_options.parallel_net_workers = 1;
+    routing::UnitBfsPathDiagnostic diagnostic;
+    diagnostic.net_index = 0;
+    diagnostic.sink_index = 1;
+    g_unit_bfs_calls = 0;
+    const routing::PathfinderResult cached_result =
+        routing::run_pathfinder(cached_graph,
+                                cached_metadata,
+                                cached_options,
+                                nullptr,
+                                &diagnostic);
+
+    require(cached_result.nets[0].sinks[0].nodes ==
+                std::vector<int>({0, 1, 2}),
+            "counterexample first sink should establish the expanded tree");
+    require(cached_result.nets[0].sinks[1].nodes ==
+                std::vector<int>({0, 3, 4}),
+            "diagnostic must preserve the current cached adapter behavior");
+    require(diagnostic.cpu_original_distance == 2 &&
+                diagnostic.raw_batched.reached &&
+                diagnostic.raw_batched.edge_count == 2 &&
+                diagnostic.fresh_original.edge_count == 2,
+            "raw UnitBFS and CPU reference should agree before tree growth");
+    require(diagnostic.tree_source_count == 3 &&
+                diagnostic.prior_sinks_reached == 1 &&
+                diagnostic.cpu_expanded_tree_distance == 1 &&
+                diagnostic.fresh_expanded_tree.reached &&
+                diagnostic.fresh_expanded_tree.edge_count == 1,
+            "fresh UnitBFS should find the one-edge expanded-tree route");
+    require(diagnostic.attached_edge_count == 2 &&
+                diagnostic.classification ==
+                    "pathfinder_cached_multi_sink_path",
+            "diagnostic should classify the stale cached multi-sink path");
+    require(g_unit_bfs_calls == 3,
+            "diagnostic should add exactly two selected-sink reference runs");
+  }
 
   g_multisource_delta_calls = 0;
   g_unit_bfs_calls = 0;
