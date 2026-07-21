@@ -360,9 +360,9 @@ HostCsrF32 make_tree_graph() {
 }
 
 HostCsrF32 make_cached_multi_sink_counterexample_graph() {
-  // The initial shortest paths are uniquely 0->1->2 and 0->3->4.  Once the
-  // first sink is attached, the exact route tree has a one-edge path 2->4,
-  // which a cached source-0 result cannot discover by trimming its old path.
+  // The source-rooted shortest paths are uniquely 0->1->2 and 0->3->4.
+  // Treating the first branch as a new zero-distance source would choose the
+  // one-edge suffix 2->4 but inflate the true root path from two to three hops.
   HostCsrF32 graph;
   graph.rows = 5;
   graph.cols = 5;
@@ -374,9 +374,9 @@ HostCsrF32 make_cached_multi_sink_counterexample_graph() {
 }
 
 HostCsrF32 make_accumulated_tree_repair_graph() {
-  // Sink 8 is initially closest through 0->6->8.  The direct 2->8 edge only
-  // becomes preferable after sink 2 is attached; sink 5 is routed in between
-  // so the repair source set must retain additions from more than one branch.
+  // Sink 8 is closest to the original source through 0->6->8.  The tempting
+  // suffix 2->8 is shorter only after incorrectly resetting tree node 2 to
+  // distance zero; its complete root path is one hop longer.
   HostCsrF32 graph;
   graph.rows = 9;
   graph.cols = 9;
@@ -385,6 +385,90 @@ HostCsrF32 make_accumulated_tree_repair_graph() {
   graph.colind = {1, 3, 6, 2, 8, 4, 5, 8};
   graph.values.assign(static_cast<std::size_t>(graph.nnz), 1.0f);
   return graph;
+}
+
+struct CriticalPathInflationFixture {
+  HostCsrF32 graph;
+  std::vector<int> sinks;
+};
+
+CriticalPathInflationFixture make_critical_path_inflation_fixture() {
+  std::vector<std::pair<int, int>> edges;
+  int next_node = 1;
+  const auto append_new_chain = [&](int start, int hop_count) {
+    int current = start;
+    for (int hop = 0; hop < hop_count; ++hop) {
+      const int next = next_node++;
+      edges.emplace_back(current, next);
+      current = next;
+    }
+    return current;
+  };
+  const auto connect_existing = [&](int start, int target, int hop_count) {
+    int current = start;
+    for (int hop = 1; hop < hop_count; ++hop) {
+      const int next = next_node++;
+      edges.emplace_back(current, next);
+      current = next;
+    }
+    edges.emplace_back(current, target);
+  };
+
+  const int sink_1 = append_new_chain(0, 100);
+  const int sink_2 = append_new_chain(0, 214);
+  const int sink_3 = append_new_chain(0, 214);
+  const int sink_4 = append_new_chain(0, 214);
+  // Zero-seeded tree repair would choose these suffixes and produce rooted
+  // depths 215, 216, and 309 instead of the direct 214-hop paths.
+  connect_existing(sink_1, sink_2, 115);
+  connect_existing(sink_2, sink_3, 1);
+  connect_existing(sink_3, sink_4, 93);
+
+  CriticalPathInflationFixture fixture;
+  fixture.graph.rows = next_node;
+  fixture.graph.cols = next_node;
+  fixture.graph.nnz = static_cast<minplus_sparse::Offset>(edges.size());
+  std::vector<std::vector<int>> outgoing(static_cast<std::size_t>(next_node));
+  for (const auto& [from, to] : edges) {
+    outgoing[static_cast<std::size_t>(from)].push_back(to);
+  }
+  fixture.graph.rowptr.reserve(static_cast<std::size_t>(next_node) + 1);
+  fixture.graph.rowptr.push_back(0);
+  for (const std::vector<int>& row : outgoing) {
+    fixture.graph.colind.insert(fixture.graph.colind.end(), row.begin(), row.end());
+    fixture.graph.rowptr.push_back(
+        static_cast<minplus_sparse::Offset>(fixture.graph.colind.size()));
+  }
+  fixture.graph.values.assign(edges.size(), 1.0f);
+  fixture.sinks = {sink_1, sink_2, sink_3, sink_4};
+  return fixture;
+}
+
+int routed_tree_hop_count(const routing::RoutedNet& net,
+                          int root,
+                          int target,
+                          int node_count) {
+  std::vector<int> parent(static_cast<std::size_t>(node_count), -1);
+  for (const routing::RoutedSink& sink : net.sinks) {
+    for (const routing::PathEdge& edge : sink.edges) {
+      int& stored = parent[static_cast<std::size_t>(edge.to)];
+      if (stored >= 0 && stored != edge.from) {
+        return -1;
+      }
+      stored = edge.from;
+    }
+  }
+  int current = target;
+  for (int hops = 0; hops <= node_count; ++hops) {
+    if (current == root) {
+      return hops;
+    }
+    if (current < 0 || current >= node_count) {
+      return -1;
+    }
+    current = parent[static_cast<std::size_t>(current)];
+  }
+  return -1;
 }
 
 HostCsrF32 make_self_loop_predecessor_graph() {
@@ -1381,7 +1465,7 @@ int main() {
       nullptr);
   require(!tentative_net.reached_all_sinks &&
               !tentative_net.sinks.front().reached &&
-              tentative_workspace.calls == 2,
+              tentative_workspace.calls == 1,
           "capped BF must reject finite targets that are not yet certified");
 
   const HostCsrF32 self_loop_graph = make_self_loop_predecessor_graph();
@@ -2013,8 +2097,8 @@ int main() {
                 std::vector<int>({0, 1, 2}),
             "counterexample first sink should establish the expanded tree");
     require(cached_result.nets[0].sinks[1].nodes ==
-                std::vector<int>({2, 4}),
-            "second sink must use the shorter path from the expanded tree");
+                std::vector<int>({0, 3, 4}),
+            "second sink must preserve its two-hop source-rooted shortest path");
     require(diagnostic.cpu_original_distance == 2 &&
                 diagnostic.fresh_original.edge_count == 2,
             "fresh UnitBFS and CPU reference should agree before tree growth");
@@ -2026,15 +2110,15 @@ int main() {
                 diagnostic.fresh_expanded_tree.reached &&
                 diagnostic.fresh_expanded_tree.edge_count == 1,
             "batched and fresh UnitBFS observations should match their tree epochs");
-    require(diagnostic.attached_edge_count == 1 &&
+    require(diagnostic.attached_edge_count == 2 &&
                 diagnostic.classification ==
                     "no_mismatch_observed",
-            "diagnostic should confirm the attached expanded-tree path");
-    require(g_unit_bfs_calls == 4,
-            "one batch, one bounded repair, and two probes should run UnitBFS");
+            "diagnostic should confirm the attached source-rooted path");
+    require(g_unit_bfs_calls == 3,
+            "one batch and two diagnostic probes should run UnitBFS");
     require(recorded_unit_depth_limits() ==
-                std::vector<int>({-1, 1, -1, -1}),
-            "UnitBFS repair should stop one level below its two-edge incumbent");
+                std::vector<int>({-1, -1, -1}),
+            "diagnostic probes should not introduce bounded repair searches");
 
     routing::RoutingMetadata on_path_metadata = cached_metadata;
     on_path_metadata.route_requests[0].sinks[1].node = 1;
@@ -2078,12 +2162,11 @@ int main() {
                                 nullptr);
     require(capped_result.nets[0].sinks[0].nodes ==
                     std::vector<int>({0, 1}) &&
-                capped_result.nets[0].sinks[1].nodes ==
-                    std::vector<int>({1, 2}),
-            "finite-depth UnitBFS must retry a target exposed by tree growth");
-    require(g_unit_bfs_calls == 2 &&
-                recorded_unit_depth_limits() == std::vector<int>({1, 1}),
-            "finite-depth tree repair should preserve the configured cap");
+                !capped_result.nets[0].sinks[1].reached,
+            "finite-depth UnitBFS must preserve the original-source cap");
+    require(g_unit_bfs_calls == 1 &&
+                recorded_unit_depth_limits() == std::vector<int>({1}),
+            "finite-depth routing should remain a single batched query");
 
     const HostCsrF32 accumulated_graph =
         make_accumulated_tree_repair_graph();
@@ -2101,12 +2184,74 @@ int main() {
                 accumulated_result.nets[0].sinks[1].nodes ==
                     std::vector<int>({0, 3, 4, 5}) &&
                 accumulated_result.nets[0].sinks[2].nodes ==
-                    std::vector<int>({2, 8}),
-            "tree repair must retain nodes added by every preceding branch");
-    require(g_unit_bfs_calls == 3,
-            "three-sink repair should use one batch and two bounded checks");
-    require(recorded_unit_depth_limits() == std::vector<int>({-1, 2, 1}),
-            "UnitBFS repairs should use each sink's strict incumbent bound");
+                    std::vector<int>({0, 6, 8}),
+            "every sink must preserve its source-rooted shortest path");
+    require(g_unit_bfs_calls == 1,
+            "three sinks should share one batched UnitBFS query");
+    require(recorded_unit_depth_limits() == std::vector<int>({-1}),
+            "batched UnitBFS should use only the configured global depth cap");
+
+    const CriticalPathInflationFixture critical_fixture =
+        make_critical_path_inflation_fixture();
+    routing::RoutingMetadata critical_metadata;
+    critical_metadata.strings = {"critical_path_inflation"};
+    critical_metadata.node_device_ids.resize(
+        static_cast<std::size_t>(critical_fixture.graph.rows));
+    add_default_node_metadata(critical_metadata);
+    critical_metadata.edge_attrs.resize(
+        static_cast<std::size_t>(critical_fixture.graph.nnz));
+    routing::RouteRequest critical_request;
+    critical_request.net_string = 0;
+    critical_request.sources.push_back({0, 0, 0});
+    for (const int sink : critical_fixture.sinks) {
+      critical_request.sinks.push_back({sink, 0, 0});
+    }
+    critical_metadata.route_requests.push_back(std::move(critical_request));
+    g_unit_bfs_calls = 0;
+    const routing::PathfinderResult critical_result =
+        routing::run_pathfinder(critical_fixture.graph,
+                                critical_metadata,
+                                cached_options,
+                                nullptr);
+    require(critical_result.nets[0].reached_all_sinks &&
+                g_unit_bfs_calls == 1,
+            "critical-path trap must route with one UnitBFS batch");
+    const std::vector<int> expected_root_hops = {100, 214, 214, 214};
+    for (std::size_t sink_index = 0;
+         sink_index < critical_fixture.sinks.size();
+         ++sink_index) {
+      require(routed_tree_hop_count(critical_result.nets[0],
+                                    0,
+                                    critical_fixture.sinks[sink_index],
+                                    static_cast<int>(critical_fixture.graph.rows)) ==
+                  expected_root_hops[sink_index],
+              "batched predecessor paths must prevent 309-hop tree inflation");
+    }
+
+    routing::PathfinderOptions critical_delta_options = cached_options;
+    critical_delta_options.sssp_engine = routing::SsspEngine::kDeltaStep;
+    critical_delta_options.delta_force_generic = true;
+    critical_delta_options.delta = 1.0f;
+    g_multisource_delta_calls = 0;
+    const routing::PathfinderResult critical_delta_result =
+        routing::run_pathfinder(critical_fixture.graph,
+                                critical_metadata,
+                                critical_delta_options,
+                                nullptr);
+    require(critical_delta_result.nets[0].reached_all_sinks &&
+                g_multisource_delta_calls == 1,
+            "critical-path trap must route with one generic Delta batch");
+    for (std::size_t sink_index = 0;
+         sink_index < critical_fixture.sinks.size();
+         ++sink_index) {
+      require(routed_tree_hop_count(
+                  critical_delta_result.nets[0],
+                  0,
+                  critical_fixture.sinks[sink_index],
+                  static_cast<int>(critical_fixture.graph.rows)) ==
+                  expected_root_hops[sink_index],
+              "generic Delta must preserve the 214-hop source-rooted bound");
+    }
 
     routing::RoutingMetadata parallel_cached_metadata = cached_metadata;
     while (parallel_cached_metadata.route_requests.size() < 4) {
@@ -2124,11 +2269,11 @@ int main() {
     require(parallel_cached_result.nets.size() == 4,
             "parallel counterexample should preserve every net slot");
     for (const routing::RoutedNet& routed_net : parallel_cached_result.nets) {
-      require(routed_net.sinks[1].nodes == std::vector<int>({2, 4}),
-              "every parallel worker must route from its expanded net tree");
+      require(routed_net.sinks[1].nodes == std::vector<int>({0, 3, 4}),
+              "every parallel worker must preserve source-rooted shortest paths");
     }
-    require(g_unit_bfs_calls == 8,
-            "four two-sink nets should each issue one batch and one repair");
+    require(g_unit_bfs_calls == 4,
+            "four two-sink nets should each issue one batched query");
 
     HostCsrF32 weighted_cached_graph = cached_graph;
     weighted_cached_graph.values = {1.0f, 3.0f, 1.0f, 1.0f, 3.0f};
@@ -2154,22 +2299,21 @@ int main() {
                 std::vector<int>({0, 1, 2}) &&
                 cached_delta_result.nets[0].sinks[1].nodes ==
                     std::vector<int>({2, 4}),
-            "weighted Delta routing must also search from the expanded tree");
-    require(g_multisource_delta_calls == 2,
-            "weighted Delta routing should issue one batch and one repair");
+            "weighted Delta routing must preserve the batched predecessor tree");
+    require(g_multisource_delta_calls == 1,
+            "weighted Delta routing should issue one batched query");
     const std::vector<float> cached_delta_limits =
         recorded_delta_distance_limits();
-    require(cached_delta_limits.size() == 2 &&
-                std::isinf(cached_delta_limits[0]) &&
-                cached_delta_limits[1] == 1.0f,
-            "Delta tree repair should receive the incumbent as a strict cutoff");
+    require(cached_delta_limits.size() == 1 &&
+                std::isinf(cached_delta_limits[0]),
+            "batched Delta routing should not issue a bounded repair");
     const std::string cached_delta_telemetry =
         single_delta_telemetry_json_line(cached_delta_stdout);
-    require(cached_delta_telemetry.find("\"queries\":2") !=
+    require(cached_delta_telemetry.find("\"queries\":1") !=
                     std::string::npos &&
-                cached_delta_telemetry.find("\"completed_queries\":2") !=
+                cached_delta_telemetry.find("\"completed_queries\":1") !=
                     std::string::npos,
-            "Delta telemetry must retain both per-sink query records");
+            "Delta telemetry must report the single batched query");
   }
 
   g_multisource_delta_calls = 0;
@@ -2206,7 +2350,7 @@ int main() {
   require(result.occupancy == std::vector<int>({1, 1, 1, 1}),
           "all route tree nodes should be occupied once");
   require(g_unit_bfs_calls == 1,
-          "a one-edge trimmed incumbent should need no UnitBFS repair");
+          "all sinks should share one UnitBFS batch");
   require(g_multisource_delta_calls == 0,
           "default unit BFS path should not call delta-step");
 
@@ -2221,8 +2365,8 @@ int main() {
           "delta-step comparison path should preserve first sink route");
   require(delta_result.nets[0].sinks[1].nodes == std::vector<int>({1, 3}),
           "delta-step comparison path should preserve second sink route");
-  require(g_multisource_delta_calls == 2,
-          "delta-step should rerun after expanding a multi-sink tree");
+  require(g_multisource_delta_calls == 1,
+          "delta-step should route all sinks in one batch");
   require(g_unit_bfs_calls == 0,
           "explicit delta-step comparison path should not call unit BFS");
 

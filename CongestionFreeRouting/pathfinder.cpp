@@ -398,12 +398,6 @@ void classify_unit_bfs_diagnostic(UnitBfsPathDiagnostic* diagnostic) {
                                      : "unreachable_consistently";
   } else if (!diagnostic->attached_reached) {
     diagnostic->classification = "pathfinder_failed_reachable_sink";
-  } else if (diagnostic->attached_edge_count >
-             static_cast<std::size_t>(diagnostic->cpu_expanded_tree_distance)) {
-    diagnostic->classification = "pathfinder_cached_multi_sink_path";
-  } else if (diagnostic->attached_edge_count <
-             static_cast<std::size_t>(diagnostic->cpu_expanded_tree_distance)) {
-    diagnostic->classification = "pathfinder_tree_state_mismatch";
   } else {
     diagnostic->classification = "no_mismatch_observed";
   }
@@ -594,8 +588,7 @@ auto run_sssp_with_optional_delta_telemetry(
     float delta,
     int max_iterations,
     hipStream_t stream,
-    DeltaSteppingCsrTelemetry*,
-    float = std::numeric_limits<float>::infinity()) {
+    DeltaSteppingCsrTelemetry*) {
   return workspace.run(sources,
                        targets,
                        delta,
@@ -612,10 +605,8 @@ DeltaSteppingCsrResult run_sssp_with_optional_delta_telemetry(
     float delta,
     int max_iterations,
     hipStream_t stream,
-    DeltaSteppingCsrTelemetry* telemetry,
-    float exclusive_distance_limit =
-        std::numeric_limits<float>::infinity()) {
-  if (telemetry == nullptr && !std::isfinite(exclusive_distance_limit)) {
+    DeltaSteppingCsrTelemetry* telemetry) {
+  if (telemetry == nullptr) {
     return workspace.run(sources,
                          targets,
                          delta,
@@ -628,8 +619,7 @@ DeltaSteppingCsrResult run_sssp_with_optional_delta_telemetry(
                        targets,
                        delta,
                        max_iterations,
-                       DeltaSteppingCsrRunOptions{
-                           telemetry, exclusive_distance_limit},
+                       DeltaSteppingCsrRunOptions{telemetry},
                        stream,
                        nullptr,
                        nullptr);
@@ -834,7 +824,7 @@ RoutedNet route_net(const HostCsrF32& graph,
     throw std::invalid_argument("route parent scratch size does not match CSR rows");
   }
   if (delta_telemetry != nullptr) {
-    delta_telemetry->reserve(request.sinks.size());
+    delta_telemetry->reserve(1);
   }
 
   std::vector<int> source_candidates;
@@ -979,9 +969,11 @@ RoutedNet route_net(const HostCsrF32& graph,
         target_observation(fresh_expanded, 0, target);
   };
 
-  // The original batch already accounts for every original source.  Only
-  // nodes added by earlier sink branches can improve one of its cached paths.
-  std::vector<int> added_tree_sources;
+  // Every candidate is a globally shortest path from the original source set.
+  // Replacing its prefix at the last existing-tree intersection preserves that
+  // same root distance by shortest-path optimal substructure. Treating newly
+  // routed nodes as zero-distance sources would instead minimize suffix cost
+  // and can lengthen the actual source-to-sink critical path.
   for (std::size_t sink_index = 0; sink_index < request.sinks.size(); ++sink_index) {
     const int target = request.sinks[sink_index].node;
     RoutedSink& routed_sink = net.sinks[sink_index];
@@ -1000,159 +992,13 @@ RoutedNet route_net(const HostCsrF32& graph,
       continue;
     }
 
-    bool incumbent_from_capped_repair = false;
-    if (!std::isfinite(routed_sink.distance) &&
-        (!added_tree_sources.empty() ||
-         options.sssp_engine != SsspEngine::kUnitBfs) &&
-        options.max_sssp_iterations >= 0) {
-      // A finite user cap can hide a target from the original batch even
-      // though a branch added later places it within the same cap. UnitBFS's
-      // cap is a distance radius, so the new nodes suffice. Delta/BF caps are
-      // scheduler iterations; retain their legacy full-current-tree semantics.
-      const std::vector<int> capped_targets{target};
-      const std::vector<int>& capped_sources =
-          options.sssp_engine == SsspEngine::kUnitBfs
-              ? added_tree_sources
-              : source_candidates;
-      DeltaSteppingCsrTelemetry capped_telemetry;
-      auto capped_sssp = [&]() {
-        PATHFINDER_PROFILE_RANGE("pathfinder.sssp_capped_tree_repair");
-        return run_sssp_with_optional_delta_telemetry(
-            workspace,
-            capped_sources,
-            capped_targets,
-            options.delta,
-            options.max_sssp_iterations,
-            stream,
-            delta_telemetry == nullptr ? nullptr : &capped_telemetry);
-      }();
-      if (delta_telemetry != nullptr && capped_telemetry.collected) {
-        delta_telemetry->push_back(std::move(capped_telemetry));
-      }
-      RoutedSink capped_candidate;
-      const bool capped_candidate_found = extract_routed_sink_candidate(
-          graph,
-          capped_sssp,
-          0,
-          1,
-          target,
-          tree_seen,
-          tree_stamp,
-          &capped_candidate);
-      const bool capped_candidate_certified =
-          capped_candidate_found &&
-          (options.sssp_engine != SsspEngine::kBellmanFord ||
-           capped_sssp.stopped_on_target || capped_sssp.converged);
-      if (capped_candidate_certified) {
-        routed_sink = std::move(capped_candidate);
-        incumbent_from_capped_repair = true;
-      }
-    }
     if (!std::isfinite(routed_sink.distance)) {
       reached_all = false;
       capture_diagnostic_probes(sink_index);
       continue;
     }
+
     trim_routed_sink_to_tree(routed_sink, tree_seen, tree_stamp);
-
-    bool run_correction = !added_tree_sources.empty() &&
-                          !incumbent_from_capped_repair;
-    int correction_iteration_limit = options.max_sssp_iterations;
-    int unit_strict_depth = -1;
-    float exclusive_distance_limit = routed_sink.distance;
-    if (options.sssp_engine == SsspEngine::kUnitBfs) {
-      // A non-tree target needs at least one edge.  A cached one-edge route is
-      // therefore already optimal; otherwise only depths below its incumbent
-      // edge count can improve it.
-      if (routed_sink.edges.size() <= 1) {
-        run_correction = false;
-      } else {
-        const std::size_t strict_depth_size = routed_sink.edges.size() - 1;
-        unit_strict_depth =
-            strict_depth_size >
-                    static_cast<std::size_t>(std::numeric_limits<int>::max())
-                ? std::numeric_limits<int>::max()
-                : static_cast<int>(strict_depth_size);
-        correction_iteration_limit =
-            correction_iteration_limit < 0
-                ? unit_strict_depth
-                : std::min(correction_iteration_limit, unit_strict_depth);
-      }
-      exclusive_distance_limit = std::numeric_limits<float>::infinity();
-    } else if (!(exclusive_distance_limit > 0.0f)) {
-      run_correction = false;
-    }
-
-    if (run_correction) {
-      const std::vector<int> correction_targets{target};
-      DeltaSteppingCsrTelemetry correction_telemetry;
-      auto correction_sssp = [&]() {
-        PATHFINDER_PROFILE_RANGE("pathfinder.sssp_tree_repair");
-        return run_sssp_with_optional_delta_telemetry(
-            workspace,
-            added_tree_sources,
-            correction_targets,
-            options.delta,
-            correction_iteration_limit,
-            stream,
-            delta_telemetry == nullptr ? nullptr : &correction_telemetry,
-            exclusive_distance_limit);
-      }();
-      if (delta_telemetry != nullptr && correction_telemetry.collected) {
-        delta_telemetry->push_back(std::move(correction_telemetry));
-      }
-
-      RoutedSink correction;
-      bool found_strict_improvement = false;
-      if (extract_routed_sink_candidate(graph,
-                                        correction_sssp,
-                                        0,
-                                        1,
-                                        target,
-                                        tree_seen,
-                                        tree_stamp,
-                                        &correction)) {
-        const bool is_strict_improvement =
-            options.sssp_engine == SsspEngine::kUnitBfs
-                ? correction.edges.size() < routed_sink.edges.size()
-                : correction.distance < routed_sink.distance;
-        if (is_strict_improvement) {
-          found_strict_improvement = true;
-        }
-      }
-      bool correction_certified = false;
-      switch (options.sssp_engine) {
-        case SsspEngine::kUnitBfs:
-          correction_certified =
-              found_strict_improvement ||
-              correction_iteration_limit >= unit_strict_depth;
-          break;
-        case SsspEngine::kDeltaStep:
-          correction_certified =
-              found_strict_improvement ||
-              correction_sssp.stopped_on_distance_limit ||
-              correction_sssp.stopped_on_target ||
-              correction_sssp.converged;
-          break;
-        case SsspEngine::kBellmanFord:
-          // Unlike level-ordered BFS and settled-target Delta-Stepping, a
-          // capped BF10 run can expose a finite but still-tentative target.
-          correction_certified = correction_sssp.stopped_on_target ||
-                                 correction_sssp.converged;
-          break;
-      }
-      if (!correction_certified) {
-        reached_all = false;
-        routed_sink.edges.clear();
-        routed_sink.nodes.clear();
-        routed_sink.distance = std::numeric_limits<float>::infinity();
-        capture_diagnostic_probes(sink_index);
-        continue;
-      }
-      if (found_strict_improvement) {
-        routed_sink = std::move(correction);
-      }
-    }
 
     capture_diagnostic_probes(sink_index);
     if (!attach_path_if_single_parent_tree(routed_sink.edges,
@@ -1167,10 +1013,7 @@ RoutedNet route_net(const HostCsrF32& graph,
     }
     routed_sink.reached = true;
     for (const int node : routed_sink.nodes) {
-      if (!tree_contains(tree_seen, tree_stamp, node)) {
-        add_unique_node(source_candidates, tree_seen, tree_stamp, node);
-        added_tree_sources.push_back(node);
-      }
+      add_unique_node(source_candidates, tree_seen, tree_stamp, node);
     }
   }
 
