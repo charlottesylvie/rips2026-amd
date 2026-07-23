@@ -11,6 +11,7 @@
 //   g++ -std=c++17 -O2 CongestionFreeRouting/pathfinder_router.cpp -o PathFinderFile
 
 #include <cerrno>
+#include <chrono>
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
@@ -114,7 +115,11 @@ void run_command(const std::vector<std::string>& argv,
               << std::flush;
   }
   errno = 0;
+  const auto started = std::chrono::steady_clock::now();
   const int status = std::system(command.c_str());
+  const double elapsed_seconds =
+      std::chrono::duration<double>(std::chrono::steady_clock::now() - started)
+          .count();
   const int system_errno = errno;
   if (status != 0) {
     std::ostringstream out;
@@ -147,6 +152,9 @@ void run_command(const std::vector<std::string>& argv,
     out << " while running " << command;
     throw std::runtime_error(out.str());
   }
+  std::cout << "[pathfinder-router] " << label << " wall time: "
+            << elapsed_seconds << " s\n"
+            << std::flush;
 }
 
 std::filesystem::path make_work_dir(const Options& options) {

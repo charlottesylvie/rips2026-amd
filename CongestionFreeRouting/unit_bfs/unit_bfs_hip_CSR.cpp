@@ -1,5 +1,6 @@
 #include "unit_bfs_hip_CSR.hpp"
 
+#include <hip/hip_cooperative_groups.h>
 #include <hip/hip_runtime.h>
 
 #include <algorithm>
@@ -33,6 +34,9 @@ constexpr int kMaxGridX = 65535;
 constexpr int kUnvisited = std::numeric_limits<int>::max();
 constexpr int kLevelsPerStatusCheck = 4;
 constexpr int kBatchBlocksPerComputeUnit = 4;
+constexpr int kCooperativeLevelsPerLaunch = 32;
+constexpr int kMaxConcurrentCooperativeWorkers = 8;
+constexpr int kTargetConcurrentCooperativeWorkers = 4;
 
 enum UnitBfsStatusIndex : int {
   kStatusQueueTail = 0,
@@ -228,6 +232,7 @@ struct OutgoingCsrOwner {
   Offset nnz = 0;
   bool uses_32_bit_offsets = false;
   int batched_launch_blocks = 1;
+  int cooperative_launch_blocks = 0;
   DeviceBuffer<CompactOffset> rowptr32;
   DeviceBuffer<Offset> rowptr64;
   DeviceBuffer<Index> colind;
@@ -657,6 +662,80 @@ __global__ void advance_frontier_kernel(int target_count,
           completed_depth < max_depth);
 }
 
+template <typename EdgeOffset>
+__global__ void cooperative_frontier_controller_kernel(
+    const EdgeOffset* out_rowptr,
+    const Index* out_colind,
+    int target_count,
+    int max_depth,
+    int level_budget,
+    int* level,
+    int* pred_node,
+    EdgeOffset* pred_edge,
+    int* frontier_queue,
+    const int* target_multiplicity,
+    int* status) {
+  cooperative_groups::grid_group grid = cooperative_groups::this_grid();
+  __shared__ int controller[4];
+
+  // initialize_sources_kernel publishes a complete initial controller before
+  // this kernel is submitted.  Every later controller transition happens in
+  // this kernel, separated from frontier expansion by a grid-wide barrier, so
+  // no cross-kernel controller handoff or per-level host copy is required.
+  int levels_this_launch = 0;
+  while (levels_this_launch < level_budget) {
+    if (threadIdx.x == 0) {
+      controller[0] = atomic_load_status(status + kStatusActive);
+      if (controller[0] != 0) {
+        controller[1] = atomic_load_status(status + kStatusFrontierBegin);
+        controller[2] = atomic_load_status(status + kStatusFrontierEnd);
+        controller[3] = atomic_load_status(status + kStatusCompletedDepth);
+      }
+    }
+    __syncthreads();
+    if (controller[0] == 0) {
+      break;
+    }
+
+    const int frontier_begin = controller[1];
+    const int frontier_end = controller[2];
+    const int next_level = controller[3] + 1;
+
+    expand_frontier_range(frontier_begin,
+                          frontier_end,
+                          next_level,
+                          out_rowptr,
+                          out_colind,
+                          level,
+                          pred_node,
+                          pred_edge,
+                          frontier_queue,
+                          target_multiplicity,
+                          status + kStatusQueueTail,
+                          status + kStatusFoundCount);
+    grid.sync();
+
+    if (grid.thread_rank() == 0) {
+      const int next_frontier_begin = frontier_end;
+      const int next_frontier_end =
+          atomic_load_status(status + kStatusQueueTail);
+      const int found_count =
+          atomic_load_status(status + kStatusFoundCount);
+      atomic_store_status(
+          status + kStatusFrontierBegin, next_frontier_begin);
+      atomic_store_status(status + kStatusFrontierEnd, next_frontier_end);
+      atomic_store_status(status + kStatusCompletedDepth, next_level);
+      __threadfence();
+      atomic_store_status(
+          status + kStatusActive,
+          next_frontier_begin < next_frontier_end &&
+              found_count < target_count && next_level < max_depth);
+    }
+    grid.sync();
+    ++levels_this_launch;
+  }
+}
+
 __global__ void mark_target_multiplicity_kernel(const int* targets,
                                                 int target_count,
                                                 int* target_multiplicity) {
@@ -818,6 +897,72 @@ static_assert(!nnz_fits_32_bit_offsets(
                       std::numeric_limits<CompactOffset>::max()) + 1),
               "graphs above INT32_MAX edges must retain wide offsets");
 
+template <typename EdgeOffset>
+int cooperative_controller_blocks(Offset rows) {
+  int device = -1;
+  UNIT_BFS_HIP_CHECK(hipGetDevice(&device));
+  int cooperative_launch = 0;
+  const hipError_t capability_status =
+      hipDeviceGetAttribute(&cooperative_launch,
+                            hipDeviceAttributeCooperativeLaunch,
+                            device);
+  if (capability_status != hipSuccess || cooperative_launch == 0) {
+    if (capability_status != hipSuccess) {
+      (void)hipGetLastError();
+    }
+    return 0;
+  }
+
+  hipDeviceProp_t properties{};
+  UNIT_BFS_HIP_CHECK(hipGetDeviceProperties(&properties, device));
+  int active_blocks_per_compute_unit = 0;
+  const hipError_t occupancy_status =
+      hipOccupancyMaxActiveBlocksPerMultiprocessor(
+          &active_blocks_per_compute_unit,
+          cooperative_frontier_controller_kernel<EdgeOffset>,
+          kBlockSize,
+          0);
+  if (occupancy_status != hipSuccess ||
+      active_blocks_per_compute_unit <= 0 ||
+      properties.multiProcessorCount <= 0) {
+    if (occupancy_status != hipSuccess) {
+      (void)hipGetLastError();
+    }
+    return 0;
+  }
+
+  const Offset row_blocks =
+      (rows + static_cast<Offset>(kBlockSize) - 1) /
+      static_cast<Offset>(kBlockSize);
+  const Offset legal_resident_limit =
+      static_cast<Offset>(active_blocks_per_compute_unit) *
+      static_cast<Offset>(properties.multiProcessorCount);
+  // PathFinder can run eight UnitBFS workspaces at once. Divide legal residency
+  // across that maximum, then target roughly one aggregate block per CU at the
+  // measured four-worker baseline. This avoids device-wide barriers across a
+  // mostly idle CU-count grid for every small routing frontier while retaining
+  // enough residency headroom for the eight-worker comparison.
+  const Offset per_worker_resident_limit =
+      std::max<Offset>(
+          1,
+          legal_resident_limit /
+              static_cast<Offset>(kMaxConcurrentCooperativeWorkers));
+  const Offset balanced_worker_blocks =
+      (static_cast<Offset>(properties.multiProcessorCount) +
+       static_cast<Offset>(kTargetConcurrentCooperativeWorkers) - 1) /
+      static_cast<Offset>(kTargetConcurrentCooperativeWorkers);
+  const Offset concurrency_friendly_limit =
+      std::min(balanced_worker_blocks, per_worker_resident_limit);
+  const Offset blocks =
+      std::min(row_blocks,
+               std::min(concurrency_friendly_limit, legal_resident_limit));
+  if (blocks <= 0 ||
+      blocks > static_cast<Offset>(std::numeric_limits<int>::max())) {
+    return 0;
+  }
+  return static_cast<int>(blocks);
+}
+
 OutgoingCsrOwner copy_host_csr_to_device(
     const HostCsrF32& host,
     hipStream_t stream,
@@ -837,6 +982,10 @@ OutgoingCsrOwner copy_host_csr_to_device(
       grid_for_items(host.rows),
       std::min<long long>(kMaxGridX,
                           compute_units * kBatchBlocksPerComputeUnit)));
+  device.cooperative_launch_blocks =
+      uses_32_bit_offsets
+          ? cooperative_controller_blocks<CompactOffset>(host.rows)
+          : cooperative_controller_blocks<Offset>(host.rows);
   const std::size_t rows = checked_size(host.rows, "rows");
   const std::size_t nnz = checked_size(host.nnz, "nnz");
   if (nnz != 0) {
@@ -914,6 +1063,49 @@ std::array<int, kStatusCount> copy_status_to_host(UnitBfsScratch& scratch,
   std::array<int, kStatusCount> status{};
   std::copy_n(scratch.host_status.get(), kStatusCount, status.begin());
   return status;
+}
+
+template <typename EdgeOffset>
+void launch_cooperative_controller(
+    const OutgoingCsrOwner& outgoing,
+    const EdgeOffset* out_rowptr,
+    UnitBfsScratch& scratch,
+    EdgeOffset* pred_edge,
+    int target_count,
+    int max_depth,
+    hipStream_t stream) {
+  const EdgeOffset* out_rowptr_arg = out_rowptr;
+  const Index* out_colind_arg = outgoing.colind.get();
+  int target_count_arg = target_count;
+  int max_depth_arg = max_depth;
+  int level_budget_arg = kCooperativeLevelsPerLaunch;
+  int* level_arg = scratch.level.get();
+  int* pred_node_arg = scratch.pred_node.get();
+  EdgeOffset* pred_edge_arg = pred_edge;
+  int* frontier_queue_arg = scratch.frontier_queue.get();
+  const int* target_multiplicity_arg = scratch.target_multiplicity.get();
+  int* status_arg = scratch.status.get();
+  void* kernel_args[] = {
+      &out_rowptr_arg,
+      &out_colind_arg,
+      &target_count_arg,
+      &max_depth_arg,
+      &level_budget_arg,
+      &level_arg,
+      &pred_node_arg,
+      &pred_edge_arg,
+      &frontier_queue_arg,
+      &target_multiplicity_arg,
+      &status_arg,
+  };
+
+  UNIT_BFS_HIP_CHECK(hipLaunchCooperativeKernel(
+      cooperative_frontier_controller_kernel<EdgeOffset>,
+      dim3(static_cast<unsigned>(outgoing.cooperative_launch_blocks)),
+      dim3(kBlockSize),
+      kernel_args,
+      0,
+      stream));
 }
 
 template <typename EdgeOffset>
@@ -1178,8 +1370,9 @@ UnitBfsCsrResult run_unit_bfs_with_offsets(
           scratch.status.get());
   UNIT_BFS_HIP_CHECK(hipGetLastError());
   // Publish target marks, sources, controller counters, and the initial queue
-  // before the first host-controlled expansion.  This costs one boundary per
-  // route, not per BFS level, and does not affect null-stream batching.
+  // before traversal starts. This one explicit-stream boundary also isolates
+  // the cooperative controller from the target runtime's unreliable
+  // cross-kernel controller handoff.
   synchronize_explicit_stream(stream);
 
   int frontier_begin = 0;
@@ -1190,7 +1383,9 @@ UnitBfsCsrResult run_unit_bfs_with_offsets(
   UnitBfsCsrResult result;
   result.target = -1;
   result.iterations_used = 0;
-  const bool use_device_controller =
+  const bool use_cooperative_controller =
+      progress_callback == nullptr && outgoing.cooperative_launch_blocks > 0;
+  const bool use_batched_device_controller =
       stream == nullptr && progress_callback == nullptr;
 
   while (current_count > 0 && found_count < target_count &&
@@ -1200,7 +1395,59 @@ UnitBfsCsrResult run_unit_bfs_with_offsets(
     const int previous_frontier_end = frontier_end;
     const int previous_depth = result.iterations_used;
 
-    if (!use_device_controller) {
+    if (use_cooperative_controller) {
+      launch_cooperative_controller(outgoing,
+                                    out_rowptr,
+                                    scratch,
+                                    pred_edge,
+                                    target_count,
+                                    max_depth,
+                                    stream);
+      const std::array<int, kStatusCount> status =
+          copy_status_to_host(scratch, stream);
+      queue_tail = status[kStatusQueueTail];
+      found_count = status[kStatusFoundCount];
+      frontier_begin = status[kStatusFrontierBegin];
+      frontier_end = status[kStatusFrontierEnd];
+      result.iterations_used = status[kStatusCompletedDepth];
+      current_count = frontier_end - frontier_begin;
+      const int expected_active =
+          current_count > 0 && found_count < target_count &&
+          result.iterations_used < max_depth;
+      const int remaining_depth = max_depth - previous_depth;
+      const int levels_budgeted =
+          std::min(kCooperativeLevelsPerLaunch, remaining_depth);
+      if (queue_tail < previous_queue_tail || queue_tail > n_int ||
+          frontier_begin < previous_frontier_end ||
+          frontier_end < frontier_begin || frontier_end != queue_tail ||
+          found_count < previous_found_count || found_count > target_count ||
+          result.iterations_used <= previous_depth ||
+          result.iterations_used > previous_depth + levels_budgeted ||
+          status[kStatusActive] != expected_active) {
+        std::ostringstream message;
+        message << "unit BFS cooperative frontier state is inconsistent"
+                << " (queue_tail=" << queue_tail
+                << ", previous_queue_tail=" << previous_queue_tail
+                << ", frontier_begin=" << frontier_begin
+                << ", frontier_end=" << frontier_end
+                << ", previous_frontier_end=" << previous_frontier_end
+                << ", found_count=" << found_count
+                << ", previous_found_count=" << previous_found_count
+                << ", completed_depth=" << result.iterations_used
+                << ", previous_depth=" << previous_depth
+                << ", levels_budgeted=" << levels_budgeted
+                << ", active=" << status[kStatusActive]
+                << ", expected_active=" << expected_active
+                << ", rows=" << n_int
+                << ", sources=" << source_count
+                << ", targets=" << target_count
+                << ", max_depth=" << max_depth << ')';
+        throw std::runtime_error(message.str());
+      }
+      continue;
+    }
+
+    if (!use_batched_device_controller) {
       // Parallel PathFinder workers use explicit nonblocking streams.  Keep
       // their frontier bounds and depth on the host, as the pre-batching
       // implementation did.  On gfx1151, an expansion's queue-tail updates

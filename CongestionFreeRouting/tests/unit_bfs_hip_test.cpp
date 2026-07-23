@@ -428,8 +428,8 @@ void require_equivalent(const UnitBfsCsrResult& left,
 }
 
 HostCsrF32 make_long_chain_graph() {
-  // 0 -> 1 -> ... -> 10, with vertex 11 isolated.  The depths cross both
-  // sides of the traversal's first-level check and its four-level batches.
+  // 0 -> 1 -> ... -> 10, with vertex 11 isolated. The depths exercise repeated
+  // cooperative controller iterations and the per-level callback fallback.
   constexpr int kChainVertices = 11;
   constexpr int kRows = 12;
   HostCsrF32 graph;
@@ -534,10 +534,9 @@ HostCsrF32 make_deep_wide_layered_graph() {
   //
   //   0 -> layer[1][0..4096] -> ... -> layer[12][0..4096]
   //
-  // The last lane is the reachable target and one extra row is isolated.  This
-  // compact shape crosses three four-level controller batches on the default
-  // stream and forces thirteen host-observed levels on explicit streams when
-  // the isolated target is queried.
+  // The last lane is the reachable target and one extra row is isolated. This
+  // compact shape crosses several controller iterations on both default and
+  // explicit streams when the isolated target is queried.
   constexpr int kRows = kDeepWideIsolated + 1;
   HostCsrF32 graph;
   graph.rows = kRows;
@@ -733,8 +732,8 @@ void run_batching_suite(UnitBfsCsrOffsetMode mode,
       mode_label + ": frontier exhausted inside batch");
 
   // Installing a progress callback retains the historical one-level polling
-  // behavior.  Compare it with the batched path to cover both controller modes
-  // and ensure callback timing remains observable after every level.
+  // behavior. Compare it with the cooperative path to cover both controller
+  // modes and ensure callback timing remains observable after every level.
   UnitBfsCsrWorkspace callback_workspace(shared_graph);
   std::vector<UnitBfsCsrProgress> target_trace;
   const UnitBfsCsrResult callback_target = callback_workspace.run(

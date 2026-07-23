@@ -22,6 +22,8 @@ are reported as diagnostics; they do not make the one-shot router fail.
   case.
 - Local CPU-only tests are available for routing logic, but full router builds
   require ROCm/HIP, Cap'n Proto C++ support, and FPGA Interchange schema files.
+- Current implementation progress, validation gaps, and immediate priorities
+  are tracked in [`DEVELOPMENT_STATUS.md`](DEVELOPMENT_STATUS.md).
 
 ## Benchmark Interface
 
@@ -660,3 +662,25 @@ output, and computes the benchmark score.
 - `pathfinder` and most HIP kernel tests require ROCm/HIP and `hipcc`; CPU-only
   tests use the fake HIP headers in `Routing/tests/fake_hip`.
 - Temporary files and downloaded reference files should be removed after tests.
+
+### Known interchange limitations
+
+- Partially routed signal nets are not continued consistently: existing PIPs
+  and `stubNodes` are neither a reusable route tree nor ordinary occupancy.
+  Until continuation is implemented, reject these nets explicitly and keep
+  conversion and reconstruction on one stub representation.
+- Endpoint lookup uses a site's primary type. Alternate site types still need
+  `altPinsToPrimaryPins` mapping and tests for active alternate endpoints.
+- A cached `.devicegraph` should record and validate the device/part,
+  `DeviceResources` fingerprint, bounds policy, and graph-builder semantic
+  version; propagate the same identity into the per-design sidecar.
+- `routes_to_phys` should compare exact source/sink/node identities, require
+  every route root and edge to be source-reachable, and verify that the input
+  physical netlist matches the payload used during conversion.
+- Pseudo-PIPs and route-throughs still need site/BEL occupancy metadata and
+  legality checks. Parallel PIPs also need a deterministic legality-based
+  selection rule.
+
+These open items were cross-checked against the
+[Runtime-First FPGA24 routing contest repository](https://github.com/Xilinx/fpga24_routing_contest)
+at commit `f86cb48769466601b9f8d70ae000fa7bae39b3d8`.
