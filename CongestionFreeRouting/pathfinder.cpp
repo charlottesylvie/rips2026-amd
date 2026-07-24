@@ -2,6 +2,7 @@
 
 #include "bellman_ford/bf10.hpp"
 #include "delta_stepping/delta_stepping_hip_CSR.hpp"
+#include "near_far/near_far.hpp"
 #include "profiling/roctx_ranges.hpp"
 #include "unit_bfs/unit_bfs_hip_CSR.hpp"
 
@@ -10,18 +11,20 @@
 // This keeps the same benchmark-facing and route JSON APIs, but the routing
 // pass intentionally ignores present/historical congestion.  The default
 // engine uses a unit-weight GPU BFS specialized for the converter's unit
-// routing graph. GPU delta-stepping and Bellman-Ford bf10 remain selectable for
-// comparison.
+// routing graph. GPU delta-stepping, Near-Far, and Bellman-Ford bf10 remain
+// selectable for comparison.
 //
 // Example GPU build from the repository root:
 //   hipcc -std=c++17 -O3 -x hip -DBF10_NO_MAIN \
 //     -I HIP_kernel/bellman_ford/src \
 //     -I CongestionFreeRouting/bellman_ford \
 //     -I CongestionFreeRouting/delta_stepping \
+//     -I CongestionFreeRouting/near_far \
 //     -I CongestionFreeRouting/unit_bfs \
 //     CongestionFreeRouting/pathfinder.cpp \
 //     CongestionFreeRouting/bellman_ford/bf10.cpp \
 //     CongestionFreeRouting/delta_stepping/delta_stepping_hip_CSR.cpp \
+//     CongestionFreeRouting/near_far/near_far.cpp \
 //     CongestionFreeRouting/unit_bfs/unit_bfs_hip_CSR.cpp \
 //     -pthread \
 //     -o congestion_free_pathfinder
@@ -146,16 +149,15 @@ void validate_csr(const HostCsrF32& graph) {
 }
 
 void validate_options(const PathfinderOptions& options) {
-  if (options.sssp_engine != SsspEngine::kDeltaStep) {
-    if (options.delta_force_generic ||
-        options.delta_force_legacy_parent ||
-        options.delta_telemetry ||
-        options.delta_auto ||
+  const bool uses_distance_width =
+      options.sssp_engine == SsspEngine::kDeltaStep ||
+      options.sssp_engine == SsspEngine::kNearFar;
+  if (!uses_distance_width) {
+    if (options.delta_auto ||
         options.delta_multiplier != 1.0f ||
         options.delta_controls_explicit) {
       throw std::invalid_argument(
-          "Delta-Stepping controls require --sssp-engine delta-step or "
-          "--use-delta-step");
+          "Delta width controls require the delta-step or near-far engine");
     }
   } else {
     if (!(options.delta_multiplier > 0.0f) ||
@@ -173,6 +175,14 @@ void validate_options(const PathfinderOptions& options) {
             "--delta-multiplier requires --delta auto");
       }
     }
+  }
+  if (options.sssp_engine != SsspEngine::kDeltaStep &&
+      (options.delta_force_generic ||
+       options.delta_force_legacy_parent ||
+       options.delta_telemetry)) {
+    throw std::invalid_argument(
+        "Delta-Stepping execution and telemetry controls require "
+        "--sssp-engine delta-step or --use-delta-step");
   }
   if (options.capacity <= 0) {
     throw std::invalid_argument("capacity must be positive");
@@ -904,8 +914,11 @@ RoutedNet route_net(const HostCsrF32& graph,
     if (delta_telemetry != nullptr && initial_telemetry.collected) {
       delta_telemetry->push_back(std::move(initial_telemetry));
     }
+    const bool potentially_capped_label_correcting =
+        options.sssp_engine == SsspEngine::kBellmanFord ||
+        options.sssp_engine == SsspEngine::kNearFar;
     const bool initial_paths_certified =
-        options.sssp_engine != SsspEngine::kBellmanFord ||
+        !potentially_capped_label_correcting ||
         initial_sssp.stopped_on_target || initial_sssp.converged;
 
     for (std::size_t target_pos = 0;
@@ -1811,6 +1824,9 @@ SsspEngine parse_sssp_engine_arg(const char* text) {
   if (value == "delta-step" || value == "delta-stepping" || value == "delta") {
     return SsspEngine::kDeltaStep;
   }
+  if (value == "near-far" || value == "near_far" || value == "nearfar") {
+    return SsspEngine::kNearFar;
+  }
   if (value == "bellman-ford" || value == "bellman_ford" || value == "bf8" ||
       value == "bf9" || value == "bf10") {
     return SsspEngine::kBellmanFord;
@@ -1824,6 +1840,8 @@ const char* sssp_engine_name(SsspEngine engine) {
       return "unit-bfs";
     case SsspEngine::kDeltaStep:
       return "delta-step";
+    case SsspEngine::kNearFar:
+      return "near-far";
     case SsspEngine::kBellmanFord:
       return "bellman-ford";
   }
@@ -1835,13 +1853,13 @@ void print_usage(const char* program) {
       << "Usage:\n"
       << "  " << program << " <graph.csrbin> [metadata.ifmeta.bin] [options]\n\n"
       << "Options:\n"
-      << "  --sssp-engine <unit-bfs|delta-step|bellman-ford|bf10>\n"
+      << "  --sssp-engine <unit-bfs|delta-step|near-far|bellman-ford|bf10>\n"
       << "                                  Shortest-path backend. bellman-ford and bf10 select BF10;\n"
       << "                                  bf8 and bf9 are compatibility aliases. Default: unit-bfs\n"
       << "  --use-delta-step                Use delta-step backend for comparison.\n"
-      << "  --delta <float|auto>            Delta-stepping bucket width. Default: 1\n"
+      << "  --delta <float|auto>            Delta/Near-Far distance width. Default: 1\n"
       << "  --delta-multiplier <float>      Positive sweep multiplier for --delta auto. Default: 1\n"
-      << "  --max-sssp-iters <int>          Delta rounds, BFS depth, or Bellman-Ford rounds; -1 for default.\n"
+      << "  --max-sssp-iters <int>          SSSP expansion rounds/depth; -1 for default.\n"
       << "  --delta-force-generic           Bypass exact-unit specialization; retain weights and delta.\n"
       << "  --delta-force-legacy-parent     Force generic Delta predecessor recovery for A/B comparison.\n"
       << "  --delta-telemetry               Emit one aggregate Delta-Stepping telemetry JSON record.\n"
@@ -2145,12 +2163,15 @@ PathfinderResult run_pathfinder(const HostCsrF32& base_graph,
   validate_options(options);
   int automatic_delta_wavefront_size = 0;
   float resolved_automatic_delta = options.delta;
-  if (options.sssp_engine == SsspEngine::kDeltaStep &&
-      (options.delta_auto || options.delta_telemetry)) {
+  const bool uses_distance_width =
+      options.sssp_engine == SsspEngine::kDeltaStep ||
+      options.sssp_engine == SsspEngine::kNearFar;
+  if ((uses_distance_width && options.delta_auto) ||
+      (options.sssp_engine == SsspEngine::kDeltaStep &&
+       options.delta_telemetry)) {
     automatic_delta_wavefront_size = current_device_wavefront_size();
   }
-  if (options.sssp_engine == SsspEngine::kDeltaStep &&
-      options.delta_auto) {
+  if (uses_distance_width && options.delta_auto) {
     PATHFINDER_PROFILE_RANGE("pathfinder.delta_auto_stats");
     // The resolver performs the same complete CSR validation while it gathers
     // the weight statistics. Avoid a second O(V + E) validation pass on large
@@ -2346,6 +2367,39 @@ PathfinderResult run_pathfinder(const HostCsrF32& base_graph,
                          actual_worker_count)
                   << '\n';
       }
+      break;
+    }
+    case SsspEngine::kNearFar: {
+      PathfinderOptions near_far_options = options;
+      if (near_far_options.delta_auto) {
+        near_far_options.delta = resolved_automatic_delta;
+        std::ostringstream message;
+        message.precision(std::numeric_limits<float>::max_digits10);
+        message << "[pathfinder] resolved automatic Near-Far delta="
+                << near_far_options.delta
+                << " (wavefront=" << automatic_delta_wavefront_size
+                << ", multiplier=" << near_far_options.delta_multiplier
+                << ")\n";
+        std::cout << message.str();
+      }
+      std::cout << "[pathfinder] selected Near-Far backend\n";
+      auto shared_graph =
+          std::make_shared<NearFarCsrGraph>(base_graph, stream);
+      if (near_far_options.parallel_net_workers == 0) {
+        near_far_options.parallel_net_workers = 1;
+        std::cout << "[pathfinder] auto-selected 1 Near-Far worker(s)\n";
+      }
+      route_all_nets_with_workspace(
+          base_graph,
+          metadata,
+          near_far_options,
+          stream,
+          route_request_count,
+          progress_interval,
+          result.nets,
+          [shared_graph](hipStream_t worker_stream) {
+            return NearFarCsrWorkspace(shared_graph, worker_stream);
+          });
       break;
     }
     case SsspEngine::kBellmanFord: {

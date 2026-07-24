@@ -35,9 +35,9 @@ so profiling cannot accidentally consume a differently preprocessed graph.
 
 ## Build with ROCTx ranges
 
-ROCTx ranges label graph upload, each net, each SSSP query, exact-unit versus
-generic delta-stepping, input loading, and route output. They are optional so
-normal and CPU-stub builds do not depend on ROCprofiler-SDK.
+ROCTx ranges label graph upload, each net, each SSSP query, BF10 execution,
+exact-unit versus generic delta-stepping, input loading, and route output. They
+are optional so normal and CPU-stub builds do not depend on ROCprofiler-SDK.
 
 Add the following to the normal `pathfinder` build:
 
@@ -64,6 +64,70 @@ hipcc -std=c++17 -O3 -x hip -DBF10_NO_MAIN \
 ROCm distributions package the header and library as
 `rocprofiler-sdk-roctx`. Rebuild without the macro/library for final timing if
 even the small marker overhead matters.
+
+## Bellman-Ford BF10 timeline
+
+Build the inner executable as `pathfinder`, then select it through the existing
+wrapper option. The Makefile still profiles only that inner process:
+
+```bash
+make ROUTER=PathFinderFile BENCHMARKS="logicnets_jscl" VERBOSE=1 \
+  PATHFINDER_SSSP_ENGINE=bellman-ford \
+  PATHFINDER_ARGS="--pathfinder ./pathfinder --parallel-net-workers 4" \
+  PATHFINDER_PROFILE=rocprofv3 \
+  PATHFINDER_PROFILE_RUN=bf10-timeline
+```
+
+Use these BF10 ROCTx ranges to separate the optimized and fallback paths:
+
+| Range | Meaning |
+| --- | --- |
+| `bf10.upload_graph` / `bf10.run` | One-time graph upload and complete adapter call. |
+| `bf10.gpu_controller` | Cooperative GPU-resident Bellman-Ford iteration control. |
+| `bf10.controller_fallback` | BF10-local host iteration loop when cooperative launch is unavailable. |
+| `bf10.gather_targets` | Compact target-state gathering after a source finishes. |
+| `bf10.gpu_reconstruct` / `bf10.copy_compact_paths` | Batched GPU predecessor traversal and compact final path transfer. |
+| `bf10.reconstruction_fallback` | Exceptional full-state CPU reconstruction for an invalid or cyclic packed predecessor chain. |
+
+The BF10 adapter test also exposes internal counters for controller launches,
+controller fallbacks, per-iteration status copies, GPU reconstruction batches,
+compact path transfers, predecessor host gathers, full-state fallbacks/copies,
+and target/path buffer growth. In the normal optimized path, per-iteration
+status copies, predecessor host gathers, and full-state copies should remain
+zero. The corresponding getter names are
+`bf10_internal_gpu_controller_launch_count`,
+`bf10_internal_controller_fallback_count`,
+`bf10_internal_iteration_status_copy_count`,
+`bf10_internal_gpu_reconstruction_batch_count`,
+`bf10_internal_compact_path_transfer_count`,
+`bf10_internal_predecessor_host_gather_count`,
+`bf10_internal_full_state_fallback_count`, and
+`bf10_internal_full_state_copy_count`; the adapter test also checks the two
+buffer-growth counters. These are process-local test instrumentation, not
+route JSONL output.
+
+`bellman-ford` and `bf10` select BF10. The names `bf8` and `bf9` are retained
+as compatibility aliases and also select BF10 in the current executable. A
+real BF9 performance comparison therefore requires a separately saved BF9
+PathFinder executable (or the historical standalone BF9/test command), not
+just `--sssp-engine bf9` on the BF10 binary.
+
+For profiler-free Make timing, explicitly set `PATHFINDER_PROFILE=none` and
+use `-W` to rerun the routed target even when its output already exists:
+
+```bash
+make -W logicnets_jscl_unrouted.phys \
+  ROUTER=PathFinderFile BENCHMARKS="logicnets_jscl" VERBOSE=1 \
+  PATHFINDER_PROFILE=none PATHFINDER_SSSP_ENGINE=bellman-ford \
+  PATHFINDER_ARGS="--pathfinder ./pathfinder --parallel-net-workers 4" \
+  logicnets_jscl_PathFinderFile.phys
+```
+
+Read `Wall-clock time (sec)` from the console or
+`logicnets_jscl_PathFinderFile.phys.log`. It measures the complete wrapper
+pipeline. For a fair BF9/BF10 A/B run, keep the input, worker count, GPU clocks,
+and thermal state fixed and use a different saved inner executable through
+`--pathfinder`.
 
 ## First pass: GPU timeline with rocprofv3
 

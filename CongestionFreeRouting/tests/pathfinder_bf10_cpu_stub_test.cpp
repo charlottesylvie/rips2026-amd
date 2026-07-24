@@ -4,6 +4,7 @@
 //     -I HIP_kernel/bellman_ford/src \
 //     -I CongestionFreeRouting/bellman_ford \
 //     -I CongestionFreeRouting/delta_stepping \
+//     -I CongestionFreeRouting/near_far \
 //     -I CongestionFreeRouting/unit_bfs \
 //     CongestionFreeRouting/tests/pathfinder_bf10_cpu_stub_test.cpp \
 //     -o /tmp/pathfinder_bf10_cpu_stub_test
@@ -27,10 +28,14 @@ std::atomic<int> g_delta_force_legacy_calls{0};
 std::atomic<int> g_bellman_ford_calls{0};
 std::atomic<int> g_bellman_ford_graph_uploads{0};
 std::atomic<int> g_bellman_ford_workspace_constructions{0};
+std::atomic<int> g_near_far_calls{0};
+std::atomic<int> g_near_far_graph_uploads{0};
+std::atomic<int> g_near_far_workspace_constructions{0};
 std::atomic<int> g_unit_bfs_calls{0};
 std::atomic<int> g_unit_bfs_graph_uploads{0};
 std::mutex g_delta_values_mutex;
 std::vector<float> g_delta_values;
+std::vector<float> g_near_far_values;
 std::mutex g_query_limits_mutex;
 std::vector<float> g_delta_distance_limits;
 std::vector<int> g_unit_depth_limits;
@@ -43,6 +48,16 @@ void clear_recorded_deltas() {
 std::vector<float> recorded_deltas() {
   std::lock_guard<std::mutex> lock(g_delta_values_mutex);
   return g_delta_values;
+}
+
+void clear_recorded_near_far_values() {
+  std::lock_guard<std::mutex> lock(g_delta_values_mutex);
+  g_near_far_values.clear();
+}
+
+std::vector<float> recorded_near_far_values() {
+  std::lock_guard<std::mutex> lock(g_delta_values_mutex);
+  return g_near_far_values;
 }
 
 void clear_recorded_query_limits() {
@@ -1089,6 +1104,198 @@ DeltaSteppingCsrResult delta_stepping_minplus_hip_csr(
   return result;
 }
 
+struct NearFarCsrGraph::Impl {
+  explicit Impl(const HostCsrF32& adjacency) : graph(adjacency) {}
+
+  HostCsrF32 graph;
+};
+
+NearFarCsrGraph::NearFarCsrGraph(const HostCsrF32& adjacency,
+                                 hipStream_t stream)
+    : impl_(std::make_shared<Impl>(adjacency)) {
+  (void)stream;
+  ++g_near_far_graph_uploads;
+}
+
+NearFarCsrGraph::~NearFarCsrGraph() = default;
+NearFarCsrGraph::NearFarCsrGraph(NearFarCsrGraph&&) noexcept = default;
+NearFarCsrGraph& NearFarCsrGraph::operator=(NearFarCsrGraph&&) noexcept =
+    default;
+
+struct NearFarCsrWorkspace::Impl {
+  HostCsrF32 graph;
+  std::vector<float> base_values;
+};
+
+NearFarCsrWorkspace::NearFarCsrWorkspace(const HostCsrF32& adjacency,
+                                         hipStream_t stream)
+    : NearFarCsrWorkspace(
+          adjacency, stream, NearFarCsrWorkspaceOptions{}) {}
+
+NearFarCsrWorkspace::NearFarCsrWorkspace(
+    const HostCsrF32& adjacency,
+    hipStream_t stream,
+    NearFarCsrWorkspaceOptions options)
+    : impl_(std::make_unique<Impl>()) {
+  (void)stream;
+  (void)options;
+  ++g_near_far_graph_uploads;
+  ++g_near_far_workspace_constructions;
+  impl_->graph = adjacency;
+  impl_->base_values = adjacency.values;
+}
+
+NearFarCsrWorkspace::NearFarCsrWorkspace(
+    std::shared_ptr<const NearFarCsrGraph> adjacency,
+    hipStream_t stream)
+    : NearFarCsrWorkspace(
+          std::move(adjacency),
+          stream,
+          NearFarCsrWorkspaceOptions{}) {}
+
+NearFarCsrWorkspace::NearFarCsrWorkspace(
+    std::shared_ptr<const NearFarCsrGraph> adjacency,
+    hipStream_t stream,
+    NearFarCsrWorkspaceOptions options)
+    : impl_(std::make_unique<Impl>()) {
+  (void)stream;
+  (void)options;
+  ++g_near_far_workspace_constructions;
+  if (!adjacency || !adjacency->impl_) {
+    throw std::invalid_argument("Near-Far shared graph must not be null");
+  }
+  impl_->graph = adjacency->impl_->graph;
+  impl_->base_values = impl_->graph.values;
+}
+
+NearFarCsrWorkspace::~NearFarCsrWorkspace() = default;
+NearFarCsrWorkspace::NearFarCsrWorkspace(NearFarCsrWorkspace&&) noexcept =
+    default;
+NearFarCsrWorkspace& NearFarCsrWorkspace::operator=(
+    NearFarCsrWorkspace&&) noexcept = default;
+
+void NearFarCsrWorkspace::update_vertex_costs(
+    const std::vector<float>& vertex_costs,
+    hipStream_t stream) {
+  (void)stream;
+  impl_->graph.values.resize(impl_->base_values.size());
+  for (int src = 0; src < impl_->graph.rows; ++src) {
+    for (minplus_sparse::Offset edge =
+             impl_->graph.rowptr[static_cast<std::size_t>(src)];
+         edge < impl_->graph.rowptr[static_cast<std::size_t>(src + 1)];
+         ++edge) {
+      const int dst = impl_->graph.colind[static_cast<std::size_t>(edge)];
+      impl_->graph.values[static_cast<std::size_t>(edge)] =
+          impl_->base_values[static_cast<std::size_t>(edge)] *
+          vertex_costs[static_cast<std::size_t>(dst)];
+    }
+  }
+}
+
+void NearFarCsrWorkspace::clear_vertex_costs(hipStream_t stream) {
+  (void)stream;
+  impl_->graph.values = impl_->base_values;
+}
+
+NearFarCsrResult NearFarCsrWorkspace::run_distances(
+    const std::vector<int>& sources,
+    float delta,
+    int max_iters,
+    hipStream_t stream,
+    NearFarCsrProgressCallback progress_callback,
+    void* progress_user_data) {
+  (void)stream;
+  ++g_near_far_calls;
+  {
+    std::lock_guard<std::mutex> lock(g_delta_values_mutex);
+    g_near_far_values.push_back(delta);
+  }
+  CpuSsspResult cpu_result =
+      cpu_dijkstra_outgoing_csr_multi(impl_->graph, sources);
+  NearFarCsrResult result;
+  result.dist = std::move(cpu_result.dist);
+  result.pred_node = std::move(cpu_result.pred_node);
+  result.pred_edge = std::move(cpu_result.pred_edge);
+  result.iterations_used = 1;
+  result.converged = true;
+  result.target_reached = true;
+  if (progress_callback != nullptr) {
+    progress_callback(
+        NearFarCsrProgress{1, max_iters, true, true},
+        progress_user_data);
+  }
+  return result;
+}
+
+NearFarCsrResult NearFarCsrWorkspace::run(
+    const std::vector<int>& sources,
+    const std::vector<int>& targets,
+    float delta,
+    int max_iters,
+    hipStream_t stream,
+    NearFarCsrProgressCallback progress_callback,
+    void* progress_user_data) {
+  (void)stream;
+  ++g_near_far_calls;
+  {
+    std::lock_guard<std::mutex> lock(g_delta_values_mutex);
+    g_near_far_values.push_back(delta);
+  }
+  NearFarCsrResult result;
+  const CpuSsspResult cpu_result =
+      cpu_dijkstra_outgoing_csr_multi(impl_->graph, sources);
+  fill_compact_target_paths(
+      impl_->graph, sources, targets, cpu_result, result);
+  result.target = -1;
+  result.iterations_used = 1;
+  result.converged = true;
+  result.stopped_on_target = result.target_reached;
+  if (progress_callback != nullptr) {
+    progress_callback(
+        NearFarCsrProgress{1, max_iters, true, true},
+        progress_user_data);
+  }
+  return result;
+}
+
+NearFarCsrResult NearFarCsrWorkspace::run(
+    const std::vector<int>& sources,
+    int target,
+    float delta,
+    int max_iters,
+    hipStream_t stream,
+    NearFarCsrProgressCallback progress_callback,
+    void* progress_user_data) {
+  NearFarCsrResult result = run(sources,
+                                std::vector<int>{target},
+                                delta,
+                                max_iters,
+                                stream,
+                                progress_callback,
+                                progress_user_data);
+  result.target = target;
+  result.target_distance = result.target_distances.front();
+  result.target_reached = std::isfinite(result.target_distance);
+  return result;
+}
+
+NearFarCsrResult NearFarCsrWorkspace::run(
+    int source,
+    int target,
+    float delta,
+    int max_iters,
+    hipStream_t stream,
+    NearFarCsrProgressCallback progress_callback,
+    void* progress_user_data) {
+  return run(std::vector<int>{source},
+             target,
+             delta,
+             max_iters,
+             stream,
+             progress_callback,
+             progress_user_data);
+}
+
 struct UnitBfsCsrGraph::Impl {
   HostCsrF32 graph;
   bool uses_32_bit_offsets = false;
@@ -1371,6 +1578,32 @@ int main() {
     }
     require(rejected,
             "a non-Delta engine must reject Delta-specific controls");
+  }
+
+  routing::PathfinderOptions valid_near_far_controls;
+  valid_near_far_controls.sssp_engine = routing::SsspEngine::kNearFar;
+  valid_near_far_controls.delta_auto = true;
+  valid_near_far_controls.delta_multiplier = 0.5f;
+  valid_near_far_controls.delta_controls_explicit = true;
+  routing::validate_options(valid_near_far_controls);
+  for (const int invalid_control : {0, 1, 2}) {
+    routing::PathfinderOptions invalid_near_far =
+        valid_near_far_controls;
+    if (invalid_control == 0) {
+      invalid_near_far.delta_force_generic = true;
+    } else if (invalid_control == 1) {
+      invalid_near_far.delta_force_legacy_parent = true;
+    } else {
+      invalid_near_far.delta_telemetry = true;
+    }
+    bool rejected = false;
+    try {
+      routing::validate_options(invalid_near_far);
+    } catch (const std::invalid_argument&) {
+      rejected = true;
+    }
+    require(rejected,
+            "Near-Far must reject Delta-only execution and telemetry controls");
   }
 
   HostCsrF32 benchmark_weights_graph = make_tree_graph();
@@ -1813,6 +2046,70 @@ int main() {
                           [](float value) { return value == 2.5f; }),
           "an explicit numeric delta must reach every worker unchanged");
 
+  routing::PathfinderOptions parallel_near_far_options = parallel_options;
+  parallel_near_far_options.sssp_engine = routing::SsspEngine::kNearFar;
+  parallel_near_far_options.delta_auto = true;
+  parallel_near_far_options.delta_multiplier = 0.5f;
+  const float expected_near_far_delta = delta_stepping_auto_delta(
+      congestion_graph,
+      64,
+      parallel_near_far_options.delta_multiplier);
+  g_near_far_calls = 0;
+  g_near_far_graph_uploads = 0;
+  g_near_far_workspace_constructions = 0;
+  g_multisource_delta_calls = 0;
+  g_unit_bfs_calls = 0;
+  clear_recorded_near_far_values();
+  const routing::PathfinderResult parallel_near_far_result =
+      routing::run_pathfinder(congestion_graph,
+                              congestion_metadata,
+                              parallel_near_far_options,
+                              nullptr);
+  require(parallel_near_far_result.routed,
+          "parallel Near-Far routing should preserve routed status");
+  require(parallel_near_far_result.nets[0].sinks[0].nodes ==
+              std::vector<int>({0, 2, 4}) &&
+              parallel_near_far_result.nets[1].sinks[0].nodes ==
+                  std::vector<int>({1, 2, 5}),
+          "Near-Far should preserve compact target paths");
+  require(g_near_far_calls == 2 && g_near_far_graph_uploads == 1,
+          "Near-Far workers should share one graph and route every net");
+  require(g_near_far_workspace_constructions == 2,
+          "two explicit Near-Far workers should own two workspaces");
+  require(g_multisource_delta_calls == 0 && g_unit_bfs_calls == 0,
+          "explicit Near-Far routing should not call another SSSP backend");
+  const std::vector<float> near_far_deltas =
+      recorded_near_far_values();
+  require(near_far_deltas.size() == 2 &&
+              std::all_of(near_far_deltas.begin(),
+                          near_far_deltas.end(),
+                          [expected_near_far_delta](float value) {
+                            return value == expected_near_far_delta;
+                          }),
+          "automatic Near-Far width must reach every worker unchanged");
+
+  routing::PathfinderOptions auto_near_far_options =
+      parallel_near_far_options;
+  auto_near_far_options.parallel_net_workers = 0;
+  g_near_far_calls = 0;
+  g_near_far_graph_uploads = 0;
+  g_near_far_workspace_constructions = 0;
+  clear_recorded_near_far_values();
+  const routing::PathfinderResult auto_near_far_result =
+      routing::run_pathfinder(congestion_graph,
+                              congestion_metadata,
+                              auto_near_far_options,
+                              nullptr);
+  require(auto_near_far_result.routed && g_near_far_calls == 2,
+          "auto-selected Near-Far worker should route every net");
+  require(g_near_far_graph_uploads == 1 &&
+              g_near_far_workspace_constructions == 1,
+          "Near-Far should initially auto-select one shared-graph worker");
+  require(recorded_near_far_values() ==
+              std::vector<float>({expected_near_far_delta,
+                                  expected_near_far_delta}),
+          "the automatic Near-Far worker did not retain the resolved width");
+
   routing::PathfinderOptions parallel_telemetry_options =
       parallel_delta_options;
   parallel_telemetry_options.delta_telemetry = true;
@@ -1983,6 +2280,15 @@ int main() {
   require(std::string(routing::sssp_engine_name(
               routing::SsspEngine::kBellmanFord)) == "bellman-ford",
           "Bellman-Ford engine should have a stable display name");
+  for (const std::string& alias :
+       std::vector<std::string>{"near-far", "near_far", "nearfar"}) {
+    require(routing::parse_sssp_engine_arg(alias.c_str()) ==
+                routing::SsspEngine::kNearFar,
+            "Near-Far engine alias should parse");
+  }
+  require(std::string(routing::sssp_engine_name(
+              routing::SsspEngine::kNearFar)) == "near-far",
+          "Near-Far engine should have a stable display name");
 
   for (const char* compatibility_alias : {"bf9", "bf10"}) {
     routing::PathfinderOptions alias_options = parallel_options;

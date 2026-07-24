@@ -79,6 +79,29 @@ int main() {
                        "--delta-telemetry") == 1,
             "router did not forward delta telemetry exactly once");
 
+    const Options near_far = parse(
+        {"PathFinderFile",
+         "design_unrouted.phys",
+         "design_routed.phys",
+         "--sssp-engine",
+         "near-far",
+         "--delta",
+         "auto",
+         "--delta-multiplier",
+         "0.5",
+         "--parallel-net-workers",
+         "3"});
+    require(near_far.pathfinder_args ==
+                std::vector<std::string>({"--sssp-engine",
+                                          "near-far",
+                                          "--delta",
+                                          "auto",
+                                          "--delta-multiplier",
+                                          "0.5",
+                                          "--parallel-net-workers",
+                                          "3"}),
+            "router did not preserve Near-Far engine and width forwarding");
+
     const Options shorthand = parse(
         {"PathFinderFile",
          "design_unrouted.phys",

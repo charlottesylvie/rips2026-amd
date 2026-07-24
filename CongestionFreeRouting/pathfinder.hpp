@@ -86,6 +86,7 @@ struct RoutedNet {
 enum class SsspEngine {
   kUnitBfs,
   kDeltaStep,
+  kNearFar,
   kBellmanFord,
 };
 
@@ -106,7 +107,7 @@ struct PathfinderOptions {
   // Appended controls preserve positional aggregate compatibility.
   bool delta_force_generic = false;
   // Set by CLI/configuration adapters when --delta or --delta-multiplier was
-  // explicitly supplied, so non-Delta engines cannot silently ignore it.
+  // explicitly supplied, so engines without a distance width cannot ignore it.
   bool delta_controls_explicit = false;
   bool delta_telemetry = false;
 };

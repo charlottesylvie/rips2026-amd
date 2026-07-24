@@ -183,7 +183,7 @@ void print_usage(const char* program) {
       << "  --routes-to-phys <path>        Route reconstructor. Env: ROUTES_TO_PHYS\n"
       << "  Env PATHFINDER_PROFILE_COMMAND Shell prefix applied only to the inner pathfinder command.\n"
       << "  --strict-routing               Fail instead of writing partial routes.\n"
-      << "  --sssp-engine <unit-bfs|delta-step|bellman-ford>\n"
+      << "  --sssp-engine <unit-bfs|delta-step|near-far|bellman-ford>\n"
       << "                                 Forwarded to pathfinder. Default: unit-bfs\n"
       << "  --use-delta-step               Forwarded to pathfinder for comparison.\n"
       << "  --delta-force-generic          Force generic Delta-Stepping even for exact-unit weights.\n"
