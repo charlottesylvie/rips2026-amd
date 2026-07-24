@@ -1,9 +1,11 @@
 #pragma once
 
 #include "../../HIP_kernel/bellman_ford/src/bf_hip_CSR.hpp"
+#include "../sssp_query_capacity.hpp"
 
 #include <hip/hip_runtime.h>
 
+#include <cstddef>
 #include <memory>
 #include <vector>
 
@@ -18,6 +20,37 @@ using UnitBfsCsrResult = BellmanFordCsrResult;
 enum class UnitBfsCsrOffsetMode {
   kAuto,
   kForce64Bit,
+};
+
+// The established host-prefix extraction and sparse-reset visitation paths
+// remain the defaults until the opt-in paths have been validated on AMD HIP.
+enum class UnitBfsCsrExtractionMode {
+  kHostOffsets,
+  kDeviceOffsets,
+};
+
+enum class UnitBfsCsrVisitationMode {
+  kSparseReset,
+  kGenerationStamped,
+};
+
+struct UnitBfsCsrWorkspaceOptions {
+  UnitBfsCsrExtractionMode extraction_mode =
+      UnitBfsCsrExtractionMode::kHostOffsets;
+  UnitBfsCsrVisitationMode visitation_mode =
+      UnitBfsCsrVisitationMode::kSparseReset;
+  // Zero-valued fields are equivalent to no reservation hint. Hints reserve
+  // only source/target-derived buffers; compact paths remain demand-driven.
+  SsspQueryCapacityHints capacity_hints{};
+};
+
+struct UnitBfsCsrAllocationState {
+  std::size_t source_capacity = 0;
+  std::size_t target_capacity = 0;
+  std::size_t target_metadata_capacity = 0;
+  std::size_t target_offset_capacity = 0;
+  std::size_t compact_path_node_capacity = 0;
+  std::size_t compact_path_edge_capacity = 0;
 };
 
 // Immutable device CSR that can be shared by independent BFS workspaces.
@@ -59,15 +92,28 @@ class UnitBfsCsrWorkspace {
   UnitBfsCsrWorkspace(const HostCsrF32& adjacency,
                       hipStream_t stream,
                       UnitBfsCsrOffsetMode offset_mode);
+  UnitBfsCsrWorkspace(const HostCsrF32& adjacency,
+                      hipStream_t stream,
+                      UnitBfsCsrWorkspaceOptions options);
+  UnitBfsCsrWorkspace(const HostCsrF32& adjacency,
+                      hipStream_t stream,
+                      UnitBfsCsrOffsetMode offset_mode,
+                      UnitBfsCsrWorkspaceOptions options);
   explicit UnitBfsCsrWorkspace(
       std::shared_ptr<const UnitBfsCsrGraph> adjacency,
       hipStream_t stream = nullptr);
+  UnitBfsCsrWorkspace(
+      std::shared_ptr<const UnitBfsCsrGraph> adjacency,
+      hipStream_t stream,
+      UnitBfsCsrWorkspaceOptions options);
   ~UnitBfsCsrWorkspace();
 
   UnitBfsCsrWorkspace(const UnitBfsCsrWorkspace&) = delete;
   UnitBfsCsrWorkspace& operator=(const UnitBfsCsrWorkspace&) = delete;
   UnitBfsCsrWorkspace(UnitBfsCsrWorkspace&&) noexcept;
   UnitBfsCsrWorkspace& operator=(UnitBfsCsrWorkspace&&) noexcept;
+
+  UnitBfsCsrAllocationState allocation_state() const noexcept;
 
   UnitBfsCsrResult run(
       const std::vector<int>& sources,

@@ -1,10 +1,12 @@
 #include "unit_bfs_hip_CSR.hpp"
+#include "unit_bfs_policy.hpp"
 
 #include <hip/hip_cooperative_groups.h>
 #include <hip/hip_runtime.h>
 
 #include <algorithm>
 #include <array>
+#include <climits>
 #include <cmath>
 #include <cstdint>
 #include <exception>
@@ -22,6 +24,7 @@ namespace unit_bfs_detail {
 using minplus_sparse::Index;
 using minplus_sparse::Offset;
 using CompactOffset = std::int32_t;
+using PackedVisitState = unsigned long long;
 
 static_assert(sizeof(CompactOffset) == 4,
               "unit BFS compact offsets must be 32-bit");
@@ -59,6 +62,13 @@ enum UnitBfsPathStatus : int {
   kPathInvalidEpoch = -6,
 };
 
+enum UnitBfsOffsetScanStatus : int {
+  kOffsetScanNotPublished = 0,
+  kOffsetScanValid = 1,
+  kOffsetScanInvalidMetadata = -1,
+  kOffsetScanOverflow = -2,
+};
+
 struct TargetPathMetadata {
   float distance;
   int length;
@@ -67,6 +77,16 @@ struct TargetPathMetadata {
   std::uint32_t query_epoch;
   std::uint32_t validation_epoch;
 };
+
+struct TargetPathTotals {
+  int total_nodes;
+  int total_edges;
+  int status;
+  std::uint32_t query_epoch;
+};
+
+static_assert(sizeof(TargetPathTotals) == 4 * sizeof(std::uint32_t),
+              "unit BFS totals descriptor must remain one packed record");
 
 static_assert(sizeof(TargetPathMetadata) == 6 * sizeof(std::uint32_t),
               "unit BFS target metadata must remain one packed 24-byte record");
@@ -152,14 +172,19 @@ class DeviceBuffer {
   }
 
   void reset(std::size_t count) {
-    release();
-    if (count != 0) {
-      T* candidate = nullptr;
-      UNIT_BFS_HIP_CHECK(
-          hipMalloc(reinterpret_cast<void**>(&candidate), count * sizeof(T)));
-      ptr_ = candidate;
-      count_ = count;
+    if (count == count_) return;
+    if (count == 0) {
+      release();
+      return;
     }
+    T* candidate = nullptr;
+    UNIT_BFS_HIP_CHECK(hipMalloc(reinterpret_cast<void**>(&candidate),
+                                sssp_capacity::checked_bytes<T>(count)));
+    if (ptr_ != nullptr) {
+      (void)hipFree(ptr_);
+    }
+    ptr_ = candidate;
+    count_ = count;
   }
 
   T* get() const { return ptr_; }
@@ -199,7 +224,7 @@ class PinnedHostBuffer {
     if (count != 0) {
       UNIT_BFS_HIP_CHECK(
           hipHostMalloc(reinterpret_cast<void**>(&candidate),
-                        count * sizeof(T),
+                        sssp_capacity::checked_bytes<T>(count),
                         hipHostMallocDefault));
     }
     if (ptr_ != nullptr) {
@@ -232,7 +257,7 @@ struct OutgoingCsrOwner {
   Offset nnz = 0;
   bool uses_32_bit_offsets = false;
   int batched_launch_blocks = 1;
-  int cooperative_launch_blocks = 0;
+  int sparse_cooperative_launch_blocks = 0;
   DeviceBuffer<CompactOffset> rowptr32;
   DeviceBuffer<Offset> rowptr64;
   DeviceBuffer<Index> colind;
@@ -247,21 +272,29 @@ struct OutgoingCsrOwner {
         nnz(nnz_),
         uses_32_bit_offsets(uses_32_bit_offsets_),
         rowptr32(uses_32_bit_offsets
-                     ? static_cast<std::size_t>(rows_) + 1
+                     ? sssp_capacity::checked_add(
+                           static_cast<std::size_t>(rows_), 1)
                      : 0),
         rowptr64(uses_32_bit_offsets
                      ? 0
-                     : static_cast<std::size_t>(rows_) + 1),
+                     : sssp_capacity::checked_add(
+                           static_cast<std::size_t>(rows_), 1)),
         colind(static_cast<std::size_t>(nnz_)) {}
 };
 
 struct UnitBfsScratch {
   Offset rows = 0;
   bool uses_32_bit_offsets = false;
+  UnitBfsCsrExtractionMode extraction_mode =
+      UnitBfsCsrExtractionMode::kHostOffsets;
+  UnitBfsCsrVisitationMode visitation_mode =
+      UnitBfsCsrVisitationMode::kSparseReset;
+  int generation_cooperative_launch_blocks = 0;
   DeviceBuffer<int> sources;
   DeviceBuffer<int> targets;
   DeviceBuffer<int> target_multiplicity;
   DeviceBuffer<int> level;
+  DeviceBuffer<PackedVisitState> generation_level;
   DeviceBuffer<int> pred_node;
   DeviceBuffer<CompactOffset> pred_edge32;
   DeviceBuffer<Offset> pred_edge64;
@@ -283,19 +316,32 @@ struct UnitBfsScratch {
   DeviceBuffer<int> target_edge_offsets;
   PinnedHostBuffer<int> host_target_node_offsets;
   PinnedHostBuffer<int> host_target_edge_offsets;
+  DeviceBuffer<TargetPathTotals> target_totals;
+  PinnedHostBuffer<TargetPathTotals> host_target_totals;
   DeviceBuffer<int> compact_path_nodes;
   DeviceBuffer<Offset> compact_path_edges;
   PinnedHostBuffer<int> host_compact_path_nodes;
   PinnedHostBuffer<Offset> host_compact_path_edges;
   std::uint32_t query_epoch = 0;
+  std::uint32_t visitation_generation = 0;
   bool initialized = false;
 
   UnitBfsScratch() = default;
-  UnitBfsScratch(Offset rows_, bool uses_32_bit_offsets_)
+  UnitBfsScratch(Offset rows_,
+                 bool uses_32_bit_offsets_,
+                 UnitBfsCsrWorkspaceOptions options)
       : rows(rows_),
         uses_32_bit_offsets(uses_32_bit_offsets_),
+        extraction_mode(options.extraction_mode),
+        visitation_mode(options.visitation_mode),
         target_multiplicity(static_cast<std::size_t>(rows_)),
-        level(static_cast<std::size_t>(rows_)),
+        level(visitation_mode == UnitBfsCsrVisitationMode::kSparseReset
+                  ? static_cast<std::size_t>(rows_)
+                  : 0),
+        generation_level(
+            visitation_mode == UnitBfsCsrVisitationMode::kGenerationStamped
+                ? static_cast<std::size_t>(rows_)
+                : 0),
         pred_node(static_cast<std::size_t>(rows_)),
         pred_edge32(uses_32_bit_offsets
                         ? static_cast<std::size_t>(rows_)
@@ -305,51 +351,82 @@ struct UnitBfsScratch {
                         : static_cast<std::size_t>(rows_)),
         frontier_queue(static_cast<std::size_t>(rows_)),
         status(kStatusCount),
-        host_status(kStatusCount) {}
+        host_status(kStatusCount),
+        target_totals(
+            extraction_mode == UnitBfsCsrExtractionMode::kDeviceOffsets ? 1
+                                                                         : 0),
+        host_target_totals(
+            extraction_mode == UnitBfsCsrExtractionMode::kDeviceOffsets ? 1
+                                                                         : 0) {
+    sssp_capacity::validate_reservation(options.capacity_hints);
+    ensure_source_capacity(options.capacity_hints.max_sources);
+    ensure_target_capacity(options.capacity_hints.max_targets);
+  }
 
   void ensure_source_capacity(std::size_t source_count) {
     if (sources.size() < source_count) {
-      sources.reset(source_count);
+      sources.reset(unit_bfs_policy::bounded_geometric_capacity(
+          sources.size(),
+          sssp_capacity::checked_device_count(source_count),
+          static_cast<std::size_t>(std::numeric_limits<int>::max())));
     }
   }
 
   void ensure_target_capacity(std::size_t target_count) {
+    if (target_count == 0) return;
+    const std::size_t capacity =
+        unit_bfs_policy::bounded_geometric_capacity(
+            targets.size(),
+            sssp_capacity::checked_device_count(target_count),
+            static_cast<std::size_t>(std::numeric_limits<int>::max()));
+    const std::size_t offset_capacity =
+        sssp_capacity::checked_target_offset_count(capacity);
     if (targets.size() < target_count) {
-      targets.reset(target_count);
+      targets.reset(capacity);
     }
     if (target_metadata.size() < target_count) {
-      target_metadata.reset(target_count);
+      target_metadata.reset(capacity);
     }
     if (host_target_metadata.size() < target_count) {
-      host_target_metadata.reset(target_count);
+      host_target_metadata.reset(capacity);
     }
-    if (target_node_offsets.size() < target_count + 1) {
-      target_node_offsets.reset(target_count + 1);
+    const std::size_t required_offsets =
+        sssp_capacity::checked_target_offset_count(target_count);
+    if (target_node_offsets.size() < required_offsets) {
+      target_node_offsets.reset(offset_capacity);
     }
-    if (host_target_node_offsets.size() < target_count + 1) {
-      host_target_node_offsets.reset(target_count + 1);
+    if (host_target_node_offsets.size() < required_offsets) {
+      host_target_node_offsets.reset(offset_capacity);
     }
-    if (target_edge_offsets.size() < target_count + 1) {
-      target_edge_offsets.reset(target_count + 1);
+    if (target_edge_offsets.size() < required_offsets) {
+      target_edge_offsets.reset(offset_capacity);
     }
-    if (host_target_edge_offsets.size() < target_count + 1) {
-      host_target_edge_offsets.reset(target_count + 1);
+    if (host_target_edge_offsets.size() < required_offsets) {
+      host_target_edge_offsets.reset(offset_capacity);
     }
   }
 
   void ensure_compact_path_capacity(std::size_t node_count,
                                     std::size_t edge_count) {
+    const std::size_t device_limit =
+        static_cast<std::size_t>(std::numeric_limits<int>::max());
     if (compact_path_nodes.size() < node_count) {
-      compact_path_nodes.reset(node_count);
+      compact_path_nodes.reset(unit_bfs_policy::bounded_geometric_capacity(
+          compact_path_nodes.size(),
+          sssp_capacity::checked_device_count(node_count),
+          device_limit));
     }
     if (host_compact_path_nodes.size() < node_count) {
-      host_compact_path_nodes.reset(node_count);
+      host_compact_path_nodes.reset(compact_path_nodes.size());
     }
     if (compact_path_edges.size() < edge_count) {
-      compact_path_edges.reset(edge_count);
+      compact_path_edges.reset(unit_bfs_policy::bounded_geometric_capacity(
+          compact_path_edges.size(),
+          sssp_capacity::checked_device_count(edge_count),
+          device_limit));
     }
     if (host_compact_path_edges.size() < edge_count) {
-      host_compact_path_edges.reset(edge_count);
+      host_compact_path_edges.reset(compact_path_edges.size());
     }
   }
 
@@ -358,6 +435,13 @@ struct UnitBfsScratch {
       throw std::overflow_error("unit BFS workspace query epoch exhausted");
     }
     return ++query_epoch;
+  }
+
+  std::uint32_t begin_generation_query() {
+    if (visitation_generation == std::numeric_limits<std::uint32_t>::max()) {
+      return 0;
+    }
+    return ++visitation_generation;
   }
 };
 
@@ -450,6 +534,68 @@ __device__ inline int atomic_load_int(const int* address) {
   return atomicAdd(const_cast<int*>(address), 0);
 }
 
+__device__ inline PackedVisitState atomic_load_packed_visit(
+    const PackedVisitState* address) {
+  return atomicCAS(const_cast<PackedVisitState*>(address), 0ULL, 0ULL);
+}
+
+__device__ inline PackedVisitState packed_visit(std::uint32_t generation,
+                                                int level) {
+  return (static_cast<PackedVisitState>(generation) << 32) |
+         static_cast<std::uint32_t>(level);
+}
+
+template <bool UseGeneration>
+__device__ inline int load_visit_level(const int* level,
+                                       const PackedVisitState* generation_level,
+                                       int vertex,
+                                       std::uint32_t generation) {
+  if constexpr (!UseGeneration) {
+    return atomic_load_int(level + vertex);
+  } else {
+    const PackedVisitState state =
+        atomic_load_packed_visit(generation_level + vertex);
+    return static_cast<std::uint32_t>(state >> 32) == generation
+               ? static_cast<int>(static_cast<std::uint32_t>(state))
+               : kUnvisited;
+  }
+}
+
+template <bool UseGeneration>
+__device__ inline bool claim_visit(int* level,
+                                   PackedVisitState* generation_level,
+                                   int vertex,
+                                   std::uint32_t generation,
+                                   int next_level) {
+  if constexpr (!UseGeneration) {
+    return atomicCAS(&level[vertex], kUnvisited, next_level) == kUnvisited;
+  } else {
+    PackedVisitState observed =
+        atomic_load_packed_visit(generation_level + vertex);
+    const PackedVisitState desired = packed_visit(generation, next_level);
+    while (static_cast<std::uint32_t>(observed >> 32) != generation) {
+      const PackedVisitState prior =
+          atomicCAS(generation_level + vertex, observed, desired);
+      if (prior == observed) return true;
+      observed = prior;
+    }
+    return false;
+  }
+}
+
+template <bool UseGeneration>
+__device__ inline void publish_source_visit(
+    int* level,
+    PackedVisitState* generation_level,
+    int vertex,
+    std::uint32_t generation) {
+  if constexpr (!UseGeneration) {
+    atomicExch(level + vertex, 0);
+  } else {
+    atomicExch(generation_level + vertex, packed_visit(generation, 0));
+  }
+}
+
 __device__ inline void count_target_if_reached(int v,
                                                const int* target_multiplicity,
                                                int* found_count) {
@@ -475,14 +621,31 @@ __device__ inline int append_position(bool append, int* queue_tail) {
   return append ? atomicAdd(queue_tail, 1) : -1;
 }
 
-__global__ void initialize_bfs_arrays_kernel(Offset rows,
-                                             int* level,
-                                             int* target_multiplicity) {
+template <bool UseGeneration>
+__global__ void initialize_bfs_arrays_kernel(
+    Offset rows,
+    int* level,
+    PackedVisitState* generation_level,
+    int* target_multiplicity) {
   for (Offset v = static_cast<Offset>(blockIdx.x) * blockDim.x + threadIdx.x;
        v < rows;
        v += static_cast<Offset>(blockDim.x) * gridDim.x) {
-    atomicExch(&level[v], kUnvisited);
+    if constexpr (!UseGeneration) {
+      atomicExch(&level[v], kUnvisited);
+    } else {
+      atomicExch(&generation_level[v], 0ULL);
+    }
     atomicExch(&target_multiplicity[v], 0);
+  }
+}
+
+__global__ void reset_generation_levels_kernel(
+    Offset rows,
+    PackedVisitState* generation_level) {
+  for (Offset v = static_cast<Offset>(blockIdx.x) * blockDim.x + threadIdx.x;
+       v < rows;
+       v += static_cast<Offset>(blockDim.x) * gridDim.x) {
+    atomicExch(&generation_level[v], 0ULL);
   }
 }
 
@@ -497,13 +660,15 @@ __global__ void reset_visited_levels_kernel(const int* frontier_queue,
   }
 }
 
-template <typename EdgeOffset>
+template <typename EdgeOffset, bool UseGeneration>
 __global__ void initialize_sources_kernel(const int* sources,
                                           int source_count,
                                           int initially_found,
                                           int target_count,
                                           int max_depth,
+                                          std::uint32_t generation,
                                           int* level,
+                                          PackedVisitState* generation_level,
                                           int* pred_node,
                                           EdgeOffset* pred_edge,
                                           int* frontier_queue,
@@ -529,18 +694,21 @@ __global__ void initialize_sources_kernel(const int* sources,
     pred_edge[source] = static_cast<EdgeOffset>(-1);
     frontier_queue[i] = source;
     __threadfence();
-    atomicExch(&level[source], 0);
+    publish_source_visit<UseGeneration>(
+        level, generation_level, source, generation);
   }
 }
 
-template <typename EdgeOffset>
+template <typename EdgeOffset, bool UseGeneration>
 __device__ inline void expand_frontier_range(
     int frontier_begin,
     int frontier_end,
     int next_level,
     const EdgeOffset* out_rowptr,
     const Index* out_colind,
+    std::uint32_t generation,
     int* level,
+    PackedVisitState* generation_level,
     int* pred_node,
     EdgeOffset* pred_edge,
     int* frontier_queue,
@@ -556,8 +724,8 @@ __device__ inline void expand_frontier_range(
       // The CAS must be unconditional. An ordinary precheck can retain a
       // finite value from the previous route after sparse reset and skip the
       // authoritative claim, leaving an old level/predecessor pair in place.
-      const bool claimed =
-          atomicCAS(&level[v], kUnvisited, next_level) == kUnvisited;
+      const bool claimed = claim_visit<UseGeneration>(
+          level, generation_level, v, generation, next_level);
       if (claimed) {
         pred_node[v] = u;
         pred_edge[v] = edge;
@@ -573,10 +741,12 @@ __device__ inline void expand_frontier_range(
   }
 }
 
-template <typename EdgeOffset>
+template <typename EdgeOffset, bool UseGeneration>
 __global__ void expand_frontier_kernel(const EdgeOffset* out_rowptr,
                                        const Index* out_colind,
+                                       std::uint32_t generation,
                                        int* level,
+                                       PackedVisitState* generation_level,
                                        int* pred_node,
                                        EdgeOffset* pred_edge,
                                        int* frontier_queue,
@@ -595,46 +765,53 @@ __global__ void expand_frontier_kernel(const EdgeOffset* out_rowptr,
   if (controller[0] == 0) {
     return;
   }
-  expand_frontier_range(controller[1],
-                        controller[2],
-                        controller[3] + 1,
-                        out_rowptr,
-                        out_colind,
-                        level,
-                        pred_node,
-                        pred_edge,
-                        frontier_queue,
-                        target_multiplicity,
-                        status + kStatusQueueTail,
-                        status + kStatusFoundCount);
+  expand_frontier_range<EdgeOffset, UseGeneration>(
+      controller[1],
+      controller[2],
+      controller[3] + 1,
+      out_rowptr,
+      out_colind,
+      generation,
+      level,
+      generation_level,
+      pred_node,
+      pred_edge,
+      frontier_queue,
+      target_multiplicity,
+      status + kStatusQueueTail,
+      status + kStatusFoundCount);
 }
 
-template <typename EdgeOffset>
+template <typename EdgeOffset, bool UseGeneration>
 __global__ void expand_frontier_host_controlled_kernel(
     int frontier_begin,
     int frontier_end,
     int next_level,
     const EdgeOffset* out_rowptr,
     const Index* out_colind,
+    std::uint32_t generation,
     int* level,
+    PackedVisitState* generation_level,
     int* pred_node,
     EdgeOffset* pred_edge,
     int* frontier_queue,
     const int* target_multiplicity,
     int* queue_tail,
     int* found_count) {
-  expand_frontier_range(frontier_begin,
-                        frontier_end,
-                        next_level,
-                        out_rowptr,
-                        out_colind,
-                        level,
-                        pred_node,
-                        pred_edge,
-                        frontier_queue,
-                        target_multiplicity,
-                        queue_tail,
-                        found_count);
+  expand_frontier_range<EdgeOffset, UseGeneration>(frontier_begin,
+                                                   frontier_end,
+                                                   next_level,
+                                                   out_rowptr,
+                                                   out_colind,
+                                                   generation,
+                                                   level,
+                                                   generation_level,
+                                                   pred_node,
+                                                   pred_edge,
+                                                   frontier_queue,
+                                                   target_multiplicity,
+                                                   queue_tail,
+                                                   found_count);
 }
 
 __global__ void advance_frontier_kernel(int target_count,
@@ -662,14 +839,16 @@ __global__ void advance_frontier_kernel(int target_count,
           completed_depth < max_depth);
 }
 
-template <typename EdgeOffset>
+template <typename EdgeOffset, bool UseGeneration>
 __global__ void cooperative_frontier_controller_kernel(
     const EdgeOffset* out_rowptr,
     const Index* out_colind,
     int target_count,
     int max_depth,
     int level_budget,
+    std::uint32_t generation,
     int* level,
+    PackedVisitState* generation_level,
     int* pred_node,
     EdgeOffset* pred_edge,
     int* frontier_queue,
@@ -701,18 +880,21 @@ __global__ void cooperative_frontier_controller_kernel(
     const int frontier_end = controller[2];
     const int next_level = controller[3] + 1;
 
-    expand_frontier_range(frontier_begin,
-                          frontier_end,
-                          next_level,
-                          out_rowptr,
-                          out_colind,
-                          level,
-                          pred_node,
-                          pred_edge,
-                          frontier_queue,
-                          target_multiplicity,
-                          status + kStatusQueueTail,
-                          status + kStatusFoundCount);
+    expand_frontier_range<EdgeOffset, UseGeneration>(
+        frontier_begin,
+        frontier_end,
+        next_level,
+        out_rowptr,
+        out_colind,
+        generation,
+        level,
+        generation_level,
+        pred_node,
+        pred_edge,
+        frontier_queue,
+        target_multiplicity,
+        status + kStatusQueueTail,
+        status + kStatusFoundCount);
     grid.sync();
 
     if (grid.thread_rank() == 0) {
@@ -757,16 +939,20 @@ __global__ void clear_target_multiplicity_kernel(const int* targets,
   }
 }
 
-__global__ void measure_target_paths_kernel(const int* targets,
-                                            int target_count,
-                                            const int* level,
-                                            std::uint32_t query_epoch,
-                                            TargetPathMetadata* metadata) {
+template <bool UseGeneration>
+__global__ void measure_target_paths_kernel(
+    const int* targets,
+    int target_count,
+    const int* level,
+    const PackedVisitState* generation_level,
+    std::uint32_t query_epoch,
+    TargetPathMetadata* metadata) {
   for (int i = blockIdx.x * blockDim.x + threadIdx.x;
        i < target_count;
        i += blockDim.x * gridDim.x) {
     const int target = targets[i];
-    const int target_level = atomic_load_int(level + target);
+    const int target_level = load_visit_level<UseGeneration>(
+        level, generation_level, target, query_epoch);
     metadata[i].distance =
         target_level == kUnvisited ? INFINITY : static_cast<float>(target_level);
     metadata[i].length =
@@ -782,6 +968,49 @@ __global__ void measure_target_paths_kernel(const int* targets,
   }
 }
 
+__global__ void scan_target_path_offsets_kernel(
+    const TargetPathMetadata* metadata,
+    int target_count,
+    std::uint32_t query_epoch,
+    int* node_offsets,
+    int* edge_offsets,
+    TargetPathTotals* totals) {
+  if (blockIdx.x != 0 || threadIdx.x != 0) return;
+
+  totals->query_epoch = query_epoch;
+  totals->total_nodes = 0;
+  totals->total_edges = 0;
+  atomic_store_status(&totals->status, kOffsetScanNotPublished);
+  node_offsets[0] = 0;
+  edge_offsets[0] = 0;
+  int total_nodes = 0;
+  int total_edges = 0;
+  int scan_status = kOffsetScanValid;
+  for (int i = 0; i < target_count; ++i) {
+    const TargetPathMetadata item = metadata[i];
+    if (item.query_epoch != query_epoch || item.validation_epoch != 0 ||
+        item.status != kPathNotValidated) {
+      scan_status = kOffsetScanInvalidMetadata;
+      break;
+    }
+    const int nodes = item.length > 0 && isfinite(item.distance) ? item.length : 0;
+    const int edges = nodes > 0 ? nodes - 1 : 0;
+    if (nodes < 0 || edges < 0 || total_nodes > INT_MAX - nodes ||
+        total_edges > INT_MAX - edges) {
+      scan_status = kOffsetScanOverflow;
+      break;
+    }
+    total_nodes += nodes;
+    total_edges += edges;
+    node_offsets[i + 1] = total_nodes;
+    edge_offsets[i + 1] = total_edges;
+  }
+  totals->total_nodes = total_nodes;
+  totals->total_edges = total_edges;
+  __threadfence_system();
+  atomic_store_status(&totals->status, scan_status);
+}
+
 __device__ inline void publish_path_status(TargetPathMetadata* metadata,
                                            std::uint32_t query_epoch,
                                            int status) {
@@ -790,7 +1019,7 @@ __device__ inline void publish_path_status(TargetPathMetadata* metadata,
   atomic_store_status(&metadata->status, status);
 }
 
-template <typename EdgeOffset>
+template <typename EdgeOffset, bool UseGeneration>
 __global__ void fill_target_paths_kernel(const int* targets,
                                          int target_count,
                                          Offset rows,
@@ -799,6 +1028,7 @@ __global__ void fill_target_paths_kernel(const int* targets,
                                          const int* pred_node,
                                          const EdgeOffset* pred_edge,
                                          const int* level,
+                                         const PackedVisitState* generation_level,
                                          TargetPathMetadata* metadata,
                                          std::uint32_t query_epoch,
                                          const int* node_offsets,
@@ -848,7 +1078,8 @@ __global__ void fill_target_paths_kernel(const int* targets,
         failure_status = kPathInvalidEdge;
         break;
       }
-      if (atomic_load_int(level + pred) != j - 1) {
+      if (load_visit_level<UseGeneration>(
+              level, generation_level, pred, query_epoch) != j - 1) {
         failure_status = kPathInvalidLevel;
         break;
       }
@@ -860,7 +1091,8 @@ __global__ void fill_target_paths_kernel(const int* targets,
       publish_path_status(&metadata[i], query_epoch, failure_status);
       continue;
     }
-    if (atomic_load_int(level + current) != 0 ||
+    if (load_visit_level<UseGeneration>(
+            level, generation_level, current, query_epoch) != 0 ||
         atomic_load_int(pred_node + current) != current) {
       publish_path_status(
           &metadata[i], query_epoch, kPathInvalidRoot);
@@ -897,7 +1129,7 @@ static_assert(!nnz_fits_32_bit_offsets(
                       std::numeric_limits<CompactOffset>::max()) + 1),
               "graphs above INT32_MAX edges must retain wide offsets");
 
-template <typename EdgeOffset>
+template <typename EdgeOffset, bool UseGeneration>
 int cooperative_controller_blocks(Offset rows) {
   int device = -1;
   UNIT_BFS_HIP_CHECK(hipGetDevice(&device));
@@ -919,7 +1151,7 @@ int cooperative_controller_blocks(Offset rows) {
   const hipError_t occupancy_status =
       hipOccupancyMaxActiveBlocksPerMultiprocessor(
           &active_blocks_per_compute_unit,
-          cooperative_frontier_controller_kernel<EdgeOffset>,
+          cooperative_frontier_controller_kernel<EdgeOffset, UseGeneration>,
           kBlockSize,
           0);
   if (occupancy_status != hipSuccess ||
@@ -982,22 +1214,22 @@ OutgoingCsrOwner copy_host_csr_to_device(
       grid_for_items(host.rows),
       std::min<long long>(kMaxGridX,
                           compute_units * kBatchBlocksPerComputeUnit)));
-  device.cooperative_launch_blocks =
+  device.sparse_cooperative_launch_blocks =
       uses_32_bit_offsets
-          ? cooperative_controller_blocks<CompactOffset>(host.rows)
-          : cooperative_controller_blocks<Offset>(host.rows);
+          ? cooperative_controller_blocks<CompactOffset, false>(host.rows)
+          : cooperative_controller_blocks<Offset, false>(host.rows);
   const std::size_t rows = checked_size(host.rows, "rows");
   const std::size_t nnz = checked_size(host.nnz, "nnz");
   if (nnz != 0) {
     UNIT_BFS_HIP_CHECK(hipMemcpyAsync(device.colind.get(),
                                       host.colind.data(),
-                                      nnz * sizeof(Index),
+                                      sssp_capacity::checked_bytes<Index>(nnz),
                                       hipMemcpyHostToDevice,
                                       stream));
   }
   std::vector<CompactOffset> compact_rowptr;
   if (uses_32_bit_offsets) {
-    compact_rowptr.resize(rows + 1);
+    compact_rowptr.resize(sssp_capacity::checked_add(rows, 1));
     std::transform(host.rowptr.begin(),
                    host.rowptr.end(),
                    compact_rowptr.begin(),
@@ -1008,12 +1240,14 @@ OutgoingCsrOwner copy_host_csr_to_device(
     // than relying on pageable-host async-copy behavior for its lifetime.
     UNIT_BFS_HIP_CHECK(hipMemcpy(device.rowptr32.get(),
                                  compact_rowptr.data(),
-                                 (rows + 1) * sizeof(CompactOffset),
+                                 sssp_capacity::checked_bytes<CompactOffset>(
+                                     sssp_capacity::checked_add(rows, 1)),
                                  hipMemcpyHostToDevice));
   } else {
     UNIT_BFS_HIP_CHECK(hipMemcpyAsync(device.rowptr64.get(),
                                       host.rowptr.data(),
-                                      (rows + 1) * sizeof(Offset),
+                                      sssp_capacity::checked_bytes<Offset>(
+                                          sssp_capacity::checked_add(rows, 1)),
                                       hipMemcpyHostToDevice,
                                       stream));
   }
@@ -1028,10 +1262,21 @@ void initialize_scratch_once(UnitBfsScratch& scratch, Offset rows, hipStream_t s
     return;
   }
 
-  initialize_bfs_arrays_kernel<<<grid_for_items(rows), kBlockSize, 0, stream>>>(
-      rows,
-      scratch.level.get(),
-      scratch.target_multiplicity.get());
+  if (scratch.visitation_mode == UnitBfsCsrVisitationMode::kSparseReset) {
+    initialize_bfs_arrays_kernel<false>
+        <<<grid_for_items(rows), kBlockSize, 0, stream>>>(
+            rows,
+            scratch.level.get(),
+            nullptr,
+            scratch.target_multiplicity.get());
+  } else {
+    initialize_bfs_arrays_kernel<true>
+        <<<grid_for_items(rows), kBlockSize, 0, stream>>>(
+            rows,
+            nullptr,
+            scratch.generation_level.get(),
+            scratch.target_multiplicity.get());
+  }
   UNIT_BFS_HIP_CHECK(hipGetLastError());
   // This is the only full-array initialization for the workspace. Publish its
   // completion before the first query so later runs depend only on their sparse
@@ -1043,6 +1288,10 @@ void initialize_scratch_once(UnitBfsScratch& scratch, Offset rows, hipStream_t s
 void reset_visited_levels(UnitBfsScratch& scratch,
                           int visited_count,
                           hipStream_t stream) {
+  if (scratch.visitation_mode ==
+      UnitBfsCsrVisitationMode::kGenerationStamped) {
+    return;
+  }
   if (visited_count > 0) {
     reset_visited_levels_kernel<<<grid_for_items(visited_count),
                                   kBlockSize,
@@ -1053,11 +1302,36 @@ void reset_visited_levels(UnitBfsScratch& scratch,
   }
 }
 
+std::uint32_t begin_query_epoch(UnitBfsScratch& scratch,
+                                hipStream_t stream) {
+  if (scratch.visitation_mode == UnitBfsCsrVisitationMode::kSparseReset) {
+    return scratch.begin_query();
+  }
+  std::uint32_t generation = scratch.begin_generation_query();
+  if (generation != 0) return generation;
+
+  // No earlier query may still observe the generation being recycled. Every
+  // successful/exceptional run already drains this stream, and this explicit
+  // boundary makes rollover safe even if that contract changes later.
+  UNIT_BFS_HIP_CHECK(hipStreamSynchronize(stream));
+  reset_generation_levels_kernel
+      <<<grid_for_items(scratch.rows), kBlockSize, 0, stream>>>(
+          scratch.rows, scratch.generation_level.get());
+  UNIT_BFS_HIP_CHECK(hipGetLastError());
+  UNIT_BFS_HIP_CHECK(hipStreamSynchronize(stream));
+  scratch.visitation_generation = 0;
+  generation = scratch.begin_generation_query();
+  if (generation == 0) {
+    throw std::logic_error("unit BFS generation rollover did not restart");
+  }
+  return generation;
+}
+
 std::array<int, kStatusCount> copy_status_to_host(UnitBfsScratch& scratch,
                                                   hipStream_t stream) {
   copy_control_synchronously(scratch.host_status.get(),
                              scratch.status.get(),
-                             kStatusCount * sizeof(int),
+                             sssp_capacity::checked_bytes<int>(kStatusCount),
                              hipMemcpyDeviceToHost,
                              stream);
   std::array<int, kStatusCount> status{};
@@ -1065,12 +1339,13 @@ std::array<int, kStatusCount> copy_status_to_host(UnitBfsScratch& scratch,
   return status;
 }
 
-template <typename EdgeOffset>
+template <typename EdgeOffset, bool UseGeneration>
 void launch_cooperative_controller(
     const OutgoingCsrOwner& outgoing,
     const EdgeOffset* out_rowptr,
     UnitBfsScratch& scratch,
     EdgeOffset* pred_edge,
+    std::uint32_t generation,
     int target_count,
     int max_depth,
     hipStream_t stream) {
@@ -1079,7 +1354,9 @@ void launch_cooperative_controller(
   int target_count_arg = target_count;
   int max_depth_arg = max_depth;
   int level_budget_arg = kCooperativeLevelsPerLaunch;
+  std::uint32_t generation_arg = generation;
   int* level_arg = scratch.level.get();
+  PackedVisitState* generation_level_arg = scratch.generation_level.get();
   int* pred_node_arg = scratch.pred_node.get();
   EdgeOffset* pred_edge_arg = pred_edge;
   int* frontier_queue_arg = scratch.frontier_queue.get();
@@ -1091,7 +1368,9 @@ void launch_cooperative_controller(
       &target_count_arg,
       &max_depth_arg,
       &level_budget_arg,
+      &generation_arg,
       &level_arg,
+      &generation_level_arg,
       &pred_node_arg,
       &pred_edge_arg,
       &frontier_queue_arg,
@@ -1100,15 +1379,17 @@ void launch_cooperative_controller(
   };
 
   UNIT_BFS_HIP_CHECK(hipLaunchCooperativeKernel(
-      cooperative_frontier_controller_kernel<EdgeOffset>,
-      dim3(static_cast<unsigned>(outgoing.cooperative_launch_blocks)),
+      cooperative_frontier_controller_kernel<EdgeOffset, UseGeneration>,
+      dim3(static_cast<unsigned>(
+          UseGeneration ? scratch.generation_cooperative_launch_blocks
+                        : outgoing.sparse_cooperative_launch_blocks)),
       dim3(kBlockSize),
       kernel_args,
       0,
       stream));
 }
 
-template <typename EdgeOffset>
+template <typename EdgeOffset, bool UseGeneration>
 void extract_target_paths_to_result(UnitBfsCsrResult& result,
                                     UnitBfsScratch& scratch,
                                     const EdgeOffset* out_rowptr,
@@ -1119,80 +1400,127 @@ void extract_target_paths_to_result(UnitBfsCsrResult& result,
                                     std::uint32_t query_epoch,
                                     hipStream_t stream) {
   const int target_count = static_cast<int>(targets.size());
-  measure_target_paths_kernel<<<grid_for_items(target_count), kBlockSize, 0, stream>>>(
-      scratch.targets.get(),
-      target_count,
-      scratch.level.get(),
-      query_epoch,
-      scratch.target_metadata.get());
+  const std::size_t target_offset_count =
+      sssp_capacity::checked_target_offset_count(targets.size());
+  measure_target_paths_kernel<UseGeneration>
+      <<<grid_for_items(target_count), kBlockSize, 0, stream>>>(
+          scratch.targets.get(),
+          target_count,
+          scratch.level.get(),
+          scratch.generation_level.get(),
+          query_epoch,
+          scratch.target_metadata.get());
   UNIT_BFS_HIP_CHECK(hipGetLastError());
-  copy_control_synchronously(scratch.host_target_metadata.get(),
-                             scratch.target_metadata.get(),
-                             targets.size() * sizeof(TargetPathMetadata),
-                             hipMemcpyDeviceToHost,
-                             stream);
 
   result.target_distances.resize(targets.size());
   result.target_sources.assign(targets.size(), -1);
-  result.target_path_offsets.assign(targets.size() + 1, 0);
-  result.target_edge_offsets.assign(targets.size() + 1, 0);
-  bool all_targets_reached = true;
+  result.target_path_offsets.assign(target_offset_count, 0);
+  result.target_edge_offsets.assign(target_offset_count, 0);
   std::size_t total_nodes = 0;
   std::size_t total_edges = 0;
-  for (std::size_t i = 0; i < targets.size(); ++i) {
-    const TargetPathMetadata& metadata = scratch.host_target_metadata.get()[i];
-    if (metadata.query_epoch != query_epoch ||
-        metadata.validation_epoch != 0 ||
-        metadata.status != kPathNotValidated) {
+  const bool use_device_offsets =
+      scratch.extraction_mode == UnitBfsCsrExtractionMode::kDeviceOffsets;
+  if (!use_device_offsets) {
+    copy_control_synchronously(
+        scratch.host_target_metadata.get(),
+        scratch.target_metadata.get(),
+        sssp_capacity::checked_bytes<TargetPathMetadata>(targets.size()),
+        hipMemcpyDeviceToHost,
+        stream);
+    for (std::size_t i = 0; i < targets.size(); ++i) {
+      const TargetPathMetadata& metadata = scratch.host_target_metadata.get()[i];
+      if (metadata.query_epoch != query_epoch ||
+          metadata.validation_epoch != 0 ||
+          metadata.status != kPathNotValidated) {
+        std::ostringstream message;
+        message << "unit BFS measured stale target metadata"
+                << " (target_index=" << i
+                << ", target=" << targets[i]
+                << ", query_epoch=" << metadata.query_epoch
+                << ", expected_epoch=" << query_epoch
+                << ", validation_epoch=" << metadata.validation_epoch
+                << ", status=" << metadata.status << ')';
+        throw std::runtime_error(message.str());
+      }
+      result.target_path_offsets[i] = static_cast<int>(total_nodes);
+      result.target_edge_offsets[i] = static_cast<int>(total_edges);
+      if (metadata.length <= 0 || !std::isfinite(metadata.distance)) continue;
+      total_nodes = sssp_capacity::checked_add(
+          total_nodes, static_cast<std::size_t>(metadata.length));
+      total_edges = sssp_capacity::checked_add(
+          total_edges, static_cast<std::size_t>(metadata.length - 1));
+      if (total_nodes >
+              static_cast<std::size_t>(std::numeric_limits<int>::max()) ||
+          total_edges >
+              static_cast<std::size_t>(std::numeric_limits<int>::max())) {
+        throw std::overflow_error("compact unit BFS target paths are too large");
+      }
+    }
+    result.target_path_offsets[targets.size()] = static_cast<int>(total_nodes);
+    result.target_edge_offsets[targets.size()] = static_cast<int>(total_edges);
+  } else {
+    scan_target_path_offsets_kernel<<<1, 1, 0, stream>>>(
+        scratch.target_metadata.get(),
+        target_count,
+        query_epoch,
+        scratch.target_node_offsets.get(),
+        scratch.target_edge_offsets.get(),
+        scratch.target_totals.get());
+    UNIT_BFS_HIP_CHECK(hipGetLastError());
+    copy_control_synchronously(
+        scratch.host_target_totals.get(),
+        scratch.target_totals.get(),
+        sssp_capacity::checked_bytes<TargetPathTotals>(1),
+        hipMemcpyDeviceToHost,
+        stream);
+    const TargetPathTotals totals = scratch.host_target_totals.get()[0];
+    if (totals.query_epoch != query_epoch ||
+        totals.status != kOffsetScanValid) {
       std::ostringstream message;
-      message << "unit BFS measured stale target metadata"
-              << " (target_index=" << i
-              << ", target=" << targets[i]
-              << ", query_epoch=" << metadata.query_epoch
-              << ", expected_epoch=" << query_epoch
-              << ", validation_epoch=" << metadata.validation_epoch
-              << ", status=" << metadata.status << ')';
+      message << "unit BFS device compact-offset scan failed"
+              << " (status=" << totals.status
+              << ", query_epoch=" << totals.query_epoch
+              << ", expected_epoch=" << query_epoch << ')';
+      if (totals.status == kOffsetScanOverflow) {
+        throw std::overflow_error(message.str());
+      }
       throw std::runtime_error(message.str());
     }
-    result.target_distances[i] = metadata.distance;
-    result.target_path_offsets[i] = static_cast<int>(total_nodes);
-    result.target_edge_offsets[i] = static_cast<int>(total_edges);
-    if (metadata.length <= 0 || !std::isfinite(metadata.distance)) {
-      all_targets_reached = false;
-      continue;
+    if (totals.total_nodes < 0 || totals.total_edges < 0 ||
+        totals.total_edges > totals.total_nodes) {
+      throw std::runtime_error(
+          "unit BFS device compact-offset totals are inconsistent");
     }
-    total_nodes += static_cast<std::size_t>(metadata.length);
-    total_edges += static_cast<std::size_t>(metadata.length - 1);
-    if (total_nodes > static_cast<std::size_t>(std::numeric_limits<int>::max()) ||
-        total_edges > static_cast<std::size_t>(std::numeric_limits<int>::max())) {
-      throw std::overflow_error("compact unit BFS target paths are too large");
-    }
+    total_nodes = static_cast<std::size_t>(totals.total_nodes);
+    total_edges = static_cast<std::size_t>(totals.total_edges);
   }
-  result.target_path_offsets[targets.size()] = static_cast<int>(total_nodes);
-  result.target_edge_offsets[targets.size()] = static_cast<int>(total_edges);
 
   result.target_path_nodes.resize(total_nodes);
   result.target_path_edges.resize(total_edges);
   if (total_nodes != 0) {
     scratch.ensure_compact_path_capacity(total_nodes, total_edges);
-    std::copy(result.target_path_offsets.begin(),
-              result.target_path_offsets.end(),
-              scratch.host_target_node_offsets.get());
-    std::copy(result.target_edge_offsets.begin(),
-              result.target_edge_offsets.end(),
-              scratch.host_target_edge_offsets.get());
-    copy_control_synchronously(scratch.target_node_offsets.get(),
-                               scratch.host_target_node_offsets.get(),
-                               (targets.size() + 1) * sizeof(int),
-                               hipMemcpyHostToDevice,
-                               stream);
-    copy_control_synchronously(scratch.target_edge_offsets.get(),
-                               scratch.host_target_edge_offsets.get(),
-                               (targets.size() + 1) * sizeof(int),
-                               hipMemcpyHostToDevice,
-                               stream);
+    if (!use_device_offsets) {
+      std::copy(result.target_path_offsets.begin(),
+                result.target_path_offsets.end(),
+                scratch.host_target_node_offsets.get());
+      std::copy(result.target_edge_offsets.begin(),
+                result.target_edge_offsets.end(),
+                scratch.host_target_edge_offsets.get());
+      copy_control_synchronously(
+          scratch.target_node_offsets.get(),
+          scratch.host_target_node_offsets.get(),
+          sssp_capacity::checked_bytes<int>(target_offset_count),
+          hipMemcpyHostToDevice,
+          stream);
+      copy_control_synchronously(
+          scratch.target_edge_offsets.get(),
+          scratch.host_target_edge_offsets.get(),
+          sssp_capacity::checked_bytes<int>(target_offset_count),
+          hipMemcpyHostToDevice,
+          stream);
+    }
 
-    fill_target_paths_kernel<EdgeOffset>
+    fill_target_paths_kernel<EdgeOffset, UseGeneration>
         <<<grid_for_items(target_count), kBlockSize, 0, stream>>>(
             scratch.targets.get(),
             target_count,
@@ -1202,6 +1530,7 @@ void extract_target_paths_to_result(UnitBfsCsrResult& result,
             scratch.pred_node.get(),
             pred_edge,
             scratch.level.get(),
+            scratch.generation_level.get(),
             scratch.target_metadata.get(),
             query_epoch,
             scratch.target_node_offsets.get(),
@@ -1211,24 +1540,48 @@ void extract_target_paths_to_result(UnitBfsCsrResult& result,
             scratch.compact_path_nodes.get(),
             scratch.compact_path_edges.get());
     UNIT_BFS_HIP_CHECK(hipGetLastError());
-    // Validation metadata controls whether the compact path is accepted, so
-    // make that small transfer host-synchronous. The potentially large node
-    // and edge payloads remain asynchronous after the fill is complete.
+  }
+  if (use_device_offsets || total_nodes != 0) {
+    // Validation metadata controls whether the compact path is accepted. In
+    // device-offset mode this is also the first metadata transfer: the earlier
+    // host prefix sum and its two H2D offset transfers are absent.
     copy_control_synchronously(scratch.host_target_metadata.get(),
                                scratch.target_metadata.get(),
-                               targets.size() * sizeof(TargetPathMetadata),
+                               sssp_capacity::checked_bytes<TargetPathMetadata>(
+                                   targets.size()),
                                hipMemcpyDeviceToHost,
                                stream);
+  }
+  if (use_device_offsets) {
+    // Offsets are control records: preserve the gfx1151 guarded transfer used
+    // for the totals/metadata descriptors. The new path still eliminates the
+    // host prefix sum and both H2D offset copies.
+    copy_control_synchronously(
+        scratch.host_target_node_offsets.get(),
+        scratch.target_node_offsets.get(),
+        sssp_capacity::checked_bytes<int>(target_offset_count),
+        hipMemcpyDeviceToHost,
+        stream);
+    copy_control_synchronously(
+        scratch.host_target_edge_offsets.get(),
+        scratch.target_edge_offsets.get(),
+        sssp_capacity::checked_bytes<int>(target_offset_count),
+        hipMemcpyDeviceToHost,
+        stream);
+  }
+  if (total_nodes != 0) {
     UNIT_BFS_HIP_CHECK(hipMemcpyAsync(scratch.host_compact_path_nodes.get(),
                                       scratch.compact_path_nodes.get(),
-                                      total_nodes * sizeof(int),
+                                      sssp_capacity::checked_bytes<int>(
+                                          total_nodes),
                                       hipMemcpyDeviceToHost,
                                       stream));
   }
   if (total_edges != 0) {
     UNIT_BFS_HIP_CHECK(hipMemcpyAsync(scratch.host_compact_path_edges.get(),
                                       scratch.compact_path_edges.get(),
-                                      total_edges * sizeof(Offset),
+                                      sssp_capacity::checked_bytes<Offset>(
+                                          total_edges),
                                       hipMemcpyDeviceToHost,
                                       stream));
   }
@@ -1236,6 +1589,22 @@ void extract_target_paths_to_result(UnitBfsCsrResult& result,
   // whenever a future search claims that vertex and never need cleanup.
   reset_visited_levels(scratch, visited_count, stream);
   UNIT_BFS_HIP_CHECK(hipStreamSynchronize(stream));
+  if (use_device_offsets) {
+    std::copy_n(scratch.host_target_node_offsets.get(),
+                target_offset_count,
+                result.target_path_offsets.begin());
+    std::copy_n(scratch.host_target_edge_offsets.get(),
+                target_offset_count,
+                result.target_edge_offsets.begin());
+    if (result.target_path_offsets.front() != 0 ||
+        result.target_edge_offsets.front() != 0 ||
+        result.target_path_offsets.back() != static_cast<int>(total_nodes) ||
+        result.target_edge_offsets.back() != static_cast<int>(total_edges)) {
+      throw std::runtime_error(
+          "unit BFS copied compact offsets do not match device totals");
+    }
+  }
+  bool all_targets_reached = true;
   for (std::size_t i = 0; i < targets.size(); ++i) {
     const TargetPathMetadata& metadata = scratch.host_target_metadata.get()[i];
     if (metadata.query_epoch != query_epoch) {
@@ -1246,6 +1615,10 @@ void extract_target_paths_to_result(UnitBfsCsrResult& result,
               << ", query_epoch=" << metadata.query_epoch
               << ", expected_epoch=" << query_epoch << ')';
       throw std::runtime_error(message.str());
+    }
+    result.target_distances[i] = metadata.distance;
+    if (metadata.length <= 0 || !std::isfinite(metadata.distance)) {
+      all_targets_reached = false;
     }
     if (metadata.length > 0 &&
         metadata.validation_epoch != query_epoch) {
@@ -1289,7 +1662,7 @@ void extract_target_paths_to_result(UnitBfsCsrResult& result,
   result.target_reached = all_targets_reached;
 }
 
-template <typename EdgeOffset>
+template <typename EdgeOffset, bool UseGeneration>
 UnitBfsCsrResult run_unit_bfs_with_offsets(
     const OutgoingCsrOwner& outgoing,
     const EdgeOffset* out_rowptr,
@@ -1338,15 +1711,16 @@ UnitBfsCsrResult run_unit_bfs_with_offsets(
   scratch.ensure_target_capacity(targets.size());
 
   initialize_scratch_once(scratch, scratch.rows, stream);
-  const std::uint32_t query_epoch = scratch.begin_query();
+  const std::uint32_t query_epoch = begin_query_epoch(scratch, stream);
   copy_control_synchronously(scratch.sources.get(),
                              effective_sources->data(),
-                             effective_sources->size() * sizeof(int),
+                             sssp_capacity::checked_bytes<int>(
+                                 effective_sources->size()),
                              hipMemcpyHostToDevice,
                              stream);
   copy_control_synchronously(scratch.targets.get(),
                              targets.data(),
-                             targets.size() * sizeof(int),
+                             sssp_capacity::checked_bytes<int>(targets.size()),
                              hipMemcpyHostToDevice,
                              stream);
 
@@ -1356,14 +1730,16 @@ UnitBfsCsrResult run_unit_bfs_with_offsets(
       scratch.target_multiplicity.get());
   UNIT_BFS_HIP_CHECK(hipGetLastError());
 
-  initialize_sources_kernel<EdgeOffset>
+  initialize_sources_kernel<EdgeOffset, UseGeneration>
       <<<grid_for_items(source_count), kBlockSize, 0, stream>>>(
           scratch.sources.get(),
           source_count,
           initially_found,
           target_count,
           max_depth,
+          query_epoch,
           scratch.level.get(),
+          scratch.generation_level.get(),
           scratch.pred_node.get(),
           pred_edge,
           scratch.frontier_queue.get(),
@@ -1383,8 +1759,11 @@ UnitBfsCsrResult run_unit_bfs_with_offsets(
   UnitBfsCsrResult result;
   result.target = -1;
   result.iterations_used = 0;
+  const int cooperative_launch_blocks =
+      UseGeneration ? scratch.generation_cooperative_launch_blocks
+                    : outgoing.sparse_cooperative_launch_blocks;
   const bool use_cooperative_controller =
-      progress_callback == nullptr && outgoing.cooperative_launch_blocks > 0;
+      progress_callback == nullptr && cooperative_launch_blocks > 0;
   const bool use_batched_device_controller =
       stream == nullptr && progress_callback == nullptr;
 
@@ -1396,13 +1775,14 @@ UnitBfsCsrResult run_unit_bfs_with_offsets(
     const int previous_depth = result.iterations_used;
 
     if (use_cooperative_controller) {
-      launch_cooperative_controller(outgoing,
-                                    out_rowptr,
-                                    scratch,
-                                    pred_edge,
-                                    target_count,
-                                    max_depth,
-                                    stream);
+      launch_cooperative_controller<EdgeOffset, UseGeneration>(outgoing,
+                                                               out_rowptr,
+                                                               scratch,
+                                                               pred_edge,
+                                                               query_epoch,
+                                                               target_count,
+                                                               max_depth,
+                                                               stream);
       const std::array<int, kStatusCount> status =
           copy_status_to_host(scratch, stream);
       queue_tail = status[kStatusQueueTail];
@@ -1454,14 +1834,16 @@ UnitBfsCsrResult run_unit_bfs_with_offsets(
       // have repeatedly become host-visible without the immediately following
       // controller-advance kernel, even though both were submitted to the same
       // stream.  Removing that dependent kernel also removes the failure mode.
-      expand_frontier_host_controlled_kernel<EdgeOffset>
+      expand_frontier_host_controlled_kernel<EdgeOffset, UseGeneration>
           <<<grid_for_frontier(current_count), kBlockSize, 0, stream>>>(
               frontier_begin,
               frontier_end,
               previous_depth + 1,
               out_rowptr,
               outgoing.colind.get(),
+              query_epoch,
               scratch.level.get(),
+              scratch.generation_level.get(),
               scratch.pred_node.get(),
               pred_edge,
               scratch.frontier_queue.get(),
@@ -1519,11 +1901,13 @@ UnitBfsCsrResult run_unit_bfs_with_offsets(
                                   outgoing.batched_launch_blocks));
 
       for (int round = 0; round < rounds_to_enqueue; ++round) {
-        expand_frontier_kernel<EdgeOffset>
+        expand_frontier_kernel<EdgeOffset, UseGeneration>
             <<<launch_blocks, kBlockSize, 0, stream>>>(
                 out_rowptr,
                 outgoing.colind.get(),
+                query_epoch,
                 scratch.level.get(),
+                scratch.generation_level.get(),
                 scratch.pred_node.get(),
                 pred_edge,
                 scratch.frontier_queue.get(),
@@ -1609,15 +1993,16 @@ UnitBfsCsrResult run_unit_bfs_with_offsets(
             target_count,
             scratch.target_multiplicity.get());
     UNIT_BFS_HIP_CHECK(hipGetLastError());
-    extract_target_paths_to_result(result,
-                                   scratch,
-                                   out_rowptr,
-                                   outgoing.colind.get(),
-                                   pred_edge,
-                                   targets,
-                                   queue_tail,
-                                   query_epoch,
-                                   stream);
+    extract_target_paths_to_result<EdgeOffset, UseGeneration>(
+        result,
+        scratch,
+        out_rowptr,
+        outgoing.colind.get(),
+        pred_edge,
+        targets,
+        queue_tail,
+        query_epoch,
+        stream);
     for (std::size_t i = 0; i < targets.size(); ++i) {
       if (!std::isfinite(result.target_distances[i])) {
         continue;
@@ -1672,7 +2057,21 @@ UnitBfsCsrResult run_unit_bfs_impl(const OutgoingCsrOwner& outgoing,
         "unit BFS graph and workspace offset representations do not match");
   }
   if (outgoing.uses_32_bit_offsets) {
-    return run_unit_bfs_with_offsets(
+    if (scratch.visitation_mode ==
+        UnitBfsCsrVisitationMode::kGenerationStamped) {
+      return run_unit_bfs_with_offsets<CompactOffset, true>(
+          outgoing,
+          outgoing.rowptr32.get(),
+          scratch,
+          scratch.pred_edge32.get(),
+          sources,
+          targets,
+          max_depth,
+          stream,
+          progress_callback,
+          progress_user_data);
+    }
+    return run_unit_bfs_with_offsets<CompactOffset, false>(
         outgoing,
         outgoing.rowptr32.get(),
         scratch,
@@ -1684,16 +2083,29 @@ UnitBfsCsrResult run_unit_bfs_impl(const OutgoingCsrOwner& outgoing,
         progress_callback,
         progress_user_data);
   }
-  return run_unit_bfs_with_offsets(outgoing,
-                                   outgoing.rowptr64.get(),
-                                   scratch,
-                                   scratch.pred_edge64.get(),
-                                   sources,
-                                   targets,
-                                   max_depth,
-                                   stream,
-                                   progress_callback,
-                                   progress_user_data);
+  if (scratch.visitation_mode ==
+      UnitBfsCsrVisitationMode::kGenerationStamped) {
+    return run_unit_bfs_with_offsets<Offset, true>(outgoing,
+                                                   outgoing.rowptr64.get(),
+                                                   scratch,
+                                                   scratch.pred_edge64.get(),
+                                                   sources,
+                                                   targets,
+                                                   max_depth,
+                                                   stream,
+                                                   progress_callback,
+                                                   progress_user_data);
+  }
+  return run_unit_bfs_with_offsets<Offset, false>(outgoing,
+                                                  outgoing.rowptr64.get(),
+                                                  scratch,
+                                                  scratch.pred_edge64.get(),
+                                                  sources,
+                                                  targets,
+                                                  max_depth,
+                                                  stream,
+                                                  progress_callback,
+                                                  progress_user_data);
 }
 
 }  // namespace unit_bfs_detail
@@ -1749,11 +2161,44 @@ struct UnitBfsCsrWorkspace::Impl {
     return graph;
   }
 
-  Impl(std::shared_ptr<const UnitBfsCsrGraph> graph_, hipStream_t stream)
+  static UnitBfsCsrWorkspaceOptions validate_options(
+      UnitBfsCsrWorkspaceOptions options) {
+    switch (options.extraction_mode) {
+      case UnitBfsCsrExtractionMode::kHostOffsets:
+      case UnitBfsCsrExtractionMode::kDeviceOffsets:
+        break;
+      default:
+        throw std::invalid_argument("unknown unit BFS extraction mode");
+    }
+    switch (options.visitation_mode) {
+      case UnitBfsCsrVisitationMode::kSparseReset:
+      case UnitBfsCsrVisitationMode::kGenerationStamped:
+        break;
+      default:
+        throw std::invalid_argument("unknown unit BFS visitation mode");
+    }
+    sssp_capacity::validate_reservation(options.capacity_hints);
+    return options;
+  }
+
+  Impl(std::shared_ptr<const UnitBfsCsrGraph> graph_,
+       hipStream_t stream,
+       UnitBfsCsrWorkspaceOptions options)
       : graph(require_graph(graph_)),
         scratch(graph->outgoing.rows,
-                graph->outgoing.uses_32_bit_offsets),
-        stream(stream) {}
+                graph->outgoing.uses_32_bit_offsets,
+                validate_options(options)),
+        stream(stream) {
+    if (scratch.visitation_mode ==
+        UnitBfsCsrVisitationMode::kGenerationStamped) {
+      scratch.generation_cooperative_launch_blocks =
+          graph->outgoing.uses_32_bit_offsets
+              ? unit_bfs_detail::cooperative_controller_blocks<
+                    unit_bfs_detail::CompactOffset, true>(graph->outgoing.rows)
+              : unit_bfs_detail::cooperative_controller_blocks<
+                    minplus_sparse::Offset, true>(graph->outgoing.rows);
+    }
+  }
 
   void require_run_context(hipStream_t candidate) const {
     if (candidate != stream) {
@@ -1770,24 +2215,74 @@ struct UnitBfsCsrWorkspace::Impl {
 UnitBfsCsrWorkspace::UnitBfsCsrWorkspace(const HostCsrF32& adjacency,
                                          hipStream_t stream)
     : UnitBfsCsrWorkspace(
-          adjacency, stream, UnitBfsCsrOffsetMode::kAuto) {}
+          adjacency,
+          stream,
+          UnitBfsCsrOffsetMode::kAuto,
+          UnitBfsCsrWorkspaceOptions{}) {}
 
 UnitBfsCsrWorkspace::UnitBfsCsrWorkspace(const HostCsrF32& adjacency,
                                          hipStream_t stream,
                                          UnitBfsCsrOffsetMode offset_mode)
     : UnitBfsCsrWorkspace(
+          adjacency, stream, offset_mode, UnitBfsCsrWorkspaceOptions{}) {}
+
+UnitBfsCsrWorkspace::UnitBfsCsrWorkspace(
+    const HostCsrF32& adjacency,
+    hipStream_t stream,
+    UnitBfsCsrWorkspaceOptions options)
+    : UnitBfsCsrWorkspace(
+          adjacency, stream, UnitBfsCsrOffsetMode::kAuto, options) {}
+
+UnitBfsCsrWorkspace::UnitBfsCsrWorkspace(
+    const HostCsrF32& adjacency,
+    hipStream_t stream,
+    UnitBfsCsrOffsetMode offset_mode,
+    UnitBfsCsrWorkspaceOptions options)
+    : UnitBfsCsrWorkspace(
           std::make_shared<UnitBfsCsrGraph>(adjacency, stream, offset_mode),
-          stream) {}
+          stream,
+          options) {}
 
 UnitBfsCsrWorkspace::UnitBfsCsrWorkspace(
     std::shared_ptr<const UnitBfsCsrGraph> adjacency,
     hipStream_t stream)
-    : impl_(std::make_unique<Impl>(std::move(adjacency), stream)) {}
+    : UnitBfsCsrWorkspace(
+          std::move(adjacency), stream, UnitBfsCsrWorkspaceOptions{}) {}
+
+UnitBfsCsrWorkspace::UnitBfsCsrWorkspace(
+    std::shared_ptr<const UnitBfsCsrGraph> adjacency,
+    hipStream_t stream,
+    UnitBfsCsrWorkspaceOptions options)
+    : impl_(std::make_unique<Impl>(
+          std::move(adjacency), stream, options)) {}
 
 UnitBfsCsrWorkspace::~UnitBfsCsrWorkspace() = default;
 UnitBfsCsrWorkspace::UnitBfsCsrWorkspace(UnitBfsCsrWorkspace&&) noexcept = default;
 UnitBfsCsrWorkspace& UnitBfsCsrWorkspace::operator=(
     UnitBfsCsrWorkspace&&) noexcept = default;
+
+UnitBfsCsrAllocationState UnitBfsCsrWorkspace::allocation_state() const noexcept {
+  UnitBfsCsrAllocationState state;
+  if (!impl_) return state;
+  const auto& scratch = impl_->scratch;
+  state.source_capacity = scratch.sources.size();
+  state.target_capacity = scratch.targets.size();
+  state.target_metadata_capacity =
+      std::min(scratch.target_metadata.size(),
+               scratch.host_target_metadata.size());
+  state.target_offset_capacity =
+      std::min({scratch.target_node_offsets.size(),
+                scratch.host_target_node_offsets.size(),
+                scratch.target_edge_offsets.size(),
+                scratch.host_target_edge_offsets.size()});
+  state.compact_path_node_capacity =
+      std::min(scratch.compact_path_nodes.size(),
+               scratch.host_compact_path_nodes.size());
+  state.compact_path_edge_capacity =
+      std::min(scratch.compact_path_edges.size(),
+               scratch.host_compact_path_edges.size());
+  return state;
+}
 
 UnitBfsCsrResult UnitBfsCsrWorkspace::run(
     const std::vector<int>& sources,

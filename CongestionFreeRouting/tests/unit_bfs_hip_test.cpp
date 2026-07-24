@@ -267,13 +267,14 @@ std::vector<UnitBfsCsrResult> run_mode_suite(
     const HostCsrF32& graph,
     UnitBfsCsrOffsetMode mode,
     bool expect_32_bit,
-    const std::string& mode_label) {
+    const std::string& mode_label,
+    UnitBfsCsrWorkspaceOptions options = {}) {
   auto shared_graph =
       std::make_shared<UnitBfsCsrGraph>(graph, nullptr, mode);
   require_equal(shared_graph->uses_32_bit_offsets(),
                 expect_32_bit,
                 mode_label + ": selected offset representation");
-  UnitBfsCsrWorkspace workspace(shared_graph);
+  UnitBfsCsrWorkspace workspace(shared_graph, nullptr, options);
   std::vector<UnitBfsCsrResult> results;
 
   const ExpectedRun full_paths{
@@ -425,6 +426,64 @@ void require_equivalent(const UnitBfsCsrResult& left,
   require_equal(left.target_path_edges,
                 right.target_path_edges,
                 label + ": compact path edges");
+}
+
+UnitBfsCsrWorkspaceOptions workspace_options(
+    UnitBfsCsrExtractionMode extraction_mode,
+    UnitBfsCsrVisitationMode visitation_mode,
+    SsspQueryCapacityHints capacity_hints = {}) {
+  UnitBfsCsrWorkspaceOptions options;
+  options.extraction_mode = extraction_mode;
+  options.visitation_mode = visitation_mode;
+  options.capacity_hints = capacity_hints;
+  return options;
+}
+
+void run_capacity_observation_suite(const HostCsrF32& graph) {
+  const UnitBfsCsrWorkspaceOptions options = workspace_options(
+      UnitBfsCsrExtractionMode::kHostOffsets,
+      UnitBfsCsrVisitationMode::kSparseReset,
+      {3, 4});
+  UnitBfsCsrWorkspace workspace(
+      graph, nullptr, UnitBfsCsrOffsetMode::kAuto, options);
+  const UnitBfsCsrAllocationState reserved = workspace.allocation_state();
+  require(reserved.source_capacity >= 3 && reserved.target_capacity >= 4 &&
+              reserved.target_metadata_capacity >= 4 &&
+              reserved.target_offset_capacity >= 5,
+          "capacity hints must pre-reserve query-derived buffers");
+  require(reserved.compact_path_node_capacity == 0 &&
+              reserved.compact_path_edge_capacity == 0,
+          "capacity hints must not pre-reserve compact paths");
+
+  (void)workspace.run(std::vector<int>{0},
+                      std::vector<int>{3, 6},
+                      1.0f,
+                      -1,
+                      nullptr,
+                      nullptr,
+                      nullptr);
+  const UnitBfsCsrAllocationState grown = workspace.allocation_state();
+  require(grown.compact_path_node_capacity >= 8 &&
+              grown.compact_path_edge_capacity >= 6,
+          "compact path buffers must grow on demand");
+  (void)workspace.run(std::vector<int>{0},
+                      std::vector<int>{0},
+                      1.0f,
+                      0,
+                      nullptr,
+                      nullptr,
+                      nullptr);
+  const UnitBfsCsrAllocationState reused = workspace.allocation_state();
+  require(reused.source_capacity == grown.source_capacity &&
+              reused.target_capacity == grown.target_capacity &&
+              reused.target_metadata_capacity ==
+                  grown.target_metadata_capacity &&
+              reused.target_offset_capacity == grown.target_offset_capacity &&
+              reused.compact_path_node_capacity ==
+                  grown.compact_path_node_capacity &&
+              reused.compact_path_edge_capacity ==
+                  grown.compact_path_edge_capacity,
+          "smaller reused queries must retain every high-water capacity");
 }
 
 HostCsrF32 make_long_chain_graph() {
@@ -664,10 +723,11 @@ void validate_progress_trace(const std::vector<UnitBfsCsrProgress>& trace,
 }
 
 void run_batching_suite(UnitBfsCsrOffsetMode mode,
-                        const std::string& mode_label) {
+                        const std::string& mode_label,
+                        UnitBfsCsrWorkspaceOptions options = {}) {
   const HostCsrF32 graph = make_long_chain_graph();
   auto shared_graph = std::make_shared<UnitBfsCsrGraph>(graph, nullptr, mode);
-  UnitBfsCsrWorkspace batched_workspace(shared_graph);
+  UnitBfsCsrWorkspace batched_workspace(shared_graph, nullptr, options);
 
   UnitBfsCsrResult depth_six_result;
   for (const int target : std::vector<int>{1, 2, 4, 5, 6, 9, 10}) {
@@ -734,7 +794,7 @@ void run_batching_suite(UnitBfsCsrOffsetMode mode,
   // Installing a progress callback retains the historical one-level polling
   // behavior. Compare it with the cooperative path to cover both controller
   // modes and ensure callback timing remains observable after every level.
-  UnitBfsCsrWorkspace callback_workspace(shared_graph);
+  UnitBfsCsrWorkspace callback_workspace(shared_graph, nullptr, options);
   std::vector<UnitBfsCsrProgress> target_trace;
   const UnitBfsCsrResult callback_target = callback_workspace.run(
       std::vector<int>{0},
@@ -786,7 +846,7 @@ void run_batching_suite(UnitBfsCsrOffsetMode mode,
            mode_label + ": repeated deep batched target");
 
   const HostCsrF32 wide_graph = make_wide_layered_graph();
-  UnitBfsCsrWorkspace wide_workspace(wide_graph, nullptr, mode);
+  UnitBfsCsrWorkspace wide_workspace(wide_graph, nullptr, mode, options);
   const ExpectedRun wide_target{
       4,
       true,
@@ -819,7 +879,8 @@ void run_batching_suite(UnitBfsCsrOffsetMode mode,
            mode_label + ": wide frontier exhaustion");
 
   const HostCsrF32 deep_wide_graph = make_deep_wide_layered_graph();
-  UnitBfsCsrWorkspace deep_wide_workspace(deep_wide_graph, nullptr, mode);
+  UnitBfsCsrWorkspace deep_wide_workspace(
+      deep_wide_graph, nullptr, mode, options);
   const ExpectedRun deep_wide_target{
       kDeepWideLevels,
       true,
@@ -835,7 +896,7 @@ void run_batching_suite(UnitBfsCsrOffsetMode mode,
            mode_label + ": deep wide default-stream batching");
 
   const HostCsrF32 mixed_graph = make_divergent_claim_graph();
-  UnitBfsCsrWorkspace mixed_workspace(mixed_graph, nullptr, mode);
+  UnitBfsCsrWorkspace mixed_workspace(mixed_graph, nullptr, mode, options);
   const ExpectedRun mixed_early_stop{
       2,
       true,
@@ -931,6 +992,38 @@ void run_workspace_affinity_and_ownership_suite() {
   require(callback_exception_propagated,
           "progress callback exception must propagate after scratch cleanup");
 
+  UnitBfsCsrWorkspace opt_in_callback_workspace(
+      shared_graph,
+      stream.get(),
+      workspace_options(UnitBfsCsrExtractionMode::kDeviceOffsets,
+                        UnitBfsCsrVisitationMode::kGenerationStamped));
+  callback_exception_propagated = false;
+  try {
+    (void)opt_in_callback_workspace.run(std::vector<int>{0},
+                                        std::vector<int>{3},
+                                        1.0f,
+                                        -1,
+                                        stream.get(),
+                                        throw_from_progress,
+                                        nullptr);
+  } catch (const ProgressCallbackFailure&) {
+    callback_exception_propagated = true;
+  }
+  require(callback_exception_propagated,
+          "opt-in progress callback exception must propagate after cleanup");
+  const UnitBfsCsrResult opt_in_after_callback =
+      opt_in_callback_workspace.run(std::vector<int>{0},
+                                    std::vector<int>{3},
+                                    1.0f,
+                                    -1,
+                                    stream.get(),
+                                    nullptr,
+                                    nullptr);
+  validate_result(graph,
+                  opt_in_after_callback,
+                  expected,
+                  "opt-in workspace reuse after callback exception");
+
   // A workspace retains the immutable backing allocation rather than reaching
   // back through the movable public graph wrapper.
   UnitBfsCsrGraph moved_graph(std::move(*shared_graph));
@@ -1008,7 +1101,8 @@ void run_parallel_workspace_suite() {
 
 void run_parallel_deep_wide_explicit_stream_suite(
     UnitBfsCsrOffsetMode mode,
-    const std::string& mode_label) {
+    const std::string& mode_label,
+    UnitBfsCsrWorkspaceOptions options = {}) {
   const HostCsrF32 graph = make_deep_wide_layered_graph();
   auto shared_graph =
       std::make_shared<UnitBfsCsrGraph>(graph, nullptr, mode);
@@ -1086,7 +1180,7 @@ void run_parallel_deep_wide_explicit_stream_suite(
       try {
         check_hip(hipSetDevice(device), "hipSetDevice");
         HipStream stream;
-        UnitBfsCsrWorkspace workspace(shared_graph, stream.get());
+        UnitBfsCsrWorkspace workspace(shared_graph, stream.get(), options);
         ready.fetch_add(1, std::memory_order_release);
         readiness_reported = true;
         start.wait();
@@ -1268,10 +1362,69 @@ int main() {
       require_equivalent(auto_results[i], forced_64_results[i], label.str());
     }
 
+    struct OptInModeCase {
+      const char* label;
+      UnitBfsCsrWorkspaceOptions options;
+    };
+    const std::vector<OptInModeCase> opt_in_modes{
+        {"device-offset/sparse",
+         workspace_options(UnitBfsCsrExtractionMode::kDeviceOffsets,
+                           UnitBfsCsrVisitationMode::kSparseReset)},
+        {"host-offset/generation",
+         workspace_options(UnitBfsCsrExtractionMode::kHostOffsets,
+                           UnitBfsCsrVisitationMode::kGenerationStamped)},
+        {"device-offset/generation",
+         workspace_options(UnitBfsCsrExtractionMode::kDeviceOffsets,
+                           UnitBfsCsrVisitationMode::kGenerationStamped)},
+    };
+    for (const OptInModeCase& mode_case : opt_in_modes) {
+      const auto compact_results = run_mode_suite(
+          graph,
+          UnitBfsCsrOffsetMode::kAuto,
+          true,
+          std::string("auto/32-bit ") + mode_case.label,
+          mode_case.options);
+      const auto wide_results = run_mode_suite(
+          graph,
+          UnitBfsCsrOffsetMode::kForce64Bit,
+          false,
+          std::string("forced-64-bit ") + mode_case.label,
+          mode_case.options);
+      require_equal(compact_results.size(),
+                    auto_results.size(),
+                    std::string(mode_case.label) + " compact result count");
+      require_equal(wide_results.size(),
+                    forced_64_results.size(),
+                    std::string(mode_case.label) + " wide result count");
+      for (std::size_t i = 0; i < auto_results.size(); ++i) {
+        require_equivalent(compact_results[i],
+                           auto_results[i],
+                           std::string(mode_case.label) +
+                               " compact/default equivalence " +
+                               std::to_string(i));
+        require_equivalent(wide_results[i],
+                           forced_64_results[i],
+                           std::string(mode_case.label) +
+                               " wide/default equivalence " +
+                               std::to_string(i));
+      }
+    }
+
+    run_capacity_observation_suite(graph);
+
     run_batching_suite(UnitBfsCsrOffsetMode::kAuto,
                        "auto/32-bit batching");
     run_batching_suite(UnitBfsCsrOffsetMode::kForce64Bit,
                        "forced-64-bit batching");
+    const UnitBfsCsrWorkspaceOptions fully_opt_in = workspace_options(
+        UnitBfsCsrExtractionMode::kDeviceOffsets,
+        UnitBfsCsrVisitationMode::kGenerationStamped);
+    run_batching_suite(UnitBfsCsrOffsetMode::kAuto,
+                       "auto/32-bit opt-in batching",
+                       fully_opt_in);
+    run_batching_suite(UnitBfsCsrOffsetMode::kForce64Bit,
+                       "forced-64-bit opt-in batching",
+                       fully_opt_in);
     run_workspace_affinity_and_ownership_suite();
     run_parallel_workspace_suite();
     run_parallel_deep_wide_explicit_stream_suite(
@@ -1280,6 +1433,14 @@ int main() {
     run_parallel_deep_wide_explicit_stream_suite(
         UnitBfsCsrOffsetMode::kForce64Bit,
         "forced-64-bit explicit host controller");
+    run_parallel_deep_wide_explicit_stream_suite(
+        UnitBfsCsrOffsetMode::kAuto,
+        "auto/32-bit opt-in explicit host controller",
+        fully_opt_in);
+    run_parallel_deep_wide_explicit_stream_suite(
+        UnitBfsCsrOffsetMode::kForce64Bit,
+        "forced-64-bit opt-in explicit host controller",
+        fully_opt_in);
 
     // The representation cutoff is compile-time production logic.  A giant CSR
     // fixture would be unsafe, and no public pure selection helper is exposed;
