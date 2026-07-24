@@ -328,6 +328,104 @@ void record_progress(const NearFarCsrProgress& progress, void* user_data) {
       ->push_back(progress);
 }
 
+void require_same_compact_result(const std::string& label,
+                                 const NearFarCsrResult& expected,
+                                 const NearFarCsrResult& actual) {
+  require(expected.target_distances == actual.target_distances,
+          label + ": target distances differ");
+  require(expected.target_sources == actual.target_sources,
+          label + ": target sources differ");
+  require(expected.target_path_offsets == actual.target_path_offsets,
+          label + ": node offsets differ");
+  require(expected.target_edge_offsets == actual.target_edge_offsets,
+          label + ": edge offsets differ");
+  require(expected.target_path_nodes == actual.target_path_nodes,
+          label + ": path nodes differ");
+  require(expected.target_path_edges == actual.target_path_edges,
+          label + ": path edges differ");
+  require(expected.target_reached == actual.target_reached,
+          label + ": target_reached differs");
+}
+
+void test_exact_unit_dispatch_epoch_wrap_and_reuse(hipStream_t stream) {
+  const HostCsrF32 graph = make_outgoing_csr(
+      7,
+      {{0, 2, 1.0f},
+       {1, 2, 1.0f},
+       {0, 3, 1.0f},
+       {1, 3, 1.0f},
+       {2, 4, 1.0f},
+       {2, 4, 1.0f},
+       {3, 4, 1.0f},
+       {4, 5, 1.0f},
+       {5, 6, 1.0f}});
+  const std::vector<int> sources{1, 0, 0};
+  const std::vector<int> targets{0, 2, 4, 6, 2, 1};
+  NearFarCsrWorkspace workspace(
+      graph, stream, NearFarCsrWorkspaceOptions{3, 2});
+
+  near_far_internal_reset_optimization_counters();
+  const NearFarCsrResult controller = run_targets_and_check(
+      "exact-unit controller",
+      workspace,
+      graph,
+      sources,
+      targets,
+      1.0f,
+      stream);
+  require(near_far_internal_unit_controller_count() == 1,
+          "exact-unit graph did not use the Near-Far controller");
+  require(near_far_internal_shard_count_copy_count() == 0,
+          "normal execution copied queue shard counts to the host");
+
+  near_far_internal_force_generic(1);
+  const NearFarCsrResult generic = run_targets_and_check(
+      "forced generic exact-unit graph",
+      workspace,
+      graph,
+      sources,
+      targets,
+      1.0f,
+      stream);
+  near_far_internal_force_generic(0);
+  require_same_compact_result(
+      "exact-unit controller versus generic", controller, generic);
+  require(near_far_internal_controller_fallback_count() >= 1,
+          "force-generic hook did not exercise controller fallback");
+
+  near_far_internal_force_epoch_wrap(1);
+  const NearFarCsrResult wrapped = run_targets_and_check(
+      "forced packed-epoch wrap",
+      workspace,
+      graph,
+      sources,
+      targets,
+      1.0f,
+      stream);
+  require_same_compact_result(
+      "packed epoch wrap", controller, wrapped);
+
+  near_far_internal_reset_optimization_counters();
+  const NearFarCsrResult reused = run_targets_and_check(
+      "allocation-free warmed reuse",
+      workspace,
+      graph,
+      sources,
+      targets,
+      1.0f,
+      stream);
+  require_same_compact_result("warmed reuse", controller, reused);
+  require(near_far_internal_device_allocation_count() == 0 &&
+              near_far_internal_pinned_allocation_count() == 0 &&
+              near_far_internal_target_growth_count() == 0 &&
+              near_far_internal_path_growth_count() == 0,
+          "warmed same-shape query allocated or grew persistent buffers");
+  require(near_far_internal_status_copy_count() > 0 &&
+              near_far_internal_path_transfer_count() == 1 &&
+              near_far_internal_shard_count_copy_count() == 0,
+          "optimized status/path transfer accounting is inconsistent");
+}
+
 void test_weighted_paths_and_ties(hipStream_t stream) {
   const HostCsrF32 graph = make_outgoing_csr(
       9,
@@ -497,6 +595,50 @@ void test_limits_callbacks_reuse_and_costs(hipStream_t stream) {
       "workspace reuse source zero", workspace, chain, {0}, {4}, 0.75f, stream);
   run_targets_and_check(
       "workspace reuse source two", workspace, chain, {2}, {0, 4}, 2.0f, stream);
+
+  std::vector<EdgeSpec> fan_edges;
+  for (int vertex = 1; vertex < 48; ++vertex) {
+    fan_edges.push_back({0, vertex, static_cast<float>(vertex % 7)});
+    fan_edges.push_back({vertex, 63, static_cast<float>(48 - vertex)});
+  }
+  fan_edges.push_back({63, 64, 0.0f});
+  fan_edges.push_back({64, 65, 1.0f});
+  const HostCsrF32 alternating = make_outgoing_csr(66, fan_edges);
+  NearFarCsrWorkspace alternating_workspace(
+      alternating,
+      stream,
+      NearFarCsrWorkspaceOptions{4, 3});
+  const NearFarCsrResult deferred_exit = alternating_workspace.run(
+      std::vector<int>{0},
+      std::vector<int>{65},
+      1.0f,
+      1,
+      stream,
+      nullptr,
+      nullptr);
+  require(!deferred_exit.converged && !deferred_exit.stopped_on_target,
+          "deferred-work capped run stopped unexpectedly");
+  run_targets_and_check("reuse after deferred queues large target set",
+                        alternating_workspace,
+                        alternating,
+                        {0, 7, 13, 13},
+                        {0, 1, 2, 3, 7, 13, 31, 47, 63, 65},
+                        2.0f,
+                        stream);
+  run_targets_and_check("reuse after deferred queues small target set",
+                        alternating_workspace,
+                        alternating,
+                        {64},
+                        {0, 65},
+                        0.5f,
+                        stream);
+  const std::vector<float> alternating_expected =
+      cpu_dijkstra(alternating, {63});
+  validate_full_distances(
+      "full distances after alternating target reuse",
+      alternating_expected,
+      alternating_workspace.run_distances(
+          std::vector<int>{63}, 1.0f, -1, stream, nullptr, nullptr));
 
   const HostCsrF32 cost_graph = make_outgoing_csr(
       3, {{0, 1, 2.0f}, {0, 2, 1.0f}, {2, 1, 1.0f}});
@@ -713,6 +855,7 @@ int main() {
     }
 
     HipStream stream;
+    test_exact_unit_dispatch_epoch_wrap_and_reuse(stream.get());
     test_weighted_paths_and_ties(stream.get());
     test_thresholds_stale_entries_and_spill(stream.get());
     test_limits_callbacks_reuse_and_costs(stream.get());

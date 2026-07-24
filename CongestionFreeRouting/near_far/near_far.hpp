@@ -5,6 +5,7 @@
 #include <hip/hip_runtime.h>
 
 #include <cstddef>
+#include <cstdint>
 #include <memory>
 #include <vector>
 
@@ -104,3 +105,19 @@ class NearFarCsrWorkspace {
  private:
   std::unique_ptr<Impl> impl_;
 };
+
+// Internal test/benchmark controls. These are C-linked so standalone HIP
+// regression binaries can query optimization behavior without exposing it in
+// the routing API.
+extern "C" void near_far_internal_reset_optimization_counters();
+extern "C" std::uint64_t near_far_internal_status_copy_count();
+extern "C" std::uint64_t near_far_internal_shard_count_copy_count();
+extern "C" std::uint64_t near_far_internal_unit_controller_count();
+extern "C" std::uint64_t near_far_internal_controller_fallback_count();
+extern "C" std::uint64_t near_far_internal_path_transfer_count();
+extern "C" std::uint64_t near_far_internal_target_growth_count();
+extern "C" std::uint64_t near_far_internal_path_growth_count();
+extern "C" std::uint64_t near_far_internal_device_allocation_count();
+extern "C" std::uint64_t near_far_internal_pinned_allocation_count();
+extern "C" void near_far_internal_force_generic(int enabled);
+extern "C" void near_far_internal_force_epoch_wrap(int enabled);
