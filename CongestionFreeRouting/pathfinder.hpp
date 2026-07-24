@@ -1,6 +1,7 @@
 #pragma once
 
 #include "../HIP_kernel/bellman_ford/src/bf_hip_CSR.hpp"
+#include "sssp_query_capacity.hpp"
 
 #include <hip/hip_runtime.h>
 
@@ -160,6 +161,13 @@ struct UnitBfsPathDiagnostic {
 
 HostCsrF32 load_csrbin(const std::filesystem::path& path);
 RoutingMetadata load_interchange_metadata(const std::filesystem::path& path);
+
+// Derive conservative initial workspace reservations from exactly the routed
+// request prefix. Raw endpoint counts are retained (including duplicates), and
+// the result is only a hint: low-level workspaces may still grow later.
+SsspQueryCapacityHints derive_query_capacity_hints(
+    const RoutingMetadata& metadata,
+    std::size_t routed_request_count);
 
 std::vector<PathEdge> reconstruct_shortest_path(
     const HostCsrF32& graph,

@@ -34,6 +34,9 @@ std::vector<float> g_delta_values;
 std::mutex g_query_limits_mutex;
 std::vector<float> g_delta_distance_limits;
 std::vector<int> g_unit_depth_limits;
+std::mutex g_capacity_hints_mutex;
+std::vector<SsspQueryCapacityHints> g_delta_capacity_hints;
+std::vector<SsspQueryCapacityHints> g_unit_capacity_hints;
 
 void clear_recorded_deltas() {
   std::lock_guard<std::mutex> lock(g_delta_values_mutex);
@@ -59,6 +62,22 @@ std::vector<float> recorded_delta_distance_limits() {
 std::vector<int> recorded_unit_depth_limits() {
   std::lock_guard<std::mutex> lock(g_query_limits_mutex);
   return g_unit_depth_limits;
+}
+
+void clear_recorded_capacity_hints() {
+  std::lock_guard<std::mutex> lock(g_capacity_hints_mutex);
+  g_delta_capacity_hints.clear();
+  g_unit_capacity_hints.clear();
+}
+
+std::vector<SsspQueryCapacityHints> recorded_delta_capacity_hints() {
+  std::lock_guard<std::mutex> lock(g_capacity_hints_mutex);
+  return g_delta_capacity_hints;
+}
+
+std::vector<SsspQueryCapacityHints> recorded_unit_capacity_hints() {
+  std::lock_guard<std::mutex> lock(g_capacity_hints_mutex);
+  return g_unit_capacity_hints;
 }
 
 struct CpuSsspResult {
@@ -869,6 +888,32 @@ DeltaSteppingCsrWorkspace::DeltaSteppingCsrWorkspace(
   impl_->base_values = impl_->graph.values;
 }
 
+DeltaSteppingCsrWorkspace::DeltaSteppingCsrWorkspace(
+    const HostCsrF32& adjacency,
+    hipStream_t stream,
+    DeltaSteppingCsrWorkspaceOptions options)
+    : DeltaSteppingCsrWorkspace(adjacency, stream) {
+  parent_mode_ = options.parent_mode;
+  execution_mode_ = options.execution_mode;
+  current_membership_mode_ = options.current_membership_mode;
+  sssp_capacity::validate_reservation(options.capacity_hints);
+  std::lock_guard<std::mutex> lock(g_capacity_hints_mutex);
+  g_delta_capacity_hints.push_back(options.capacity_hints);
+}
+
+DeltaSteppingCsrWorkspace::DeltaSteppingCsrWorkspace(
+    std::shared_ptr<const DeltaSteppingCsrGraph> adjacency,
+    hipStream_t stream,
+    DeltaSteppingCsrWorkspaceOptions options)
+    : DeltaSteppingCsrWorkspace(std::move(adjacency), stream) {
+  parent_mode_ = options.parent_mode;
+  execution_mode_ = options.execution_mode;
+  current_membership_mode_ = options.current_membership_mode;
+  sssp_capacity::validate_reservation(options.capacity_hints);
+  std::lock_guard<std::mutex> lock(g_capacity_hints_mutex);
+  g_delta_capacity_hints.push_back(options.capacity_hints);
+}
+
 DeltaSteppingCsrWorkspace::~DeltaSteppingCsrWorkspace() = default;
 DeltaSteppingCsrWorkspace::DeltaSteppingCsrWorkspace(
     DeltaSteppingCsrWorkspace&&) noexcept = default;
@@ -1155,6 +1200,37 @@ UnitBfsCsrWorkspace::UnitBfsCsrWorkspace(
   impl_->graph = std::move(adjacency);
 }
 
+UnitBfsCsrWorkspace::UnitBfsCsrWorkspace(
+    const HostCsrF32& adjacency,
+    hipStream_t stream,
+    UnitBfsCsrWorkspaceOptions options)
+    : UnitBfsCsrWorkspace(adjacency, stream) {
+  sssp_capacity::validate_reservation(options.capacity_hints);
+  std::lock_guard<std::mutex> lock(g_capacity_hints_mutex);
+  g_unit_capacity_hints.push_back(options.capacity_hints);
+}
+
+UnitBfsCsrWorkspace::UnitBfsCsrWorkspace(
+    const HostCsrF32& adjacency,
+    hipStream_t stream,
+    UnitBfsCsrOffsetMode offset_mode,
+    UnitBfsCsrWorkspaceOptions options)
+    : UnitBfsCsrWorkspace(adjacency, stream, offset_mode) {
+  sssp_capacity::validate_reservation(options.capacity_hints);
+  std::lock_guard<std::mutex> lock(g_capacity_hints_mutex);
+  g_unit_capacity_hints.push_back(options.capacity_hints);
+}
+
+UnitBfsCsrWorkspace::UnitBfsCsrWorkspace(
+    std::shared_ptr<const UnitBfsCsrGraph> adjacency,
+    hipStream_t stream,
+    UnitBfsCsrWorkspaceOptions options)
+    : UnitBfsCsrWorkspace(std::move(adjacency), stream) {
+  sssp_capacity::validate_reservation(options.capacity_hints);
+  std::lock_guard<std::mutex> lock(g_capacity_hints_mutex);
+  g_unit_capacity_hints.push_back(options.capacity_hints);
+}
+
 UnitBfsCsrWorkspace::~UnitBfsCsrWorkspace() = default;
 UnitBfsCsrWorkspace::UnitBfsCsrWorkspace(UnitBfsCsrWorkspace&&) noexcept = default;
 UnitBfsCsrWorkspace& UnitBfsCsrWorkspace::operator=(
@@ -1232,6 +1308,44 @@ UnitBfsCsrResult UnitBfsCsrWorkspace::run(
 }
 
 int main() {
+  {
+    const routing::RoutingMetadata empty_metadata;
+    const SsspQueryCapacityHints empty_hints =
+        routing::derive_query_capacity_hints(empty_metadata, 0);
+    require(empty_hints.max_sources == 0 && empty_hints.max_targets == 0,
+            "empty routing metadata must produce empty capacity hints");
+
+    routing::RoutingMetadata hint_metadata;
+    routing::RouteRequest first;
+    first.sources = {{1, 0, 0}, {1, 0, 0}};
+    first.sinks = {{2, 0, 0}};
+    hint_metadata.route_requests.push_back(first);
+    routing::RouteRequest second;
+    second.sources = {{3, 0, 0}};
+    second.sinks = {{4, 0, 0}, {4, 0, 0}, {5, 0, 0}};
+    hint_metadata.route_requests.push_back(second);
+
+    const SsspQueryCapacityHints limited_hints =
+        routing::derive_query_capacity_hints(hint_metadata, 1);
+    require(limited_hints.max_sources == 2 &&
+                limited_hints.max_targets == 1,
+            "capacity hints must honor the routed metadata prefix and retain "
+            "duplicate endpoint counts");
+    const SsspQueryCapacityHints all_hints =
+        routing::derive_query_capacity_hints(hint_metadata, 2);
+    require(all_hints.max_sources == 2 && all_hints.max_targets == 3,
+            "capacity hints must take independent source and target maxima");
+
+    bool rejected_excess_request_count = false;
+    try {
+      (void)routing::derive_query_capacity_hints(hint_metadata, 3);
+    } catch (const std::invalid_argument&) {
+      rejected_excess_request_count = true;
+    }
+    require(rejected_excess_request_count,
+            "capacity hints must reject a routed prefix beyond metadata");
+  }
+
   require(routing::PathfinderOptions{}.delta == 1.0f,
           "default delta-stepping bucket width must be one");
   require(!routing::PathfinderOptions{}.delta_auto,
@@ -1768,6 +1882,7 @@ int main() {
   g_multisource_delta_calls = 0;
   g_unit_bfs_calls = 0;
   g_unit_bfs_graph_uploads = 0;
+  clear_recorded_capacity_hints();
   routing::PathfinderResult parallel_result =
       routing::run_pathfinder(congestion_graph,
                               congestion_metadata,
@@ -1785,6 +1900,22 @@ int main() {
           "parallel unit BFS workers should share one uploaded CSR graph");
   require(g_multisource_delta_calls == 0,
           "parallel default routing should not call delta-step");
+  const SsspQueryCapacityHints expected_parallel_hints =
+      routing::derive_query_capacity_hints(
+          congestion_metadata, congestion_metadata.route_requests.size());
+  const std::vector<SsspQueryCapacityHints> parallel_unit_hints =
+      recorded_unit_capacity_hints();
+  require(parallel_unit_hints.size() == 2 &&
+              std::all_of(parallel_unit_hints.begin(),
+                          parallel_unit_hints.end(),
+                          [expected_parallel_hints](
+                              const SsspQueryCapacityHints& hints) {
+                            return hints.max_sources ==
+                                       expected_parallel_hints.max_sources &&
+                                   hints.max_targets ==
+                                       expected_parallel_hints.max_targets;
+                          }),
+          "every parallel UnitBFS workspace must receive identical hints");
 
   routing::PathfinderOptions parallel_delta_options = parallel_options;
   parallel_delta_options.sssp_engine = routing::SsspEngine::kDeltaStep;
@@ -1793,6 +1924,7 @@ int main() {
   g_unit_bfs_calls = 0;
   g_delta_graph_uploads = 0;
   clear_recorded_deltas();
+  clear_recorded_capacity_hints();
   routing::PathfinderResult parallel_delta_result =
       routing::run_pathfinder(congestion_graph,
                               congestion_metadata,
@@ -1806,6 +1938,19 @@ int main() {
           "parallel delta workers should share one uploaded CSR graph");
   require(g_unit_bfs_calls == 0,
           "parallel explicit delta routing should not call unit BFS");
+  const std::vector<SsspQueryCapacityHints> parallel_delta_hints =
+      recorded_delta_capacity_hints();
+  require(parallel_delta_hints.size() == 2 &&
+              std::all_of(parallel_delta_hints.begin(),
+                          parallel_delta_hints.end(),
+                          [expected_parallel_hints](
+                              const SsspQueryCapacityHints& hints) {
+                            return hints.max_sources ==
+                                       expected_parallel_hints.max_sources &&
+                                   hints.max_targets ==
+                                       expected_parallel_hints.max_targets;
+                          }),
+          "every parallel Delta workspace must receive identical hints");
   const std::vector<float> explicit_deltas = recorded_deltas();
   require(explicit_deltas.size() == 2 &&
               std::all_of(explicit_deltas.begin(),
@@ -2261,6 +2406,7 @@ int main() {
     routing::PathfinderOptions parallel_cached_options = cached_options;
     parallel_cached_options.parallel_net_workers = 4;
     g_unit_bfs_calls = 0;
+    clear_recorded_capacity_hints();
     const routing::PathfinderResult parallel_cached_result =
         routing::run_pathfinder(cached_graph,
                                 parallel_cached_metadata,
@@ -2274,6 +2420,16 @@ int main() {
     }
     require(g_unit_bfs_calls == 4,
             "four two-sink nets should each issue one batched query");
+    const std::vector<SsspQueryCapacityHints> four_worker_hints =
+        recorded_unit_capacity_hints();
+    require(four_worker_hints.size() == 4 &&
+                std::all_of(four_worker_hints.begin(),
+                            four_worker_hints.end(),
+                            [](const SsspQueryCapacityHints& hints) {
+                              return hints.max_sources == 1 &&
+                                     hints.max_targets == 2;
+                            }),
+            "the four-worker UnitBFS baseline must apply identical hints");
 
     HostCsrF32 weighted_cached_graph = cached_graph;
     weighted_cached_graph.values = {1.0f, 3.0f, 1.0f, 1.0f, 3.0f};
@@ -2328,6 +2484,7 @@ int main() {
   unit_graph.values = {1.0f, 1.0f, 1.0f};
   routing::RoutingMetadata metadata = make_metadata();
   metadata.edge_attrs.resize(static_cast<std::size_t>(unit_graph.nnz));
+  clear_recorded_capacity_hints();
   routing::PathfinderResult result =
       routing::run_pathfinder(unit_graph, metadata, options, nullptr);
   require(result.routed, "PathFinder should route the simple tree graph");
@@ -2353,11 +2510,55 @@ int main() {
           "all sinks should share one UnitBFS batch");
   require(g_multisource_delta_calls == 0,
           "default unit BFS path should not call delta-step");
+  const std::vector<SsspQueryCapacityHints> unit_capacity_hints =
+      recorded_unit_capacity_hints();
+  require(unit_capacity_hints.size() == 1 &&
+              unit_capacity_hints.front().max_sources == 1 &&
+              unit_capacity_hints.front().max_targets == 2,
+          "PathFinder must apply metadata-derived UnitBFS reservations");
+
+  routing::RoutingMetadata net_limited_metadata = metadata;
+  routing::RouteRequest ignored_larger_request =
+      net_limited_metadata.route_requests.front();
+  ignored_larger_request.sources.push_back(
+      ignored_larger_request.sources.front());
+  ignored_larger_request.sources.push_back(
+      ignored_larger_request.sources.front());
+  ignored_larger_request.sinks.push_back(ignored_larger_request.sinks.front());
+  ignored_larger_request.sinks.push_back(ignored_larger_request.sinks.front());
+  net_limited_metadata.route_requests.push_back(
+      std::move(ignored_larger_request));
+  routing::PathfinderOptions net_limited_options = options;
+  net_limited_options.net_limit = 1;
+  clear_recorded_capacity_hints();
+  const routing::PathfinderResult net_limited_result =
+      routing::run_pathfinder(
+          unit_graph, net_limited_metadata, net_limited_options, nullptr);
+  const std::vector<SsspQueryCapacityHints> net_limited_hints =
+      recorded_unit_capacity_hints();
+  require(net_limited_result.nets.size() == 1 &&
+              net_limited_hints.size() == 1 &&
+              net_limited_hints.front().max_sources == 1 &&
+              net_limited_hints.front().max_targets == 2,
+          "--net-limit must exclude later metadata from capacity hints");
+
+  routing::RoutingMetadata empty_request_metadata = metadata;
+  empty_request_metadata.route_requests.clear();
+  clear_recorded_capacity_hints();
+  (void)routing::run_pathfinder(
+      unit_graph, empty_request_metadata, options, nullptr);
+  const std::vector<SsspQueryCapacityHints> empty_capacity_hints =
+      recorded_unit_capacity_hints();
+  require(empty_capacity_hints.size() == 1 &&
+              empty_capacity_hints.front().max_sources == 0 &&
+              empty_capacity_hints.front().max_targets == 0,
+          "empty routed metadata must preserve optional zero reservations");
 
   g_multisource_delta_calls = 0;
   g_unit_bfs_calls = 0;
   routing::PathfinderOptions delta_options = options;
   delta_options.sssp_engine = routing::SsspEngine::kDeltaStep;
+  clear_recorded_capacity_hints();
   routing::PathfinderResult delta_result =
       routing::run_pathfinder(unit_graph, metadata, delta_options, nullptr);
   require(delta_result.routed, "delta-step comparison path should still route");
@@ -2369,6 +2570,12 @@ int main() {
           "delta-step should route all sinks in one batch");
   require(g_unit_bfs_calls == 0,
           "explicit delta-step comparison path should not call unit BFS");
+  const std::vector<SsspQueryCapacityHints> delta_capacity_hints =
+      recorded_delta_capacity_hints();
+  require(delta_capacity_hints.size() == 1 &&
+              delta_capacity_hints.front().max_sources == 1 &&
+              delta_capacity_hints.front().max_targets == 2,
+          "PathFinder must apply metadata-derived Delta reservations");
 
   routing::RoutingMetadata invalid_sink_metadata = make_metadata();
   invalid_sink_metadata.edge_attrs.resize(static_cast<std::size_t>(unit_graph.nnz));

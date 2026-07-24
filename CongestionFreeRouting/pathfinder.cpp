@@ -78,18 +78,37 @@ int read_route_node(std::ifstream& in, const char* name) {
 }
 
 template <typename T>
+std::size_t checked_vector_count(std::uint64_t count, const char* name) {
+  if (count >
+      static_cast<std::uint64_t>(std::numeric_limits<std::size_t>::max())) {
+    throw std::overflow_error(std::string(name) +
+                              " count is too large for this host");
+  }
+  const std::size_t host_count = static_cast<std::size_t>(count);
+  try {
+    (void)sssp_capacity::checked_bytes<T>(host_count);
+  } catch (const std::overflow_error&) {
+    throw std::overflow_error(std::string(name) + " byte count overflows");
+  }
+  return host_count;
+}
+
+template <typename T>
 void read_array(std::ifstream& in,
                 std::vector<T>& values,
                 std::uint64_t count,
                 const char* name) {
-  if (count > static_cast<std::uint64_t>(std::numeric_limits<std::size_t>::max())) {
-    throw std::runtime_error(std::string(name) + " count is too large for this host");
+  const std::size_t host_count = checked_vector_count<T>(count, name);
+  const std::size_t bytes = sssp_capacity::checked_bytes<T>(host_count);
+  if (bytes > static_cast<std::size_t>(
+                  std::numeric_limits<std::streamsize>::max())) {
+    throw std::overflow_error(std::string(name) +
+                              " byte count exceeds stream range");
   }
-  values.resize(static_cast<std::size_t>(count));
+  values.resize(host_count);
   if (values.empty()) {
     return;
   }
-  const std::size_t bytes = values.size() * sizeof(T);
   in.read(reinterpret_cast<char*>(values.data()), static_cast<std::streamsize>(bytes));
   if (!in) {
     throw std::runtime_error(std::string("failed while reading ") + name);
@@ -98,11 +117,14 @@ void read_array(std::ifstream& in,
 
 std::string read_string(std::ifstream& in) {
   const std::uint64_t size = read_u64(in, "metadata string length");
-  if (size > static_cast<std::uint64_t>(std::numeric_limits<std::size_t>::max())) {
-    throw std::runtime_error("metadata string is too large for this host");
+  const std::size_t host_size =
+      checked_vector_count<char>(size, "metadata string");
+  if (host_size > static_cast<std::size_t>(
+                      std::numeric_limits<std::streamsize>::max())) {
+    throw std::overflow_error(
+        "metadata string byte count exceeds stream range");
   }
-
-  std::string text(static_cast<std::size_t>(size), '\0');
+  std::string text(host_size, '\0');
   if (!text.empty()) {
     in.read(text.data(), static_cast<std::streamsize>(text.size()));
     if (!in) {
@@ -1662,6 +1684,24 @@ std::filesystem::path default_metadata_path(const std::filesystem::path& csr_pat
   return path;
 }
 
+SsspQueryCapacityHints derive_query_capacity_hints(
+    const RoutingMetadata& metadata,
+    std::size_t routed_request_count) {
+  if (routed_request_count > metadata.route_requests.size()) {
+    throw std::invalid_argument(
+        "routed request count exceeds available routing metadata");
+  }
+  SsspQueryCapacityHints hints;
+  for (std::size_t request_index = 0;
+       request_index < routed_request_count;
+       ++request_index) {
+    const RouteRequest& request = metadata.route_requests[request_index];
+    sssp_capacity::accumulate_query_counts(
+        hints, request.sources.size(), request.sinks.size());
+  }
+  return hints;
+}
+
 int parse_int_arg(const char* text, const char* name) {
   char* end = nullptr;
   const long value = std::strtol(text, &end, 10);
@@ -1961,7 +2001,8 @@ RoutingMetadata load_interchange_metadata(const std::filesystem::path& path) {
   metadata.logical_path_string = read_u64(in, "metadata logical path string");
   metadata.logical_design_name_string = read_u64(in, "metadata logical design name");
 
-  metadata.strings.reserve(static_cast<std::size_t>(string_count));
+  metadata.strings.reserve(
+      checked_vector_count<std::string>(string_count, "metadata strings"));
   for (std::uint64_t i = 0; i < string_count; ++i) {
     metadata.strings.push_back(read_string(in));
   }
@@ -1992,33 +2033,43 @@ RoutingMetadata load_interchange_metadata(const std::filesystem::path& path) {
              node_count,
              "metadata node wire type strings");
 
-  metadata.edge_attrs.resize(static_cast<std::size_t>(edge_attr_count));
+  metadata.edge_attrs.resize(
+      checked_vector_count<EdgeAttr>(edge_attr_count,
+                                     "metadata edge attributes"));
   for (EdgeAttr& attr : metadata.edge_attrs) {
     attr.tile_string = read_u64(in, "metadata edge tile string");
     attr.pip_data_index = read_u64(in, "metadata edge pip data index");
   }
 
-  metadata.pip_data.resize(static_cast<std::size_t>(pip_data_count));
+  metadata.pip_data.resize(
+      checked_vector_count<PipData>(pip_data_count, "metadata pip data"));
   for (PipData& pip : metadata.pip_data) {
     pip.wire0_string = read_u64(in, "metadata pip wire0 string");
     pip.wire1_string = read_u64(in, "metadata pip wire1 string");
     pip.forward = read_u64(in, "metadata pip forward flag") != 0;
   }
 
-  metadata.site_pin_attrs.resize(static_cast<std::size_t>(site_pin_attr_count));
+  metadata.site_pin_attrs.resize(
+      checked_vector_count<SitePinNode>(site_pin_attr_count,
+                                        "metadata site pin attributes"));
   for (SitePinNode& attr : metadata.site_pin_attrs) {
     attr.node = read_route_node(in, "metadata site pin node");
     attr.site_string = read_u64(in, "metadata site pin site");
     attr.pin_string = read_u64(in, "metadata site pin pin");
   }
 
-  metadata.route_requests.resize(static_cast<std::size_t>(route_request_count));
+  metadata.route_requests.resize(
+      checked_vector_count<RouteRequest>(route_request_count,
+                                          "metadata route requests"));
   for (RouteRequest& request : metadata.route_requests) {
     request.net_string = read_u64(in, "metadata route request net");
     request.logical_net_index = read_u64(in, "metadata route logical net");
 
     const std::uint64_t source_count = read_u64(in, "metadata source count");
-    request.sources.resize(static_cast<std::size_t>(source_count));
+    const std::size_t host_source_count =
+        checked_vector_count<SitePinNode>(source_count, "metadata sources");
+    sssp_capacity::checked_device_count(host_source_count);
+    request.sources.resize(host_source_count);
     for (SitePinNode& source : request.sources) {
       source.node = read_route_node(in, "metadata source node");
       source.site_string = read_u64(in, "metadata source site");
@@ -2026,7 +2077,10 @@ RoutingMetadata load_interchange_metadata(const std::filesystem::path& path) {
     }
 
     const std::uint64_t sink_count = read_u64(in, "metadata sink count");
-    request.sinks.resize(static_cast<std::size_t>(sink_count));
+    const std::size_t host_sink_count =
+        checked_vector_count<SitePinNode>(sink_count, "metadata sinks");
+    sssp_capacity::checked_device_count(host_sink_count);
+    request.sinks.resize(host_sink_count);
     for (SitePinNode& sink : request.sinks) {
       sink.node = read_route_node(in, "metadata sink node");
       sink.site_string = read_u64(in, "metadata sink site");
@@ -2185,6 +2239,8 @@ PathfinderResult run_pathfinder(const HostCsrF32& base_graph,
       options.net_limit == 0
           ? metadata.route_requests.size()
           : std::min(options.net_limit, metadata.route_requests.size());
+  const SsspQueryCapacityHints query_capacity_hints =
+      derive_query_capacity_hints(metadata, route_request_count);
   if (unit_bfs_diagnostic != nullptr) {
     if (options.sssp_engine != SsspEngine::kUnitBfs) {
       throw std::invalid_argument(
@@ -2247,8 +2303,11 @@ PathfinderResult run_pathfinder(const HostCsrF32& base_graph,
           route_request_count,
           progress_interval,
           result.nets,
-          [shared_graph](hipStream_t worker_stream) {
-            return UnitBfsCsrWorkspace(shared_graph, worker_stream);
+          [shared_graph, query_capacity_hints](hipStream_t worker_stream) {
+            UnitBfsCsrWorkspaceOptions workspace_options;
+            workspace_options.capacity_hints = query_capacity_hints;
+            return UnitBfsCsrWorkspace(
+                shared_graph, worker_stream, workspace_options);
           },
           nullptr,
           unit_bfs_diagnostic);
@@ -2286,13 +2345,16 @@ PathfinderResult run_pathfinder(const HostCsrF32& base_graph,
                   << delta_options.parallel_net_workers
                   << " delta-step worker(s)\n";
       }
-      const DeltaSteppingCsrWorkspaceOptions workspace_options{
+      DeltaSteppingCsrWorkspaceOptions workspace_options;
+      workspace_options.parent_mode =
           delta_options.delta_force_legacy_parent
               ? DeltaSteppingCsrParentMode::kForceLegacy
-              : DeltaSteppingCsrParentMode::kAutomatic,
+              : DeltaSteppingCsrParentMode::kAutomatic;
+      workspace_options.execution_mode =
           delta_options.delta_force_generic
               ? DeltaSteppingCsrExecutionMode::kForceGeneric
-              : DeltaSteppingCsrExecutionMode::kAutomatic};
+              : DeltaSteppingCsrExecutionMode::kAutomatic;
+      workspace_options.capacity_hints = query_capacity_hints;
       if (workspace_options.execution_mode ==
           DeltaSteppingCsrExecutionMode::kForceGeneric) {
         std::cout << "[pathfinder] selected forced generic delta execution\n";

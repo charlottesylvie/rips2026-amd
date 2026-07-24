@@ -287,39 +287,41 @@ routing::RoutingMetadata make_two_net_metadata(const HostCsrF32& graph) {
 
 }  // namespace
 
-struct BellmanFordCsrGraph::Impl {
+struct BellmanFord10CsrGraph::Impl {
   explicit Impl(const HostCsrF32& adjacency) : graph(adjacency) {}
 
   HostCsrF32 graph;
 };
 
-BellmanFordCsrGraph::BellmanFordCsrGraph(const HostCsrF32& adjacency,
-                                         hipStream_t stream)
+BellmanFord10CsrGraph::BellmanFord10CsrGraph(const HostCsrF32& adjacency,
+                                             hipStream_t stream)
     : impl_(std::make_shared<Impl>(adjacency)) {
   (void)stream;
   ++g_bellman_ford_graph_uploads;
 }
 
-BellmanFordCsrGraph::~BellmanFordCsrGraph() = default;
-BellmanFordCsrGraph::BellmanFordCsrGraph(BellmanFordCsrGraph&&) noexcept = default;
-BellmanFordCsrGraph& BellmanFordCsrGraph::operator=(
-    BellmanFordCsrGraph&&) noexcept = default;
+BellmanFord10CsrGraph::~BellmanFord10CsrGraph() = default;
+BellmanFord10CsrGraph::BellmanFord10CsrGraph(
+    BellmanFord10CsrGraph&&) noexcept = default;
+BellmanFord10CsrGraph& BellmanFord10CsrGraph::operator=(
+    BellmanFord10CsrGraph&&) noexcept = default;
 
-struct BellmanFordCsrWorkspace::Impl {
-  std::shared_ptr<const BellmanFordCsrGraph::Impl> graph;
+struct BellmanFord10CsrWorkspace::Impl {
+  std::shared_ptr<const BellmanFord10CsrGraph::Impl> graph;
 };
 
-BellmanFordCsrWorkspace::BellmanFordCsrWorkspace(const HostCsrF32& adjacency,
-                                                 hipStream_t stream)
+BellmanFord10CsrWorkspace::BellmanFord10CsrWorkspace(
+    const HostCsrF32& adjacency,
+    hipStream_t stream)
     : impl_(std::make_unique<Impl>()) {
   (void)stream;
   ++g_bellman_ford_workspace_constructions;
   ++g_bellman_ford_graph_uploads;
-  impl_->graph = std::make_shared<BellmanFordCsrGraph::Impl>(adjacency);
+  impl_->graph = std::make_shared<BellmanFord10CsrGraph::Impl>(adjacency);
 }
 
-BellmanFordCsrWorkspace::BellmanFordCsrWorkspace(
-    std::shared_ptr<const BellmanFordCsrGraph> adjacency,
+BellmanFord10CsrWorkspace::BellmanFord10CsrWorkspace(
+    std::shared_ptr<const BellmanFord10CsrGraph> adjacency,
     hipStream_t stream)
     : impl_(std::make_unique<Impl>()) {
   (void)stream;
@@ -330,13 +332,13 @@ BellmanFordCsrWorkspace::BellmanFordCsrWorkspace(
   impl_->graph = adjacency->impl_;
 }
 
-BellmanFordCsrWorkspace::~BellmanFordCsrWorkspace() = default;
-BellmanFordCsrWorkspace::BellmanFordCsrWorkspace(
-    BellmanFordCsrWorkspace&&) noexcept = default;
-BellmanFordCsrWorkspace& BellmanFordCsrWorkspace::operator=(
-    BellmanFordCsrWorkspace&&) noexcept = default;
+BellmanFord10CsrWorkspace::~BellmanFord10CsrWorkspace() = default;
+BellmanFord10CsrWorkspace::BellmanFord10CsrWorkspace(
+    BellmanFord10CsrWorkspace&&) noexcept = default;
+BellmanFord10CsrWorkspace& BellmanFord10CsrWorkspace::operator=(
+    BellmanFord10CsrWorkspace&&) noexcept = default;
 
-BellmanFordCsrResult BellmanFordCsrWorkspace::run(
+BellmanFordCsrResult BellmanFord10CsrWorkspace::run(
     const std::vector<int>& sources,
     const std::vector<int>& targets,
     float delta,
@@ -363,7 +365,7 @@ BellmanFordCsrResult BellmanFordCsrWorkspace::run(
   return result;
 }
 
-BellmanFordCsrResult BellmanFordCsrWorkspace::run(
+BellmanFordCsrResult BellmanFord10CsrWorkspace::run(
     const std::vector<int>& sources,
     int target,
     float delta,
@@ -384,7 +386,7 @@ BellmanFordCsrResult BellmanFordCsrWorkspace::run(
   return result;
 }
 
-BellmanFordCsrResult BellmanFordCsrWorkspace::run(
+BellmanFordCsrResult BellmanFord10CsrWorkspace::run(
     int source,
     int target,
     float delta,
@@ -444,6 +446,28 @@ DeltaSteppingCsrWorkspace::DeltaSteppingCsrWorkspace(
   }
   impl_->graph = adjacency->impl_->graph;
   impl_->base_values = impl_->graph.values;
+}
+
+DeltaSteppingCsrWorkspace::DeltaSteppingCsrWorkspace(
+    const HostCsrF32& adjacency,
+    hipStream_t stream,
+    DeltaSteppingCsrWorkspaceOptions options)
+    : DeltaSteppingCsrWorkspace(adjacency, stream) {
+  parent_mode_ = options.parent_mode;
+  execution_mode_ = options.execution_mode;
+  current_membership_mode_ = options.current_membership_mode;
+  sssp_capacity::validate_reservation(options.capacity_hints);
+}
+
+DeltaSteppingCsrWorkspace::DeltaSteppingCsrWorkspace(
+    std::shared_ptr<const DeltaSteppingCsrGraph> adjacency,
+    hipStream_t stream,
+    DeltaSteppingCsrWorkspaceOptions options)
+    : DeltaSteppingCsrWorkspace(std::move(adjacency), stream) {
+  parent_mode_ = options.parent_mode;
+  execution_mode_ = options.execution_mode;
+  current_membership_mode_ = options.current_membership_mode;
+  sssp_capacity::validate_reservation(options.capacity_hints);
 }
 
 DeltaSteppingCsrWorkspace::~DeltaSteppingCsrWorkspace() = default;
@@ -657,6 +681,31 @@ UnitBfsCsrWorkspace::UnitBfsCsrWorkspace(
     throw std::invalid_argument("unit BFS shared graph must not be null");
   }
   impl_->graph = std::move(adjacency);
+}
+
+UnitBfsCsrWorkspace::UnitBfsCsrWorkspace(
+    const HostCsrF32& adjacency,
+    hipStream_t stream,
+    UnitBfsCsrWorkspaceOptions options)
+    : UnitBfsCsrWorkspace(adjacency, stream) {
+  sssp_capacity::validate_reservation(options.capacity_hints);
+}
+
+UnitBfsCsrWorkspace::UnitBfsCsrWorkspace(
+    const HostCsrF32& adjacency,
+    hipStream_t stream,
+    UnitBfsCsrOffsetMode offset_mode,
+    UnitBfsCsrWorkspaceOptions options)
+    : UnitBfsCsrWorkspace(adjacency, stream, offset_mode) {
+  sssp_capacity::validate_reservation(options.capacity_hints);
+}
+
+UnitBfsCsrWorkspace::UnitBfsCsrWorkspace(
+    std::shared_ptr<const UnitBfsCsrGraph> adjacency,
+    hipStream_t stream,
+    UnitBfsCsrWorkspaceOptions options)
+    : UnitBfsCsrWorkspace(std::move(adjacency), stream) {
+  sssp_capacity::validate_reservation(options.capacity_hints);
 }
 
 UnitBfsCsrWorkspace::~UnitBfsCsrWorkspace() = default;
@@ -1006,8 +1055,8 @@ int main() {
           "route tree should contain nodes 0,1,2,3");
   require(result.occupancy == std::vector<int>({1, 1, 1, 1}),
           "all route tree nodes should be occupied once");
-  require(g_unit_bfs_calls == 2,
-          "PathFinder should rerun unit BFS after expanding a multi-sink tree");
+  require(g_unit_bfs_calls == 1,
+          "all sinks should share one UnitBFS batch");
   require(g_multisource_delta_calls == 0,
           "default unit BFS path should not call delta-step");
 
@@ -1022,8 +1071,8 @@ int main() {
           "delta-step comparison path should preserve first sink route");
   require(delta_result.nets[0].sinks[1].nodes == std::vector<int>({1, 3}),
           "delta-step comparison path should preserve second sink route");
-  require(g_multisource_delta_calls == 2,
-          "delta-step should rerun after expanding a multi-sink tree");
+  require(g_multisource_delta_calls == 1,
+          "delta-step should route all sinks in one batch");
   require(g_unit_bfs_calls == 0,
           "explicit delta-step comparison path should not call unit BFS");
 
