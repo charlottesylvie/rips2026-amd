@@ -1,109 +1,152 @@
 # GPU SSSP Development Status
 
-Updated 2026-07-23 from the working tree after commit `c35b824`.
+Updated 2026-07-24 for the bounded UnitBFS/classic-Delta optimization pass.
+All GPU changes below are implemented but HIP-unvalidated.
 
-This is a concise snapshot of landed work, current confidence, and the next
-development gates. Build instructions, public options, the routing pipeline,
-and file formats belong in [README.md](README.md); measurements and detailed
-design proposals are linked below rather than repeated here.
+This file is the concise source of truth for landed work, confidence, and the
+next development gates. Build instructions, public options, the routing
+pipeline, and file formats belong in [README.md](README.md). Historical
+measurements and reproduction commands belong in
+[BENCHMARKING.md](BENCHMARKING.md), while profiler procedures and Delta
+telemetry definitions belong in
+[GPU_PROFILING.md](CongestionFreeRouting/GPU_PROFILING.md).
 
-## Current objective
+## Current objective and algorithm scope
 
-The primary research target is a competitive single-GPU HIP/ROCm SSSP backend
-for arbitrary nonnegative weights. UnitBFS remains the production specialization
-for exact-unit routing graphs, while classic Delta-Stepping is the generic
-baseline from which the weighted implementation will evolve.
+The production graph has exact unit weights, so UnitBFS is the default and the
+most relevant routing backend. Classic Delta-Stepping is the retained backend
+for arbitrary nonnegative weights and for controlled comparisons on the same
+CSR. Bellman--Ford/BF10 remains a reference and fallback.
 
-## Immediate correctness gate
+The optimization scope is UnitBFS and classic Delta-Stepping. A separate
+Near/Far scheduler is not planned. Reusable ideas such as degree-aware edge
+expansion, destination aggregation, compact state, and device-resident control
+remain in scope when they improve either of the two retained algorithms.
 
-The expanded-tree repair attempt was both about twice as slow and produced a
-reported critical path of 309 instead of 214 on `logicnets_jscl`. That design
-treated newly attached tree nodes as zero-distance sources and was reverted.
+## Current routing correctness gate
 
-Current PathFinder instead performs one original-source, multi-target SSSP per
-net, trims each returned source-rooted shortest path at its last existing-tree
-intersection, and rejects conflicting child-parent assignments. The CPU-stub
-suite now contains an explicit 214-versus-309 regression for UnitBFS and forced
-generic Delta; it passes at the current commit. A fresh end-to-end AMD run on
-`logicnets_jscl` has not yet confirmed the current code's analyzer result or
-restored throughput. Until it does, the real multi-sink fix and its performance
-remain provisional.
+PathFinder performs one original-source, multi-target SSSP per net, trims each
+source-rooted result at its last existing-tree intersection, and rejects
+conflicting child-parent assignments. The reverted expanded-tree repair was
+about twice as slow and reported a critical path of 309 instead of 214 on
+`logicnets_jscl` because newly attached tree nodes were incorrectly treated as
+zero-distance sources.
 
-## Landed implementation
+The CPU-stub regression contains the 214-versus-309 case and passes at this
+snapshot for UnitBFS and forced-generic Delta. A fresh end-to-end AMD run has
+not yet confirmed critical path 214, routed-output validity, or restored
+throughput, so the real multi-sink result remains provisional.
 
-| Area | Current state |
+## Implementation verified in the working tree
+
+| Area | Current implementation |
 | --- | --- |
-| Routing adapter | One batched original-source search per net, source-attached compact paths, deterministic parent-conflict rejection, and a regression for critical-path inflation. |
-| UnitBFS | Shared immutable graph; private stream-affine workspaces; compact 32-bit offsets and edge IDs when eligible with a wide fallback; append-only traversal; sparse reset; compact validated target paths. |
-| UnitBFS control | Cooperative-capable devices run up to 32 levels per persistent grid-synchronized launch, including explicit worker streams. Unsupported devices retain the proven null-stream batching / explicit-stream host fallback, and progress callbacks still report every level. |
-| Generic Delta | Multi-source/multi-target classic Delta-Stepping with compact original-edge parents, lazy legacy fallback, sparse reset, optional no-parent distances-only execution, and strict distances-only graph storage. |
-| Delta experiments | Automatic delta seed and multiplier, explicit generic/legacy controls, deterministic synthetic weight families, opt-in telemetry, and a low-level exclusive distance bound are implemented. |
-| Bellman--Ford | Retained as an active-frontier reference/fallback, not the current optimization target. |
+| Routing adapter | One batched original-source search per net, compact source-rooted paths, last-tree-intersection trimming, deterministic parent-conflict rejection, and a critical-path-inflation regression. |
+| UnitBFS graph | Shared immutable outgoing CSR. Graph construction validates every edge weight as exactly `1.0f`; normal dispatch therefore already rejects non-unit input. |
+| Shared query capacity | PathFinder derives optional source/target high-water hints from exactly the routed metadata prefix, retaining duplicate endpoint counts. Checked count/byte arithmetic rejects overflow; low-level callers may omit hints. Compact paths are never reserved from graph size. |
+| UnitBFS state | Private stream-affine workspaces, automatic 32-bit row/predecessor-edge offsets when `nnz <= INT32_MAX`, a forced-64-bit test mode, one append-only frontier/visited queue, geometrically retained source/target/metadata/offset/path buffers, and compact validated target paths. Sparse reset remains the default; packed generation-stamped visitation is opt-in and performs a safe full reset on rollover. |
+| UnitBFS controller | Cooperative-capable devices run at most 32 levels per grid-synchronized launch on null or explicit streams. Unsupported devices and progress callbacks retain the host-controlled fallbacks; the null-stream fallback can batch four levels. |
+| UnitBFS extraction | Host-built offsets remain the default. An opt-in two-pass device path measures target lengths, scans deterministic offsets, publishes one totals/status descriptor, grows demand-sized compact buffers, validates paths, and copies the result without the host prefix sum or two H2D offset copies. |
+| Generic Delta | Multi-source/multi-target classic Delta-Stepping with one thread per active row, separate light/heavy passes, a flat pending set with minimum reduction and compaction, sparse touched reset, and frequent host-visible controller decisions. Immutable CSR row offsets are automatically `uint32_t` only when the complete range fits; `kForce64Bit` retains the wide A/B path and public edge IDs stay 64-bit. |
+| Delta parents | Automatic vector-target runs use a compact 64-bit `{distance_bits, original_edge_id}` key and a shared 32-bit edge-to-source map when eligible. Legacy predecessor arrays are lazy fallback state. |
+| Delta modes | Exact-unit specialization for eligible small graphs, compile-time no-parent `run_distances()`, strict distances-only graph storage, exclusive distance bounds, automatic delta seeding, deterministic weight families, force controls, and opt-in telemetry are implemented. Boolean `in_current` plus its guarded clear remains the default; generation-tagged membership is opt-in and rollover-safe. |
+| Delta capacity | Source/target hints pre-reserve only applicable state. Query and compact-path buffers retain geometric high-water capacity; compact-parent runs avoid legacy predecessor arrays, and strict distances-only storage ignores target/path hints. |
+| Bellman--Ford | BF10 is wired as the Bellman--Ford engine and retained as a reference/fallback, not a current optimization target. |
 
-The CPU-only PathFinder suite passes at this snapshot, including detached-path,
-multi-worker adapter, telemetry, source-rooting, and critical-path-inflation
-coverage. The production HIP UnitBFS and Delta suites cannot be executed on
-this macOS host and still require a current AMD ROCm run.
+## Verification completed in this audit
 
-## Known limitations
+The following CPU/fake-HIP checks pass on the current macOS checkout with
+`-Wall -Wextra -Wpedantic -Werror` where applicable:
 
-- Normal UnitBFS routing assumes exact-unit weights but does not currently
-  reject a non-unit graph; only diagnostic mode checks that contract.
-- The new UnitBFS cooperative controller needs a repeated AMD stress campaign
-  at 1, 4, and 8 workers. Earlier explicit-stream implementations exposed
-  nondeterministic validation failures and GPU faults, so one successful run is
-  not sufficient evidence.
-- Generic Delta still assigns one thread to each active row, processes long
-  rows serially, scans mixed rows in both light and heavy phases, and scans and
-  compacts one flat pending set to advance buckets.
-- Generic Delta retains frequent host-visible count/controller boundaries;
-  explicit streams check every light-closure round for correctness.
-- Generic Delta device row offsets remain 64-bit and its per-worker
-  per-vertex queues and membership arrays remain memory-intensive.
-- The production graph is larger than the exact-unit Delta specialization's
-  row limit, so selecting Delta there exercises the generic path.
-- No current weighted AMD correctness or performance baseline exists. The
-  retained profile used all-unit weights and legacy predecessor materialization
-  and must be treated as historical evidence, not current performance.
-- The low-level Delta distance bound remains implemented, but PathFinder no
-  longer uses it after reverting expanded-tree repair.
-- Interchange reconstruction limitations are tracked under
+- `pathfinder_bf10_cpu_stub_test`;
+- `pathfinder_cpu_stub_test`;
+- `pathfinder_router_args_test`; and
+- `pathfinder_benchmark_args_test.py`;
+- `sssp_query_capacity_test`;
+- `unit_bfs_policy_test`;
+- `delta_stepping_policy_test`;
+- `device_routing_graph_test`; and
+- `gzip_io_test`.
+
+The first suite covers the current PathFinder adapter, engine dispatch,
+automatic Delta controls, worker behavior, compact results, telemetry
+aggregation, source rooting, and the critical-path regression through the fake
+HIP runtime.
+
+ASan+UBSan builds pass for both fake-HIP PathFinder suites and all three new
+host policy/model suites with `ASAN_OPTIONS=detect_leaks=0`; this macOS ASan
+runtime does not support leak detection. `git diff --check` also passes.
+
+`hipcc`, ROCm, and an AMD GPU are unavailable on this host. Consequently the
+production `unit_bfs_hip_CSR.cpp`, `delta_stepping_hip_CSR.cpp`, the linked
+HIP `pathfinder` executable, and every HIP regression translation unit that
+uses those implementations remain uncompiled and unexecuted. No production
+speedup or GPU-memory reduction has been measured. The exact later-hardware
+commands and acceptance checklist are in
+[GPU_PROFILING.md](CongestionFreeRouting/GPU_PROFILING.md#amd-validation-checklist-for-the-bounded-optimizations).
+
+## Remaining correctness and measurement gates
+
+1. Rerun `logicnets_jscl` and require critical path 214, valid
+   routed output, complete route-tree equivalence, and a profiler-free timing
+   baseline.
+2. Run UnitBFS's host/device extraction and sparse/generation visitation matrix
+   in compact and wide row modes. Repeat its four-worker explicit-stream stress
+   long enough to expose reuse failures rather than accepting one successful
+   run. Use four workers for the future production timing baseline.
+3. Establish weighted Delta correctness against CPU Dijkstra and record AMD
+   baselines for compact/wide rows and Boolean/generation membership in both
+   path-producing and distances-only modes, including all-light, all-heavy,
+   mixed, zero-weight, and skewed-degree cases. Use two workers for the future
+   production timing baseline.
+4. Reprofile current compact-parent Delta. The retained profile used all-unit
+   weights and the legacy parent materialization path, so its percentages are
+   historical evidence rather than a measurement of current code.
+5. Collect reached-row degree histograms, per-frontier destination collision
+   ratios, reset time, path-extraction time, and controller time before choosing
+   collision- or degree-specific kernels.
+
+## Known implementation limits
+
+- Generic Delta allocates six `V`-sized queues and three `V`-sized membership
+  arrays in path-producing mode. Its core mutable footprint is approximately
+  48 B/V with compact parents, 60 B/V with legacy parents, and 40 B/V in
+  distances-only mode.
+- Generic Delta serially scans each active row, scans mixed rows in both light
+  and heavy phases, scans the flat pending set to find the next bucket, and
+  scans it again to compact that bucket.
+- Explicit-stream generic Delta checks every light-closure round on the host
+  because dependent batched dispatches previously exposed controller-state
+  failures on gfx1151.
+- Default UnitBFS still has host-visible per-query setup, status,
+  compact-offset, and extraction boundaries even when its inner level loop is
+  cooperative. The device-offset alternative is opt-in pending AMD validation.
+- UnitBFS and Delta capacity hints cover source/target-derived storage only.
+  Compact paths remain demand-sized because graph-sized or otherwise
+  speculative path reservation is intentionally prohibited.
+- Generation-stamped UnitBFS visitation and generation-tagged Delta current
+  membership are opt-in. Sparse reset and Boolean/clear membership remain the
+  enabled defaults until the AMD checklist passes.
+- The production full-device graph has more than `2^24` rows, so Delta's
+  exact-unit specialization is ineligible and Delta selection exercises the
+  generic scheduler even though the converter emits unit weights.
+- Automatic Delta is resolved once by PathFinder. Mutable low-level callers
+  must recompute a numeric width after `update_values()` or
+  `update_vertex_costs()`.
+- Interchange reconstruction limitations remain under
   [README caveats](README.md#known-interchange-limitations).
 
-## Next milestones
+## Optimization backlogs
 
-1. Rerun `logicnets_jscl` at the current commit and require critical path 214,
-   valid routed output, and comparable wall time before accepting further
-   end-to-end performance changes.
-2. Stress UnitBFS's cooperative path repeatedly with 1, 4, and 8 workers;
-   compare complete route trees, analyzer output, and per-phase wall times, not
-   just process exit status.
-3. Enforce UnitBFS's exact-unit input contract at the normal dispatch boundary.
-4. Establish weighted Delta correctness against CPU Dijkstra and record AMD
-   baselines for both distances-only and path-producing modes.
-5. Reduce generic state and reset traffic, including eligible 32-bit device row
-   offsets, before increasing worker or query concurrency.
-6. Build a degree-aware outgoing-edge expander and measure destination
-   collision rates; add wave-local aggregation only where measurements justify
-   it.
-7. Prototype cuGraph-style Near/Far scheduling behind an A/B flag. Pursue
-   broader destination reduction and device-resident control after the queue
-   design is stable.
+The ranked, algorithm-specific backlogs and acceptance criteria are now kept
+only in:
 
-Multi-query launch batching, graph relabeling, and multi-GPU work remain
-deferred until one weighted single-query backend is correct and competitive.
+- [Classic Delta-Stepping roadmap](CongestionFreeRouting/DELTA_STEPPING_OPTIMIZATION_ROADMAP.md); and
+- [UnitBFS roadmap](CongestionFreeRouting/UNIT_BFS_OPTIMIZATION_ROADMAP.md).
 
-## Canonical references
-
-- [README.md](README.md): build, CLI/API use, routing flow, tests, formats, and
-  interchange caveats.
-- [BENCHMARKING.md](BENCHMARKING.md): recorded measurements, reproduction
-  commands, and historical profiling evidence.
-- [GPU_PROFILING.md](CongestionFreeRouting/GPU_PROFILING.md): profiler workflow
-  and telemetry-field definitions.
-- [Generic Delta roadmap](CongestionFreeRouting/DELTA_STEPPING_OPTIMIZATION_ROADMAP.md):
-  ranked weighted-SSSP implementation and acceptance plan.
-- [cuGraph roadmap](CongestionFreeRouting/cuGraph-roadmap.md): source audit and
-  design rationale for Near/Far, edge expansion, and candidate reduction.
-- [UnitBFS roadmap](CongestionFreeRouting/UNIT_BFS_OPTIMIZATION_ROADMAP.md):
-  specialization-specific maintenance and validation work.
+The former standalone cuGraph roadmap was removed because its primary proposal
+was an out-of-scope Near/Far backend and its applicable traversal ideas are now
+folded into the two retained algorithm roadmaps. The branch-specific
+`bellman_ford/MEMORY.md` manual ledger was also removed; the durable BF10 status
+is the implementation row above plus the public build and test documentation in
+the README.

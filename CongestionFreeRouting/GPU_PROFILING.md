@@ -1,5 +1,15 @@
 # GPU profiling the PathFinder benchmark
 
+## Evidence boundary (2026-07-24)
+
+This file is a profiling procedure and telemetry reference, not a statement
+that the current kernels have been measured. The retained `39155` Delta trace
+used the generic all-light path with legacy predecessor materialization. It
+predates automatic compact parents, distances-only execution, and the current
+telemetry. No post-`c3c65e5` profile of UnitBFS's 32-level cooperative
+controller is stored in this repository. Reproduce profiler-free correctness
+and timing before using the archived percentages to rank current code.
+
 The full profiling workflow has a manual one-time device stage followed by
 three Make-driven per-test processes:
 
@@ -139,6 +149,26 @@ Start by checking:
 - whether multiple worker streams overlap or serialize;
 - allocation and scratch-memory activity inside repeated SSSP queries; and
 - the `delta_step.generic` range rather than conversion or JSON output.
+
+### UnitBFS production pass
+
+Profile the production specialization separately; a Delta trace cannot
+establish UnitBFS's launch, reset, or extraction costs:
+
+```bash
+make ROUTER=PathFinderFile BENCHMARKS="logicnets_jscl" VERBOSE=1 \
+  PATHFINDER_SSSP_ENGINE=unit-bfs \
+  PATHFINDER_ARGS="--parallel-net-workers 4" \
+  PATHFINDER_PROFILE=rocprofv3 \
+  PATHFINDER_PROFILE_RUN=unit-bfs-w4
+```
+
+Repeat with 1 and 8 workers after a correctness stress run. Attribute the
+one-time graph upload separately from per-query source/target setup, the
+cooperative controller, final status copies, sparse level reset, target
+measurement, compact path fill, and output copies. Current UnitBFS has no
+algorithm-counter JSON analogous to Delta telemetry, so use ROCTx/runtime
+traces or add diagnostic-only counters before making a structural claim.
 
 ## Opt-in algorithm telemetry
 
@@ -381,3 +411,258 @@ work, relax attempts per successful update, or repeated pending scans. Use the
 opt-in JSON counters above for those ratios, but collect them separately from
 the uninstrumented timing baseline because telemetry deliberately adds device
 instrumentation.
+
+## AMD validation checklist for the bounded optimizations
+
+Nothing in this section was run on the host that implemented the bounded
+optimization pass: it has no HIP compiler, ROCm runtime, or AMD GPU. Run these
+commands from the repository root on the later AMD system and retain every
+log. Do not change either generation path to the default until its complete
+matrix and explicit-stream stress pass.
+
+Record the checkout and device first, then build the production router and the
+two focused HIP regressions:
+
+```bash
+set -euo pipefail
+mkdir -p amd-validation/bin amd-validation/logs \
+  amd-validation/results amd-validation/work amd-validation/timing
+
+git rev-parse HEAD | tee amd-validation/logs/git-head.txt
+hipcc --version 2>&1 | tee amd-validation/logs/hipcc-version.txt
+rocminfo > amd-validation/logs/rocminfo.txt
+
+make ./PathFinderFile ./pathfinder
+test -x ./interchange_to_csr
+test -x ./routes_to_phys
+
+hipcc -std=c++17 -O2 -pthread -x hip \
+  -I HIP_kernel/bellman_ford/src \
+  -I CongestionFreeRouting/unit_bfs \
+  CongestionFreeRouting/tests/unit_bfs_hip_test.cpp \
+  CongestionFreeRouting/unit_bfs/unit_bfs_hip_CSR.cpp \
+  -o amd-validation/bin/unit_bfs_hip_test
+
+hipcc -std=c++17 -O2 -pthread -x hip \
+  -I HIP_kernel/bellman_ford/src \
+  -I CongestionFreeRouting/delta_stepping \
+  CongestionFreeRouting/tests/delta_stepping_hip_test.cpp \
+  CongestionFreeRouting/delta_stepping/delta_stepping_hip_CSR.cpp \
+  -o amd-validation/bin/delta_stepping_hip_test
+```
+
+The UnitBFS binary runs automatic-compact and forced-wide rows through all
+four extraction/visitation combinations: host offsets with sparse reset (the
+default), device offsets with sparse reset, host offsets with generation
+visitation, and device offsets with generation visitation. The Delta binary
+runs automatic-compact and forced-wide row offsets and Boolean/default versus
+generation current-membership cases, including path-capable and
+distances-only policies. Run the ordinary matrices and then increase the
+explicit-stream reuse count:
+
+```bash
+./amd-validation/bin/unit_bfs_hip_test \
+  2>&1 | tee amd-validation/logs/unit-bfs-matrix.log
+UNIT_BFS_REUSE_STRESS_RUNS=1200 \
+  ./amd-validation/bin/unit_bfs_hip_test \
+  2>&1 | tee amd-validation/logs/unit-bfs-explicit-stream-stress.log
+
+./amd-validation/bin/delta_stepping_hip_test \
+  2>&1 | tee amd-validation/logs/delta-matrix.log
+DELTA_MULTI_QUEUE_STRESS_RUNS=1200 \
+  ./amd-validation/bin/delta_stepping_hip_test \
+  2>&1 | tee amd-validation/logs/delta-explicit-stream-stress.log
+```
+
+These commands validate result equivalence, rollover/cleanup models exercised
+by the suites, repeated workspace reuse, and the guarded explicit-stream
+boundaries. A passing low-level suite is required before interpreting timing.
+
+For `logicnets_jscl`, first create a small route-tree depth checker. It treats
+the JSONL edge union as an outgoing graph, starts at every requested source,
+requires every recorded sink to be reached, and fails unless the maximum
+source-to-sink hop count is exactly 214:
+
+```bash
+cat > amd-validation/check_route_depth.py <<'PY'
+import collections
+import json
+import pathlib
+import sys
+
+routes_path = pathlib.Path(sys.argv[1])
+expected = int(sys.argv[2])
+critical = 0
+net_count = 0
+
+with routes_path.open(encoding="utf-8") as routes:
+    for line_number, line in enumerate(routes, 1):
+        if not line.strip():
+            continue
+        net_count += 1
+        net = json.loads(line)
+        if not net.get("routed", False):
+            raise SystemExit(f"line {line_number}: net is not fully routed")
+        adjacency = collections.defaultdict(list)
+        for edge in net["edges"]:
+            adjacency[edge["from"]].append(edge["to"])
+        distance = {source["node"]: 0 for source in net["sources"]}
+        queue = collections.deque(distance)
+        while queue:
+            node = queue.popleft()
+            for successor in adjacency[node]:
+                if successor not in distance:
+                    distance[successor] = distance[node] + 1
+                    queue.append(successor)
+        for sink in net["sinks"]:
+            target = sink["node"]
+            if not sink.get("reached", False) or target not in distance:
+                raise SystemExit(
+                    f"line {line_number}: sink {target} is not source-rooted"
+                )
+            critical = max(critical, distance[target])
+
+if net_count == 0:
+    raise SystemExit("route file is empty")
+if critical != expected:
+    raise SystemExit(f"critical path {critical}, expected {expected}")
+print(f"critical path {critical}; {net_count} nets source-rooted and reached")
+PY
+```
+
+Run the complete checker/analyzer pipeline first with the enabled UnitBFS
+behavior and four workers. The low-level suite above, not this production
+command, selects the still-opt-in device-offset and generation modes:
+
+```bash
+rm -f logicnets_jscl_PathFinderFile.phys \
+  logicnets_jscl_PathFinderFile.phys.log \
+  logicnets_jscl_PathFinderFile.check \
+  logicnets_jscl_PathFinderFile.check.log \
+  logicnets_jscl_PathFinderFile.wirelength
+
+make ROUTER=PathFinderFile BENCHMARKS="logicnets_jscl" VERBOSE=1 \
+  PATHFINDER_SSSP_ENGINE=unit-bfs \
+  PATHFINDER_ARGS="--parallel-net-workers 4 --strict-routing \
+    --work-dir amd-validation/work/logicnets-unit-w4" \
+  run-PathFinderFile \
+  2>&1 | tee amd-validation/logs/logicnets-unit-w4.log
+
+test "$(cat logicnets_jscl_PathFinderFile.check)" = PASS
+python3 amd-validation/check_route_depth.py \
+  amd-validation/work/logicnets-unit-w4/logicnets_jscl_PathFinderFile.routes.jsonl \
+  214 | tee amd-validation/logs/logicnets-unit-w4-depth.log
+cp logicnets_jscl_PathFinderFile.phys \
+  amd-validation/results/logicnets-unit-w4.phys
+cp logicnets_jscl_PathFinderFile.wirelength \
+  amd-validation/results/logicnets-unit-w4.wirelength
+```
+
+Repeat with two workers and forced-generic classic Delta-Stepping. Automatic
+compact row offsets and Boolean membership are the production settings here;
+the compact/wide and Boolean/generation A/B matrix remains in the low-level
+suite:
+
+```bash
+rm -f logicnets_jscl_PathFinderFile.phys \
+  logicnets_jscl_PathFinderFile.phys.log \
+  logicnets_jscl_PathFinderFile.check \
+  logicnets_jscl_PathFinderFile.check.log \
+  logicnets_jscl_PathFinderFile.wirelength
+
+make ROUTER=PathFinderFile BENCHMARKS="logicnets_jscl" VERBOSE=1 \
+  PATHFINDER_SSSP_ENGINE=delta-step \
+  PATHFINDER_ARGS="--delta auto --delta-force-generic \
+    --parallel-net-workers 2 --strict-routing \
+    --work-dir amd-validation/work/logicnets-delta-w2" \
+  run-PathFinderFile \
+  2>&1 | tee amd-validation/logs/logicnets-delta-w2.log
+
+test "$(cat logicnets_jscl_PathFinderFile.check)" = PASS
+python3 amd-validation/check_route_depth.py \
+  amd-validation/work/logicnets-delta-w2/logicnets_jscl_PathFinderFile.routes.jsonl \
+  214 | tee amd-validation/logs/logicnets-delta-w2-depth.log
+cp logicnets_jscl_PathFinderFile.phys \
+  amd-validation/results/logicnets-delta-w2.phys
+cp logicnets_jscl_PathFinderFile.wirelength \
+  amd-validation/results/logicnets-delta-w2.wirelength
+```
+
+Four UnitBFS workers and two Delta workers are controlled future performance
+baselines, not defaults to embed in portable workspace behavior.
+
+Finally collect profiler-free end-to-end samples and peak resident memory.
+The commands below use GNU `time`, keep telemetry/profilers disabled, perform
+one warm-up for each engine, and then record seven fresh conversion, routing,
+and reconstruction runs per engine:
+
+```bash
+env PATHFINDER_PROFILE_COMMAND= ./PathFinderFile \
+  logicnets_jscl_unrouted.phys amd-validation/timing/unit-w4-warmup.phys \
+  --logical-netlist logicnets_jscl.netlist \
+  --device-graph xcvu3p.full-poc-base-wire.devicegraph \
+  --work-dir amd-validation/work/timing-unit-w4-warmup \
+  --sssp-engine unit-bfs --parallel-net-workers 4 --strict-routing
+
+env PATHFINDER_PROFILE_COMMAND= ./PathFinderFile \
+  logicnets_jscl_unrouted.phys amd-validation/timing/delta-w2-warmup.phys \
+  --logical-netlist logicnets_jscl.netlist \
+  --device-graph xcvu3p.full-poc-base-wire.devicegraph \
+  --work-dir amd-validation/work/timing-delta-w2-warmup \
+  --sssp-engine delta-step --delta auto --delta-force-generic \
+  --parallel-net-workers 2 --strict-routing
+
+for validation_run in 1 2 3 4 5 6 7; do
+  /usr/bin/time -f 'wall_seconds=%e\npeak_rss_kib=%M' \
+    -o "amd-validation/logs/unit-w4-time-${validation_run}.txt" \
+    env PATHFINDER_PROFILE_COMMAND= ./PathFinderFile \
+      logicnets_jscl_unrouted.phys \
+      "amd-validation/timing/unit-w4-${validation_run}.phys" \
+      --logical-netlist logicnets_jscl.netlist \
+      --device-graph xcvu3p.full-poc-base-wire.devicegraph \
+      --work-dir "amd-validation/work/timing-unit-w4-${validation_run}" \
+      --sssp-engine unit-bfs --parallel-net-workers 4 --strict-routing
+done
+
+for validation_run in 1 2 3 4 5 6 7; do
+  /usr/bin/time -f 'wall_seconds=%e\npeak_rss_kib=%M' \
+    -o "amd-validation/logs/delta-w2-time-${validation_run}.txt" \
+    env PATHFINDER_PROFILE_COMMAND= ./PathFinderFile \
+      logicnets_jscl_unrouted.phys \
+      "amd-validation/timing/delta-w2-${validation_run}.phys" \
+      --logical-netlist logicnets_jscl.netlist \
+      --device-graph xcvu3p.full-poc-base-wire.devicegraph \
+      --work-dir "amd-validation/work/timing-delta-w2-${validation_run}" \
+      --sssp-engine delta-step --delta auto --delta-force-generic \
+      --parallel-net-workers 2 --strict-routing
+done
+
+python3 - <<'PY'
+import pathlib
+import statistics
+
+for label in ("unit-w4", "delta-w2"):
+    walls = []
+    peaks = []
+    for path in sorted(pathlib.Path("amd-validation/logs").glob(f"{label}-time-*.txt")):
+        fields = dict(
+            line.strip().split("=", 1)
+            for line in path.read_text().splitlines()
+            if "=" in line
+        )
+        walls.append(float(fields["wall_seconds"]))
+        peaks.append(int(fields["peak_rss_kib"]))
+    if len(walls) != 7:
+        raise SystemExit(f"{label}: expected 7 samples, found {len(walls)}")
+    print(
+        label,
+        f"median_wall_seconds={statistics.median(walls):.3f}",
+        f"median_peak_rss_kib={statistics.median(peaks):.0f}",
+        f"max_peak_rss_kib={max(peaks)}",
+    )
+PY
+```
+
+Compare exact route/checker outputs before comparing medians. Report the raw
+seven samples, dispersion, median peak RSS, and maximum peak RSS; do not infer
+a kernel speedup from end-to-end samples alone.
