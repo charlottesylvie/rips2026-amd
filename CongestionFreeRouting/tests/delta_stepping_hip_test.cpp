@@ -329,13 +329,16 @@ void run_distances_and_check(
     const std::vector<int>& sources,
     float delta,
     hipStream_t stream,
-    const std::vector<float>* vertex_costs = nullptr) {
+    const std::vector<float>* vertex_costs = nullptr,
+    bool expect_no_path_storage = true) {
   const std::vector<float> expected =
       cpu_dijkstra_outgoing_multi_source(graph, sources, vertex_costs);
   const DeltaSteppingCsrResult result = workspace.run_distances(
       sources, delta, -1, stream, nullptr, nullptr);
   validate_distances_only_result(label, expected, result);
-  require_no_mutable_path_storage(label, workspace);
+  if (expect_no_path_storage) {
+    require_no_mutable_path_storage(label, workspace);
+  }
 }
 
 bool contains_source(const std::vector<int>& sources, int vertex) {
@@ -542,6 +545,19 @@ void test_compact_edge_id_eligibility() {
   require(!delta_stepping_compact_edge_ids_eligible(
               static_cast<Offset>(edge_id_count_limit + 1)),
           "graph above the 32-bit edge-ID boundary was eligible");
+
+  require(!delta_stepping_compact_row_offsets_eligible(-1),
+          "negative nnz was compact-row eligible");
+  require(delta_stepping_compact_row_offsets_eligible(0),
+          "edgeless graph was not compact-row eligible");
+  require(delta_stepping_compact_row_offsets_eligible(
+              static_cast<std::int64_t>(
+                  std::numeric_limits<std::uint32_t>::max())),
+          "UINT32_MAX terminal row offset was not compact-row eligible");
+  require(!delta_stepping_compact_row_offsets_eligible(
+              static_cast<std::int64_t>(
+                  std::numeric_limits<std::uint32_t>::max()) + 1),
+          "2^32 terminal row offset was compact-row eligible");
 }
 
 void test_braced_default_stream_constructor_compatibility() {
@@ -674,6 +690,105 @@ HostCsrF32 make_weighted_corner_graph() {
        {11, 10, 1.5f}});
 }
 
+void test_offset_and_membership_ab_matrix(hipStream_t stream) {
+  const HostCsrF32 graph = make_weighted_corner_graph();
+  const std::vector<int> sources = {0, 8, 0};
+  const std::vector<int> targets = {7, 4, 0, 8, 9, 7};
+  const std::vector<float> expected =
+      cpu_dijkstra_outgoing_multi_source(graph, sources);
+
+  for (const DeltaSteppingCsrOffsetMode offset_mode : {
+           DeltaSteppingCsrOffsetMode::kAuto,
+           DeltaSteppingCsrOffsetMode::kForce64Bit}) {
+    auto shared_graph =
+        std::make_shared<DeltaSteppingCsrGraph>(graph, stream, offset_mode);
+    require(shared_graph->uses_32_bit_offsets() ==
+                (offset_mode == DeltaSteppingCsrOffsetMode::kAuto),
+            "Delta row-offset A/B mode selected the wrong width");
+    for (const DeltaSteppingCsrCurrentMembershipMode membership_mode : {
+             DeltaSteppingCsrCurrentMembershipMode::kBoolean,
+             DeltaSteppingCsrCurrentMembershipMode::kGeneration}) {
+      DeltaSteppingCsrWorkspaceOptions options;
+      options.execution_mode = DeltaSteppingCsrExecutionMode::kForceGeneric;
+      options.current_membership_mode = membership_mode;
+      options.capacity_hints = {8, 8};
+      DeltaSteppingCsrWorkspace workspace(shared_graph, stream, options);
+      const DeltaSteppingCsrAllocationState reserved =
+          workspace.allocation_state();
+      require(reserved.target_storage && !reserved.path_nodes &&
+                  !reserved.path_edges && !reserved.parent_key &&
+                  !reserved.predecessor_nodes && !reserved.predecessor_edges,
+              "Delta capacity hint allocated paths or parents eagerly");
+
+      const DeltaSteppingCsrResult result = workspace.run(
+          sources, targets, 1.0f, -1, stream, nullptr, nullptr);
+      validate_compact_target_paths("Delta offset/membership A/B", graph,
+                                    sources, targets, expected, result);
+      require(!workspace.allocation_state().predecessor_nodes &&
+                  !workspace.allocation_state().predecessor_edges,
+              "compact-parent A/B run allocated legacy parents");
+
+      const std::vector<int> reuse_sources = {10, 10};
+      const std::vector<int> reuse_targets = {11, 0, 11};
+      const std::vector<float> reuse_expected =
+          cpu_dijkstra_outgoing_multi_source(graph, reuse_sources);
+      const DeltaSteppingCsrResult reused = workspace.run(
+          reuse_sources, reuse_targets, 0.5f, -1, stream, nullptr, nullptr);
+      validate_compact_target_paths("Delta offset/membership A/B reuse",
+                                    graph, reuse_sources, reuse_targets,
+                                    reuse_expected, reused);
+    }
+
+    HostCsrF32 unit_graph = graph;
+    std::fill(unit_graph.values.begin(), unit_graph.values.end(), 1.0f);
+    auto unit_shared_graph =
+        std::make_shared<DeltaSteppingCsrGraph>(unit_graph, stream, offset_mode);
+    DeltaSteppingCsrWorkspace unit_workspace(unit_shared_graph, stream);
+    const std::vector<float> unit_expected =
+        cpu_dijkstra_outgoing_multi_source(unit_graph, sources);
+    const DeltaSteppingCsrResult unit_result = unit_workspace.run(
+        sources, targets, 1.0f, -1, stream, nullptr, nullptr);
+    validate_compact_target_paths("Delta exact-unit row-offset A/B",
+                                  unit_graph, sources, targets,
+                                  unit_expected, unit_result);
+
+    DeltaSteppingCsrGraphOptions distances_graph_options;
+    distances_graph_options.storage_mode =
+        DeltaSteppingCsrStorageMode::kDistancesOnly;
+    distances_graph_options.offset_mode = offset_mode;
+    auto typed_distances_graph = std::make_shared<DeltaSteppingCsrGraph>(
+        graph, stream, distances_graph_options);
+    for (const DeltaSteppingCsrCurrentMembershipMode membership_mode : {
+             DeltaSteppingCsrCurrentMembershipMode::kBoolean,
+             DeltaSteppingCsrCurrentMembershipMode::kGeneration}) {
+      DeltaSteppingCsrWorkspaceOptions distances_options;
+      distances_options.current_membership_mode = membership_mode;
+      DeltaSteppingCsrWorkspace distances_workspace(
+          typed_distances_graph, stream, distances_options);
+      run_distances_and_check("Delta distances-only row/membership A/B",
+                              distances_workspace,
+                              graph,
+                              sources,
+                              1.0f,
+                              stream);
+    }
+  }
+
+  auto distances_graph = std::make_shared<DeltaSteppingCsrGraph>(
+      graph, stream,
+      DeltaSteppingCsrGraphOptions{
+          DeltaSteppingCsrStorageMode::kDistancesOnly,
+          DeltaSteppingCsrOffsetMode::kAuto});
+  DeltaSteppingCsrWorkspaceOptions hinted_options;
+  hinted_options.capacity_hints = {8, 8};
+  DeltaSteppingCsrWorkspace distances_only(
+      distances_graph, stream, hinted_options);
+  require(!distances_only.allocation_state().target_storage &&
+              !distances_only.allocation_state().path_nodes &&
+              !distances_only.allocation_state().path_edges,
+          "strict distances-only workspace applied target/path hints");
+}
+
 void test_distances_only_graph_families(hipStream_t stream) {
   {
     const HostCsrF32 graph = make_outgoing_csr(1, {});
@@ -795,7 +910,9 @@ void test_distances_only_path_state_transitions(hipStream_t stream) {
                           weighted_graph,
                           sources,
                           1.0f,
-                          stream);
+                          stream,
+                          nullptr,
+                          false);
   require(workspace.allocation_state().edge_source,
           "path-capable distance run released the immutable edge map");
 
@@ -845,8 +962,14 @@ void test_distances_only_path_state_transitions(hipStream_t stream) {
   validate_distances_only_result("distances-only after exact unit",
                                  unit_expected,
                                  unit_distances);
-  require_no_mutable_path_storage(
-      "distances-only after exact unit", workspace);
+  {
+    const DeltaSteppingCsrAllocationState state = workspace.allocation_state();
+    require(!state.parent_key && !state.predecessor_nodes &&
+                !state.predecessor_edges && state.target_storage &&
+                state.path_nodes && state.path_edges,
+            "path-capable distances-only run did not retain only target/path "
+            "high-water storage");
+  }
   require(distances_telemetry.collected && distances_telemetry.completed,
           "distances-only telemetry was not collected and completed");
   require(distances_telemetry.execution_path ==
@@ -886,7 +1009,9 @@ void test_distances_only_path_state_transitions(hipStream_t stream) {
                           weighted_graph,
                           {10},
                           0.75f,
-                          stream);
+                          stream,
+                          nullptr,
+                          false);
 }
 
 void test_distances_only_strict_storage_and_validation(hipStream_t stream) {
@@ -1335,7 +1460,9 @@ void test_forced_generic_increasing_distance_reuse(hipStream_t stream) {
   }
 }
 
-void test_forced_generic_multi_queue_reuse() {
+void test_forced_generic_multi_queue_reuse(
+    DeltaSteppingCsrCurrentMembershipMode membership_mode,
+    const std::string& membership_label) {
   // Every path is unique. Sources zero and one reach vertex six with sharply
   // different distances, while source sixteen reaches the deep target through
   // a separate short edge. Alternating these queries forces sparse reset to
@@ -1361,9 +1488,10 @@ void test_forced_generic_multi_queue_reuse() {
        {16, 14, 0.5f}});
   auto shared_graph =
       std::make_shared<DeltaSteppingCsrGraph>(graph, nullptr);
-  const DeltaSteppingCsrWorkspaceOptions options{
-      DeltaSteppingCsrParentMode::kAutomatic,
-      DeltaSteppingCsrExecutionMode::kForceGeneric};
+  DeltaSteppingCsrWorkspaceOptions options;
+  options.parent_mode = DeltaSteppingCsrParentMode::kAutomatic;
+  options.execution_mode = DeltaSteppingCsrExecutionMode::kForceGeneric;
+  options.current_membership_mode = membership_mode;
 
   const std::vector<int> source_zero{0};
   const std::vector<int> source_one{1};
@@ -1431,7 +1559,8 @@ void test_forced_generic_multi_queue_reuse() {
             nullptr,
             nullptr);
         validate_compact_target_paths(
-            "forced-generic multi-queue instrumented worker " +
+            "forced-generic " + membership_label +
+                " multi-queue instrumented worker " +
                 std::to_string(worker),
             graph,
             source_one,
@@ -1461,7 +1590,8 @@ void test_forced_generic_multi_queue_reuse() {
                 nullptr,
                 nullptr);
             validate_compact_target_paths(
-                "forced-generic multi-queue worker " +
+                "forced-generic " + membership_label +
+                    " multi-queue worker " +
                     std::to_string(worker) + " reuse " +
                     std::to_string(repetition) + ": " + query.name,
                 graph,
@@ -2632,6 +2762,17 @@ void test_callback_exception_cleanup(hipStream_t stream) {
       graph, stream, DeltaSteppingCsrParentMode::kForceLegacy);
   exercise("automatic callback cleanup", automatic);
   exercise("forced-legacy callback cleanup", legacy);
+
+  DeltaSteppingCsrWorkspaceOptions generation_options;
+  generation_options.current_membership_mode =
+      DeltaSteppingCsrCurrentMembershipMode::kGeneration;
+  DeltaSteppingCsrWorkspace generation_automatic(
+      graph, stream, generation_options);
+  generation_options.parent_mode = DeltaSteppingCsrParentMode::kForceLegacy;
+  DeltaSteppingCsrWorkspace generation_legacy(
+      graph, stream, generation_options);
+  exercise("generation automatic callback cleanup", generation_automatic);
+  exercise("generation forced-legacy callback cleanup", generation_legacy);
 }
 
 void test_wave_boundary_contention(hipStream_t stream) {
@@ -3188,6 +3329,7 @@ int main() {
     test_braced_default_stream_constructor_compatibility();
     HipStream stream;
     test_empty_and_singleton_graphs(stream.get());
+    test_offset_and_membership_ab_matrix(stream.get());
     test_distances_only_graph_families(stream.get());
     test_distances_only_path_state_transitions(stream.get());
     test_distances_only_strict_storage_and_validation(stream.get());
@@ -3195,7 +3337,10 @@ int main() {
     test_generic_compact_parent_modes(stream.get());
     test_compact_early_settlement_reset(stream.get());
     test_forced_generic_increasing_distance_reuse(stream.get());
-    test_forced_generic_multi_queue_reuse();
+    test_forced_generic_multi_queue_reuse(
+        DeltaSteppingCsrCurrentMembershipMode::kBoolean, "Boolean");
+    test_forced_generic_multi_queue_reuse(
+        DeltaSteppingCsrCurrentMembershipMode::kGeneration, "generation");
     test_compact_weight_class_updates(stream.get());
     test_compact_to_unit_storage_transition(stream.get());
     test_unit_weight_specialization(stream.get());

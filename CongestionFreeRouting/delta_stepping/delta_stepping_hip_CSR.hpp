@@ -1,7 +1,9 @@
 #pragma once
 
+#include "../sssp_query_capacity.hpp"
 #include "bf_hip_CSR.hpp"
 #include "delta_stepping_auto_delta.hpp"
+#include "delta_stepping_policy.hpp"
 
 #include <hip/hip_runtime.h>
 
@@ -126,6 +128,19 @@ struct DeltaSteppingCsrWorkspaceOptions {
       DeltaSteppingCsrParentMode::kAutomatic;
   DeltaSteppingCsrExecutionMode execution_mode =
       DeltaSteppingCsrExecutionMode::kAutomatic;
+  // The established Boolean/clear-kernel implementation remains the default
+  // until the generation path is validated on the target AMD GPU.
+  DeltaSteppingCsrCurrentMembershipMode current_membership_mode =
+      DeltaSteppingCsrCurrentMembershipMode::kBoolean;
+  // Zero fields preserve lazy growth for low-level callers.
+  SsspQueryCapacityHints capacity_hints{};
+};
+
+struct DeltaSteppingCsrGraphOptions {
+  DeltaSteppingCsrStorageMode storage_mode =
+      DeltaSteppingCsrStorageMode::kPathCapable;
+  DeltaSteppingCsrOffsetMode offset_mode =
+      DeltaSteppingCsrOffsetMode::kAuto;
 };
 
 // A graph with 2^32 edges is still eligible: its largest original CSR edge ID
@@ -150,12 +165,25 @@ class DeltaSteppingCsrGraph {
   DeltaSteppingCsrGraph(const HostCsrF32& adjacency,
                         hipStream_t stream,
                         DeltaSteppingCsrStorageMode storage_mode);
+  DeltaSteppingCsrGraph(const HostCsrF32& adjacency,
+                        hipStream_t stream,
+                        DeltaSteppingCsrOffsetMode offset_mode);
+  DeltaSteppingCsrGraph(const HostCsrF32& adjacency,
+                        hipStream_t stream,
+                        DeltaSteppingCsrStorageMode storage_mode,
+                        DeltaSteppingCsrOffsetMode offset_mode);
+  DeltaSteppingCsrGraph(const HostCsrF32& adjacency,
+                        hipStream_t stream,
+                        DeltaSteppingCsrGraphOptions options);
   ~DeltaSteppingCsrGraph();
 
   DeltaSteppingCsrGraph(const DeltaSteppingCsrGraph&) = delete;
   DeltaSteppingCsrGraph& operator=(const DeltaSteppingCsrGraph&) = delete;
   DeltaSteppingCsrGraph(DeltaSteppingCsrGraph&&) noexcept;
   DeltaSteppingCsrGraph& operator=(DeltaSteppingCsrGraph&&) noexcept;
+
+  // A moved-from graph has no storage and reports false.
+  bool uses_32_bit_offsets() const noexcept;
 
  private:
   // Workspaces retain this immutable backing allocation directly, so moving
@@ -178,6 +206,13 @@ class DeltaSteppingCsrWorkspace {
                             DeltaSteppingCsrStorageMode storage_mode);
   DeltaSteppingCsrWorkspace(const HostCsrF32& adjacency,
                             hipStream_t stream,
+                            DeltaSteppingCsrOffsetMode offset_mode);
+  DeltaSteppingCsrWorkspace(const HostCsrF32& adjacency,
+                            hipStream_t stream,
+                            DeltaSteppingCsrStorageMode storage_mode,
+                            DeltaSteppingCsrOffsetMode offset_mode);
+  DeltaSteppingCsrWorkspace(const HostCsrF32& adjacency,
+                            hipStream_t stream,
                             DeltaSteppingCsrParentMode parent_mode)
       : DeltaSteppingCsrWorkspace(adjacency, stream) {
     parent_mode_ = parent_mode;
@@ -185,11 +220,7 @@ class DeltaSteppingCsrWorkspace {
   DeltaSteppingCsrWorkspace(
       const HostCsrF32& adjacency,
       hipStream_t stream,
-      DeltaSteppingCsrWorkspaceOptions options)
-      : DeltaSteppingCsrWorkspace(adjacency, stream) {
-    parent_mode_ = options.parent_mode;
-    execution_mode_ = options.execution_mode;
-  }
+      DeltaSteppingCsrWorkspaceOptions options);
   // Shared-graph workspaces keep private mutable search state but reuse the
   // immutable CSR. update_values() is intentionally unavailable for this form;
   // update_vertex_costs() remains workspace-local and is supported.
@@ -206,11 +237,7 @@ class DeltaSteppingCsrWorkspace {
   DeltaSteppingCsrWorkspace(
       std::shared_ptr<const DeltaSteppingCsrGraph> adjacency,
       hipStream_t stream,
-      DeltaSteppingCsrWorkspaceOptions options)
-      : DeltaSteppingCsrWorkspace(std::move(adjacency), stream) {
-    parent_mode_ = options.parent_mode;
-    execution_mode_ = options.execution_mode;
-  }
+      DeltaSteppingCsrWorkspaceOptions options);
   ~DeltaSteppingCsrWorkspace();
 
   DeltaSteppingCsrWorkspace(const DeltaSteppingCsrWorkspace&) = delete;
@@ -226,7 +253,8 @@ class DeltaSteppingCsrWorkspace {
 
   // Compile-time no-parent Delta-Stepping specialization. Only dist is
   // populated in the result; predecessor and compact target/path vectors stay
-  // empty. Entering this mode releases any path-only mutable workspace state.
+  // empty. Strict distances-only storage never allocates path state; a
+  // path-capable workspace may retain prior high-water capacity for reuse.
   DeltaSteppingCsrResult run_distances(
       const std::vector<int>& sources,
       float delta,
@@ -383,6 +411,8 @@ class DeltaSteppingCsrWorkspace {
       DeltaSteppingCsrParentMode::kAutomatic;
   DeltaSteppingCsrExecutionMode execution_mode_ =
       DeltaSteppingCsrExecutionMode::kAutomatic;
+  DeltaSteppingCsrCurrentMembershipMode current_membership_mode_ =
+      DeltaSteppingCsrCurrentMembershipMode::kBoolean;
   DeltaSteppingCsrTelemetry* active_telemetry_ = nullptr;
   float active_distance_limit_ = std::numeric_limits<float>::infinity();
   std::unique_ptr<Impl> impl_;
