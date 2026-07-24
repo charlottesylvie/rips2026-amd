@@ -112,7 +112,7 @@ struct PathfinderOptions {
   // Opt-in heuristic: route each Delta-Stepping net inside the source/sink
   // rectangle expanded by this many tiles on every side.
   bool route_window_enabled = false;
-  std::uint16_t route_window_margin = 20;
+  std::uint16_t route_window_margin = 50;
 };
 
 struct PathfinderResult {

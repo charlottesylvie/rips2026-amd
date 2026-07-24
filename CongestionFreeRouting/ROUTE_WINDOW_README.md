@@ -13,7 +13,7 @@ pathfinder <graph.csrbin> <metadata.ifmeta.bin> \
 ```
 
 For every net, PathFinder combines the extents of all source nodes and all
-initially unresolved sink nodes, then expands that rectangle by **20 tiles on
+initially unresolved sink nodes, then expands that rectangle by **50 tiles on
 every side**. The bounds are clamped to the packed-coordinate range.
 
 The shared immutable Delta-Stepping graph uploads one packed `uint64_t` bounds
@@ -32,7 +32,7 @@ the globally shortest route.
 - The feature is disabled unless `--route-window` is supplied.
 - It applies only to Delta-Stepping, and windowed queries deliberately bypass
   the exact-unit specialization in favor of generic Delta-Stepping.
-- The margin is currently fixed at 20; adaptive growth, CLI-configurable
+- The margin is currently fixed at 50; adaptive growth, CLI-configurable
   margins, per-net telemetry, and metadata-sidecar serialization of packed
   bounds are follow-up work.
 - Bounds are packed from the existing metadata coordinate arrays at PathFinder
@@ -41,7 +41,7 @@ the globally shortest route.
 
 ## Files changed for the first implementation
 
-- `pathfinder.hpp`: route-window option and fixed 20-tile default.
+- `pathfinder.hpp`: route-window option and fixed 50-tile default.
 - `pathfinder.cpp`: per-net window construction, packed-host bounds, fallback,
   CLI parsing, and shared graph creation.
 - `delta_stepping/delta_stepping_hip_CSR.hpp/.cpp`: immutable device bounds,

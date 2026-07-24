@@ -995,7 +995,7 @@ RoutedNet route_net(const HostCsrF32& graph,
         net.sinks[sink_index] = std::move(candidate);
       }
     }
-    // This first slice uses a fixed 20-tile margin. If that heuristic misses
+    // This first slice uses a fixed 50-tile margin. If that heuristic misses
     // any requested sink, rerun the original batched query unbounded rather
     // than accepting partial reachability caused by the window.
     if (route_window.enabled) {
@@ -1940,7 +1940,7 @@ void print_usage(const char* program) {
       << "  --delta-force-generic           Bypass exact-unit specialization; retain weights and delta.\n"
       << "  --delta-force-legacy-parent     Force generic Delta predecessor recovery for A/B comparison.\n"
       << "  --delta-telemetry               Emit one aggregate Delta-Stepping telemetry JSON record.\n"
-      << "  --route-window                  Restrict each Delta net search to its source/sink box plus 20 tiles; falls back to full graph.\n"
+      << "  --route-window                  Restrict each Delta net search to its source/sink box plus 50 tiles; falls back to full graph.\n"
       << "  --delta-benchmark-weights <unit|all-light|all-heavy|mixed>\n"
       << "                                  Replace CSR weights deterministically for numeric-delta benchmarks.\n"
       << "  --delta-benchmark-weight-seed <uint>\n"
