@@ -54,3 +54,5 @@ the globally shortest route.
 
 `git diff --check` passes. The local environment currently has neither `g++`
 nor `hipcc` on `PATH`, so the CPU-stub and HIP test suites have not yet run.
+The CPU-stub test has been kept in sync with the added graph constructor and
+the `route_net()` metadata parameter.

@@ -14,6 +14,7 @@
 
 #include "../pathfinder.cpp"
 
+#include <cassert>
 #include <fstream>
 #include <queue>
 #include <sstream>
@@ -1433,10 +1434,12 @@ int main() {
   std::vector<std::uint32_t> detached_parent_seen(
       static_cast<std::size_t>(graph.rows), 0);
   routing::PathfinderOptions detached_options;
+  const routing::RoutingMetadata detached_metadata = make_metadata();
   bool detached_path_rejected = false;
   try {
     (void)routing::route_net(graph,
                              detached_workspace,
+                             detached_metadata,
                              detached_request,
                              detached_tree_seen,
                              detached_parent_by_child,
@@ -1464,6 +1467,7 @@ int main() {
   const routing::RoutedNet tentative_net = routing::route_net(
       graph,
       tentative_workspace,
+      detached_metadata,
       detached_request,
       tentative_tree_seen,
       tentative_parent_by_child,
