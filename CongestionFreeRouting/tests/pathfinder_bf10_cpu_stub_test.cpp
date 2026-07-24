@@ -836,6 +836,14 @@ DeltaSteppingCsrGraph::DeltaSteppingCsrGraph(const HostCsrF32& adjacency,
   ++g_delta_graph_uploads;
 }
 
+DeltaSteppingCsrGraph::DeltaSteppingCsrGraph(
+    const HostCsrF32& adjacency,
+    const std::vector<std::uint64_t>& node_bounds,
+    hipStream_t stream)
+    : DeltaSteppingCsrGraph(adjacency, stream) {
+  assert(node_bounds.size() == static_cast<std::size_t>(adjacency.rows));
+}
+
 DeltaSteppingCsrGraph::~DeltaSteppingCsrGraph() = default;
 DeltaSteppingCsrGraph::DeltaSteppingCsrGraph(
     DeltaSteppingCsrGraph&&) noexcept = default;

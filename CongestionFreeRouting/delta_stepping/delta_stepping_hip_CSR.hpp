@@ -77,6 +77,15 @@ struct DeltaSteppingCsrRunOptions {
   // Process exactly the distance buckets that can contain a path strictly
   // below this value. Infinity preserves an ordinary unbounded run.
   float exclusive_distance_limit = std::numeric_limits<float>::infinity();
+  // A windowed query deliberately uses the generic Delta-Stepping path. Node
+  // bounds are immutable graph data; this only describes one query.
+  struct RouteWindow {
+    bool enabled = false;
+    std::uint16_t min_x = 0;
+    std::uint16_t max_x = 0;
+    std::uint16_t min_y = 0;
+    std::uint16_t max_y = 0;
+  } route_window;
 };
 
 const char* delta_stepping_execution_path_name(
@@ -150,6 +159,9 @@ class DeltaSteppingCsrGraph {
   DeltaSteppingCsrGraph(const HostCsrF32& adjacency,
                         hipStream_t stream,
                         DeltaSteppingCsrStorageMode storage_mode);
+  DeltaSteppingCsrGraph(const HostCsrF32& adjacency,
+                        const std::vector<std::uint64_t>& node_bounds,
+                        hipStream_t stream = nullptr);
   ~DeltaSteppingCsrGraph();
 
   DeltaSteppingCsrGraph(const DeltaSteppingCsrGraph&) = delete;
@@ -367,14 +379,17 @@ class DeltaSteppingCsrWorkspace {
     }
     active_telemetry_ = run_options.telemetry;
     active_distance_limit_ = run_options.exclusive_distance_limit;
+    active_route_window_ = run_options.route_window;
     try {
       DeltaSteppingCsrResult result = run();
       active_telemetry_ = nullptr;
       active_distance_limit_ = std::numeric_limits<float>::infinity();
+      active_route_window_ = {};
       return result;
     } catch (...) {
       active_telemetry_ = nullptr;
       active_distance_limit_ = std::numeric_limits<float>::infinity();
+      active_route_window_ = {};
       throw;
     }
   }
@@ -385,6 +400,7 @@ class DeltaSteppingCsrWorkspace {
       DeltaSteppingCsrExecutionMode::kAutomatic;
   DeltaSteppingCsrTelemetry* active_telemetry_ = nullptr;
   float active_distance_limit_ = std::numeric_limits<float>::infinity();
+  DeltaSteppingCsrRunOptions::RouteWindow active_route_window_;
   std::unique_ptr<Impl> impl_;
 };
 

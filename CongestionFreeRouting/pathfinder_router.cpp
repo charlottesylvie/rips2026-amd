@@ -274,6 +274,8 @@ Options parse_args(int argc, char** argv) {
         options.pathfinder_args.push_back(option);
         delta_telemetry = true;
       }
+    } else if (option == "--route-window") {
+      options.pathfinder_args.push_back(option);
     } else if (option == "--delta-benchmark-weights") {
       delta_benchmark_weights = require_value("--delta-benchmark-weights");
       options.pathfinder_args.push_back(option);

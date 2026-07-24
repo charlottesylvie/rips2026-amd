@@ -109,6 +109,10 @@ struct PathfinderOptions {
   // explicitly supplied, so non-Delta engines cannot silently ignore it.
   bool delta_controls_explicit = false;
   bool delta_telemetry = false;
+  // Opt-in heuristic: route each Delta-Stepping net inside the source/sink
+  // rectangle expanded by this many tiles on every side.
+  bool route_window_enabled = false;
+  std::uint16_t route_window_margin = 20;
 };
 
 struct PathfinderResult {

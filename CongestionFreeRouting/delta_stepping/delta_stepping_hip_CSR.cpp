@@ -50,6 +50,25 @@ enum DeviceTelemetryCounter : int {
   kTelemetryCounterCount,
 };
 
+constexpr std::uint16_t kPackedBoundsMissing = 0xffffu;
+
+__device__ inline bool node_intersects_window(
+    std::uint64_t packed,
+    const DeltaSteppingCsrRunOptions::RouteWindow& window) {
+  const std::uint16_t min_x = static_cast<std::uint16_t>(packed);
+  const std::uint16_t max_x = static_cast<std::uint16_t>(packed >> 16);
+  const std::uint16_t min_y = static_cast<std::uint16_t>(packed >> 32);
+  const std::uint16_t max_y = static_cast<std::uint16_t>(packed >> 48);
+  // Keep special/nonphysical nodes: excluding them can make an otherwise
+  // valid route spuriously unreachable.
+  if (min_x == kPackedBoundsMissing || max_x == kPackedBoundsMissing ||
+      min_y == kPackedBoundsMissing || max_y == kPackedBoundsMissing) {
+    return true;
+  }
+  return max_x >= window.min_x && min_x <= window.max_x &&
+         max_y >= window.min_y && min_y <= window.max_y;
+}
+
 enum UnitStatusIndex : int {
   kUnitStatusQueueTail = 0,
   kUnitStatusFoundCount,
@@ -1539,6 +1558,8 @@ __global__ void relax_light_edges_kernel(const int* frontier,
                                          const Offset* out_rowptr,
                                          const Index* out_colind,
                                          const float* out_values,
+                                         const std::uint64_t* node_bounds,
+                                         DeltaSteppingCsrRunOptions::RouteWindow route_window,
                                          const float* vertex_costs,
                                          float* dist,
                                          unsigned long long* parent_key,
@@ -1606,6 +1627,10 @@ __global__ void relax_light_edges_kernel(const int* frontier,
         }
         const float w = out_values[e];
         const int v = static_cast<int>(out_colind[e]);
+        if (node_bounds != nullptr && route_window.enabled &&
+            !node_intersects_window(node_bounds[v], route_window)) {
+          continue;
+        }
         const float effective_w =
             HasVertexCosts ? w * vertex_costs[v] : w;
         const float candidate = du + effective_w;
@@ -1715,6 +1740,8 @@ __global__ void relax_heavy_edges_kernel(const int* heavy_vertices,
                                          const Offset* out_rowptr,
                                          const Index* out_colind,
                                          const float* out_values,
+                                         const std::uint64_t* node_bounds,
+                                         DeltaSteppingCsrRunOptions::RouteWindow route_window,
                                          const float* vertex_costs,
                                          float* dist,
                                          unsigned long long* parent_key,
@@ -1748,6 +1775,10 @@ __global__ void relax_heavy_edges_kernel(const int* heavy_vertices,
         }
         const float w = out_values[e];
         const int v = static_cast<int>(out_colind[e]);
+        if (node_bounds != nullptr && route_window.enabled &&
+            !node_intersects_window(node_bounds[v], route_window)) {
+          continue;
+        }
         const float effective_w =
             HasVertexCosts ? w * vertex_costs[v] : w;
         const float candidate = du + effective_w;
@@ -1826,6 +1857,8 @@ template <bool TrackParents,
 void launch_relax_light_edges(
     const minplus_sparse::DeviceCsrF32& graph,
     DeltaSteppingScratch& scratch,
+    const std::uint64_t* node_bounds,
+    DeltaSteppingCsrRunOptions::RouteWindow route_window,
     const float* vertex_costs,
     const int* current_queue,
     const int* current_count,
@@ -1842,7 +1875,8 @@ void launch_relax_light_edges(
       <<<launch_blocks, kBlockSize, 0, stream>>>(
           current_queue, current_count, current_bucket, delta,
           exclusive_distance_limit,
-          graph.rowptr, graph.colind, graph.values, vertex_costs,
+          graph.rowptr, graph.colind, graph.values, node_bounds, route_window,
+          vertex_costs,
           scratch.dist.get(), scratch.parent_key.get(),
           scratch.in_current.get(), scratch.in_pending.get(),
           scratch.in_heavy.get(), scratch.touched_queue.get(),
@@ -1860,6 +1894,8 @@ template <bool TrackParents,
 void launch_relax_heavy_edges(
     const minplus_sparse::DeviceCsrF32& graph,
     DeltaSteppingScratch& scratch,
+    const std::uint64_t* node_bounds,
+    DeltaSteppingCsrRunOptions::RouteWindow route_window,
     const float* vertex_costs,
     int launch_blocks,
     int current_bucket,
@@ -1872,7 +1908,8 @@ void launch_relax_heavy_edges(
       <<<launch_blocks, kBlockSize, 0, stream>>>(
           scratch.heavy_queue.get(), scratch.heavy_count.get(),
           current_bucket, delta, exclusive_distance_limit,
-          graph.rowptr, graph.colind, graph.values, vertex_costs,
+          graph.rowptr, graph.colind, graph.values, node_bounds, route_window,
+          vertex_costs,
           scratch.dist.get(), scratch.parent_key.get(), scratch.in_pending.get(),
           scratch.touched_queue.get(), scratch.touched_count.get(),
           pending_queue, scratch.pending_count.get(), scratch.in_heavy.get(),
@@ -3035,6 +3072,8 @@ template <bool TrackParents, bool UseEdgeParent, bool CollectTelemetry>
 DeltaSteppingCsrResult run_delta_stepping_impl(
     const minplus_sparse::DeviceCsrF32& d_adjacency,
     const std::uint32_t* edge_source,
+    const std::uint64_t* node_bounds,
+    DeltaSteppingCsrRunOptions::RouteWindow route_window,
     DeltaSteppingScratch& scratch,
     const std::vector<int>& sources,
     int target,
@@ -3300,28 +3339,28 @@ DeltaSteppingCsrResult run_delta_stepping_impl(
         if (terminal_bucket && vertex_costs != nullptr) {
           launch_relax_light_edges<TrackParents, UseEdgeParent, true, false,
                                    true, CollectTelemetry>(
-              d_adjacency, scratch, vertex_costs, current_queue,
+              d_adjacency, scratch, node_bounds, route_window, vertex_costs, current_queue,
               current_count_device, launch_blocks, current_bucket, delta,
               exclusive_distance_limit, next_queue, next_count_device,
               pending_queue, stream);
         } else if (terminal_bucket || skip_heavy_edges) {
           launch_relax_light_edges<TrackParents, UseEdgeParent, false, false,
                                    true, CollectTelemetry>(
-              d_adjacency, scratch, nullptr, current_queue,
+              d_adjacency, scratch, node_bounds, route_window, nullptr, current_queue,
               current_count_device, launch_blocks, current_bucket, delta,
               exclusive_distance_limit, next_queue, next_count_device,
               pending_queue, stream);
         } else if (vertex_costs != nullptr) {
           launch_relax_light_edges<TrackParents, UseEdgeParent, true, true,
                                    false, CollectTelemetry>(
-              d_adjacency, scratch, vertex_costs, current_queue,
+              d_adjacency, scratch, node_bounds, route_window, vertex_costs, current_queue,
               current_count_device, launch_blocks, current_bucket, delta,
               exclusive_distance_limit, next_queue, next_count_device,
               pending_queue, stream);
         } else {
           launch_relax_light_edges<TrackParents, UseEdgeParent, false, true,
                                    false, CollectTelemetry>(
-              d_adjacency, scratch, nullptr, current_queue,
+              d_adjacency, scratch, node_bounds, route_window, nullptr, current_queue,
               current_count_device, launch_blocks, current_bucket, delta,
               exclusive_distance_limit, next_queue, next_count_device,
               pending_queue, stream);
@@ -3345,13 +3384,13 @@ DeltaSteppingCsrResult run_delta_stepping_impl(
       if (vertex_costs != nullptr) {
         launch_relax_heavy_edges<TrackParents, UseEdgeParent, true,
                                  CollectTelemetry>(
-            d_adjacency, scratch, vertex_costs, device_count_blocks,
+            d_adjacency, scratch, node_bounds, route_window, vertex_costs, device_count_blocks,
             current_bucket, delta, exclusive_distance_limit, pending_queue,
             stream);
       } else {
         launch_relax_heavy_edges<TrackParents, UseEdgeParent, false,
                                  CollectTelemetry>(
-            d_adjacency, scratch, nullptr, device_count_blocks,
+            d_adjacency, scratch, node_bounds, route_window, nullptr, device_count_blocks,
             current_bucket, delta, exclusive_distance_limit, pending_queue,
             stream);
       }
@@ -3614,6 +3653,8 @@ template <bool TrackParents, bool UseEdgeParent>
 DeltaSteppingCsrResult dispatch_delta_stepping_impl(
     const minplus_sparse::DeviceCsrF32& d_adjacency,
     const std::uint32_t* edge_source,
+    const std::uint64_t* node_bounds,
+    DeltaSteppingCsrRunOptions::RouteWindow route_window,
     DeltaSteppingScratch& scratch,
     const std::vector<int>& sources,
     int target,
@@ -3629,13 +3670,13 @@ DeltaSteppingCsrResult dispatch_delta_stepping_impl(
     DeltaSteppingCsrTelemetry* telemetry) {
   if (telemetry != nullptr) {
     return run_delta_stepping_impl<TrackParents, UseEdgeParent, true>(
-        d_adjacency, edge_source, scratch, sources, target, targets,
+        d_adjacency, edge_source, node_bounds, route_window, scratch, sources, target, targets,
         vertex_costs, skip_heavy_edges, delta, max_iters,
         exclusive_distance_limit, stream,
         progress_callback, progress_user_data, telemetry);
   }
   return run_delta_stepping_impl<TrackParents, UseEdgeParent, false>(
-      d_adjacency, edge_source, scratch, sources, target, targets,
+      d_adjacency, edge_source, node_bounds, route_window, scratch, sources, target, targets,
       vertex_costs, skip_heavy_edges, delta, max_iters,
       exclusive_distance_limit, stream,
       progress_callback, progress_user_data, nullptr);
@@ -3684,13 +3725,15 @@ const char* delta_stepping_execution_path_name(
 struct DeltaSteppingCsrGraph::Impl {
   int device = 0;
   ds_delta_detail::DeviceCsrOwner adjacency;
+  ds_delta_detail::DeviceBuffer<std::uint64_t> node_bounds;
   float max_edge_value = 0.0f;
   bool has_exact_unit_edge_values = false;
   bool path_capable = true;
 
   Impl(const HostCsrF32& host,
        hipStream_t stream,
-       DeltaSteppingCsrStorageMode storage_mode)
+       DeltaSteppingCsrStorageMode storage_mode,
+       const std::vector<std::uint64_t>& host_node_bounds = {})
       : device(ds_delta_detail::current_hip_device()),
         adjacency(ds_delta_detail::copy_host_csr_to_device(
             host, stream,
@@ -3699,7 +3742,19 @@ struct DeltaSteppingCsrGraph::Impl {
         has_exact_unit_edge_values(
             ds_delta_detail::has_exact_unit_edge_values(host.values)),
         path_capable(
-            storage_mode == DeltaSteppingCsrStorageMode::kPathCapable) {}
+            storage_mode == DeltaSteppingCsrStorageMode::kPathCapable) {
+    if (!host_node_bounds.empty()) {
+      if (host_node_bounds.size() != static_cast<std::size_t>(host.rows)) {
+        throw std::invalid_argument("node bounds size does not match CSR rows");
+      }
+      node_bounds.reset(host_node_bounds.size());
+      DS_DELTA_HIP_CHECK(hipMemcpyAsync(
+          node_bounds.get(), host_node_bounds.data(),
+          host_node_bounds.size() * sizeof(std::uint64_t),
+          hipMemcpyHostToDevice, stream));
+      if (stream == nullptr) DS_DELTA_HIP_CHECK(hipDeviceSynchronize());
+    }
+  }
 };
 
 DeltaSteppingCsrGraph::DeltaSteppingCsrGraph(const HostCsrF32& adjacency,
@@ -3723,6 +3778,20 @@ DeltaSteppingCsrGraph::DeltaSteppingCsrGraph(
         "frontier vertices are stored as int; rows must fit in int");
   }
   impl_ = std::make_shared<Impl>(adjacency, stream, storage_mode);
+}
+
+DeltaSteppingCsrGraph::DeltaSteppingCsrGraph(
+    const HostCsrF32& adjacency,
+    const std::vector<std::uint64_t>& node_bounds,
+    hipStream_t stream) {
+  PATHFINDER_PROFILE_RANGE("delta_step.upload_graph");
+  using namespace ds_delta_detail;
+  validate_host_csr_arrays(adjacency);
+  if (adjacency.rows <= 0 || adjacency.rows != adjacency.cols) {
+    throw std::invalid_argument("CSR graph must be nonempty and square");
+  }
+  impl_ = std::make_shared<Impl>(adjacency, stream,
+      DeltaSteppingCsrStorageMode::kPathCapable, node_bounds);
 }
 
 DeltaSteppingCsrGraph::~DeltaSteppingCsrGraph() = default;
@@ -3789,6 +3858,12 @@ struct DeltaSteppingCsrWorkspace::Impl {
       return shared_graph->adjacency;
     }
     return *owned_adjacency;
+  }
+
+  const std::uint64_t* node_bounds() const {
+    return shared_graph && shared_graph->node_bounds.size() != 0
+               ? shared_graph->node_bounds.get()
+               : nullptr;
   }
 
   ds_delta_detail::DeviceCsrOwner& mutable_adjacency() {
@@ -3968,7 +4043,7 @@ DeltaSteppingCsrResult DeltaSteppingCsrWorkspace::run_distances(
       skip_heavy_edges,
       false);
   return dispatch_delta_stepping_impl<false, false>(
-      adjacency.view, nullptr, impl_->scratch, sources, -1, nullptr,
+      adjacency.view, nullptr, impl_->node_bounds(), active_route_window_, impl_->scratch, sources, -1, nullptr,
       impl_->has_vertex_costs ? impl_->vertex_costs.get() : nullptr,
       skip_heavy_edges, delta, max_iters, active_distance_limit_, stream,
       progress_callback, progress_user_data, active_telemetry_);
@@ -4003,7 +4078,7 @@ DeltaSteppingCsrResult DeltaSteppingCsrWorkspace::run(
       parent_mode_ == DeltaSteppingCsrParentMode::kForceLegacy,
       impl_->has_vertex_costs, skip_heavy_edges, false);
   return dispatch_delta_stepping_impl<true, false>(
-      adjacency.view, nullptr, impl_->scratch, sources, target, nullptr,
+      adjacency.view, nullptr, impl_->node_bounds(), active_route_window_, impl_->scratch, sources, target, nullptr,
       impl_->has_vertex_costs ? impl_->vertex_costs.get() : nullptr,
       skip_heavy_edges, delta, max_iters, active_distance_limit_, stream,
       progress_callback, progress_user_data, active_telemetry_);
@@ -4033,6 +4108,7 @@ DeltaSteppingCsrResult DeltaSteppingCsrWorkspace::run(
       parent_mode_ == DeltaSteppingCsrParentMode::kAutomatic &&
       impl_->has_exact_unit_edge_values &&
       !impl_->has_vertex_costs &&
+      !active_route_window_.enabled &&
       adjacency.view.rows <= kMaxUnitSpecializationRows &&
       max_iters < 0 &&
       progress_callback == nullptr) {
@@ -4063,7 +4139,7 @@ DeltaSteppingCsrResult DeltaSteppingCsrWorkspace::run(
         execution_mode_ == DeltaSteppingCsrExecutionMode::kForceGeneric,
         false, impl_->has_vertex_costs, skip_heavy_edges, false);
     return dispatch_delta_stepping_impl<true, true>(
-        adjacency.view, adjacency.edge_source.get(), impl_->scratch, sources,
+        adjacency.view, adjacency.edge_source.get(), impl_->node_bounds(), active_route_window_, impl_->scratch, sources,
         -1, &targets, vertex_costs, skip_heavy_edges, delta, max_iters,
         active_distance_limit_, stream, progress_callback, progress_user_data,
         active_telemetry_);
@@ -4078,7 +4154,7 @@ DeltaSteppingCsrResult DeltaSteppingCsrWorkspace::run(
       parent_mode_ == DeltaSteppingCsrParentMode::kForceLegacy,
       impl_->has_vertex_costs, skip_heavy_edges, compact_parent_fallback);
   return dispatch_delta_stepping_impl<true, false>(
-      adjacency.view, nullptr, impl_->scratch, sources, -1, &targets,
+      adjacency.view, nullptr, impl_->node_bounds(), active_route_window_, impl_->scratch, sources, -1, &targets,
       vertex_costs, skip_heavy_edges, delta, max_iters,
       active_distance_limit_, stream, progress_callback, progress_user_data,
       active_telemetry_);
@@ -4116,7 +4192,7 @@ DeltaSteppingCsrResult delta_stepping_minplus_hip_csr(
   validate_device_csr_contents(d_adjacency, stream);
   DeltaSteppingScratch scratch(d_adjacency.rows);
   return dispatch_delta_stepping_impl<true, false>(
-      d_adjacency, nullptr, scratch, sources, target, nullptr, nullptr, false,
+      d_adjacency, nullptr, nullptr, {}, scratch, sources, target, nullptr, nullptr, false,
       delta, max_iters, std::numeric_limits<float>::infinity(), stream,
       progress_callback, progress_user_data, nullptr);
 }
