@@ -1,93 +1,60 @@
-# Route-window implementation notes
+# Adaptive route windows
 
-This file records the current implementation status of the opt-in per-net
-PathFinder route-window heuristic. Update it whenever this feature changes.
-
-## Current behavior
-
-Enable the feature only for production Delta-Stepping runs:
-
-```text
-pathfinder <graph.csrbin> <metadata.ifmeta.bin> \
-  --sssp-engine delta-step --route-window
-```
-
-To profile an unbounded baseline and then apply windows only to measured
-expensive nets:
+Route windows are an opt-in Delta-Stepping optimization.  They never change
+PathFinder's shortest-path result: a bounded path is only an incumbent, and
+each reached target is checked by an unbounded query with an exclusive distance
+limit equal to that incumbent's cost.  A strictly cheaper global path replaces
+it; no result below the limit proves the bounded path is globally optimal.
 
 ```text
-pathfinder graph.csrbin metadata.ifmeta.bin \
-  --sssp-engine delta-step --delta-force-generic \
-  --route-window-stats-out baseline.jsonl
-
-# Keep both fields from selected baseline rows for metadata validation.
-{"net_index":17,"net":"example_net"}
-
-pathfinder graph.csrbin metadata.ifmeta.bin \
-  --sssp-engine delta-step --delta-force-generic --route-window \
-  --route-window-net-list hard_nets.jsonl \
-  --route-window-stats-out windowed.jsonl
+pathfinder graph.csrbin graph.ifmeta.bin --sssp-engine delta-step \
+  --route-window --route-window-stats-out route-window.jsonl
 ```
 
-`--route-window-net-list` requires `--route-window`. Entries beyond
-`--net-limit` are valid but inactive for that invocation.
+`--route-window-net-list selected.jsonl` limits the optimization to JSONL
+entries such as `{"net_index":17}` or `{"net":"example_net"}`.  It requires
+`--route-window`.
 
-For every net, PathFinder combines the extents of all source nodes and all
-initially unresolved sink nodes, then expands that rectangle by **50 tiles on
-every side**. The bounds are clamped to the packed-coordinate range.
+## Window schedule
 
-The shared immutable Delta-Stepping graph uploads one packed `uint64_t` bounds
-entry per CSR row. During generic light/heavy edge relaxation, a candidate
-destination is skipped when its physical extent does not intersect the current
-net window. Nodes without valid physical coordinates are kept conservatively.
+PathFinder forms the bounding box of valid source and initially unresolved sink
+node extents.  Initial margins are independent for X and Y:
 
-If any requested sink is unreachable in the window, PathFinder reruns the same
-batched query with no window before accepting the net. Consequently, the
-current fixed-margin version preserves completeness relative to the unbounded
-query, although a successful bounded route remains a heuristic: it need not be
-the globally shortest route.
+```text
+margin_axis = clamp(ceil(endpoint_span_axis * scale), min_margin, max_margin)
+```
 
-Every `--route-window-stats-out` row describes one Delta SSSP query in stable
-net-index order. It records query kind (`unbounded_baseline`, `window`, or
-`fallback`), box extents, source/target counts, unresolved targets,
-`touched_nodes`, edge and atomic counters, `window_rejected_edges`, and the
-fallback flag. A failed window emits a `window` row with
-`fallback_triggered:true`, followed by its unbounded `fallback` row.
+Defaults are `min_margin=16`, `max_margin=512`, and `scale=0.5`.  Configure
+them with `--route-window-min-margin`, `--route-window-max-margin`, and
+`--route-window-margin-scale`.
 
-For generic Delta queries, stats output also uses reusable HIP events to record
-stream-local `materialize_ms` and `reset_ms`. CompactGeneric path extraction is
-included in `materialize_ms`; per-worker stream times may sum to more than
-wall-clock time when workers overlap.
+If any sink is missing, each margin doubles from the original endpoint box on
+every retry.  Each resulting box is clamped to the coordinate extents of the
+uploaded device node metadata.  When expansion cannot enlarge the box (which
+includes reaching full-device bounds), PathFinder performs a full unbounded
+fallback.  Endpoint nodes with unknown coordinates simply disable the window
+for that net and run an explicitly reported unbounded query.
 
-## Current scope and limitations
+## Bounds and safety
 
-- The feature is disabled unless `--route-window` is supplied.
-- It applies only to Delta-Stepping, and windowed queries deliberately bypass
-  the exact-unit specialization in favor of generic Delta-Stepping.
-- The margin is currently fixed at 50; adaptive growth, a CLI-configurable
-  margin, and metadata-sidecar serialization of packed bounds remain follow-up
-  work.
-- Bounds are packed from the existing metadata coordinate arrays at PathFinder
-  startup and uploaded once. This avoids a per-net upload, but a later format
-  revision can serialize the packed sidecar array directly.
+The immutable shared Delta graph uploads one compact `int32_t` bounds record
+per CSR row once.  It has four inclusive coordinates plus an explicit validity
+bit; coordinates at or above 65535 are valid.  An all-unknown node remains
+traversable conservatively, and telemetry reports the graph-wide count of such
+nodes.  Partial unknown coordinates and inverted metadata ranges are rejected
+before dispatch.  Enabling a route window without uploaded bounds fails fast.
 
-## Files changed for the first implementation
+Both generic Delta-Stepping light/heavy relaxation and the exact-unit
+specialization apply the same destination interval-intersection predicate, so
+unit-weight nets retain their specialization.  Bounds are shared immutable
+graph data; no per-net device upload occurs.
 
-- `pathfinder.hpp`: route-window option, selected-net list, and stats output
-  path.
-- `pathfinder.cpp`: per-net window construction, packed-host bounds, fallback,
-  selected-net scheduling, per-query JSONL, CLI parsing, and shared graph
-  creation.
-- `delta_stepping/delta_stepping_hip_CSR.hpp/.cpp`: immutable device bounds,
-  query window API, generic dispatch, and destination filtering.
-- `pathfinder_router.cpp`: forwarding of the window, selected-list, and stats
-  options.
-- `tests/pathfinder_bf10_cpu_stub_test.cpp`: selected-net and stats JSONL
-  coverage.
+## Telemetry
 
-## Verification status
-
-`git diff --check` passes. The local environment currently has neither `g++`
-nor `hipcc` on `PATH`, so the CPU-stub and HIP test suites have not yet run.
-The CPU-stub test has been kept in sync with the added graph constructor and
-the `route_net()` metadata parameter.
+`--route-window-stats-out` writes one stable-order JSONL record for every
+bounded attempt, unbounded baseline, verification, and fallback.  Records
+include the attempt number, box, retry/verification reason, reached and
+unreached target counts, rejected edges, unknown-coordinate count, and whether
+global-cost verification was required, plus the selected execution path.  A
+successful bounded attempt is always followed by one verification record per
+target.

@@ -69,7 +69,10 @@ struct CpuSsspResult {
 };
 
 CpuSsspResult cpu_dijkstra_outgoing_csr_multi(const HostCsrF32& graph,
-                                              const std::vector<int>& sources) {
+                                              const std::vector<int>& sources,
+                                              const std::vector<DeltaSteppingCsrNodeBounds>* node_bounds = nullptr,
+                                              DeltaSteppingCsrRunOptions::RouteWindow route_window = {},
+                                              std::uint64_t* rejected_edges = nullptr) {
   struct OutEdge {
     int to = -1;
     float weight = 0.0f;
@@ -107,6 +110,19 @@ CpuSsspResult cpu_dijkstra_outgoing_csr_multi(const HostCsrF32& graph,
       continue;
     }
     for (const OutEdge& edge : outgoing[static_cast<std::size_t>(u)]) {
+      if (route_window.enabled && node_bounds != nullptr) {
+        const DeltaSteppingCsrNodeBounds& bounds =
+            (*node_bounds)[static_cast<std::size_t>(edge.to)];
+        const bool intersects = bounds.valid == 0 ||
+            (bounds.max_x >= route_window.min_x &&
+             bounds.min_x <= route_window.max_x &&
+             bounds.max_y >= route_window.min_y &&
+             bounds.min_y <= route_window.max_y);
+        if (!intersects) {
+          if (rejected_edges != nullptr) ++*rejected_edges;
+          continue;
+        }
+      }
       const float candidate = du + edge.weight;
       if (candidate < result.dist[static_cast<std::size_t>(edge.to)]) {
         result.dist[static_cast<std::size_t>(edge.to)] = candidate;
@@ -825,9 +841,12 @@ BellmanFordCsrResult BellmanFord10CsrWorkspace::run(
 }
 
 struct DeltaSteppingCsrGraph::Impl {
-  explicit Impl(const HostCsrF32& adjacency) : graph(adjacency) {}
+  explicit Impl(const HostCsrF32& adjacency,
+                std::vector<DeltaSteppingCsrNodeBounds> bounds = {})
+      : graph(adjacency), node_bounds(std::move(bounds)) {}
 
   HostCsrF32 graph;
+  std::vector<DeltaSteppingCsrNodeBounds> node_bounds;
 };
 
 DeltaSteppingCsrGraph::DeltaSteppingCsrGraph(const HostCsrF32& adjacency,
@@ -839,10 +858,12 @@ DeltaSteppingCsrGraph::DeltaSteppingCsrGraph(const HostCsrF32& adjacency,
 
 DeltaSteppingCsrGraph::DeltaSteppingCsrGraph(
     const HostCsrF32& adjacency,
-    const std::vector<std::uint64_t>& node_bounds,
+    const std::vector<DeltaSteppingCsrNodeBounds>& node_bounds,
     hipStream_t stream)
-    : DeltaSteppingCsrGraph(adjacency, stream) {
+    : impl_(std::make_shared<Impl>(adjacency, node_bounds)) {
+  (void)stream;
   assert(node_bounds.size() == static_cast<std::size_t>(adjacency.rows));
+  ++g_delta_graph_uploads;
 }
 
 DeltaSteppingCsrGraph::~DeltaSteppingCsrGraph() = default;
@@ -854,6 +875,7 @@ DeltaSteppingCsrGraph& DeltaSteppingCsrGraph::operator=(
 struct DeltaSteppingCsrWorkspace::Impl {
   HostCsrF32 graph;
   std::vector<float> base_values;
+  std::vector<DeltaSteppingCsrNodeBounds> node_bounds;
   bool has_vertex_costs = false;
 };
 
@@ -876,6 +898,7 @@ DeltaSteppingCsrWorkspace::DeltaSteppingCsrWorkspace(
   }
   impl_->graph = adjacency->impl_->graph;
   impl_->base_values = impl_->graph.values;
+  impl_->node_bounds = adjacency->impl_->node_bounds;
 }
 
 DeltaSteppingCsrWorkspace::~DeltaSteppingCsrWorkspace() = default;
@@ -974,6 +997,10 @@ DeltaSteppingCsrResult DeltaSteppingCsrWorkspace::run(
   if (parent_mode_ == DeltaSteppingCsrParentMode::kForceLegacy) {
     ++g_delta_force_legacy_calls;
   }
+  if (active_route_window_.enabled && impl_->node_bounds.empty()) {
+    throw std::logic_error(
+        "route-window query requires uploaded immutable node bounds");
+  }
   DeltaSteppingCsrResult result =
       delta_stepping_minplus_hip_csr(impl_->graph,
                                      sources,
@@ -983,31 +1010,18 @@ DeltaSteppingCsrResult DeltaSteppingCsrWorkspace::run(
                                      stream,
                                      progress_callback,
                                      progress_user_data);
-  CpuSsspResult cpu_result;
-  cpu_result.dist = result.dist;
-  cpu_result.pred_node = result.pred_node;
-  cpu_result.pred_edge = result.pred_edge;
+  std::uint64_t rejected_edges = 0;
+  const std::vector<DeltaSteppingCsrNodeBounds>* active_bounds =
+      impl_->node_bounds.empty() ? nullptr : &impl_->node_bounds;
+  CpuSsspResult cpu_result = cpu_dijkstra_outgoing_csr_multi(
+      impl_->graph, sources, active_bounds, active_route_window_,
+      &rejected_edges);
   apply_exclusive_distance_limit(cpu_result, active_distance_limit_);
   fill_compact_target_paths(impl_->graph, sources, targets, cpu_result, result);
   if (std::isfinite(active_distance_limit_)) {
     result.stopped_on_target = result.target_reached;
     result.stopped_on_distance_limit = !result.target_reached;
     result.converged = false;
-  }
-  // Give the PathFinder route-window tests a deterministic bounded-query miss
-  // so they exercise the unbounded fallback and its separate telemetry row.
-  // Ordinary CPU-stub queries retain their exact Dijkstra result.
-  if (active_route_window_.enabled) {
-    result.target_distances.assign(
-        targets.size(), std::numeric_limits<float>::infinity());
-    result.target_sources.assign(targets.size(), -1);
-    result.target_path_offsets.assign(targets.size() + 1, 0);
-    result.target_edge_offsets.assign(targets.size() + 1, 0);
-    result.target_path_nodes.clear();
-    result.target_path_edges.clear();
-    result.target_reached = false;
-    result.stopped_on_target = false;
-    result.converged = true;
   }
   result.dist.clear();
   result.pred_node.clear();
@@ -1016,7 +1030,7 @@ DeltaSteppingCsrResult DeltaSteppingCsrWorkspace::run(
     const bool exact_unit_path =
         execution_mode_ == DeltaSteppingCsrExecutionMode::kAutomatic &&
         parent_mode_ == DeltaSteppingCsrParentMode::kAutomatic &&
-        !impl_->has_vertex_costs && !active_route_window_.enabled &&
+        !impl_->has_vertex_costs &&
         max_iters < 0 &&
         progress_callback == nullptr &&
         std::all_of(impl_->graph.values.begin(), impl_->graph.values.end(),
@@ -1036,6 +1050,13 @@ DeltaSteppingCsrResult DeltaSteppingCsrWorkspace::run(
         execution_mode_ == DeltaSteppingCsrExecutionMode::kForceGeneric,
         parent_mode_ == DeltaSteppingCsrParentMode::kForceLegacy,
         impl_->has_vertex_costs);
+    active_telemetry_->window_rejected_edges = rejected_edges;
+    active_telemetry_->window_unknown_coordinate_nodes =
+        static_cast<std::uint64_t>(std::count_if(
+            impl_->node_bounds.begin(), impl_->node_bounds.end(),
+            [](const DeltaSteppingCsrNodeBounds& bounds) {
+              return bounds.valid == 0;
+            }));
   }
   return result;
 }
@@ -1817,11 +1838,12 @@ int main() {
                   "\"kind\":\"unbounded_baseline\"") != std::string::npos &&
               route_window_stats_json.find("\"touched_nodes\":") !=
                   std::string::npos &&
-              route_window_stats_json.find("\"fallback_triggered\":true") !=
+              route_window_stats_json.find(
+                  "\"global_cost_verification_required\":true") !=
                   std::string::npos &&
-              route_window_stats_json.find("\"kind\":\"fallback\"") !=
+              route_window_stats_json.find("\"kind\":\"verification\"") !=
                   std::string::npos,
-          "per-query stats must distinguish selected windows, fallback, and unbounded nets");
+          "per-query stats must distinguish selected windows, verification, and unbounded nets");
 
   const std::filesystem::path bad_hard_nets_path =
       "/tmp/pathfinder_bad_hard_nets.jsonl";

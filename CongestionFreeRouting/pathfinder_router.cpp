@@ -198,6 +198,9 @@ void print_usage(const char* program) {
       << "  --delta-telemetry              Forward opt-in Delta-Stepping runtime telemetry.\n"
       << "  --delta-force-legacy-parent    Forwarded for generic Delta parent-path A/B comparison.\n"
       << "  --route-window                 Forward per-net source/sink bounding boxes.\n"
+      << "  --route-window-min-margin <int> Forward adaptive window initial-margin floor.\n"
+      << "  --route-window-max-margin <int> Forward adaptive window initial-margin cap.\n"
+      << "  --route-window-margin-scale <f> Forward adaptive window span scale.\n"
       << "  --route-window-net-list <path> Forward selected-window JSONL net list.\n"
       << "  --route-window-stats-out <path> Forward per-query window statistics JSONL path.\n"
       << "  --delta <float|auto>           Forwarded to pathfinder.\n"
@@ -280,7 +283,10 @@ Options parse_args(int argc, char** argv) {
     } else if (option == "--route-window") {
       options.pathfinder_args.push_back(option);
     } else if (option == "--route-window-net-list" ||
-               option == "--route-window-stats-out") {
+               option == "--route-window-stats-out" ||
+               option == "--route-window-min-margin" ||
+               option == "--route-window-max-margin" ||
+               option == "--route-window-margin-scale") {
       options.pathfinder_args.push_back(option);
       options.pathfinder_args.push_back(require_value(option.c_str()));
     } else if (option == "--delta-benchmark-weights") {

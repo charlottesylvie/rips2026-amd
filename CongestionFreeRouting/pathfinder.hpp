@@ -109,10 +109,13 @@ struct PathfinderOptions {
   // explicitly supplied, so non-Delta engines cannot silently ignore it.
   bool delta_controls_explicit = false;
   bool delta_telemetry = false;
-  // Opt-in heuristic: route each Delta-Stepping net inside the source/sink
-  // rectangle expanded by this many tiles on every side.
+  // Opt-in heuristic: route each Delta-Stepping net inside an adaptive
+  // source/sink rectangle.  The initial X/Y margin is clamp(span * scale,
+  // min_margin, max_margin); retries double from the original endpoint box.
   bool route_window_enabled = false;
-  std::uint16_t route_window_margin = 50;
+  std::int32_t route_window_min_margin = 16;
+  std::int32_t route_window_max_margin = 512;
+  float route_window_margin_scale = 0.5f;
   // Optional JSONL selection list for --route-window.  The list is resolved
   // against interchange net names inside run_pathfinder(), after metadata is
   // available, so library callers can use the same diagnostic input as the

@@ -152,6 +152,9 @@ void validate_options(const PathfinderOptions& options) {
         options.delta_force_legacy_parent ||
         options.delta_telemetry ||
         options.route_window_enabled ||
+        options.route_window_min_margin != 16 ||
+        options.route_window_max_margin != 512 ||
+        options.route_window_margin_scale != 0.5f ||
         !options.route_window_net_list_path.empty() ||
         !options.route_window_stats_out_path.empty() ||
         options.delta_auto ||
@@ -599,7 +602,8 @@ auto run_sssp_with_optional_delta_telemetry(
     hipStream_t stream,
     DeltaSteppingCsrRunOptions::RouteWindow,
     bool,
-    DeltaSteppingCsrTelemetry*) {
+    DeltaSteppingCsrTelemetry*,
+    float = std::numeric_limits<float>::infinity()) {
   return workspace.run(sources,
                        targets,
                        delta,
@@ -618,8 +622,10 @@ DeltaSteppingCsrResult run_sssp_with_optional_delta_telemetry(
     hipStream_t stream,
     DeltaSteppingCsrRunOptions::RouteWindow route_window,
     bool collect_phase_timings,
-    DeltaSteppingCsrTelemetry* telemetry) {
-  if (telemetry == nullptr && !route_window.enabled) {
+    DeltaSteppingCsrTelemetry* telemetry,
+    float exclusive_distance_limit = std::numeric_limits<float>::infinity()) {
+  if (telemetry == nullptr && !route_window.enabled &&
+      !std::isfinite(exclusive_distance_limit)) {
     return workspace.run(sources,
                          targets,
                          delta,
@@ -632,6 +638,7 @@ DeltaSteppingCsrResult run_sssp_with_optional_delta_telemetry(
   run_options.telemetry = telemetry;
   run_options.collect_phase_timings = collect_phase_timings;
   run_options.route_window = route_window;
+  run_options.exclusive_distance_limit = exclusive_distance_limit;
   return workspace.run(sources,
                        targets,
                        delta,
@@ -642,46 +649,183 @@ DeltaSteppingCsrResult run_sssp_with_optional_delta_telemetry(
                        nullptr);
 }
 
-DeltaSteppingCsrRunOptions::RouteWindow make_route_window(
-    const RoutingMetadata& metadata,
+struct RouteWindowSeed {
+  bool has_endpoint_bounds = false;
+  std::int32_t endpoint_min_x = 0;
+  std::int32_t endpoint_max_x = 0;
+  std::int32_t endpoint_min_y = 0;
+  std::int32_t endpoint_max_y = 0;
+  std::int32_t device_min_x = 0;
+  std::int32_t device_max_x = 0;
+  std::int32_t device_min_y = 0;
+  std::int32_t device_max_y = 0;
+  std::int32_t initial_margin_x = 0;
+  std::int32_t initial_margin_y = 0;
+};
+
+std::vector<DeltaSteppingCsrNodeBounds> make_node_bounds(
+    const RoutingMetadata& metadata, minplus_sparse::Offset rows) {
+  if (rows < 0) {
+    throw std::invalid_argument("node bounds require a nonnegative CSR row count");
+  }
+  const std::size_t node_count = static_cast<std::size_t>(rows);
+  const auto require_count = [&](const std::vector<std::int32_t>& values,
+                                 const char* name) {
+    if (values.size() != node_count) {
+      throw std::invalid_argument(std::string("route-window node ") + name +
+                                  " count does not match CSR rows");
+    }
+    if (options.route_window_enabled &&
+        (options.route_window_min_margin < 0 ||
+         options.route_window_max_margin < options.route_window_min_margin ||
+         !std::isfinite(options.route_window_margin_scale) ||
+         options.route_window_margin_scale < 0.0f)) {
+      throw std::invalid_argument(
+          "route-window margins require 0 <= min <= max and a finite nonnegative scale");
+    }
+  };
+  require_count(metadata.node_min_x, "min_x");
+  require_count(metadata.node_max_x, "max_x");
+  require_count(metadata.node_min_y, "min_y");
+  require_count(metadata.node_max_y, "max_y");
+
+  std::vector<DeltaSteppingCsrNodeBounds> bounds(node_count);
+  for (std::size_t i = 0; i < node_count; ++i) {
+    const std::int32_t min_x = metadata.node_min_x[i];
+    const std::int32_t max_x = metadata.node_max_x[i];
+    const std::int32_t min_y = metadata.node_min_y[i];
+    const std::int32_t max_y = metadata.node_max_y[i];
+    const bool all_unknown = min_x == -1 && max_x == -1 &&
+                             min_y == -1 && max_y == -1;
+    if (all_unknown) {
+      continue;
+    }
+    if (min_x < 0 || max_x < 0 || min_y < 0 || max_y < 0 ||
+        min_x > max_x || min_y > max_y) {
+      throw std::invalid_argument(
+          "route-window node bounds contain a partial unknown or invalid range");
+    }
+    bounds[i] = {min_x, max_x, min_y, max_y, 1};
+  }
+  return bounds;
+}
+
+std::int32_t clamp_margin(double span,
+                          std::int32_t minimum,
+                          std::int32_t maximum,
+                          float scale) {
+  if (minimum < 0 || maximum < minimum || !std::isfinite(scale) || scale < 0.0f) {
+    throw std::invalid_argument(
+        "route-window margins require 0 <= min <= max and a finite nonnegative scale");
+  }
+  const double scaled = std::ceil(span * static_cast<double>(scale));
+  const double capped = std::min<double>(
+      static_cast<double>(maximum), std::max<double>(minimum, scaled));
+  return static_cast<std::int32_t>(capped);
+}
+
+RouteWindowSeed make_route_window_seed(
+    const std::vector<DeltaSteppingCsrNodeBounds>& bounds,
     const std::vector<int>& sources,
     const std::vector<int>& targets,
-    std::uint16_t margin) {
-  constexpr std::int32_t kInvalidCoordinate = -1;
-  std::int32_t min_x = std::numeric_limits<std::int32_t>::max();
-  std::int32_t max_x = -1;
-  std::int32_t min_y = std::numeric_limits<std::int32_t>::max();
-  std::int32_t max_y = -1;
+    const PathfinderOptions& options) {
+  RouteWindowSeed seed;
+  bool have_device_bounds = false;
+  for (const DeltaSteppingCsrNodeBounds& bounds_for_node : bounds) {
+    if (bounds_for_node.valid == 0) continue;
+    if (!have_device_bounds) {
+      seed.device_min_x = bounds_for_node.min_x;
+      seed.device_max_x = bounds_for_node.max_x;
+      seed.device_min_y = bounds_for_node.min_y;
+      seed.device_max_y = bounds_for_node.max_y;
+      have_device_bounds = true;
+    } else {
+      seed.device_min_x = std::min(seed.device_min_x, bounds_for_node.min_x);
+      seed.device_max_x = std::max(seed.device_max_x, bounds_for_node.max_x);
+      seed.device_min_y = std::min(seed.device_min_y, bounds_for_node.min_y);
+      seed.device_max_y = std::max(seed.device_max_y, bounds_for_node.max_y);
+    }
+  }
   auto add_node = [&](int node) {
-    if (node < 0 || static_cast<std::size_t>(node) >= metadata.node_min_x.size()) return;
-    const std::size_t i = static_cast<std::size_t>(node);
-    if (metadata.node_min_x[i] == kInvalidCoordinate ||
-        metadata.node_max_x[i] == kInvalidCoordinate ||
-        metadata.node_min_y[i] == kInvalidCoordinate ||
-        metadata.node_max_y[i] == kInvalidCoordinate) return;
-    min_x = std::min(min_x, metadata.node_min_x[i]);
-    max_x = std::max(max_x, metadata.node_max_x[i]);
-    min_y = std::min(min_y, metadata.node_min_y[i]);
-    max_y = std::max(max_y, metadata.node_max_y[i]);
+    if (node < 0 || static_cast<std::size_t>(node) >= bounds.size()) return;
+    const DeltaSteppingCsrNodeBounds& node_bounds =
+        bounds[static_cast<std::size_t>(node)];
+    if (node_bounds.valid == 0) return;
+    if (!seed.has_endpoint_bounds) {
+      seed.endpoint_min_x = node_bounds.min_x;
+      seed.endpoint_max_x = node_bounds.max_x;
+      seed.endpoint_min_y = node_bounds.min_y;
+      seed.endpoint_max_y = node_bounds.max_y;
+      seed.has_endpoint_bounds = true;
+    } else {
+      seed.endpoint_min_x = std::min(seed.endpoint_min_x, node_bounds.min_x);
+      seed.endpoint_max_x = std::max(seed.endpoint_max_x, node_bounds.max_x);
+      seed.endpoint_min_y = std::min(seed.endpoint_min_y, node_bounds.min_y);
+      seed.endpoint_max_y = std::max(seed.endpoint_max_y, node_bounds.max_y);
+    }
   };
   for (int node : sources) add_node(node);
   for (int node : targets) add_node(node);
+  if (!seed.has_endpoint_bounds || !have_device_bounds) return seed;
+
+  seed.initial_margin_x = clamp_margin(
+      static_cast<double>(seed.endpoint_max_x) - seed.endpoint_min_x,
+      options.route_window_min_margin, options.route_window_max_margin,
+      options.route_window_margin_scale);
+  seed.initial_margin_y = clamp_margin(
+      static_cast<double>(seed.endpoint_max_y) - seed.endpoint_min_y,
+      options.route_window_min_margin, options.route_window_max_margin,
+      options.route_window_margin_scale);
+  return seed;
+}
+
+DeltaSteppingCsrRunOptions::RouteWindow make_route_window(
+    const RouteWindowSeed& seed,
+    std::int32_t margin_x,
+    std::int32_t margin_y) {
   DeltaSteppingCsrRunOptions::RouteWindow window;
-  if (max_x < 0 || max_y < 0) return window;
-  window.enabled = true;
-  auto clamp = [](std::int32_t value) -> std::uint16_t {
-    return static_cast<std::uint16_t>(std::clamp(value, 0, 65534));
+  if (!seed.has_endpoint_bounds || margin_x < 0 || margin_y < 0) return window;
+  const auto expand_and_clamp = [](std::int32_t lower,
+                                   std::int32_t upper,
+                                   std::int32_t margin,
+                                   std::int32_t device_lower,
+                                   std::int32_t device_upper,
+                                   std::int32_t* out_lower,
+                                   std::int32_t* out_upper) {
+    const std::int64_t expanded_lower = static_cast<std::int64_t>(lower) - margin;
+    const std::int64_t expanded_upper = static_cast<std::int64_t>(upper) + margin;
+    *out_lower = static_cast<std::int32_t>(std::max<std::int64_t>(
+        device_lower, expanded_lower));
+    *out_upper = static_cast<std::int32_t>(std::min<std::int64_t>(
+        device_upper, expanded_upper));
   };
-  window.min_x = clamp(min_x - margin);
-  window.max_x = clamp(max_x + margin);
-  window.min_y = clamp(min_y - margin);
-  window.max_y = clamp(max_y + margin);
+  window.enabled = true;
+  expand_and_clamp(seed.endpoint_min_x, seed.endpoint_max_x, margin_x,
+                   seed.device_min_x, seed.device_max_x,
+                   &window.min_x, &window.max_x);
+  expand_and_clamp(seed.endpoint_min_y, seed.endpoint_max_y, margin_y,
+                   seed.device_min_y, seed.device_max_y,
+                   &window.min_y, &window.max_y);
   return window;
+}
+
+bool same_route_window(const DeltaSteppingCsrRunOptions::RouteWindow& left,
+                       const DeltaSteppingCsrRunOptions::RouteWindow& right) {
+  return left.enabled == right.enabled && left.min_x == right.min_x &&
+         left.max_x == right.max_x && left.min_y == right.min_y &&
+         left.max_y == right.max_y;
+}
+
+std::int32_t doubled_margin(std::int32_t margin) {
+  return margin == 0 ? 1 : static_cast<std::int32_t>(std::min<std::int64_t>(
+      std::numeric_limits<std::int32_t>::max(),
+      static_cast<std::int64_t>(margin) * 2));
 }
 
 enum class RouteWindowQueryKind {
   kUnboundedBaseline,
   kWindow,
+  kVerification,
   kFallback,
 };
 
@@ -692,7 +836,11 @@ struct RouteWindowQueryStats {
   DeltaSteppingCsrRunOptions::RouteWindow window;
   std::size_t source_count = 0;
   std::size_t target_count = 0;
+  std::size_t reached_target_count = 0;
   std::size_t unreached_target_count = 0;
+  std::size_t attempt = 0;
+  std::string reason;
+  bool global_cost_verification_required = false;
   bool fallback_triggered = false;
   DeltaSteppingCsrTelemetry telemetry;
 };
@@ -703,25 +851,14 @@ const char* route_window_query_kind_name(RouteWindowQueryKind kind) {
       return "unbounded_baseline";
     case RouteWindowQueryKind::kWindow:
       return "window";
+    case RouteWindowQueryKind::kVerification:
+      return "verification";
     case RouteWindowQueryKind::kFallback:
       return "fallback";
   }
   return "unknown";
 }
 
-std::vector<std::uint64_t> pack_node_bounds(const RoutingMetadata& metadata) {
-  std::vector<std::uint64_t> packed(metadata.node_min_x.size());
-  for (std::size_t i = 0; i < packed.size(); ++i) {
-    const auto pack = [](std::int32_t value) -> std::uint16_t {
-      return value < 0 || value >= 0xffff ? 0xffffu : static_cast<std::uint16_t>(value);
-    };
-    packed[i] = std::uint64_t{pack(metadata.node_min_x[i])} |
-                (std::uint64_t{pack(metadata.node_max_x[i])} << 16) |
-                (std::uint64_t{pack(metadata.node_min_y[i])} << 32) |
-                (std::uint64_t{pack(metadata.node_max_y[i])} << 48);
-  }
-  return packed;
-}
 
 float routed_path_cost(const RoutedSink& sink) {
   float distance = 0.0f;
@@ -902,6 +1039,7 @@ template <typename SsspWorkspace>
 RoutedNet route_net(const HostCsrF32& graph,
                     SsspWorkspace& workspace,
                     const RoutingMetadata& metadata,
+                    const std::vector<DeltaSteppingCsrNodeBounds>* node_bounds,
                     const RouteRequest& request,
                     std::size_t net_index,
                     bool route_window_selected,
@@ -930,7 +1068,7 @@ RoutedNet route_net(const HostCsrF32& graph,
     delta_telemetry->reserve(2);
   }
   if (route_window_stats != nullptr) {
-    route_window_stats->reserve(2);
+    route_window_stats->reserve(2 + request.sinks.size());
   }
 
   std::vector<int> source_candidates;
@@ -995,18 +1133,31 @@ RoutedNet route_net(const HostCsrF32& graph,
   }
 
   if (!initial_targets.empty()) {
-    const auto route_window =
-        route_window_selected && options.sssp_engine == SsspEngine::kDeltaStep
-            ? make_route_window(metadata, source_candidates, initial_targets,
-                                options.route_window_margin)
-            : DeltaSteppingCsrRunOptions::RouteWindow{};
+    const bool route_window_requested =
+        route_window_selected && options.sssp_engine == SsspEngine::kDeltaStep;
+    if (route_window_requested && node_bounds == nullptr) {
+      throw std::logic_error(
+          "route-window routing requires immutable uploaded node bounds");
+    }
+    const RouteWindowSeed route_window_seed = route_window_requested
+        ? make_route_window_seed(*node_bounds, source_candidates,
+                                 initial_targets, options)
+        : RouteWindowSeed{};
+    std::int32_t margin_x = route_window_seed.initial_margin_x;
+    std::int32_t margin_y = route_window_seed.initial_margin_y;
+    DeltaSteppingCsrRunOptions::RouteWindow route_window =
+        make_route_window(route_window_seed, margin_x, margin_y);
     const bool collect_query_telemetry =
         delta_telemetry != nullptr || route_window_stats != nullptr;
     auto append_query_record =
         [&](RouteWindowQueryKind kind,
             const DeltaSteppingCsrRunOptions::RouteWindow& query_window,
             const DeltaSteppingCsrTelemetry& telemetry,
+            std::size_t query_target_count,
             std::size_t unreached_target_count,
+            std::size_t attempt,
+            const char* reason,
+            bool global_cost_verification_required,
             bool fallback_triggered) {
           if (delta_telemetry != nullptr && telemetry.collected) {
             delta_telemetry->push_back(telemetry);
@@ -1018,8 +1169,14 @@ RoutedNet route_net(const HostCsrF32& graph,
             record.kind = kind;
             record.window = query_window;
             record.source_count = source_candidates.size();
-            record.target_count = initial_targets.size();
+            record.target_count = query_target_count;
+            record.reached_target_count =
+                query_target_count - unreached_target_count;
             record.unreached_target_count = unreached_target_count;
+            record.attempt = attempt;
+            record.reason = reason;
+            record.global_cost_verification_required =
+                global_cost_verification_required;
             record.fallback_triggered = fallback_triggered;
             record.telemetry = telemetry;
             route_window_stats->push_back(std::move(record));
@@ -1035,59 +1192,63 @@ RoutedNet route_net(const HostCsrF32& graph,
       return unreached;
     };
 
-    DeltaSteppingCsrTelemetry initial_telemetry;
-    auto initial_sssp = [&]() {
-      PATHFINDER_PROFILE_RANGE("pathfinder.sssp");
-      return run_sssp_with_optional_delta_telemetry(
-          workspace,
-          source_candidates,
-          initial_targets,
-          options.delta,
-          options.max_sssp_iterations,
-          stream,
-          route_window,
-          route_window_stats != nullptr,
-          collect_query_telemetry ? &initial_telemetry : nullptr);
-    }();
-    const bool initial_paths_certified =
-        options.sssp_engine != SsspEngine::kBellmanFord ||
-        initial_sssp.stopped_on_target || initial_sssp.converged;
+    std::size_t attempt = 1;
+    for (;;) {
+      DeltaSteppingCsrTelemetry attempt_telemetry;
+      auto attempt_sssp = [&]() {
+        PATHFINDER_PROFILE_RANGE("pathfinder.sssp");
+        return run_sssp_with_optional_delta_telemetry(
+            workspace, source_candidates, initial_targets, options.delta,
+            options.max_sssp_iterations, stream, route_window,
+            route_window_stats != nullptr,
+            collect_query_telemetry ? &attempt_telemetry : nullptr);
+      }();
+      const bool paths_certified =
+          options.sssp_engine != SsspEngine::kBellmanFord ||
+          attempt_sssp.stopped_on_target || attempt_sssp.converged;
+      for (std::size_t target_pos = 0;
+           target_pos < initial_target_sink_indices.size(); ++target_pos) {
+        const std::size_t sink_index = initial_target_sink_indices[target_pos];
+        const int target = request.sinks[sink_index].node;
+        if (unit_bfs_diagnostic != nullptr &&
+            sink_index == unit_bfs_diagnostic->sink_index && attempt == 1) {
+          unit_bfs_diagnostic->raw_batched =
+              target_observation(attempt_sssp, target_pos, target);
+        }
+        RoutedSink candidate;
+        if (paths_certified &&
+            extract_routed_sink_candidate(graph, attempt_sssp, target_pos,
+                                          initial_targets.size(), target,
+                                          tree_seen, tree_stamp, &candidate)) {
+          net.sinks[sink_index] = std::move(candidate);
+        }
+      }
+      const std::size_t unreached = count_unreached_initial_targets();
+      if (!route_window.enabled) {
+        append_query_record(RouteWindowQueryKind::kUnboundedBaseline, {},
+                            attempt_telemetry, initial_targets.size(), unreached, attempt,
+                            route_window_requested ? "endpoint_bounds_unknown"
+                                                   : "unbounded",
+                            false, false);
+        break;
+      }
+      if (unreached != 0) {
+        const auto next_window = make_route_window(
+            route_window_seed, doubled_margin(margin_x), doubled_margin(margin_y));
+        const bool can_expand = !same_route_window(route_window, next_window);
+        append_query_record(RouteWindowQueryKind::kWindow, route_window,
+                            attempt_telemetry, initial_targets.size(), unreached, attempt,
+                            can_expand ? "missing_targets_expand"
+                                       : "device_bounds_fallback",
+                            false, !can_expand);
+        if (can_expand) {
+          margin_x = doubled_margin(margin_x);
+          margin_y = doubled_margin(margin_y);
+          route_window = next_window;
+          ++attempt;
+          continue;
+        }
 
-    for (std::size_t target_pos = 0;
-         target_pos < initial_target_sink_indices.size();
-         ++target_pos) {
-      const std::size_t sink_index = initial_target_sink_indices[target_pos];
-      const int target = request.sinks[sink_index].node;
-      if (unit_bfs_diagnostic != nullptr &&
-          sink_index == unit_bfs_diagnostic->sink_index) {
-        unit_bfs_diagnostic->raw_batched =
-            target_observation(initial_sssp, target_pos, target);
-      }
-      RoutedSink candidate;
-      if (initial_paths_certified &&
-          extract_routed_sink_candidate(graph,
-                                        initial_sssp,
-                                        target_pos,
-                                        initial_targets.size(),
-                                        target,
-                                        tree_seen,
-                                        tree_stamp,
-                                        &candidate)) {
-        net.sinks[sink_index] = std::move(candidate);
-      }
-    }
-    // If the bounded query misses any requested sink, retain its telemetry and
-    // rerun the original batched query unbounded.  Keeping the two records
-    // separate prevents failed windows from looking artificially cheap.
-    const std::size_t initial_unreached = count_unreached_initial_targets();
-    const bool needs_full_fallback =
-        route_window.enabled && initial_unreached != 0;
-    append_query_record(
-        route_window.enabled ? RouteWindowQueryKind::kWindow
-                             : RouteWindowQueryKind::kUnboundedBaseline,
-        route_window, initial_telemetry, initial_unreached,
-        needs_full_fallback);
-    if (needs_full_fallback) {
         DeltaSteppingCsrTelemetry fallback_telemetry;
         auto full_sssp = run_sssp_with_optional_delta_telemetry(
             workspace, source_candidates, initial_targets, options.delta,
@@ -1106,8 +1267,45 @@ RoutedNet route_net(const HostCsrF32& graph,
           }
         }
         append_query_record(RouteWindowQueryKind::kFallback, {},
-                            fallback_telemetry,
-                            count_unreached_initial_targets(), false);
+                            fallback_telemetry, initial_targets.size(),
+                            count_unreached_initial_targets(), attempt,
+                            "unbounded_fallback", false, false);
+        break;
+      }
+
+      append_query_record(RouteWindowQueryKind::kWindow, route_window,
+                          attempt_telemetry, initial_targets.size(), 0, attempt,
+                          "all_targets_reached_verify", true, false);
+      // Reachability inside a window is not a shortest-path proof.  Query each
+      // target globally below its bounded cost; a finite result is strictly
+      // better and replaces the incumbent, otherwise the window path is safe.
+      for (std::size_t target_pos = 0;
+           target_pos < initial_target_sink_indices.size(); ++target_pos) {
+        const std::size_t sink_index = initial_target_sink_indices[target_pos];
+        const float incumbent_cost = net.sinks[sink_index].distance;
+        DeltaSteppingCsrTelemetry verification_telemetry;
+        auto verification_sssp = run_sssp_with_optional_delta_telemetry(
+            workspace, source_candidates,
+            std::vector<int>{request.sinks[sink_index].node}, options.delta,
+            options.max_sssp_iterations, stream, {},
+            route_window_stats != nullptr,
+            collect_query_telemetry ? &verification_telemetry : nullptr,
+            incumbent_cost);
+        RoutedSink better_candidate;
+        const bool found_cheaper = extract_routed_sink_candidate(
+            graph, verification_sssp, 0, 1, request.sinks[sink_index].node,
+            tree_seen, tree_stamp, &better_candidate);
+        if (found_cheaper) {
+          net.sinks[sink_index] = std::move(better_candidate);
+        }
+        append_query_record(RouteWindowQueryKind::kVerification, {},
+                            verification_telemetry, 1, found_cheaper ? 0 : 1,
+                            attempt,
+                            found_cheaper ? "verification_cheaper_path"
+                                         : "verification_no_cheaper_path",
+                            true, false);
+      }
+      break;
     }
   }
 
@@ -1474,7 +1672,7 @@ void write_route_window_query_stats_jsonl(
     for (const RouteWindowQueryStats& record : net_records) {
       const DeltaSteppingCsrTelemetry& telemetry = record.telemetry;
       out << "{\"type\":\"route_window_query\""
-          << ",\"schema_version\":1"
+          << ",\"schema_version\":2"
           << ",\"net_index\":" << record.net_index
           << ",\"net_string\":" << record.net_string
           << ",\"net\":";
@@ -1482,6 +1680,11 @@ void write_route_window_query_stats_jsonl(
       out << ",\"kind\":\"" << route_window_query_kind_name(record.kind)
           << "\",\"fallback_triggered\":"
           << (record.fallback_triggered ? "true" : "false")
+          << ",\"attempt\":" << record.attempt
+          << ",\"reason\":";
+      write_json_string(out, record.reason);
+      out << ",\"global_cost_verification_required\":"
+          << (record.global_cost_verification_required ? "true" : "false")
           << ",\"window\":{\"enabled\":"
           << (record.window.enabled ? "true" : "false")
           << ",\"min_x\":" << record.window.min_x
@@ -1490,6 +1693,7 @@ void write_route_window_query_stats_jsonl(
           << ",\"max_y\":" << record.window.max_y << "}"
           << ",\"source_count\":" << record.source_count
           << ",\"target_count\":" << record.target_count
+          << ",\"reached_target_count\":" << record.reached_target_count
           << ",\"unreached_target_count\":"
           << record.unreached_target_count
           << ",\"touched_nodes\":" << telemetry.reached_vertices
@@ -1497,6 +1701,13 @@ void write_route_window_query_stats_jsonl(
           << telemetry.light_edge_visits + telemetry.heavy_edge_visits
           << ",\"window_rejected_edges\":"
           << telemetry.window_rejected_edges
+          << ",\"window_unknown_coordinate_nodes\":"
+          << telemetry.window_unknown_coordinate_nodes
+          << ",\"execution_path\":";
+      write_json_string(out,
+                        delta_stepping_execution_path_name(
+                            telemetry.execution_path));
+      out
           << ",\"atomic_attempts\":"
           << telemetry.distance_atomic_attempts
           << ",\"cas_retries\":" << telemetry.distance_cas_retries
@@ -1729,6 +1940,7 @@ std::size_t recommend_delta_worker_count(minplus_sparse::Offset rows,
 template <typename WorkspaceFactory>
 void route_all_nets_with_workspace(const HostCsrF32& base_graph,
                                    const RoutingMetadata& metadata,
+                                   const std::vector<DeltaSteppingCsrNodeBounds>* node_bounds,
                                    const PathfinderOptions& options,
                                    hipStream_t stream,
                                    std::size_t route_request_count,
@@ -1785,6 +1997,7 @@ void route_all_nets_with_workspace(const HostCsrF32& base_graph,
             route_net(base_graph,
                        sssp_workspace,
                        metadata,
+                       node_bounds,
                        request,
                        net_index,
                        route_window_selected,
@@ -1875,6 +2088,7 @@ void route_all_nets_with_workspace(const HostCsrF32& base_graph,
             route_net(base_graph,
                        sssp_workspace,
                        metadata,
+                       node_bounds,
                        request,
                        net_index,
                        route_window_selected,
@@ -2286,7 +2500,10 @@ void print_usage(const char* program) {
       << "  --delta-force-generic           Bypass exact-unit specialization; retain weights and delta.\n"
       << "  --delta-force-legacy-parent     Force generic Delta predecessor recovery for A/B comparison.\n"
       << "  --delta-telemetry               Emit one aggregate Delta-Stepping telemetry JSON record.\n"
-      << "  --route-window                  Restrict each Delta net search to its source/sink box plus 50 tiles; falls back to full graph.\n"
+      << "  --route-window                  Use adaptive Delta source/sink windows; every bounded result is globally verified.\n"
+      << "  --route-window-min-margin <int> Initial per-axis margin floor. Default: 16\n"
+      << "  --route-window-max-margin <int> Initial per-axis margin cap. Default: 512\n"
+      << "  --route-window-margin-scale <f> Initial margin = ceil(endpoint span * scale). Default: 0.5\n"
       << "  --route-window-net-list <path>  JSONL net_index/net selection list; requires --route-window.\n"
       << "  --route-window-stats-out <path> Write one JSONL work/timing record per Delta SSSP query.\n"
       << "  --delta-benchmark-weights <unit|all-light|all-heavy|mixed>\n"
@@ -2686,6 +2903,7 @@ PathfinderResult run_pathfinder(const HostCsrF32& base_graph,
       route_all_nets_with_workspace(
           base_graph,
           metadata,
+          nullptr,
           unit_options,
           stream,
           route_request_count,
@@ -2723,15 +2941,21 @@ PathfinderResult run_pathfinder(const HostCsrF32& base_graph,
                 << ", multiplier=" << delta_options.delta_multiplier << ")\n";
         std::cout << message.str();
       }
+      std::vector<DeltaSteppingCsrNodeBounds> route_window_node_bounds;
+      const std::vector<DeltaSteppingCsrNodeBounds>* route_window_node_bounds_ptr =
+          nullptr;
+      if (any_selected_route_window) {
+        route_window_node_bounds = make_node_bounds(metadata, base_graph.rows);
+        route_window_node_bounds_ptr = &route_window_node_bounds;
+      }
       auto shared_graph = any_selected_route_window
           ? std::make_shared<DeltaSteppingCsrGraph>(
-                base_graph, pack_node_bounds(metadata), stream)
+                base_graph, route_window_node_bounds, stream)
           : std::make_shared<DeltaSteppingCsrGraph>(base_graph, stream);
       if (delta_options.parallel_net_workers == 0) {
         const bool uses_unit_specialization =
             !delta_options.delta_force_generic &&
             !delta_options.delta_force_legacy_parent &&
-            !any_selected_route_window &&
             delta_options.max_sssp_iterations < 0 &&
             base_graph.rows <=
                 (static_cast<minplus_sparse::Offset>(1) <<
@@ -2774,6 +2998,7 @@ PathfinderResult run_pathfinder(const HostCsrF32& base_graph,
       route_all_nets_with_workspace(
           base_graph,
           metadata,
+          route_window_node_bounds_ptr,
           delta_options,
           stream,
           route_request_count,
@@ -2837,6 +3062,7 @@ PathfinderResult run_pathfinder(const HostCsrF32& base_graph,
       route_all_nets_with_workspace(
           base_graph,
           metadata,
+          nullptr,
           bellman_ford_options,
           stream,
           route_request_count,
@@ -3147,6 +3373,18 @@ int main(int argc, char** argv) {
         options.delta_telemetry = true;
       } else if (option == "--route-window") {
         options.route_window_enabled = true;
+      } else if (option == "--route-window-min-margin") {
+        options.route_window_min_margin = routing::parse_int_arg(
+            require_value("--route-window-min-margin"),
+            "route-window-min-margin");
+      } else if (option == "--route-window-max-margin") {
+        options.route_window_max_margin = routing::parse_int_arg(
+            require_value("--route-window-max-margin"),
+            "route-window-max-margin");
+      } else if (option == "--route-window-margin-scale") {
+        options.route_window_margin_scale = routing::parse_float_arg(
+            require_value("--route-window-margin-scale"),
+            "route-window-margin-scale");
       } else if (option == "--route-window-net-list") {
         options.route_window_net_list_path =
             require_value("--route-window-net-list");

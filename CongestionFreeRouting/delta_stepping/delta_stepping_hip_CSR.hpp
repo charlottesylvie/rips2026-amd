@@ -71,6 +71,9 @@ struct DeltaSteppingCsrTelemetry {
   // Edges rejected because their destination is outside the active route
   // window.  light/heavy_edge_visits still include these attempts.
   std::uint64_t window_rejected_edges = 0;
+  // Nodes with deliberately unknown/special coordinates are never rejected by
+  // a route window.  This immutable-graph count makes weak pruning visible.
+  std::uint64_t window_unknown_coordinate_nodes = 0;
   // GPU stream elapsed time for the output/path recovery phase and sparse
   // scratch reset.  Collected only when RunOptions::collect_phase_timings is
   // true; phase_timings_collected distinguishes a real zero from no timing.
@@ -80,6 +83,17 @@ struct DeltaSteppingCsrTelemetry {
   float reset_ms = 0.0f;
 };
 
+// Coordinates stay in their interchange int32_t representation.  `valid` is
+// deliberately separate from the coordinate values: a physical tile at 65535
+// (or any larger int32_t coordinate) is valid and must never alias "missing".
+struct DeltaSteppingCsrNodeBounds {
+  std::int32_t min_x = 0;
+  std::int32_t max_x = 0;
+  std::int32_t min_y = 0;
+  std::int32_t max_y = 0;
+  std::uint32_t valid = 0;
+};
+
 struct DeltaSteppingCsrRunOptions {
   // Null keeps telemetry completely disabled. A nonnull record is reset before
   // dispatch and remains completed=false if the invocation throws.
@@ -87,14 +101,14 @@ struct DeltaSteppingCsrRunOptions {
   // Process exactly the distance buckets that can contain a path strictly
   // below this value. Infinity preserves an ordinary unbounded run.
   float exclusive_distance_limit = std::numeric_limits<float>::infinity();
-  // A windowed query deliberately uses the generic Delta-Stepping path. Node
-  // bounds are immutable graph data; this only describes one query.
+  // Node bounds are immutable graph data; this only describes one query.
+  // Ranges are inclusive and are checked before dispatch.
   struct RouteWindow {
     bool enabled = false;
-    std::uint16_t min_x = 0;
-    std::uint16_t max_x = 0;
-    std::uint16_t min_y = 0;
-    std::uint16_t max_y = 0;
+    std::int32_t min_x = 0;
+    std::int32_t max_x = 0;
+    std::int32_t min_y = 0;
+    std::int32_t max_y = 0;
   } route_window;
   // When telemetry is enabled, record reusable HIP-event timings for the
   // output/path recovery and sparse-reset phases. Disabled by default so
@@ -175,7 +189,7 @@ class DeltaSteppingCsrGraph {
                         hipStream_t stream,
                         DeltaSteppingCsrStorageMode storage_mode);
   DeltaSteppingCsrGraph(const HostCsrF32& adjacency,
-                        const std::vector<std::uint64_t>& node_bounds,
+                        const std::vector<DeltaSteppingCsrNodeBounds>& node_bounds,
                         hipStream_t stream = nullptr);
   ~DeltaSteppingCsrGraph();
 
@@ -388,6 +402,11 @@ class DeltaSteppingCsrWorkspace {
         run_options.exclusive_distance_limit < 0.0f) {
       throw std::invalid_argument(
           "Delta-Stepping distance limit must be nonnegative or infinity");
+    }
+    if (run_options.route_window.enabled &&
+        (run_options.route_window.min_x > run_options.route_window.max_x ||
+         run_options.route_window.min_y > run_options.route_window.max_y)) {
+      throw std::invalid_argument("Delta-Stepping route window has an invalid range");
     }
     if (run_options.telemetry != nullptr) {
       *run_options.telemetry = DeltaSteppingCsrTelemetry{};

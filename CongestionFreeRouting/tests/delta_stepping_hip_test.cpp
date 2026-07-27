@@ -3180,6 +3180,93 @@ void test_seeded_random_graphs(hipStream_t stream) {
   }
 }
 
+void test_route_window_against_unbounded_distances(hipStream_t stream) {
+  // The first box cannot traverse node 2.  The expanded box can; its distance
+  // must match the unbounded reference even if predecessor tie-breaking differs.
+  const HostCsrF32 graph = make_outgoing_csr(
+      4, {{0, 1, 5.0f}, {1, 3, 5.0f},
+          {0, 2, 1.0f}, {0, 2, 3.0f}, {2, 3, 1.0f}});
+  const std::vector<DeltaSteppingCsrNodeBounds> bounds = {
+      {0, 0, 0, 0, 1}, {1, 1, 0, 0, 1},
+      {100, 100, 0, 0, 1}, {2, 2, 0, 0, 1}};
+  auto shared_graph = std::make_shared<DeltaSteppingCsrGraph>(
+      graph, bounds, stream);
+  DeltaSteppingCsrWorkspace workspace(shared_graph, stream);
+  const std::vector<int> sources = {0};
+  const std::vector<int> targets = {3};
+  const DeltaSteppingCsrResult unbounded = workspace.run(
+      sources, targets, 1.0f, -1, stream, nullptr, nullptr);
+  require(unbounded.target_reached && unbounded.target_distances[0] == 2.0f,
+          "route-window unbounded reference did not find the shortest path");
+
+  DeltaSteppingCsrRunOptions narrow_options;
+  DeltaSteppingCsrTelemetry narrow_telemetry;
+  narrow_options.telemetry = &narrow_telemetry;
+  narrow_options.route_window = {true, 0, 2, 0, 0};
+  const DeltaSteppingCsrResult narrow = workspace.run(
+      sources, targets, 1.0f, -1, narrow_options, stream, nullptr, nullptr);
+  require(narrow.target_reached && narrow.target_distances[0] == 10.0f &&
+              narrow_telemetry.window_rejected_edges >= 2,
+          "narrow route window did not filter both light and heavy edges");
+
+  DeltaSteppingCsrRunOptions verification_options;
+  verification_options.exclusive_distance_limit = narrow.target_distances[0];
+  const DeltaSteppingCsrResult verified = workspace.run(
+      sources, targets, 1.0f, -1, verification_options, stream, nullptr,
+      nullptr);
+  require(verified.target_reached &&
+              std::fabs(verified.target_distances[0] -
+                        unbounded.target_distances[0]) <= kAbsoluteTolerance,
+          "unbounded exclusive-cost verification did not recover the cheaper path");
+
+  DeltaSteppingCsrRunOptions expanded_options;
+  expanded_options.route_window = {true, 0, 100, 0, 0};
+  const DeltaSteppingCsrResult expanded = workspace.run(
+      sources, targets, 1.0f, -1, expanded_options, stream, nullptr, nullptr);
+  require(expanded.target_reached &&
+              std::fabs(expanded.target_distances[0] -
+                        unbounded.target_distances[0]) <= kAbsoluteTolerance,
+          "expanded route window did not match the unbounded distance");
+
+  // Exact-unit routing carries the same window predicate rather than falling
+  // back to generic Delta-Stepping.  A physical coordinate above 65535 stays
+  // valid, while the middle unknown node remains traversable.
+  const HostCsrF32 unit_graph = make_outgoing_csr(
+      3, {{0, 1, 1.0f}, {1, 2, 1.0f}});
+  const std::vector<DeltaSteppingCsrNodeBounds> unit_bounds = {
+      {70000, 70000, 0, 0, 1}, {}, {70002, 70002, 0, 0, 1}};
+  auto unit_shared_graph = std::make_shared<DeltaSteppingCsrGraph>(
+      unit_graph, unit_bounds, stream);
+  DeltaSteppingCsrWorkspace unit_workspace(unit_shared_graph, stream);
+  const DeltaSteppingCsrResult unit_unbounded = unit_workspace.run(
+      std::vector<int>{0}, std::vector<int>{2}, 1.0f, -1, stream, nullptr,
+      nullptr);
+  DeltaSteppingCsrRunOptions unit_window_options;
+  DeltaSteppingCsrTelemetry unit_window_telemetry;
+  unit_window_options.telemetry = &unit_window_telemetry;
+  unit_window_options.route_window = {true, 70000, 70002, 0, 0};
+  const DeltaSteppingCsrResult unit_windowed = unit_workspace.run(
+      std::vector<int>{0}, std::vector<int>{2}, 1.0f, -1,
+      unit_window_options, stream, nullptr, nullptr);
+  require(unit_window_telemetry.execution_path ==
+              DeltaSteppingCsrExecutionPath::kExactUnit &&
+              unit_windowed.target_reached && unit_unbounded.target_reached &&
+              unit_windowed.target_distances == unit_unbounded.target_distances,
+          "windowed exact-unit routing did not match unbounded distance");
+
+  bool missing_bounds_threw = false;
+  try {
+    DeltaSteppingCsrWorkspace no_bounds_workspace(unit_graph, stream);
+    (void)no_bounds_workspace.run(std::vector<int>{0}, std::vector<int>{2},
+                                  1.0f, -1, unit_window_options, stream,
+                                  nullptr, nullptr);
+  } catch (const std::logic_error&) {
+    missing_bounds_threw = true;
+  }
+  require(missing_bounds_threw,
+          "route windows without an uploaded bounds sidecar must fail fast");
+}
+
 }  // namespace
 
 int main() {
@@ -3213,6 +3300,7 @@ int main() {
     test_workspace_reuse_and_updates(stream.get());
     test_compact_legacy_mode_alternation(stream.get());
     test_seeded_random_graphs(stream.get());
+    test_route_window_against_unbounded_distances(stream.get());
     test_stream_affinity(stream.get());
     check_hip(hipStreamSynchronize(stream.get()), "final hipStreamSynchronize");
     std::cout << "Delta-Stepping outgoing-CSR HIP regression test passed\n";
