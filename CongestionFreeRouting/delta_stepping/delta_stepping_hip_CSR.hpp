@@ -68,6 +68,16 @@ struct DeltaSteppingCsrTelemetry {
   std::uint64_t heavy_queue_high_water = 0;
   std::uint64_t controller_round_trips = 0;
   std::uint64_t compact_parent_fallback_events = 0;
+  // Edges rejected because their destination is outside the active route
+  // window.  light/heavy_edge_visits still include these attempts.
+  std::uint64_t window_rejected_edges = 0;
+  // GPU stream elapsed time for the output/path recovery phase and sparse
+  // scratch reset.  Collected only when RunOptions::collect_phase_timings is
+  // true; phase_timings_collected distinguishes a real zero from no timing.
+  bool phase_timings_requested = false;
+  bool phase_timings_collected = false;
+  float materialize_ms = 0.0f;
+  float reset_ms = 0.0f;
 };
 
 struct DeltaSteppingCsrRunOptions {
@@ -86,6 +96,11 @@ struct DeltaSteppingCsrRunOptions {
     std::uint16_t min_y = 0;
     std::uint16_t max_y = 0;
   } route_window;
+  // When telemetry is enabled, record reusable HIP-event timings for the
+  // output/path recovery and sparse-reset phases. Disabled by default so
+  // aggregate counter telemetry retains its previous overhead profile.
+  // Appended to preserve the established aggregate-initializer field order.
+  bool collect_phase_timings = false;
 };
 
 const char* delta_stepping_execution_path_name(
@@ -376,6 +391,8 @@ class DeltaSteppingCsrWorkspace {
     }
     if (run_options.telemetry != nullptr) {
       *run_options.telemetry = DeltaSteppingCsrTelemetry{};
+      run_options.telemetry->phase_timings_requested =
+          run_options.collect_phase_timings;
     }
     active_telemetry_ = run_options.telemetry;
     active_distance_limit_ = run_options.exclusive_distance_limit;

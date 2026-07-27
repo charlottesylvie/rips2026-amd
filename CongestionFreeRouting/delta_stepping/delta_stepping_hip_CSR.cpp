@@ -10,6 +10,7 @@
 #include <cstdint>
 #include <exception>
 #include <limits>
+#include <memory>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -47,6 +48,7 @@ enum DeviceTelemetryCounter : int {
   kTelemetryCurrentQueueHighWater,
   kTelemetryPendingQueueHighWater,
   kTelemetryHeavyQueueHighWater,
+  kTelemetryWindowRejectedEdges,
   kTelemetryCounterCount,
 };
 
@@ -233,6 +235,92 @@ struct DeviceCsrOwner {
   }
 };
 
+// These events belong to one stream-affine workspace and are allocated only
+// for explicit per-query profiling.  Reusing them avoids a HIP allocation for
+// every net while keeping normal routing completely event-free.
+class QueryStageTimingEvents {
+ public:
+  QueryStageTimingEvents() = default;
+  ~QueryStageTimingEvents() {
+    if (materialize_begin_ != nullptr) (void)hipEventDestroy(materialize_begin_);
+    if (materialize_end_ != nullptr) (void)hipEventDestroy(materialize_end_);
+    if (reset_begin_ != nullptr) (void)hipEventDestroy(reset_begin_);
+    if (reset_end_ != nullptr) (void)hipEventDestroy(reset_end_);
+  }
+
+  QueryStageTimingEvents(const QueryStageTimingEvents&) = delete;
+  QueryStageTimingEvents& operator=(const QueryStageTimingEvents&) = delete;
+
+  void begin_query() {
+    ensure_events();
+    materialize_recorded_ = false;
+    reset_recorded_ = false;
+  }
+
+  void record_materialize_begin(hipStream_t stream) {
+    DS_DELTA_HIP_CHECK(hipEventRecord(materialize_begin_, stream));
+    materialize_recorded_ = true;
+  }
+
+  void record_materialize_end(hipStream_t stream) {
+    DS_DELTA_HIP_CHECK(hipEventRecord(materialize_end_, stream));
+  }
+
+  void record_reset_begin(hipStream_t stream) {
+    DS_DELTA_HIP_CHECK(hipEventRecord(reset_begin_, stream));
+    reset_recorded_ = true;
+  }
+
+  void record_reset_end(hipStream_t stream) {
+    DS_DELTA_HIP_CHECK(hipEventRecord(reset_end_, stream));
+  }
+
+  void write_elapsed(DeltaSteppingCsrTelemetry* telemetry) const {
+    if (telemetry == nullptr) return;
+    if (materialize_recorded_) {
+      DS_DELTA_HIP_CHECK(hipEventElapsedTime(
+          &telemetry->materialize_ms, materialize_begin_, materialize_end_));
+    }
+    if (reset_recorded_) {
+      DS_DELTA_HIP_CHECK(
+          hipEventElapsedTime(&telemetry->reset_ms, reset_begin_, reset_end_));
+    }
+    telemetry->phase_timings_collected = materialize_recorded_ && reset_recorded_;
+  }
+
+ private:
+  void ensure_events() {
+    if (materialize_begin_ != nullptr) return;
+    DS_DELTA_HIP_CHECK(hipEventCreate(&materialize_begin_));
+    try {
+      DS_DELTA_HIP_CHECK(hipEventCreate(&materialize_end_));
+      DS_DELTA_HIP_CHECK(hipEventCreate(&reset_begin_));
+      DS_DELTA_HIP_CHECK(hipEventCreate(&reset_end_));
+    } catch (...) {
+      if (materialize_begin_ != nullptr) {
+        (void)hipEventDestroy(materialize_begin_);
+        materialize_begin_ = nullptr;
+      }
+      if (materialize_end_ != nullptr) {
+        (void)hipEventDestroy(materialize_end_);
+        materialize_end_ = nullptr;
+      }
+      if (reset_begin_ != nullptr) {
+        (void)hipEventDestroy(reset_begin_);
+        reset_begin_ = nullptr;
+      }
+      throw;
+    }
+  }
+
+  hipEvent_t materialize_begin_ = nullptr;
+  hipEvent_t materialize_end_ = nullptr;
+  hipEvent_t reset_begin_ = nullptr;
+  hipEvent_t reset_end_ = nullptr;
+  bool materialize_recorded_ = false;
+  bool reset_recorded_ = false;
+};
+
 struct DeltaSteppingScratch {
   Offset rows = 0;
   DeviceBuffer<int> sources;
@@ -278,6 +366,7 @@ struct DeltaSteppingScratch {
   DeviceBuffer<Offset> compact_path_edges;
   PinnedHostBuffer<int> host_scalar;
   PinnedHostBuffer<int> host_unit_status;
+  std::unique_ptr<QueryStageTimingEvents> phase_timing_events;
   bool unit_initialized = false;
   bool generic_initialized = false;
   bool parent_key_initialized = false;
@@ -346,6 +435,13 @@ struct DeltaSteppingScratch {
     if (telemetry_counters.size() < kTelemetryCounterCount) {
       telemetry_counters.reset(kTelemetryCounterCount);
     }
+  }
+
+  QueryStageTimingEvents& ensure_phase_timing_events() {
+    if (!phase_timing_events) {
+      phase_timing_events = std::make_unique<QueryStageTimingEvents>();
+    }
+    return *phase_timing_events;
   }
 
   void ensure_target_capacity(std::size_t target_count) {
@@ -1629,6 +1725,9 @@ __global__ void relax_light_edges_kernel(const int* frontier,
         const int v = static_cast<int>(out_colind[e]);
         if (node_bounds != nullptr && route_window.enabled &&
             !node_intersects_window(node_bounds[v], route_window)) {
+          if constexpr (CollectTelemetry) {
+            ++telemetry[kTelemetryWindowRejectedEdges];
+          }
           continue;
         }
         const float effective_w =
@@ -1777,6 +1876,9 @@ __global__ void relax_heavy_edges_kernel(const int* heavy_vertices,
         const int v = static_cast<int>(out_colind[e]);
         if (node_bounds != nullptr && route_window.enabled &&
             !node_intersects_window(node_bounds[v], route_window)) {
+          if constexpr (CollectTelemetry) {
+            ++telemetry[kTelemetryWindowRejectedEdges];
+          }
           continue;
         }
         const float effective_w =
@@ -2282,6 +2384,8 @@ void copy_device_telemetry_to_host(DeltaSteppingScratch& scratch,
       counters[kTelemetryPendingQueueHighWater];
   telemetry.heavy_queue_high_water =
       counters[kTelemetryHeavyQueueHighWater];
+  telemetry.window_rejected_edges =
+      counters[kTelemetryWindowRejectedEdges];
 }
 
 void initialize_legacy_predecessors_once(DeltaSteppingScratch& scratch,
@@ -3150,6 +3254,15 @@ DeltaSteppingCsrResult run_delta_stepping_impl(
   if constexpr (CollectTelemetry) {
     prepare_device_telemetry(scratch, stream);
   }
+  QueryStageTimingEvents* phase_timing_events = nullptr;
+  if constexpr (CollectTelemetry) {
+    // run_with_telemetry sets this request bit before dispatch. It is updated
+    // to mean "successfully collected" only after both event ranges complete.
+    if (telemetry->phase_timings_requested) {
+      phase_timing_events = &scratch.ensure_phase_timing_events();
+      phase_timing_events->begin_query();
+    }
+  }
   const bool target_is_source =
       !use_target_set && target >= 0 && zero_distance_within_limit &&
       is_effective_source(target);
@@ -3231,6 +3344,9 @@ DeltaSteppingCsrResult run_delta_stepping_impl(
     result.target_distance = 0.0f;
     result.target_reached = true;
     result.stopped_on_target = true;
+    if (phase_timing_events != nullptr) {
+      phase_timing_events->record_materialize_begin(stream);
+    }
     try {
       if constexpr (TrackParents) {
         copy_predecessors_to_result(result, d_adjacency,
@@ -3251,6 +3367,9 @@ DeltaSteppingCsrResult run_delta_stepping_impl(
       DS_DELTA_HIP_CHECK(hipStreamSynchronize(stream));
       std::rethrow_exception(materialization_exception);
     }
+    if (phase_timing_events != nullptr) {
+      phase_timing_events->record_materialize_end(stream);
+    }
     if constexpr (CollectTelemetry) {
       copy_device_telemetry_to_host(scratch, *telemetry, stream);
       telemetry->reached_vertices =
@@ -3258,13 +3377,22 @@ DeltaSteppingCsrResult run_delta_stepping_impl(
       telemetry->current_queue_high_water =
           static_cast<std::uint64_t>(source_count);
     }
+    if (phase_timing_events != nullptr) {
+      phase_timing_events->record_reset_begin(stream);
+    }
     if constexpr (TrackParents) {
       reset_touched_vertices(scratch, inf, stream);
     } else {
       reset_distance_only_touched_vertices(scratch, inf, stream);
     }
+    if (phase_timing_events != nullptr) {
+      phase_timing_events->record_reset_end(stream);
+    }
     DS_DELTA_HIP_CHECK(hipStreamSynchronize(stream));
     if constexpr (CollectTelemetry) {
+      if (phase_timing_events != nullptr) {
+        phase_timing_events->write_elapsed(telemetry);
+      }
       telemetry->completed = true;
     }
     return result;
@@ -3514,6 +3642,11 @@ DeltaSteppingCsrResult run_delta_stepping_impl(
   }
 
   int touched_count_for_reset = -1;
+  if (phase_timing_events != nullptr) {
+    // This covers both legacy predecessor materialization and CompactGeneric
+    // target-path extraction, which is the normal route-window path.
+    phase_timing_events->record_materialize_begin(stream);
+  }
   try {
     const int* const settled_target_filter =
         use_target_set && !result.converged && !result.stopped_on_target
@@ -3594,6 +3727,9 @@ DeltaSteppingCsrResult run_delta_stepping_impl(
         }
       }
     }
+    if (phase_timing_events != nullptr) {
+      phase_timing_events->record_materialize_end(stream);
+    }
   } catch (...) {
     // Counts are still trusted here: traversal completed successfully and the
     // failure arose only while materializing host-visible results.
@@ -3630,6 +3766,9 @@ DeltaSteppingCsrResult run_delta_stepping_impl(
         static_cast<std::uint64_t>(source_count));
     telemetry->controller_round_trips = controller_round_trips;
   }
+  if (phase_timing_events != nullptr) {
+    phase_timing_events->record_reset_begin(stream);
+  }
   if constexpr (UseEdgeParent) {
     reset_compact_parent_touched_vertices(
         scratch, inf, stream, touched_count_for_reset, !skip_heavy_edges);
@@ -3639,11 +3778,17 @@ DeltaSteppingCsrResult run_delta_stepping_impl(
     reset_distance_only_touched_vertices(
         scratch, inf, stream, touched_count_for_reset);
   }
+  if (phase_timing_events != nullptr) {
+    phase_timing_events->record_reset_end(stream);
+  }
   // Sparse cleanup is part of the run's completion contract.  Parallel
   // PathFinder workers immediately reuse this workspace for another query, so
   // returning with reset kernels still queued can race the next source setup.
   DS_DELTA_HIP_CHECK(hipStreamSynchronize(stream));
   if constexpr (CollectTelemetry) {
+    if (phase_timing_events != nullptr) {
+      phase_timing_events->write_elapsed(telemetry);
+    }
     telemetry->completed = true;
   }
   return result;

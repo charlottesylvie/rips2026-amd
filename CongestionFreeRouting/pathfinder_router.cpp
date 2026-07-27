@@ -197,6 +197,9 @@ void print_usage(const char* program) {
       << "  --delta-force-generic          Force generic Delta-Stepping even for exact-unit weights.\n"
       << "  --delta-telemetry              Forward opt-in Delta-Stepping runtime telemetry.\n"
       << "  --delta-force-legacy-parent    Forwarded for generic Delta parent-path A/B comparison.\n"
+      << "  --route-window                 Forward per-net source/sink bounding boxes.\n"
+      << "  --route-window-net-list <path> Forward selected-window JSONL net list.\n"
+      << "  --route-window-stats-out <path> Forward per-query window statistics JSONL path.\n"
       << "  --delta <float|auto>           Forwarded to pathfinder.\n"
       << "  --delta-multiplier <float>     Forwarded for an automatic-delta sweep.\n"
       << "  --delta-benchmark-weights <unit|all-light|all-heavy|mixed>\n"
@@ -276,6 +279,10 @@ Options parse_args(int argc, char** argv) {
       }
     } else if (option == "--route-window") {
       options.pathfinder_args.push_back(option);
+    } else if (option == "--route-window-net-list" ||
+               option == "--route-window-stats-out") {
+      options.pathfinder_args.push_back(option);
+      options.pathfinder_args.push_back(require_value(option.c_str()));
     } else if (option == "--delta-benchmark-weights") {
       delta_benchmark_weights = require_value("--delta-benchmark-weights");
       options.pathfinder_args.push_back(option);

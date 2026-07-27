@@ -90,6 +90,23 @@ int main() {
                                           "--delta-force-generic"}),
             "router did not forward the delta shorthand and force-generic flag");
 
+    const Options selective_windows = parse(
+        {"PathFinderFile",
+         "design_unrouted.phys",
+         "design_routed.phys",
+         "--route-window",
+         "--route-window-net-list",
+         "hard_nets.jsonl",
+         "--route-window-stats-out",
+         "window_stats.jsonl"});
+    require(selective_windows.pathfinder_args ==
+                std::vector<std::string>({"--route-window",
+                                          "--route-window-net-list",
+                                          "hard_nets.jsonl",
+                                          "--route-window-stats-out",
+                                          "window_stats.jsonl"}),
+            "router did not forward selective window diagnostic options");
+
     bool missing_seed_rejected = false;
     try {
       (void)parse({"PathFinderFile",

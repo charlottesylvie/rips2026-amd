@@ -34,6 +34,7 @@
 #include <array>
 #include <atomic>
 #include <cerrno>
+#include <cctype>
 #include <cmath>
 #include <cstddef>
 #include <cstdlib>
@@ -151,6 +152,8 @@ void validate_options(const PathfinderOptions& options) {
         options.delta_force_legacy_parent ||
         options.delta_telemetry ||
         options.route_window_enabled ||
+        !options.route_window_net_list_path.empty() ||
+        !options.route_window_stats_out_path.empty() ||
         options.delta_auto ||
         options.delta_multiplier != 1.0f ||
         options.delta_controls_explicit) {
@@ -159,6 +162,11 @@ void validate_options(const PathfinderOptions& options) {
           "--use-delta-step");
     }
   } else {
+    if (!options.route_window_net_list_path.empty() &&
+        !options.route_window_enabled) {
+      throw std::invalid_argument(
+          "--route-window-net-list requires --route-window");
+    }
     if (!(options.delta_multiplier > 0.0f) ||
         !std::isfinite(options.delta_multiplier)) {
       throw std::invalid_argument(
@@ -590,6 +598,7 @@ auto run_sssp_with_optional_delta_telemetry(
     int max_iterations,
     hipStream_t stream,
     DeltaSteppingCsrRunOptions::RouteWindow,
+    bool,
     DeltaSteppingCsrTelemetry*) {
   return workspace.run(sources,
                        targets,
@@ -608,6 +617,7 @@ DeltaSteppingCsrResult run_sssp_with_optional_delta_telemetry(
     int max_iterations,
     hipStream_t stream,
     DeltaSteppingCsrRunOptions::RouteWindow route_window,
+    bool collect_phase_timings,
     DeltaSteppingCsrTelemetry* telemetry) {
   if (telemetry == nullptr && !route_window.enabled) {
     return workspace.run(sources,
@@ -620,6 +630,7 @@ DeltaSteppingCsrResult run_sssp_with_optional_delta_telemetry(
   }
   DeltaSteppingCsrRunOptions run_options;
   run_options.telemetry = telemetry;
+  run_options.collect_phase_timings = collect_phase_timings;
   run_options.route_window = route_window;
   return workspace.run(sources,
                        targets,
@@ -666,6 +677,36 @@ DeltaSteppingCsrRunOptions::RouteWindow make_route_window(
   window.min_y = clamp(min_y - margin);
   window.max_y = clamp(max_y + margin);
   return window;
+}
+
+enum class RouteWindowQueryKind {
+  kUnboundedBaseline,
+  kWindow,
+  kFallback,
+};
+
+struct RouteWindowQueryStats {
+  std::size_t net_index = 0;
+  std::uint64_t net_string = kNoIndex;
+  RouteWindowQueryKind kind = RouteWindowQueryKind::kUnboundedBaseline;
+  DeltaSteppingCsrRunOptions::RouteWindow window;
+  std::size_t source_count = 0;
+  std::size_t target_count = 0;
+  std::size_t unreached_target_count = 0;
+  bool fallback_triggered = false;
+  DeltaSteppingCsrTelemetry telemetry;
+};
+
+const char* route_window_query_kind_name(RouteWindowQueryKind kind) {
+  switch (kind) {
+    case RouteWindowQueryKind::kUnboundedBaseline:
+      return "unbounded_baseline";
+    case RouteWindowQueryKind::kWindow:
+      return "window";
+    case RouteWindowQueryKind::kFallback:
+      return "fallback";
+  }
+  return "unknown";
 }
 
 std::vector<std::uint64_t> pack_node_bounds(const RoutingMetadata& metadata) {
@@ -862,6 +903,8 @@ RoutedNet route_net(const HostCsrF32& graph,
                     SsspWorkspace& workspace,
                     const RoutingMetadata& metadata,
                     const RouteRequest& request,
+                    std::size_t net_index,
+                    bool route_window_selected,
                     std::vector<std::uint32_t>& tree_seen,
                     std::vector<int>& parent_by_child,
                     std::vector<std::uint32_t>& parent_seen,
@@ -870,7 +913,9 @@ RoutedNet route_net(const HostCsrF32& graph,
                     hipStream_t stream,
                     std::vector<DeltaSteppingCsrTelemetry>* delta_telemetry =
                         nullptr,
-                    UnitBfsPathDiagnostic* unit_bfs_diagnostic = nullptr) {
+                    UnitBfsPathDiagnostic* unit_bfs_diagnostic = nullptr,
+                    std::vector<RouteWindowQueryStats>* route_window_stats =
+                        nullptr) {
   PATHFINDER_PROFILE_RANGE("pathfinder.route_net");
   RoutedNet net;
   net.net_string = request.net_string;
@@ -882,7 +927,10 @@ RoutedNet route_net(const HostCsrF32& graph,
     throw std::invalid_argument("route parent scratch size does not match CSR rows");
   }
   if (delta_telemetry != nullptr) {
-    delta_telemetry->reserve(1);
+    delta_telemetry->reserve(2);
+  }
+  if (route_window_stats != nullptr) {
+    route_window_stats->reserve(2);
   }
 
   std::vector<int> source_candidates;
@@ -948,10 +996,45 @@ RoutedNet route_net(const HostCsrF32& graph,
 
   if (!initial_targets.empty()) {
     const auto route_window =
-        options.route_window_enabled && options.sssp_engine == SsspEngine::kDeltaStep
+        route_window_selected && options.sssp_engine == SsspEngine::kDeltaStep
             ? make_route_window(metadata, source_candidates, initial_targets,
                                 options.route_window_margin)
             : DeltaSteppingCsrRunOptions::RouteWindow{};
+    const bool collect_query_telemetry =
+        delta_telemetry != nullptr || route_window_stats != nullptr;
+    auto append_query_record =
+        [&](RouteWindowQueryKind kind,
+            const DeltaSteppingCsrRunOptions::RouteWindow& query_window,
+            const DeltaSteppingCsrTelemetry& telemetry,
+            std::size_t unreached_target_count,
+            bool fallback_triggered) {
+          if (delta_telemetry != nullptr && telemetry.collected) {
+            delta_telemetry->push_back(telemetry);
+          }
+          if (route_window_stats != nullptr) {
+            RouteWindowQueryStats record;
+            record.net_index = net_index;
+            record.net_string = request.net_string;
+            record.kind = kind;
+            record.window = query_window;
+            record.source_count = source_candidates.size();
+            record.target_count = initial_targets.size();
+            record.unreached_target_count = unreached_target_count;
+            record.fallback_triggered = fallback_triggered;
+            record.telemetry = telemetry;
+            route_window_stats->push_back(std::move(record));
+          }
+        };
+    auto count_unreached_initial_targets = [&]() {
+      std::size_t unreached = 0;
+      for (const std::size_t sink_index : initial_target_sink_indices) {
+        if (!std::isfinite(net.sinks[sink_index].distance)) {
+          ++unreached;
+        }
+      }
+      return unreached;
+    };
+
     DeltaSteppingCsrTelemetry initial_telemetry;
     auto initial_sssp = [&]() {
       PATHFINDER_PROFILE_RANGE("pathfinder.sssp");
@@ -963,11 +1046,9 @@ RoutedNet route_net(const HostCsrF32& graph,
           options.max_sssp_iterations,
           stream,
           route_window,
-          delta_telemetry == nullptr ? nullptr : &initial_telemetry);
+          route_window_stats != nullptr,
+          collect_query_telemetry ? &initial_telemetry : nullptr);
     }();
-    if (delta_telemetry != nullptr && initial_telemetry.collected) {
-      delta_telemetry->push_back(std::move(initial_telemetry));
-    }
     const bool initial_paths_certified =
         options.sssp_engine != SsspEngine::kBellmanFord ||
         initial_sssp.stopped_on_target || initial_sssp.converged;
@@ -995,22 +1076,24 @@ RoutedNet route_net(const HostCsrF32& graph,
         net.sinks[sink_index] = std::move(candidate);
       }
     }
-    // This first slice uses a fixed 50-tile margin. If that heuristic misses
-    // any requested sink, rerun the original batched query unbounded rather
-    // than accepting partial reachability caused by the window.
-    if (route_window.enabled) {
-      bool needs_full_fallback = false;
-      for (std::size_t sink_index : initial_target_sink_indices) {
-        if (!std::isfinite(net.sinks[sink_index].distance)) {
-          needs_full_fallback = true;
-          break;
-        }
-      }
-      if (needs_full_fallback) {
+    // If the bounded query misses any requested sink, retain its telemetry and
+    // rerun the original batched query unbounded.  Keeping the two records
+    // separate prevents failed windows from looking artificially cheap.
+    const std::size_t initial_unreached = count_unreached_initial_targets();
+    const bool needs_full_fallback =
+        route_window.enabled && initial_unreached != 0;
+    append_query_record(
+        route_window.enabled ? RouteWindowQueryKind::kWindow
+                             : RouteWindowQueryKind::kUnboundedBaseline,
+        route_window, initial_telemetry, initial_unreached,
+        needs_full_fallback);
+    if (needs_full_fallback) {
+        DeltaSteppingCsrTelemetry fallback_telemetry;
         auto full_sssp = run_sssp_with_optional_delta_telemetry(
             workspace, source_candidates, initial_targets, options.delta,
             options.max_sssp_iterations, stream, {},
-            delta_telemetry == nullptr ? nullptr : &initial_telemetry);
+            route_window_stats != nullptr,
+            collect_query_telemetry ? &fallback_telemetry : nullptr);
         for (std::size_t target_pos = 0;
              target_pos < initial_target_sink_indices.size(); ++target_pos) {
           RoutedSink candidate;
@@ -1022,7 +1105,9 @@ RoutedNet route_net(const HostCsrF32& graph,
             net.sinks[sink_index] = std::move(candidate);
           }
         }
-      }
+        append_query_record(RouteWindowQueryKind::kFallback, {},
+                            fallback_telemetry,
+                            count_unreached_initial_targets(), false);
     }
   }
 
@@ -1201,6 +1286,232 @@ std::string json_escape(const std::string& text) {
 
 void write_json_string(std::ostream& out, const std::string& text) {
   out << '"' << json_escape(text) << '"';
+}
+
+const std::string& route_request_net_name(const RoutingMetadata& metadata,
+                                          std::size_t net_index) {
+  if (net_index >= metadata.route_requests.size()) {
+    throw std::out_of_range("route-window net index is outside metadata");
+  }
+  const std::uint64_t string_index = metadata.route_requests[net_index].net_string;
+  if (string_index >= metadata.strings.size()) {
+    throw std::out_of_range("route-window net string index is outside metadata");
+  }
+  return metadata.strings[static_cast<std::size_t>(string_index)];
+}
+
+std::string trim_ascii_whitespace(const std::string& text) {
+  std::size_t begin = 0;
+  while (begin < text.size() &&
+         std::isspace(static_cast<unsigned char>(text[begin]))) {
+    ++begin;
+  }
+  std::size_t end = text.size();
+  while (end > begin &&
+         std::isspace(static_cast<unsigned char>(text[end - 1]))) {
+    --end;
+  }
+  return text.substr(begin, end - begin);
+}
+
+bool find_json_field_value(const std::string& line,
+                           const char* field,
+                           std::size_t* value_offset) {
+  const std::string key = std::string("\"") + field + "\"";
+  const std::size_t key_offset = line.find(key);
+  if (key_offset == std::string::npos) return false;
+  const std::size_t colon = line.find(':', key_offset + key.size());
+  if (colon == std::string::npos) return false;
+  std::size_t value = colon + 1;
+  while (value < line.size() &&
+         std::isspace(static_cast<unsigned char>(line[value]))) {
+    ++value;
+  }
+  *value_offset = value;
+  return true;
+}
+
+bool parse_json_u64_field(const std::string& line,
+                          const char* field,
+                          std::uint64_t* value) {
+  std::size_t offset = 0;
+  if (!find_json_field_value(line, field, &offset) || offset >= line.size() ||
+      line[offset] == '-') {
+    return false;
+  }
+  errno = 0;
+  char* end = nullptr;
+  const unsigned long long parsed = std::strtoull(line.c_str() + offset, &end, 10);
+  if (end == line.c_str() + offset || errno == ERANGE) return false;
+  *value = static_cast<std::uint64_t>(parsed);
+  return true;
+}
+
+bool parse_json_string_field(const std::string& line,
+                             const char* field,
+                             std::string* value) {
+  std::size_t offset = 0;
+  if (!find_json_field_value(line, field, &offset) || offset >= line.size() ||
+      line[offset] != '"') {
+    return false;
+  }
+  value->clear();
+  for (++offset; offset < line.size(); ++offset) {
+    const char ch = line[offset];
+    if (ch == '"') return true;
+    if (ch != '\\') {
+      value->push_back(ch);
+      continue;
+    }
+    if (++offset >= line.size()) return false;
+    switch (line[offset]) {
+      case '"': value->push_back('"'); break;
+      case '\\': value->push_back('\\'); break;
+      case '/': value->push_back('/'); break;
+      case 'b': value->push_back('\b'); break;
+      case 'f': value->push_back('\f'); break;
+      case 'n': value->push_back('\n'); break;
+      case 'r': value->push_back('\r'); break;
+      case 't': value->push_back('\t'); break;
+      case 'u': {
+        if (offset + 4 >= line.size()) return false;
+        unsigned int code_point = 0;
+        for (int digit = 0; digit != 4; ++digit) {
+          const char hex = line[offset + 1 + digit];
+          code_point <<= 4;
+          if (hex >= '0' && hex <= '9') {
+            code_point += static_cast<unsigned int>(hex - '0');
+          } else if (hex >= 'a' && hex <= 'f') {
+            code_point += static_cast<unsigned int>(hex - 'a' + 10);
+          } else if (hex >= 'A' && hex <= 'F') {
+            code_point += static_cast<unsigned int>(hex - 'A' + 10);
+          } else {
+            return false;
+          }
+        }
+        // JSONL emitted by this router uses \u escapes only for C0 controls.
+        // Reject non-ASCII escapes rather than silently comparing a different
+        // net name to the metadata UTF-8 string.
+        if (code_point > 0x7f) return false;
+        value->push_back(static_cast<char>(code_point));
+        offset += 4;
+        break;
+      }
+      default:
+        return false;
+    }
+  }
+  return false;
+}
+
+std::vector<std::uint8_t> load_route_window_selection(
+    const std::filesystem::path& path,
+    const RoutingMetadata& metadata) {
+  std::ifstream in(path);
+  if (!in) {
+    throw std::runtime_error(
+        "could not open route-window net list: " + path.string());
+  }
+  std::vector<std::uint8_t> selected(metadata.route_requests.size(), 0);
+  std::string line;
+  std::size_t line_number = 0;
+  std::size_t selected_count = 0;
+  while (std::getline(in, line)) {
+    ++line_number;
+    const std::string record = trim_ascii_whitespace(line);
+    if (record.empty() || record[0] == '#') continue;
+    if (record.front() != '{' || record.back() != '}') {
+      throw std::runtime_error(
+          "route-window net list line " + std::to_string(line_number) +
+          " must be a JSON object");
+    }
+    std::uint64_t raw_index = 0;
+    std::string expected_name;
+    if (!parse_json_u64_field(record, "net_index", &raw_index) ||
+        !parse_json_string_field(record, "net", &expected_name) ||
+        raw_index > std::numeric_limits<std::size_t>::max()) {
+      throw std::runtime_error(
+          "route-window net list line " + std::to_string(line_number) +
+          " must contain net_index and net fields");
+    }
+    const std::size_t net_index = static_cast<std::size_t>(raw_index);
+    if (net_index >= metadata.route_requests.size()) {
+      throw std::runtime_error(
+          "route-window net list line " + std::to_string(line_number) +
+          " has an out-of-range net_index");
+    }
+    if (selected[net_index] != 0) {
+      throw std::runtime_error(
+          "route-window net list contains duplicate net_index " +
+          std::to_string(net_index));
+    }
+    if (expected_name != route_request_net_name(metadata, net_index)) {
+      throw std::runtime_error(
+          "route-window net list line " + std::to_string(line_number) +
+          " net name does not match metadata for net_index " +
+          std::to_string(net_index));
+    }
+    selected[net_index] = 1;
+    ++selected_count;
+  }
+  if (selected_count == 0) {
+    throw std::runtime_error("route-window net list contains no selected nets");
+  }
+  return selected;
+}
+
+void write_route_window_query_stats_jsonl(
+    const std::filesystem::path& path,
+    const RoutingMetadata& metadata,
+    const std::vector<std::vector<RouteWindowQueryStats>>& records_by_net) {
+  std::ofstream out(path);
+  if (!out) {
+    throw std::runtime_error(
+        "could not open route-window statistics output: " + path.string());
+  }
+  out.precision(std::numeric_limits<float>::max_digits10);
+  for (const auto& net_records : records_by_net) {
+    for (const RouteWindowQueryStats& record : net_records) {
+      const DeltaSteppingCsrTelemetry& telemetry = record.telemetry;
+      out << "{\"type\":\"route_window_query\""
+          << ",\"schema_version\":1"
+          << ",\"net_index\":" << record.net_index
+          << ",\"net_string\":" << record.net_string
+          << ",\"net\":";
+      write_json_string(out, route_request_net_name(metadata, record.net_index));
+      out << ",\"kind\":\"" << route_window_query_kind_name(record.kind)
+          << "\",\"fallback_triggered\":"
+          << (record.fallback_triggered ? "true" : "false")
+          << ",\"window\":{\"enabled\":"
+          << (record.window.enabled ? "true" : "false")
+          << ",\"min_x\":" << record.window.min_x
+          << ",\"max_x\":" << record.window.max_x
+          << ",\"min_y\":" << record.window.min_y
+          << ",\"max_y\":" << record.window.max_y << "}"
+          << ",\"source_count\":" << record.source_count
+          << ",\"target_count\":" << record.target_count
+          << ",\"unreached_target_count\":"
+          << record.unreached_target_count
+          << ",\"touched_nodes\":" << telemetry.reached_vertices
+          << ",\"edge_visits\":"
+          << telemetry.light_edge_visits + telemetry.heavy_edge_visits
+          << ",\"window_rejected_edges\":"
+          << telemetry.window_rejected_edges
+          << ",\"atomic_attempts\":"
+          << telemetry.distance_atomic_attempts
+          << ",\"cas_retries\":" << telemetry.distance_cas_retries
+          << ",\"phase_timings_collected\":"
+          << (telemetry.phase_timings_collected ? "true" : "false")
+          << ",\"reset_ms\":" << telemetry.reset_ms
+          << ",\"materialize_ms\":" << telemetry.materialize_ms
+          << ",\"completed\":"
+          << (telemetry.completed ? "true" : "false") << "}\n";
+    }
+  }
+  if (!out) {
+    throw std::runtime_error(
+        "failed while writing route-window statistics output: " + path.string());
+  }
 }
 
 std::uint64_t edge_key(int from, int to) {
@@ -1422,16 +1733,30 @@ void route_all_nets_with_workspace(const HostCsrF32& base_graph,
                                    hipStream_t stream,
                                    std::size_t route_request_count,
                                    std::size_t progress_interval,
-                                   std::vector<RoutedNet>& nets,
-                                   WorkspaceFactory workspace_factory,
-                                   std::vector<std::vector<DeltaSteppingCsrTelemetry>>*
-                                       delta_telemetry_records = nullptr,
-                                   UnitBfsPathDiagnostic*
-                                       unit_bfs_diagnostic = nullptr) {
+                                    std::vector<RoutedNet>& nets,
+                                    WorkspaceFactory workspace_factory,
+                                    std::vector<std::vector<DeltaSteppingCsrTelemetry>>*
+                                        delta_telemetry_records = nullptr,
+                                    UnitBfsPathDiagnostic*
+                                        unit_bfs_diagnostic = nullptr,
+                                    std::vector<std::vector<RouteWindowQueryStats>>*
+                                        route_window_stats_records = nullptr,
+                                    const std::vector<std::uint8_t>*
+                                        route_window_selection = nullptr) {
   if (delta_telemetry_records != nullptr &&
       delta_telemetry_records->size() != route_request_count) {
     throw std::invalid_argument(
         "Delta telemetry record count must match route request count");
+  }
+  if (route_window_stats_records != nullptr &&
+      route_window_stats_records->size() != route_request_count) {
+    throw std::invalid_argument(
+        "Route-window statistics record count must match route request count");
+  }
+  if (route_window_selection != nullptr &&
+      route_window_selection->size() != metadata.route_requests.size()) {
+    throw std::invalid_argument(
+        "Route-window selection count must match metadata route requests");
   }
   std::size_t worker_count =
       std::min<std::size_t>(options.parallel_net_workers,
@@ -1449,27 +1774,36 @@ void route_all_nets_with_workspace(const HostCsrF32& base_graph,
 
     for (std::size_t net_index = 0; net_index < route_request_count; ++net_index) {
       const RouteRequest& request = metadata.route_requests[net_index];
+      const bool route_window_selected =
+          options.route_window_enabled &&
+          (route_window_selection == nullptr ||
+           (*route_window_selection)[net_index] != 0);
       const std::uint32_t tree_stamp =
           next_tree_stamp(route_tree_seen, &route_tree_stamp);
       try {
         nets[net_index] =
             route_net(base_graph,
-                      sssp_workspace,
-                      metadata,
-                      request,
-                      route_tree_seen,
+                       sssp_workspace,
+                       metadata,
+                       request,
+                       net_index,
+                       route_window_selected,
+                       route_tree_seen,
                       route_parent_by_child,
                       route_parent_seen,
                       tree_stamp,
                       options,
                       stream,
                       delta_telemetry_records == nullptr
-                          ? nullptr
-                          : &(*delta_telemetry_records)[net_index],
-                      unit_bfs_diagnostic != nullptr &&
-                              unit_bfs_diagnostic->net_index == net_index
-                          ? unit_bfs_diagnostic
-                          : nullptr);
+                           ? nullptr
+                           : &(*delta_telemetry_records)[net_index],
+                       unit_bfs_diagnostic != nullptr &&
+                               unit_bfs_diagnostic->net_index == net_index
+                           ? unit_bfs_diagnostic
+                           : nullptr,
+                       route_window_stats_records == nullptr
+                           ? nullptr
+                           : &(*route_window_stats_records)[net_index]);
       } catch (const std::exception& error) {
         throw std::runtime_error(
             "route request " + std::to_string(net_index) + " failed: " +
@@ -1530,27 +1864,36 @@ void route_all_nets_with_workspace(const HostCsrF32& base_graph,
         }
 
         const RouteRequest& request = metadata.route_requests[net_index];
+        const bool route_window_selected =
+            options.route_window_enabled &&
+            (route_window_selection == nullptr ||
+             (*route_window_selection)[net_index] != 0);
         const std::uint32_t tree_stamp =
             next_tree_stamp(route_tree_seen, &route_tree_stamp);
         try {
           nets[net_index] =
             route_net(base_graph,
-                      sssp_workspace,
-                      metadata,
-                      request,
-                        route_tree_seen,
+                       sssp_workspace,
+                       metadata,
+                       request,
+                       net_index,
+                       route_window_selected,
+                       route_tree_seen,
                         route_parent_by_child,
                         route_parent_seen,
                         tree_stamp,
                         options,
                         local_stream,
                         delta_telemetry_records == nullptr
-                            ? nullptr
-                            : &(*delta_telemetry_records)[net_index],
+                             ? nullptr
+                             : &(*delta_telemetry_records)[net_index],
                         unit_bfs_diagnostic != nullptr &&
                                 unit_bfs_diagnostic->net_index == net_index
                             ? unit_bfs_diagnostic
-                            : nullptr);
+                            : nullptr,
+                        route_window_stats_records == nullptr
+                            ? nullptr
+                            : &(*route_window_stats_records)[net_index]);
         } catch (const std::exception& error) {
           throw std::runtime_error(
               "route request " + std::to_string(net_index) + " failed: " +
@@ -1665,6 +2008,7 @@ DeltaTelemetryTotals aggregate_delta_telemetry(
         record.controller_round_trips;
     totals.sums.compact_parent_fallback_events +=
         record.compact_parent_fallback_events;
+    totals.sums.window_rejected_edges += record.window_rejected_edges;
     totals.current_queue_high_water =
         std::max(totals.current_queue_high_water,
                  record.current_queue_high_water);
@@ -1739,6 +2083,8 @@ std::string delta_telemetry_aggregate_json(
       << sums.controller_round_trips
       << ",\"compact_parent_fallback_events\":"
       << sums.compact_parent_fallback_events
+      << ",\"window_rejected_edges\":"
+      << sums.window_rejected_edges
       << "},\"maxima\":{"
       << "\"current_queue_high_water\":"
       << totals.current_queue_high_water
@@ -1941,6 +2287,8 @@ void print_usage(const char* program) {
       << "  --delta-force-legacy-parent     Force generic Delta predecessor recovery for A/B comparison.\n"
       << "  --delta-telemetry               Emit one aggregate Delta-Stepping telemetry JSON record.\n"
       << "  --route-window                  Restrict each Delta net search to its source/sink box plus 50 tiles; falls back to full graph.\n"
+      << "  --route-window-net-list <path>  JSONL net_index/net selection list; requires --route-window.\n"
+      << "  --route-window-stats-out <path> Write one JSONL work/timing record per Delta SSSP query.\n"
       << "  --delta-benchmark-weights <unit|all-light|all-heavy|mixed>\n"
       << "                                  Replace CSR weights deterministically for numeric-delta benchmarks.\n"
       << "  --delta-benchmark-weight-seed <uint>\n"
@@ -2352,6 +2700,19 @@ PathfinderResult run_pathfinder(const HostCsrF32& base_graph,
     }
     case SsspEngine::kDeltaStep: {
       PathfinderOptions delta_options = options;
+      std::vector<std::uint8_t> route_window_selection;
+      const std::vector<std::uint8_t>* route_window_selection_ptr = nullptr;
+      if (!delta_options.route_window_net_list_path.empty()) {
+        route_window_selection = load_route_window_selection(
+            delta_options.route_window_net_list_path, metadata);
+        route_window_selection_ptr = &route_window_selection;
+      }
+      const bool any_selected_route_window =
+          delta_options.route_window_enabled && route_request_count != 0 &&
+          (route_window_selection_ptr == nullptr ||
+           std::any_of(route_window_selection_ptr->begin(),
+                       route_window_selection_ptr->begin() + route_request_count,
+                       [](std::uint8_t selected) { return selected != 0; }));
       if (delta_options.delta_auto) {
         delta_options.delta = resolved_automatic_delta;
         std::ostringstream message;
@@ -2362,7 +2723,7 @@ PathfinderResult run_pathfinder(const HostCsrF32& base_graph,
                 << ", multiplier=" << delta_options.delta_multiplier << ")\n";
         std::cout << message.str();
       }
-      auto shared_graph = options.route_window_enabled
+      auto shared_graph = any_selected_route_window
           ? std::make_shared<DeltaSteppingCsrGraph>(
                 base_graph, pack_node_bounds(metadata), stream)
           : std::make_shared<DeltaSteppingCsrGraph>(base_graph, stream);
@@ -2370,6 +2731,7 @@ PathfinderResult run_pathfinder(const HostCsrF32& base_graph,
         const bool uses_unit_specialization =
             !delta_options.delta_force_generic &&
             !delta_options.delta_force_legacy_parent &&
+            !any_selected_route_window &&
             delta_options.max_sssp_iterations < 0 &&
             base_graph.rows <=
                 (static_cast<minplus_sparse::Offset>(1) <<
@@ -2405,6 +2767,10 @@ PathfinderResult run_pathfinder(const HostCsrF32& base_graph,
       if (delta_options.delta_telemetry) {
         delta_telemetry_records.resize(route_request_count);
       }
+      std::vector<std::vector<RouteWindowQueryStats>> route_window_stats_records;
+      if (!delta_options.route_window_stats_out_path.empty()) {
+        route_window_stats_records.resize(route_request_count);
+      }
       route_all_nets_with_workspace(
           base_graph,
           metadata,
@@ -2417,7 +2783,18 @@ PathfinderResult run_pathfinder(const HostCsrF32& base_graph,
             return DeltaSteppingCsrWorkspace(shared_graph, worker_stream,
                                              workspace_options);
           },
-          delta_options.delta_telemetry ? &delta_telemetry_records : nullptr);
+          delta_options.delta_telemetry ? &delta_telemetry_records : nullptr,
+          nullptr,
+          delta_options.route_window_stats_out_path.empty()
+              ? nullptr
+              : &route_window_stats_records,
+          route_window_selection_ptr);
+      if (!delta_options.route_window_stats_out_path.empty()) {
+        write_route_window_query_stats_jsonl(
+            delta_options.route_window_stats_out_path,
+            metadata,
+            route_window_stats_records);
+      }
       if (delta_options.delta_telemetry) {
         std::vector<DeltaSteppingCsrTelemetry> flattened_telemetry;
         std::size_t telemetry_query_count = 0;
@@ -2770,6 +3147,12 @@ int main(int argc, char** argv) {
         options.delta_telemetry = true;
       } else if (option == "--route-window") {
         options.route_window_enabled = true;
+      } else if (option == "--route-window-net-list") {
+        options.route_window_net_list_path =
+            require_value("--route-window-net-list");
+      } else if (option == "--route-window-stats-out") {
+        options.route_window_stats_out_path =
+            require_value("--route-window-stats-out");
       } else if (option == "--delta-benchmark-weights") {
         delta_benchmark_weights =
             routing::parse_delta_benchmark_weights_arg(

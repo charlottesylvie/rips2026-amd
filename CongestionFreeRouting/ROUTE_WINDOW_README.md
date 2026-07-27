@@ -12,6 +12,26 @@ pathfinder <graph.csrbin> <metadata.ifmeta.bin> \
   --sssp-engine delta-step --route-window
 ```
 
+To profile an unbounded baseline and then apply windows only to measured
+expensive nets:
+
+```text
+pathfinder graph.csrbin metadata.ifmeta.bin \
+  --sssp-engine delta-step --delta-force-generic \
+  --route-window-stats-out baseline.jsonl
+
+# Keep both fields from selected baseline rows for metadata validation.
+{"net_index":17,"net":"example_net"}
+
+pathfinder graph.csrbin metadata.ifmeta.bin \
+  --sssp-engine delta-step --delta-force-generic --route-window \
+  --route-window-net-list hard_nets.jsonl \
+  --route-window-stats-out windowed.jsonl
+```
+
+`--route-window-net-list` requires `--route-window`. Entries beyond
+`--net-limit` are valid but inactive for that invocation.
+
 For every net, PathFinder combines the extents of all source nodes and all
 initially unresolved sink nodes, then expands that rectangle by **50 tiles on
 every side**. The bounds are clamped to the packed-coordinate range.
@@ -27,28 +47,43 @@ current fixed-margin version preserves completeness relative to the unbounded
 query, although a successful bounded route remains a heuristic: it need not be
 the globally shortest route.
 
+Every `--route-window-stats-out` row describes one Delta SSSP query in stable
+net-index order. It records query kind (`unbounded_baseline`, `window`, or
+`fallback`), box extents, source/target counts, unresolved targets,
+`touched_nodes`, edge and atomic counters, `window_rejected_edges`, and the
+fallback flag. A failed window emits a `window` row with
+`fallback_triggered:true`, followed by its unbounded `fallback` row.
+
+For generic Delta queries, stats output also uses reusable HIP events to record
+stream-local `materialize_ms` and `reset_ms`. CompactGeneric path extraction is
+included in `materialize_ms`; per-worker stream times may sum to more than
+wall-clock time when workers overlap.
+
 ## Current scope and limitations
 
 - The feature is disabled unless `--route-window` is supplied.
 - It applies only to Delta-Stepping, and windowed queries deliberately bypass
   the exact-unit specialization in favor of generic Delta-Stepping.
-- The margin is currently fixed at 50; adaptive growth, CLI-configurable
-  margins, per-net telemetry, and metadata-sidecar serialization of packed
-  bounds are follow-up work.
+- The margin is currently fixed at 50; adaptive growth, a CLI-configurable
+  margin, and metadata-sidecar serialization of packed bounds remain follow-up
+  work.
 - Bounds are packed from the existing metadata coordinate arrays at PathFinder
   startup and uploaded once. This avoids a per-net upload, but a later format
   revision can serialize the packed sidecar array directly.
 
 ## Files changed for the first implementation
 
-- `pathfinder.hpp`: route-window option and fixed 50-tile default.
+- `pathfinder.hpp`: route-window option, selected-net list, and stats output
+  path.
 - `pathfinder.cpp`: per-net window construction, packed-host bounds, fallback,
-  CLI parsing, and shared graph creation.
+  selected-net scheduling, per-query JSONL, CLI parsing, and shared graph
+  creation.
 - `delta_stepping/delta_stepping_hip_CSR.hpp/.cpp`: immutable device bounds,
   query window API, generic dispatch, and destination filtering.
-- `pathfinder_router.cpp`: forwarding of `--route-window`.
-- `tests/pathfinder_bf10_cpu_stub_test.cpp`: constructor stub matching the new
-  shared Delta graph API.
+- `pathfinder_router.cpp`: forwarding of the window, selected-list, and stats
+  options.
+- `tests/pathfinder_bf10_cpu_stub_test.cpp`: selected-net and stats JSONL
+  coverage.
 
 ## Verification status
 

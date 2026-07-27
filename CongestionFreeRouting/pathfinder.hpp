@@ -113,6 +113,15 @@ struct PathfinderOptions {
   // rectangle expanded by this many tiles on every side.
   bool route_window_enabled = false;
   std::uint16_t route_window_margin = 50;
+  // Optional JSONL selection list for --route-window.  The list is resolved
+  // against interchange net names inside run_pathfinder(), after metadata is
+  // available, so library callers can use the same diagnostic input as the
+  // command-line router.
+  std::filesystem::path route_window_net_list_path;
+  // Optional JSONL destination for one diagnostic record per Delta SSSP
+  // invocation.  This deliberately works without --route-window so an
+  // unbounded run can be used as a baseline.
+  std::filesystem::path route_window_stats_out_path;
 };
 
 struct PathfinderResult {

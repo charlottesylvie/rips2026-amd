@@ -994,6 +994,21 @@ DeltaSteppingCsrResult DeltaSteppingCsrWorkspace::run(
     result.stopped_on_distance_limit = !result.target_reached;
     result.converged = false;
   }
+  // Give the PathFinder route-window tests a deterministic bounded-query miss
+  // so they exercise the unbounded fallback and its separate telemetry row.
+  // Ordinary CPU-stub queries retain their exact Dijkstra result.
+  if (active_route_window_.enabled) {
+    result.target_distances.assign(
+        targets.size(), std::numeric_limits<float>::infinity());
+    result.target_sources.assign(targets.size(), -1);
+    result.target_path_offsets.assign(targets.size() + 1, 0);
+    result.target_edge_offsets.assign(targets.size() + 1, 0);
+    result.target_path_nodes.clear();
+    result.target_path_edges.clear();
+    result.target_reached = false;
+    result.stopped_on_target = false;
+    result.converged = true;
+  }
   result.dist.clear();
   result.pred_node.clear();
   result.pred_edge.clear();
@@ -1001,7 +1016,8 @@ DeltaSteppingCsrResult DeltaSteppingCsrWorkspace::run(
     const bool exact_unit_path =
         execution_mode_ == DeltaSteppingCsrExecutionMode::kAutomatic &&
         parent_mode_ == DeltaSteppingCsrParentMode::kAutomatic &&
-        !impl_->has_vertex_costs && max_iters < 0 &&
+        !impl_->has_vertex_costs && !active_route_window_.enabled &&
+        max_iters < 0 &&
         progress_callback == nullptr &&
         std::all_of(impl_->graph.values.begin(), impl_->graph.values.end(),
                     [](float value) { return value == 1.0f; });
@@ -1441,6 +1457,8 @@ int main() {
                              detached_workspace,
                              detached_metadata,
                              detached_request,
+                             0,
+                             false,
                              detached_tree_seen,
                              detached_parent_by_child,
                              detached_parent_seen,
@@ -1469,6 +1487,8 @@ int main() {
       tentative_workspace,
       detached_metadata,
       detached_request,
+      0,
+      false,
       tentative_tree_seen,
       tentative_parent_by_child,
       tentative_parent_seen,
@@ -1659,6 +1679,7 @@ int main() {
                                   false,
                                   false,
                                   false);
+    record.window_rejected_edges = static_cast<std::uint64_t>(i + 1);
     aggregate_records.push_back(record);
   }
   aggregate_records[1].completed = false;
@@ -1694,7 +1715,8 @@ int main() {
               telemetry_sums.stale_pending_entry_examinations == 170 &&
               telemetry_sums.reached_vertices == 180 &&
               telemetry_sums.controller_round_trips == 220 &&
-              telemetry_sums.compact_parent_fallback_events == 230,
+              telemetry_sums.compact_parent_fallback_events == 230 &&
+              telemetry_sums.window_rejected_edges == 10,
           "telemetry aggregation must sum every counter and ignore empty slots");
   require(telemetry_totals.current_queue_high_water == 76 &&
               telemetry_totals.pending_queue_high_water == 80 &&
@@ -1717,10 +1739,12 @@ int main() {
                   "\"execution_paths\":{\"exact_unit\":1,"
                   "\"compact_generic\":1,\"legacy_generic\":1,"
                   "\"generic_distances_only\":1}") != std::string::npos &&
-              aggregate_json.find(
-                  "\"maxima\":{\"current_queue_high_water\":76,"
-                  "\"pending_queue_high_water\":80,"
-                  "\"heavy_queue_high_water\":84}") != std::string::npos,
+               aggregate_json.find(
+                   "\"maxima\":{\"current_queue_high_water\":76,"
+                   "\"pending_queue_high_water\":80,"
+                   "\"heavy_queue_high_water\":84}") != std::string::npos &&
+               aggregate_json.find("\"window_rejected_edges\":10") !=
+                   std::string::npos,
           "aggregate telemetry JSON must preserve stable counts and maxima");
   const std::filesystem::path aggregate_telemetry_path =
       "/tmp/pathfinder_delta_telemetry_aggregate.json";
@@ -1755,6 +1779,85 @@ int main() {
           "overlapping route output should still include the second net");
   require(overlap_routes_json.find("\"from\":1,\"to\":2") != std::string::npos,
           "overlapping route output should include the shared shortest path");
+
+  const std::filesystem::path hard_nets_path =
+      "/tmp/pathfinder_hard_nets.jsonl";
+  {
+    std::ofstream hard_nets_file(hard_nets_path);
+    hard_nets_file << "{\"net_index\":0,\"net\":\"net_a\"}\n";
+    require(static_cast<bool>(hard_nets_file),
+            "selected route-window list fixture must be writable");
+  }
+  const std::filesystem::path route_window_stats_path =
+      "/tmp/pathfinder_route_window_stats.jsonl";
+  routing::PathfinderOptions route_window_stats_options;
+  route_window_stats_options.sssp_engine = routing::SsspEngine::kDeltaStep;
+  route_window_stats_options.delta = 1.0f;
+  route_window_stats_options.delta_force_generic = true;
+  route_window_stats_options.parallel_net_workers = 2;
+  route_window_stats_options.route_window_enabled = true;
+  route_window_stats_options.route_window_net_list_path = hard_nets_path;
+  route_window_stats_options.route_window_stats_out_path = route_window_stats_path;
+  const routing::PathfinderResult route_window_stats_result =
+      routing::run_pathfinder(congestion_graph,
+                              congestion_metadata,
+                              route_window_stats_options,
+                              nullptr);
+  require(route_window_stats_result.routed,
+          "selected route windows should preserve routed status in the CPU stub");
+  std::ifstream route_window_stats_file(route_window_stats_path);
+  const std::string route_window_stats_json(
+      (std::istreambuf_iterator<char>(route_window_stats_file)),
+      std::istreambuf_iterator<char>());
+  require(route_window_stats_json.find(
+              "\"net_index\":0,\"net_string\":0,\"net\":\"net_a\","
+              "\"kind\":\"window\"") != std::string::npos &&
+              route_window_stats_json.find(
+                  "\"net_index\":1,\"net_string\":1,\"net\":\"net_b\","
+                  "\"kind\":\"unbounded_baseline\"") != std::string::npos &&
+              route_window_stats_json.find("\"touched_nodes\":") !=
+                  std::string::npos &&
+              route_window_stats_json.find("\"fallback_triggered\":true") !=
+                  std::string::npos &&
+              route_window_stats_json.find("\"kind\":\"fallback\"") !=
+                  std::string::npos,
+          "per-query stats must distinguish selected windows, fallback, and unbounded nets");
+
+  const std::filesystem::path bad_hard_nets_path =
+      "/tmp/pathfinder_bad_hard_nets.jsonl";
+  {
+    std::ofstream bad_hard_nets_file(bad_hard_nets_path);
+    bad_hard_nets_file << "{\"net_index\":0,\"net\":\"wrong_net\"}\n";
+    require(static_cast<bool>(bad_hard_nets_file),
+            "invalid route-window list fixture must be writable");
+  }
+  routing::PathfinderOptions mismatched_list_options = route_window_stats_options;
+  mismatched_list_options.route_window_net_list_path = bad_hard_nets_path;
+  bool mismatched_list_rejected = false;
+  try {
+    (void)routing::run_pathfinder(congestion_graph,
+                                  congestion_metadata,
+                                  mismatched_list_options,
+                                  nullptr);
+  } catch (const std::runtime_error&) {
+    mismatched_list_rejected = true;
+  }
+  require(mismatched_list_rejected,
+          "route-window selection must validate a listed net name");
+
+  routing::PathfinderOptions list_without_window_options = route_window_stats_options;
+  list_without_window_options.route_window_enabled = false;
+  bool list_without_window_rejected = false;
+  try {
+    (void)routing::run_pathfinder(congestion_graph,
+                                  congestion_metadata,
+                                  list_without_window_options,
+                                  nullptr);
+  } catch (const std::invalid_argument&) {
+    list_without_window_rejected = true;
+  }
+  require(list_without_window_rejected,
+          "a selective net list must require route-window mode");
 
   auto movable_delta_graph =
       std::make_shared<DeltaSteppingCsrGraph>(congestion_graph, nullptr);
