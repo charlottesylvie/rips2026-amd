@@ -299,7 +299,23 @@ graph and metadata sidecar:
 The expensive parsing, coordinate extraction, PIP construction, and base-CSR
 formatting have already happened in `device_to_routing_graph`. This stage
 loads the two design netlists, extracts route requests and blockages, filters
-the shared graph, and writes design-specific CSR and metadata outputs.
+the shared graph, and writes design-specific CSR and metadata outputs. Its
+summary distinguishes eligible route requests, source-less OOC exclusions,
+already-preserved nets, and unsupported preserved work. Unsupported partial,
+static, or structurally incompatible work fails conversion by default; the
+diagnostic-only `--allow-unsupported-preserved-nets` option keeps it unchanged
+but deliberately excludes it from PathFinder completion accounting.
+`PathFinderFile` intentionally does not expose this diagnostic escape hatch.
+The two outputs are staged before publication. Separate adjacent `.publishing`
+guards are acquired for the CSR and metadata paths, so converters that share
+either output cannot race. CSR version 2 and metadata version 5 embed the same
+nonzero 128-bit pair ID; the `.generation` sidecar publishes its canonical hex
+form, and PathFinder propagates it into every route JSON record. Current
+readers sample the guards/generation around their reads and require every
+available ID to match. This rejects overlapping publication, stable old/new
+pairs, and stale route files. An interrupted process can leave a guard behind
+intentionally; inspect the artifacts, remove the guard, and rerun conversion
+rather than using either file independently.
 
 ### `pathfinder`
 
@@ -313,7 +329,7 @@ Runs the CSR PathFinder prototype:
 Direct `pathfinder` runs refuse to write `--routes-out` when any sink remains
 unreached unless `--allow-unrouted` is supplied. The `PathFinderFile` wrapper
 adds that option by default; use `--strict-routing` on the wrapper only when a
-complete route is an explicit acceptance requirement.
+route for every eligible request is an explicit acceptance requirement.
 
 Tuning options:
 
@@ -489,9 +505,10 @@ Useful wrapper options:
 | `<benchmark>.netlist` | Contest setup | Matching logical netlist. |
 | `xcvu3p.device` | RapidWright | FPGA Interchange device resources for the target part. |
 | `.devicegraph` | `device_to_routing_graph` | Persistent device-wide CSR, node/PIP metadata, and lookup tables for one device/bounds policy. |
-| `.csrbin` | `interchange_to_csr` | Internal CSR routing graph. |
-| `.csrbin.ifmeta.bin` | `interchange_to_csr` | Metadata sidecar with string table, node coordinate ranges, tile/wire type IDs, PIP data, site pins, logical summaries, and route requests. |
-| `.routes.jsonl` | `pathfinder` | One JSON object per net containing sources, sinks, and selected PIP edges. |
+| `.csrbin` | `interchange_to_csr` | Internal outgoing CSR routing graph; new version-2 files embed an artifact-pair ID. |
+| `.csrbin.ifmeta.bin` | `interchange_to_csr` | Version-5 metadata sidecar with the matching pair ID, string table, node coordinate ranges, tile/wire type IDs, PIP data, site pins, logical summaries, and route requests. |
+| `.csrbin.ifmeta.bin.generation` | `interchange_to_csr` | Canonical pair ID sampled around reads; must match both binary headers. |
+| `.routes.jsonl` | `pathfinder` | One pair-ID-bound JSON object per net containing sources, sinks, and selected PIP edges. |
 | `<benchmark>_PathFinderFile.phys` | `routes_to_phys` | Routed physical netlist. |
 | `.check` / `.check.log` | Makefile checker | `PASS` or `FAIL` plus checker output. |
 | `.wirelength` | Makefile wirelength analyzer | Routed design wirelength report. |
@@ -499,6 +516,13 @@ Useful wrapper options:
 CSR orientation is outgoing-edge: row `u`, column `v` represents directed edge
 `u -> v`. Edge weights are stored as a separate `float` array aligned with
 `colind`; node coordinate ranges and tile/wire type metadata stay in the sidecar.
+
+Device-graph format version 3 excludes pseudo-PIPs whose site occupancy cannot
+be represented, retains typed primary/alternate site-pin aliases, records the
+device name for PhysicalNetlist part validation, and rejects ambiguous
+tile/wire mappings. Regenerate every version-1 or version-2 `.devicegraph`
+with the current `device_to_routing_graph`; old caches are rejected
+deliberately.
 
 ## Testing
 
@@ -512,6 +536,17 @@ g++ -std=c++17 -O2 \
   -o /tmp/device_routing_graph_test
 
 /tmp/device_routing_graph_test
+```
+
+Host-only PhysicalNetlist classification, fixed-resource, pseudo-PIP, and
+primary/alternate site-pin policy test:
+
+```bash
+g++ -std=c++17 -O2 -Wall -Wextra -Wpedantic -Werror \
+  CongestionFreeRouting/tests/interchange_import_policy_test.cpp \
+  -o /tmp/interchange_import_policy_test
+
+/tmp/interchange_import_policy_test
 ```
 
 Gzip/plain FPGAIF input integrity test (including truncated gzip streams):
@@ -676,21 +711,63 @@ output, and computes the benchmark score.
 
 ### Known interchange limitations
 
-- Partially routed signal nets are not continued consistently: existing PIPs
-  and `stubNodes` are neither a reusable route tree nor ordinary occupancy.
-  Until continuation is implemented, reject these nets explicitly and keep
-  conversion and reconstruction on one stub representation.
-- Endpoint lookup uses a site's primary type. Alternate site types still need
-  `altPinsToPrimaryPins` mapping and tests for active alternate endpoints.
-- A cached `.devicegraph` should record and validate the device/part,
-  `DeviceResources` fingerprint, bounds policy, and graph-builder semantic
-  version; propagate the same identity into the per-design sidecar.
-- `routes_to_phys` should compare exact source/sink/node identities, require
-  every route root and edge to be source-reachable, and verify that the input
-  physical netlist matches the payload used during conversion.
-- Pseudo-PIPs and route-throughs still need site/BEL occupancy metadata and
-  legality checks. Parallel PIPs also need a deterministic legality-based
-  selection rule.
+- Driverless signal nets in out-of-context designs are not routing work.
+  Conversion now preserves their mapped endpoint occupancy, reports each
+  excluded net, and omits it from PathFinder completion accounting, matching
+  the contest RWRoute wrapper. Only an actually empty source forest gets this
+  treatment; a nonempty unsupported source shape is never mislabeled as
+  driverless, and no source node is invented.
+- Only completely unrouted ordinary signal nets with top-level `sitePin` stubs
+  are eligible route requests. Stub children are retained by reconstruction.
+  Partially routed signals containing PIPs or `stubNodes`, incompatible source
+  or top-level-stub shapes, and unrouted GND/VCC nets are preserved and
+  reported, then fail conversion by default. The explicit
+  `--allow-unsupported-preserved-nets` diagnostic mode leaves those nets
+  unchanged; they are not covered by PathFinder's reached-all-sinks result.
+  Contest static and global routing is expected to arrive pre-routed.
+- Device preprocessing follows `altPinsToPrimaryPins`, retains site type in
+  every cache key, and requires exact schema lengths. Per-design lookup uses
+  `PhysicalNetlist.siteInsts` to select the active `(site,type,pin)` mapping.
+  If site-instance metadata is missing, an endpoint is accepted without a type
+  only when every possible type agrees on one node; fixed occupancy blocks all
+  candidates conservatively rather than guessing one.
+- Nonconventional/pseudo-PIPs are excluded from the static graph. Supporting
+  route-throughs later requires retaining their traversed-site metadata and
+  checking site/BEL occupancy before `routes_to_phys` can emit them legally.
+- Fixed nets now reserve every mapped site-pin and `stubNode` plus both PIP
+  endpoints. For the audited xcvu3p, fixed GND/VCC SLICEL/SLICEM outputs also
+  reserve the mutually exclusive `[A-H]_O`/`[A-H]MUX` counterpart exactly as
+  RWRoute does. Versal's distinct `Q` pairing remains unsupported until its
+  device-family legality is represented explicitly.
+- Routable sinks are terminal in the shared CSR unless the exact same node is
+  also a source of that net; that overlap keeps its outgoing row. Incoming
+  edges to every routable source are removed while its outgoing row remains
+  available to the owning request. Cross-net endpoint ownership collisions
+  are rejected. RWRoute permits a narrower same-net traversal through a
+  non-source sink with `NODE_PINBOUNCE` intent; this immutable CSR cannot
+  represent that exception yet and may conservatively report a later sink
+  unreachable.
+- A cached `.devicegraph` records a semantic format version, content
+  fingerprint, bounds policy, and device name; conversion rejects a
+  PhysicalNetlist for a different part. CSR/metadata publication is guarded
+  against concurrent converters and process interruption. New CSR v2,
+  metadata v5, generation, and route records carry one pair ID and supported
+  readers require equality. Coherent CSR v1/metadata v4 pairs without a
+  generation remain readable as explicitly legacy/unverified input; mixed
+  legacy/current files fail. Pair IDs are provenance tokens rather than content
+  checksums, and this remains a fail-closed protocol rather than a durable
+  multi-file filesystem transaction across power loss.
+- C++ reconstruction compares its route pair ID and ordered source/sink/node
+  identities with the metadata. The current benchmark Python wrapper also
+  checks the metadata/generation/route ID chain. Both C++ and Python
+  reconstruction require every reached sink to be attached to a source-rooted
+  tree, preserve duplicate sink stubs, reject nonintegral node IDs, and choose
+  one deterministic physical root when source aliases share a CSR node. They
+  do not yet verify that the input physical netlist is the exact byte payload
+  captured during conversion; the separate legacy `Routing/` Python writer has
+  no metadata identity check.
+- Parallel conventional PIPs still need a deterministic legality-based
+  selection rule beyond the current stable latest-edge choice.
 
 These open items were cross-checked against the
 [Runtime-First FPGA24 routing contest repository](https://github.com/Xilinx/fpga24_routing_contest)

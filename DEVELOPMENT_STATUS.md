@@ -1,6 +1,7 @@
 # GPU SSSP Development Status
 
-Updated 2026-07-24 for the bounded UnitBFS/classic-Delta optimization pass.
+Updated 2026-07-27 for the bounded UnitBFS/classic-Delta optimization pass and
+the FPGA Interchange import correctness audit.
 All GPU changes below are implemented but HIP-unvalidated.
 
 This file is the concise source of truth for landed work, confidence, and the
@@ -42,6 +43,7 @@ throughput, so the real multi-sink result remains provisional.
 | Area | Current implementation |
 | --- | --- |
 | Routing adapter | One batched original-source search per net, compact source-rooted paths, last-tree-intersection trimming, deterministic parent-conflict rejection, and a critical-path-inflation regression. |
+| Interchange import | Truly source-less OOC signals are preserved but excluded from route completion. Unsupported partial/static/shape work is preserved and reported, then rejected by default unless diagnostic-only opt-in is explicit. Fixed routes reserve pins, stub nodes, both PIP endpoints, and xcvu3p's paired static SLICEL/SLICEM outputs. Device-graph v3 uses active typed alternate-site mappings, validates the physical part, rejects ambiguous lookups, duplicate physical names, and cross-net endpoint ownership, excludes unserializable pseudo-PIPs, makes non-source sinks terminal, and removes incoming edges to exclusive sources while retaining their outgoing rows. Logical name-only links are emitted only when globally unambiguous. New CSR v2/metadata v5 outputs embed one 128-bit pair ID, publish it in the generation sidecar, and propagate it to routes; guarded readers reject mixed or stale artifacts. |
 | UnitBFS graph | Shared immutable outgoing CSR. Graph construction validates every edge weight as exactly `1.0f`; normal dispatch therefore already rejects non-unit input. |
 | Shared query capacity | PathFinder derives optional source/target high-water hints from exactly the routed metadata prefix, retaining duplicate endpoint counts. Checked count/byte arithmetic rejects overflow; low-level callers may omit hints. Compact paths are never reserved from graph size. |
 | UnitBFS state | Private stream-affine workspaces, automatic 32-bit row/predecessor-edge offsets when `nnz <= INT32_MAX`, a forced-64-bit test mode, one append-only frontier/visited queue, geometrically retained source/target/metadata/offset/path buffers, and compact validated target paths. Sparse reset remains the default; packed generation-stamped visitation is opt-in and performs a safe full reset on rollover. |
@@ -66,24 +68,42 @@ The following CPU/fake-HIP checks pass on the current macOS checkout with
 - `unit_bfs_policy_test`;
 - `delta_stepping_policy_test`;
 - `device_routing_graph_test`; and
-- `gzip_io_test`.
+- `interchange_import_policy_test`; and
+- `gzip_io_test`; and
+- `pathfinder_benchmark_writer_test.py`.
 
-The first suite covers the current PathFinder adapter, engine dispatch,
+The PathFinder suites cover the current adapter, engine dispatch,
 automatic Delta controls, worker behavior, compact results, telemetry
 aggregation, source rooting, and the critical-path regression through the fake
-HIP runtime.
+HIP runtime. The interchange policy suites cover exact driverless OOC
+classification, unsupported-net preservation policy, both-endpoint fixed
+occupancy, terminal-sink and endpoint-ownership invariants, safe pseudo-PIP
+exclusion, typed alternate pin mapping, xcvu3p static-output pairing, part
+matching, lookup/name-conflict rejection, path alias guards, artifact pair-ID
+round trips/mismatch rejection, CSR filtering, binary round trips, duplicate
+endpoint reconstruction, reached-sink attachment, integral route IDs, and
+deterministic shared-node source roots without generated Cap'n Proto
+headers.
 
-ASan+UBSan builds pass for both fake-HIP PathFinder suites and all three new
-host policy/model suites with `ASAN_OPTIONS=detect_leaks=0`; this macOS ASan
-runtime does not support leak detection. `git diff --check` also passes.
+ASan+UBSan builds pass for both fake-HIP PathFinder suites and the host
+policy/model suites with `ASAN_OPTIONS=detect_leaks=0`; this macOS ASan runtime
+does not support leak detection. `git diff --check` also passes.
 
 `hipcc`, ROCm, and an AMD GPU are unavailable on this host. Consequently the
 production `unit_bfs_hip_CSR.cpp`, `delta_stepping_hip_CSR.cpp`, the linked
-HIP `pathfinder` executable, and every HIP regression translation unit that
-uses those implementations remain uncompiled and unexecuted. No production
-speedup or GPU-memory reduction has been measured. The exact later-hardware
+HIP `pathfinder` executable, the standalone `bf8.cpp`, `bf9.cpp`, and
+`bf10.cpp` HIP programs, and every HIP regression translation unit that uses
+those implementations remain uncompiled and unexecuted. The Bellman--Ford
+files received fake-HIP preprocessing only. No production speedup or
+GPU-memory reduction has been measured. The exact later-hardware
 commands and acceptance checklist are in
 [GPU_PROFILING.md](CongestionFreeRouting/GPU_PROFILING.md#amd-validation-checklist-for-the-bounded-optimizations).
+
+The generated FPGA Interchange Cap'n Proto C++ headers/libraries and compiler
+are also unavailable on this host. Therefore `device_to_routing_graph.cpp`,
+`interchange_to_csr.cpp`, and `routes_to_phys.cpp` remain production-uncompiled;
+their schema-facing changes received static review plus host policy/model and
+Python reconstruction coverage, not a substitute compile claim.
 
 ## Remaining correctness and measurement gates
 
