@@ -1382,6 +1382,17 @@ int main() {
               128.0f,
           "automatic delta must apply its sweep multiplier to the seed");
 
+  delta_stats_graph.values = {1.0f, 1.0f};
+  require(delta_stepping_auto_delta(delta_stats_graph, 64) == 1.0f,
+          "exact-unit graphs must use the natural unit bucket width");
+  require(delta_stepping_auto_delta(delta_stats_graph, 32) == 1.0f,
+          "exact-unit automatic delta must be wavefront independent");
+  require(delta_stepping_auto_delta(delta_stats_graph, 64, 0.25f) == 0.25f,
+          "exact-unit automatic delta must retain multiplier sweeps");
+  require(delta_stepping_auto_delta(
+              delta_stats_graph, std::vector<float>(4, 1.0f), 64) == 1.0f,
+          "unit destination costs must preserve the exact-unit seed");
+
   delta_stats_graph.values = {0.0f, 6.0f};
   require(delta_stepping_auto_delta(delta_stats_graph, 64) == 384.0f,
           "zero-weight edges must still contribute to average degree");
@@ -2056,6 +2067,27 @@ int main() {
                             return value == expected_graph_aware_delta;
                           }),
           "automatic delta must resolve once and reach every worker identically");
+
+  routing::PathfinderOptions unit_auto_delta_options =
+      parallel_delta_options;
+  unit_auto_delta_options.delta_auto = true;
+  unit_auto_delta_options.delta_force_generic = true;
+  unit_auto_delta_options.delta_multiplier = 1.0f;
+  g_multisource_delta_calls = 0;
+  clear_recorded_deltas();
+  const routing::PathfinderResult unit_auto_delta_result =
+      routing::run_pathfinder(congestion_graph,
+                              congestion_metadata,
+                              unit_auto_delta_options,
+                              nullptr);
+  require(unit_auto_delta_result.routed,
+          "exact-unit automatic Delta routing must preserve routed status");
+  const std::vector<float> unit_automatic_deltas = recorded_deltas();
+  require(unit_automatic_deltas.size() == 2 &&
+              std::all_of(unit_automatic_deltas.begin(),
+                          unit_automatic_deltas.end(),
+                          [](float value) { return value == 1.0f; }),
+          "PathFinder must pass the exact-unit automatic width to every worker");
 
   routing::PathfinderOptions parallel_bellman_ford_options = parallel_options;
   parallel_bellman_ford_options.sssp_engine =

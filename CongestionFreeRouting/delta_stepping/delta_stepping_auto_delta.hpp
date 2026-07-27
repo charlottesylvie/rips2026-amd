@@ -94,6 +94,7 @@ inline float compute_auto_delta(
   // scan on hosts where long double uses x87 instructions.
   double effective_weight_sum = 0.0;
   double compensation = 0.0;
+  bool all_effective_weights_are_one = nnz != 0;
   for (std::size_t edge = 0; edge < nnz; ++edge) {
     const minplus_sparse::Index destination = adjacency.colind[edge];
     const float weight = adjacency.values[edge];
@@ -113,6 +114,9 @@ inline float compute_auto_delta(
                   (*vertex_costs)[static_cast<std::size_t>(destination)]);
     const double effective_weight =
         static_cast<double>(weight) * destination_cost;
+    if (effective_weight != 1.0) {
+      all_effective_weights_are_one = false;
+    }
     const double adjusted = effective_weight - compensation;
     const double next = effective_weight_sum + adjusted;
     compensation = (next - effective_weight_sum) - adjusted;
@@ -123,6 +127,15 @@ inline float compute_auto_delta(
   // for any positive width. Use a stable unit seed and still honor the sweep
   // multiplier instead of returning the invalid formula value zero.
   if (nnz == 0 || effective_weight_sum == 0.0) {
+    return clamp_auto_delta(1.0, multiplier);
+  }
+
+  // Exact-unit graphs are the production routing case. The degree heuristic
+  // otherwise inflates their bucket width to wavefront_size / average_degree,
+  // merging several integer distance levels without any weight information
+  // that justifies doing so. Preserve the natural unit bucket and let the
+  // explicit multiplier provide controlled sweeps around it.
+  if (all_effective_weights_are_one) {
     return clamp_auto_delta(1.0, multiplier);
   }
 
@@ -139,7 +152,8 @@ inline float compute_auto_delta(
 
 }  // namespace delta_stepping_auto_detail
 
-// cuGraph-inspired graph-aware bucket-width seed:
+// Exact-unit effective weights use a seed of one. Other nonzero weighted
+// graphs use the cuGraph-inspired graph-aware bucket-width seed:
 //   wavefront_size * average_effective_weight / average_out_degree.
 // The multiplier supports an explicit sweep around that seed. The overload
 // with vertex costs uses the algorithm's destination-cost convention exactly:
