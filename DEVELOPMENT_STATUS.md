@@ -43,7 +43,7 @@ throughput, so the real multi-sink result remains provisional.
 | Area | Current implementation |
 | --- | --- |
 | Routing adapter | One batched original-source search per net, compact source-rooted paths, last-tree-intersection trimming, deterministic parent-conflict rejection, and a critical-path-inflation regression. |
-| Interchange import | Truly source-less OOC signals are preserved but excluded from route completion. Unsupported partial/static/shape work is preserved and reported, then rejected by default unless diagnostic-only opt-in is explicit. Fixed routes reserve pins, stub nodes, both PIP endpoints, and xcvu3p's paired static SLICEL/SLICEM outputs. Device-graph v3 uses active typed alternate-site mappings, validates the physical part, rejects ambiguous lookups, duplicate physical names, and cross-net endpoint ownership, excludes unserializable pseudo-PIPs, makes non-source sinks terminal, and removes incoming edges to exclusive sources while retaining their outgoing rows. Logical name-only links are emitted only when globally unambiguous. New CSR v2/metadata v5 outputs embed one 128-bit pair ID, publish it in the generation sidecar, and propagate it to routes; guarded readers reject mixed or stale artifacts. |
+| Interchange import | Truly source-less OOC signals are preserved but excluded from route completion. RapidWright's exact `GLOBAL_USEDNET` sentinel is supported preservation-only occupancy; unrouted static nets still fail closed because dedicated static routing is not modeled. Other unsupported partial/static/shape work is preserved and reported, then rejected by default unless diagnostic-only opt-in is explicit. Fixed routes reserve pins, stub nodes, both PIP endpoints, and xcvu3p's paired static SLICEL/SLICEM outputs. Device-graph v3 uses active typed alternate-site mappings, validates the physical part, rejects ambiguous lookups, duplicate physical names, and cross-net endpoint ownership, excludes unserializable pseudo-PIPs, makes non-source sinks terminal, and removes incoming edges to exclusive sources while retaining their outgoing rows. Source/stub analysis retains scratch high-water capacity, and the blocked/exclusive destination union restores one destination-mask read per filtered edge. The one-time preprocessor avoids duplicate device-string/wire lookup storage and compacts row offsets in place. Logical name-only links are emitted only when globally unambiguous. New CSR v2/metadata v5 outputs embed one 128-bit pair ID, publish it in the generation sidecar, and propagate it to routes; guarded readers reject mixed or stale artifacts. |
 | UnitBFS graph | Shared immutable outgoing CSR. Graph construction validates every edge weight as exactly `1.0f`; normal dispatch therefore already rejects non-unit input. |
 | Shared query capacity | PathFinder derives optional source/target high-water hints from exactly the routed metadata prefix, retaining duplicate endpoint counts. Checked count/byte arithmetic rejects overflow; low-level callers may omit hints. Compact paths are never reserved from graph size. |
 | UnitBFS state | Private stream-affine workspaces, automatic 32-bit row/predecessor-edge offsets when `nnz <= INT32_MAX`, a forced-64-bit test mode, one append-only frontier/visited queue, geometrically retained source/target/metadata/offset/path buffers, and compact validated target paths. Sparse reset remains the default; packed generation-stamped visitation is opt-in and performs a safe full reset on rollover. |
@@ -82,8 +82,10 @@ exclusion, typed alternate pin mapping, xcvu3p static-output pairing, part
 matching, lookup/name-conflict rejection, path alias guards, artifact pair-ID
 round trips/mismatch rejection, CSR filtering, binary round trips, duplicate
 endpoint reconstruction, reached-sink attachment, integral route IDs, and
-deterministic shared-node source roots without generated Cap'n Proto
-headers.
+deterministic shared-node source roots without generated Cap'n Proto headers.
+The device-graph suite also exhausts all 4,096 four-node combinations of
+blocked, terminal-sink, and exclusive-source masks against the former
+two-mask reference policy.
 
 ASan+UBSan builds pass for both fake-HIP PathFinder suites and the host
 policy/model suites with `ASAN_OPTIONS=detect_leaks=0`; this macOS ASan runtime

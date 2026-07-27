@@ -306,6 +306,20 @@ static, or structurally incompatible work fails conversion by default; the
 diagnostic-only `--allow-unsupported-preserved-nets` option keeps it unchanged
 but deliberately excludes it from PathFinder completion accounting.
 `PathFinderFile` intentionally does not expose this diagnostic escape hatch.
+RapidWright's exact case-sensitive signal sentinel `GLOBAL_USEDNET` is
+supported preservation-only occupancy and is not counted as an unsupported
+signal shape. An unrouted `GLOBAL_LOGIC0`/`GLOBAL_LOGIC1` remains unsupported:
+RWRoute uses dedicated static-net source and legality rules that an ordinary
+source-rooted UnitBFS/Delta request cannot reproduce safely.
+
+The per-design importer retains its route-branch and endpoint scratch capacity,
+analyzes each routable source forest once, reserves the large name/endpoint
+maps, and precombines blocked/exclusive destination state before the edge
+filter. The one-time device preprocessor builds compact lookup records directly
+and compacts row offsets in place. These changes preserve serialized order and
+filter semantics; no production converter timing is claimed on the host-only
+development machine.
+
 The two outputs are staged before publication. Separate adjacent `.publishing`
 guards are acquired for the CSR and metadata paths, so converters that share
 either output cannot race. CSR version 2 and metadata version 5 embed the same
@@ -724,7 +738,10 @@ output, and computes the benchmark score.
   reported, then fail conversion by default. The explicit
   `--allow-unsupported-preserved-nets` diagnostic mode leaves those nets
   unchanged; they are not covered by PathFinder's reached-all-sinks result.
-  Contest static and global routing is expected to arrive pre-routed.
+  Contest static and global routing is expected to arrive pre-routed. The exact
+  RapidWright `GLOBAL_USEDNET` sentinel is not a logical connection: its
+  represented resources are preserved as supported occupancy without creating
+  a route request.
 - Device preprocessing follows `altPinsToPrimaryPins`, retains site type in
   every cache key, and requires exact schema lengths. Per-design lookup uses
   `PhysicalNetlist.siteInsts` to select the active `(site,type,pin)` mapping.
