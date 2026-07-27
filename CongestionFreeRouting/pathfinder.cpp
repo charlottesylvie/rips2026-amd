@@ -1282,11 +1282,13 @@ std::size_t recommend_unit_bfs_worker_count(minplus_sparse::Offset rows,
 #endif
 }
 
-std::size_t recommend_delta_worker_count(minplus_sparse::Offset rows,
-                                         std::size_t route_request_count,
-                                         bool unit_specialization,
-                                         hipStream_t stream) {
-  if (stream != nullptr || rows <= 0 || route_request_count <= 1) {
+std::size_t recommend_weighted_worker_count(
+    minplus_sparse::Offset rows,
+    std::size_t route_request_count,
+    std::size_t bytes_per_vertex_budget,
+    hipStream_t stream) {
+  if (stream != nullptr || rows <= 0 || route_request_count <= 1 ||
+      bytes_per_vertex_budget == 0) {
     return 1;
   }
 
@@ -1299,12 +1301,9 @@ std::size_t recommend_delta_worker_count(minplus_sparse::Offset rows,
   (void)total_bytes;
 
   // The immutable CSR has already been uploaded once and is reflected in
-  // free_bytes. Exact-unit PathFinder queries allocate only their 24-byte per
-  // vertex append-only traversal state. Generic weighted fallback lazily adds
-  // membership flags, bucket queues, touched state, and race-safe parent keys,
-  // reaching 60 bytes per vertex. Vertex costs are also lazy and PathFinder
-  // never installs them. Leave a reserve for query and compact path buffers.
-  const std::size_t bytes_per_vertex_budget = unit_specialization ? 24 : 60;
+  // free_bytes. The caller supplies a conservative backend-specific mutable
+  // state estimate. Vertex costs are lazy and PathFinder never installs them.
+  // Leave a reserve for query and compact path buffers.
   constexpr std::size_t kPerWorkerReserve = 64ULL * 1024ULL * 1024ULL;
   constexpr std::size_t kMaxAutoWorkers = 8;
   const std::size_t row_count = static_cast<std::size_t>(rows);
@@ -1864,7 +1863,7 @@ void print_usage(const char* program) {
       << "  --delta-force-legacy-parent     Force generic Delta predecessor recovery for A/B comparison.\n"
       << "  --delta-telemetry               Emit one aggregate Delta-Stepping telemetry JSON record.\n"
       << "  --delta-benchmark-weights <unit|all-light|all-heavy|mixed>\n"
-      << "                                  Replace CSR weights deterministically for numeric-delta benchmarks.\n"
+      << "                                  Replace CSR weights for numeric Delta/Near-Far benchmarks.\n"
       << "  --delta-benchmark-weight-seed <uint>\n"
       << "                                  Seed for the mixed benchmark family. Default: 0\n"
       << "  --capacity <int>                Capacity used only for overuse diagnostics. Default: 1\n"
@@ -2300,9 +2299,13 @@ PathfinderResult run_pathfinder(const HostCsrF32& base_graph,
             std::all_of(base_graph.values.begin(),
                         base_graph.values.end(),
                         [](float value) { return value == 1.0f; });
-        delta_options.parallel_net_workers = recommend_delta_worker_count(
-            base_graph.rows, route_request_count, uses_unit_specialization,
-            stream);
+        const std::size_t bytes_per_vertex_budget =
+            uses_unit_specialization ? 24 : 60;
+        delta_options.parallel_net_workers =
+            recommend_weighted_worker_count(base_graph.rows,
+                                             route_request_count,
+                                             bytes_per_vertex_budget,
+                                             stream);
         std::cout << "[pathfinder] auto-selected "
                   << delta_options.parallel_net_workers
                   << " delta-step worker(s)\n";
@@ -2386,8 +2389,18 @@ PathfinderResult run_pathfinder(const HostCsrF32& base_graph,
       auto shared_graph =
           std::make_shared<NearFarCsrGraph>(base_graph, stream);
       if (near_far_options.parallel_net_workers == 0) {
-        near_far_options.parallel_net_workers = 1;
-        std::cout << "[pathfinder] auto-selected 1 Near-Far worker(s)\n";
+        // Compact Near-Far uses at most 56 bytes/vertex of persistent mutable
+        // state; wide parents raise the worst case to 60 bytes/vertex.
+        constexpr std::size_t kNearFarBytesPerVertexBudget = 60;
+        near_far_options.parallel_net_workers =
+            recommend_weighted_worker_count(
+                base_graph.rows,
+                route_request_count,
+                kNearFarBytesPerVertexBudget,
+                stream);
+        std::cout << "[pathfinder] auto-selected "
+                  << near_far_options.parallel_net_workers
+                  << " Near-Far worker(s)\n";
       }
       route_all_nets_with_workspace(
           base_graph,
@@ -2780,10 +2793,11 @@ int main(int argc, char** argv) {
     }
 
     if (delta_benchmark_weights_seen) {
-      if (options.sssp_engine != routing::SsspEngine::kDeltaStep) {
+      if (options.sssp_engine != routing::SsspEngine::kDeltaStep &&
+          options.sssp_engine != routing::SsspEngine::kNearFar) {
         throw std::runtime_error(
             "--delta-benchmark-weights requires --sssp-engine delta-step "
-            "or --use-delta-step");
+            "or near-far");
       }
       if (!delta_option_seen || options.delta_auto) {
         throw std::runtime_error(

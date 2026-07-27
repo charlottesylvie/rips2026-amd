@@ -2101,10 +2101,20 @@ int main() {
                               auto_near_far_options,
                               nullptr);
   require(auto_near_far_result.routed && g_near_far_calls == 2,
-          "auto-selected Near-Far worker should route every net");
+          "auto-selected Near-Far workers should route every net");
+  const std::size_t expected_near_far_workers =
+      routing::recommend_weighted_worker_count(
+          congestion_graph.rows,
+          congestion_metadata.route_requests.size(),
+          60,
+          nullptr);
+  require(expected_near_far_workers == 2,
+          "fake-memory Near-Far estimator should select two workers");
   require(g_near_far_graph_uploads == 1 &&
-              g_near_far_workspace_constructions == 1,
-          "Near-Far should initially auto-select one shared-graph worker");
+              g_near_far_workspace_constructions ==
+                  static_cast<int>(expected_near_far_workers),
+          "Near-Far automatic workers should share one graph and respect "
+          "the memory-aware worker budget");
   require(recorded_near_far_values() ==
               std::vector<float>({expected_near_far_delta,
                                   expected_near_far_delta}),

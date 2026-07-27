@@ -102,6 +102,35 @@ def main() -> None:
         "benchmark wrapper must preserve an explicit numeric delta",
     )
 
+    near_far = benchmark.parse_args(
+        [
+            "input.phys",
+            "output.phys",
+            "--sssp-engine",
+            "near-far",
+            "--delta",
+            "2.5",
+            "--delta-benchmark-weights",
+            "mixed",
+            "--delta-benchmark-weight-seed",
+            "17",
+        ]
+    )
+    require(
+        benchmark.pathfinder_args(near_far)
+        == [
+            "--sssp-engine",
+            "near-far",
+            "--delta",
+            "2.5",
+            "--delta-benchmark-weights",
+            "mixed",
+            "--delta-benchmark-weight-seed",
+            "17",
+        ],
+        "benchmark wrapper must forward Near-Far width and weight controls",
+    )
+
     forced = benchmark.parse_args(
         [
             "input.phys",
@@ -195,11 +224,15 @@ def main() -> None:
         ["--sssp-engine", "unit-bfs", "--delta-force-generic"],
         "force-generic was accepted with the unit-BFS engine",
     )
-    for non_delta_engine in ("unit-bfs", "bellman-ford"):
+    for non_delta_engine in ("unit-bfs", "near-far", "bellman-ford"):
         require_parse_rejected(
             ["--sssp-engine", non_delta_engine, "--delta-telemetry"],
             f"delta telemetry was accepted with {non_delta_engine!r}",
         )
+    require_parse_rejected(
+        ["--sssp-engine", "near-far", "--delta-force-generic"],
+        "Delta force-generic was accepted with the Near-Far engine",
+    )
     require_parse_rejected(
         ["--sssp-engine", "delta-step", "--delta-multiplier", "2"],
         "delta multiplier was accepted without --delta auto",

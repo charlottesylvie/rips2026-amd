@@ -168,7 +168,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     engine = parser.add_mutually_exclusive_group()
     engine.add_argument(
         "--sssp-engine",
-        choices=("unit-bfs", "delta-step", "bellman-ford"),
+        choices=("unit-bfs", "delta-step", "near-far", "bellman-ford"),
         help="shortest-path backend forwarded to PathFinder",
     )
     engine.add_argument(
@@ -177,7 +177,9 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         help="shorthand forwarded to select the delta-step backend",
     )
     parser.add_argument(
-        "--delta", type=delta_arg, help="positive delta-step bucket width or 'auto'"
+        "--delta",
+        type=delta_arg,
+        help="positive Delta/Near-Far distance width or 'auto'",
     )
     parser.add_argument(
         "--delta-multiplier",
@@ -217,7 +219,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument(
         "--max-sssp-iters",
         type=int,
-        help="delta-step rounds or unit-BFS depth cap",
+        help="Delta/Near-Far rounds or unit-BFS depth cap",
     )
     parser.add_argument(
         "--capacity",
@@ -259,19 +261,27 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     args = parser.parse_args(argv)
 
     delta_selected = args.use_delta_step or args.sssp_engine == "delta-step"
-    delta_specific_controls = (
+    weighted_selected = delta_selected or args.sssp_engine == "near-far"
+    width_controls = (
         args.delta is not None
         or args.delta_multiplier is not None
-        or args.delta_force_generic
-        or args.delta_force_legacy_parent
-        or args.delta_telemetry
         or args.delta_benchmark_weights is not None
         or args.delta_benchmark_weight_seed is not None
     )
-    if delta_specific_controls and not delta_selected:
+    if width_controls and not weighted_selected:
         parser.error(
-            "delta-specific options require --sssp-engine delta-step or "
-            "--use-delta-step"
+            "distance-width and benchmark-weight options require "
+            "--sssp-engine delta-step or near-far"
+        )
+    delta_only_controls = (
+        args.delta_force_generic
+        or args.delta_force_legacy_parent
+        or args.delta_telemetry
+    )
+    if delta_only_controls and not delta_selected:
+        parser.error(
+            "Delta execution and telemetry controls require "
+            "--sssp-engine delta-step or --use-delta-step"
         )
     if args.delta_multiplier is not None and args.delta != "auto":
         parser.error("--delta-multiplier requires --delta auto")

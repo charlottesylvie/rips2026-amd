@@ -102,6 +102,29 @@ int main() {
                                           "3"}),
             "router did not preserve Near-Far engine and width forwarding");
 
+    const Options near_far_weighted = parse(
+        {"PathFinderFile",
+         "design_unrouted.phys",
+         "design_routed.phys",
+         "--sssp-engine",
+         "near-far",
+         "--delta",
+         "1.25",
+         "--delta-benchmark-weights",
+         "mixed",
+         "--delta-benchmark-weight-seed",
+         "23"});
+    require(near_far_weighted.pathfinder_args ==
+                std::vector<std::string>({"--sssp-engine",
+                                          "near-far",
+                                          "--delta",
+                                          "1.25",
+                                          "--delta-benchmark-weights",
+                                          "mixed",
+                                          "--delta-benchmark-weight-seed",
+                                          "23"}),
+            "router did not preserve weighted Near-Far forwarding");
+
     const Options shorthand = parse(
         {"PathFinderFile",
          "design_unrouted.phys",

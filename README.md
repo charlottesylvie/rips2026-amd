@@ -65,23 +65,28 @@ make ROUTER=PathFinderFile BENCHMARKS="boom_med_pb" VERBOSE=1 \
   PATHFINDER_ARGS="--delta 2 --max-pathfinder-iters 20 --keep-work-dir"
 ```
 
-Compare the congestion-free unit-BFS backend against delta-stepping while
-keeping the same benchmark, preprocessed device graph, route writer, and
-wrapper path:
+Compare the congestion-free unit-BFS, Delta-Stepping, and Near-Far backends
+while keeping the same benchmark, preprocessed device graph, route writer,
+and wrapper path:
 
 ```bash
 make ROUTER=PathFinderFile BENCHMARKS="boom_med_pb" VERBOSE=1 \
   PATHFINDER_SSSP_ENGINE=unit-bfs
 make ROUTER=PathFinderFile BENCHMARKS="boom_med_pb" VERBOSE=1 \
   PATHFINDER_SSSP_ENGINE=delta-step
+make ROUTER=PathFinderFile BENCHMARKS="boom_med_pb" VERBOSE=1 \
+  PATHFINDER_SSSP_ENGINE=near-far
 ```
 
-The delta backend also accepts a graph-aware bucket-width seed and a sweep
+The two weighted backends accept the same graph-aware width seed and sweep
 multiplier while retaining numeric widths as explicit overrides:
 
 ```bash
 make ROUTER=PathFinderFile BENCHMARKS="boom_med_pb" VERBOSE=1 \
   PATHFINDER_SSSP_ENGINE=delta-step \
+  PATHFINDER_ARGS="--delta auto --delta-multiplier 0.5"
+make ROUTER=PathFinderFile BENCHMARKS="boom_med_pb" VERBOSE=1 \
+  PATHFINDER_SSSP_ENGINE=near-far \
   PATHFINDER_ARGS="--delta auto --delta-multiplier 0.5"
 ```
 
@@ -104,6 +109,16 @@ make ROUTER=PathFinderFile BENCHMARKS="boom_med_pb" VERBOSE=1 \
   PATHFINDER_ARGS="--delta 2 --delta-force-generic \
     --delta-benchmark-weights mixed --delta-benchmark-weight-seed 17 \
     --delta-telemetry"
+```
+
+Use the same transformed graph and numeric width for the corresponding
+Near-Far run (Delta telemetry and force controls remain Delta-only):
+
+```bash
+make ROUTER=PathFinderFile BENCHMARKS="boom_med_pb" VERBOSE=1 \
+  PATHFINDER_SSSP_ENGINE=near-far \
+  PATHFINDER_ARGS="--delta 2 \
+    --delta-benchmark-weights mixed --delta-benchmark-weight-seed 17"
 ```
 
 For AMD GPU profiling through the same Makefile path, see
@@ -168,6 +183,7 @@ the generated `.csrbin`, metadata, and routes files for debugging.
 | Path | Purpose |
 | --- | --- |
 | `CongestionFreeRouting/delta_stepping` | Production outgoing-CSR Delta-Stepping implementation used by PathFinder. |
+| `CongestionFreeRouting/near_far` | cuGraph-inspired outgoing-CSR Near-Far implementation selectable by PathFinder. |
 | `HIP_kernel/delta_stepping` | Legacy incoming-CSR Delta-Stepping experiment; it is not used by PathFinder. |
 | `HIP_kernel/bellman_ford` | Bellman-Ford experiments and correctness tests. Result metadata has target fields, but Bellman-Ford does not currently target-early-stop like Delta Stepping. |
 | `HIP_kernel/minplus_mm` | Dense and sparse min-plus matrix multiplication experiments. |
@@ -223,10 +239,12 @@ hipcc -std=c++17 -O3 -x hip -DBF10_NO_MAIN \
   -I HIP_kernel/bellman_ford/src \
   -I CongestionFreeRouting/bellman_ford \
   -I CongestionFreeRouting/delta_stepping \
+  -I CongestionFreeRouting/near_far \
   -I CongestionFreeRouting/unit_bfs \
   CongestionFreeRouting/pathfinder.cpp \
   CongestionFreeRouting/bellman_ford/bf10.cpp \
   CongestionFreeRouting/delta_stepping/delta_stepping_hip_CSR.cpp \
+  CongestionFreeRouting/near_far/near_far.cpp \
   CongestionFreeRouting/unit_bfs/unit_bfs_hip_CSR.cpp \
   -pthread -o pathfinder
 
@@ -308,16 +326,16 @@ Tuning options:
 
 | Option | Default | Meaning |
 | --- | --- | --- |
-| `--sssp-engine <unit-bfs\|delta-step\|bellman-ford\|bf10>` | `unit-bfs` | Shortest-path backend; `bf8`, `bf9`, and `bf10` are Bellman-Ford compatibility aliases. |
+| `--sssp-engine <unit-bfs\|delta-step\|near-far\|bellman-ford\|bf10>` | `unit-bfs` | Shortest-path backend; `bf8`, `bf9`, and `bf10` are Bellman-Ford compatibility aliases. |
 | `--use-delta-step` | unset | Shorthand for `--sssp-engine delta-step`. |
-| `--delta <float\|auto>` | `1` | Explicit Delta-Stepping bucket width, or a graph-aware seed based on runtime wavefront size, average edge weight, and average out-degree. |
+| `--delta <float\|auto>` | `1` | Explicit Delta/Near-Far distance width, or a graph-aware seed based on runtime wavefront size, average edge weight, and average out-degree. |
 | `--delta-multiplier <float>` | `1` | Positive multiplier for sweeping around `--delta auto`; rejected with an explicit numeric width. |
 | `--delta-force-generic` | unset | Bypass only the exact-unit Delta dispatch while preserving weights, delta, destination costs, and automatic compact-parent selection. |
 | `--delta-force-legacy-parent` | unset | Select legacy predecessor recovery for generic vector-target Delta runs; combine with force-generic for a parent-policy A/B test. |
 | `--delta-telemetry` | unset | Emit one aggregate Delta-Stepping telemetry JSON record after all net workers join. |
-| `--delta-benchmark-weights <unit\|all-light\|all-heavy\|mixed>` | unset | Deterministically replace in-memory CSR weights for a benchmark; requires an explicit numeric delta. |
+| `--delta-benchmark-weights <unit\|all-light\|all-heavy\|mixed>` | unset | Deterministically replace in-memory CSR weights for a Delta/Near-Far benchmark; requires an explicit numeric delta. |
 | `--delta-benchmark-weight-seed <uint>` | `0` | Seed the `mixed` family; rejected for every other family. |
-| `--max-sssp-iters <int>` | `-1` | Delta buckets, unit-BFS depth, or Bellman-Ford rounds; `-1` uses the default. |
+| `--max-sssp-iters <int>` | `-1` | Delta buckets, Near-Far expansions, unit-BFS depth, or Bellman-Ford rounds; `-1` uses the default. |
 | `--capacity <int>` | `1` | Capacity used only for overuse diagnostics. |
 | `--net-limit <count>` | unset | Route only the first `count` requests. |
 | `--parallel-net-workers <count>` | `0` | Independent net workers; `0` enables engine-dependent auto-selection. Workers share one immutable CSR across worker-private search state. |
@@ -326,15 +344,16 @@ Tuning options:
 | `--routes-out <path>` | unset | Write routed PIP tree data as JSONL. |
 | `--max-pathfinder-iters`, `--present-factor`, `--present-multiplier`, `--history-factor`, `--route-batch-size` | ignored | Compatibility-only options accepted by the one-shot router. |
 
-Every Delta-specific control requires `--sssp-engine delta-step` or
-`--use-delta-step`; other engines reject rather than ignore it. Force-generic
-works with numeric or automatic delta. The multiplier requires automatic
-delta, benchmark weight families require an explicit numeric delta, and the
-seed is valid only with `mixed`. Force-generic and force-legacy-parent may be
-combined: the first chooses generic execution and the second chooses its
-parent representation. Force-legacy-parent by itself also makes the fixed
-exact-unit parent path ineligible, so use force-generic with automatic parents
-for a clean execution-path A/B comparison.
+Distance-width and benchmark-weight controls require `delta-step` or
+`near-far`. The force-generic, force-legacy-parent, and telemetry controls
+remain Delta-only; other engines reject rather than ignore them. The
+multiplier requires automatic delta, benchmark weight families require an
+explicit numeric delta, and the seed is valid only with `mixed`.
+Force-generic and force-legacy-parent may be combined: the first chooses
+generic Delta execution and the second chooses its parent representation.
+Force-legacy-parent by itself also makes the fixed exact-unit Delta parent
+path ineligible, so use force-generic with automatic parents for a clean
+execution-path A/B comparison.
 
 The converter emits exact unit weights. An automatic vector-target Delta
 workspace uses its append-only exact-unit specialization only when the graph
@@ -345,7 +364,9 @@ bypasses only that dispatch; it does not rewrite weights, delta,
 destination-cost semantics, or compact-versus-legacy parent policy. A finite
 iteration limit or nonnull low-level callback also makes the call generic, but
 those controls change execution semantics and should not be used as benchmark
-forcing tricks.
+shortcuts. Near-Far similarly selects its exact-unit controller for unlimited,
+callback-free unit-weight runs without destination costs; non-unit transformed
+weights exercise its generic four-queue scheduler.
 
 Benchmark families are applied after loading and change only the in-memory
 graph; the `.csrbin` file remains unchanged:
@@ -519,6 +540,7 @@ g++ -std=c++17 -O2 -pthread \
   -I HIP_kernel/bellman_ford/src \
   -I CongestionFreeRouting/bellman_ford \
   -I CongestionFreeRouting/delta_stepping \
+  -I CongestionFreeRouting/near_far \
   -I CongestionFreeRouting/unit_bfs \
   CongestionFreeRouting/tests/pathfinder_bf10_cpu_stub_test.cpp \
   -o /tmp/pathfinder_bf10_cpu_stub_test
@@ -586,6 +608,34 @@ hipcc -std=c++17 -O2 -pthread -x hip \
   -o /tmp/delta_stepping_hip_test
 
 /tmp/delta_stepping_hip_test
+```
+
+Near-Far correctness regression and validated Delta/UnitBFS comparison
+benchmark (requires an AMD HIP system):
+
+```bash
+hipcc -std=c++17 -O2 -pthread -x hip \
+  -I HIP_kernel/bellman_ford/src \
+  -I CongestionFreeRouting/near_far \
+  CongestionFreeRouting/tests/near_far_hip_test.cpp \
+  CongestionFreeRouting/near_far/near_far.cpp \
+  -o /tmp/near_far_hip_test
+
+/tmp/near_far_hip_test
+
+hipcc -std=c++17 -O3 -DNDEBUG -pthread -x hip \
+  -I HIP_kernel/bellman_ford/src \
+  -I CongestionFreeRouting/bellman_ford \
+  -I CongestionFreeRouting/delta_stepping \
+  -I CongestionFreeRouting/near_far \
+  -I CongestionFreeRouting/unit_bfs \
+  CongestionFreeRouting/tests/near_far_benchmark_hip.cpp \
+  CongestionFreeRouting/near_far/near_far.cpp \
+  CongestionFreeRouting/delta_stepping/delta_stepping_hip_CSR.cpp \
+  CongestionFreeRouting/unit_bfs/unit_bfs_hip_CSR.cpp \
+  -o /tmp/near_far_benchmark_hip
+
+/tmp/near_far_benchmark_hip 32768 21
 ```
 
 Python route-writer regression test:

@@ -526,6 +526,7 @@ struct DeviceQueueView {
   unsigned int membership_bit = 0;
   int queue_index = 0;
   int shards = 1;
+  int shard_mask = 0;
   int shard_capacity = 0;
   int logical_capacity = 0;
   bool bounded = false;
@@ -536,6 +537,7 @@ struct QueueStorage {
   DeviceBuffer<int> shard_counts;
   DeviceBuffer<int> total_claims;
   int shards = 1;
+  int shard_mask = 0;
   int shard_capacity = 0;
   int logical_capacity = 0;
   unsigned int membership_bit = 0;
@@ -558,6 +560,9 @@ struct QueueStorage {
         shard_counts(static_cast<std::size_t>(shard_count)),
         total_claims(capacity < row_count ? 1 : 0),
         shards(shard_count),
+        shard_mask((shard_count & (shard_count - 1)) == 0
+                       ? shard_count - 1
+                       : -1),
         shard_capacity(capacity_per_shard(capacity, shard_count)),
         logical_capacity(capacity),
         membership_bit(1U << static_cast<unsigned int>(queue_index)),
@@ -578,6 +583,7 @@ struct QueueStorage {
             membership_bit,
             queue_index,
             shards,
+            shard_mask,
             shard_capacity,
             logical_capacity,
             bounded};
@@ -930,7 +936,9 @@ __device__ inline bool enqueue_unique(DeviceQueueView queue,
     if (!inserted) return true;
   }
 
-  const int shard = vertex % queue.shards;
+  const int shard = queue.shard_mask >= 0
+                        ? vertex & queue.shard_mask
+                        : vertex % queue.shards;
   const int position = atomicAdd(queue.shard_counts + shard, 1);
   if (position >= queue.shard_capacity) {
     set_device_error(queue.status, kDeferredQueueOverflow);
@@ -1168,18 +1176,22 @@ __global__ void expand_queue_kernel(
                                                    version,
                                                    processed_version,
                                                    input.epoch_queue);
-      const Offset current_edge =
-          load_parent_edge<CompactParents>(
-              v, compact_parent, wide_pred_edge);
-      if (candidate_is_better(candidate_distance,
-                              source_owner,
-                              candidate_hops,
-                              edge,
-                              dist[v],
-                              owner_source[v],
-                              hops[v],
-                              current_edge) &&
-          bump_version(version + v, input.status)) {
+      const float current_distance = dist[v];
+      bool better = candidate_distance < current_distance;
+      if (candidate_distance == current_distance) {
+        const Offset current_edge =
+            load_parent_edge<CompactParents>(
+                v, compact_parent, wide_pred_edge);
+        better = candidate_is_better(candidate_distance,
+                                     source_owner,
+                                     candidate_hops,
+                                     edge,
+                                     current_distance,
+                                     owner_source[v],
+                                     hops[v],
+                                     current_edge);
+      }
+      if (better && bump_version(version + v, input.status)) {
         dist[v] = candidate_distance;
         owner_source[v] = source_owner;
         hops[v] = candidate_hops;
@@ -1288,18 +1300,22 @@ __global__ void expand_exact_unit_kernel(
                                                    version,
                                                    processed_version,
                                                    input.epoch_queue);
-      const Offset current_edge =
-          load_parent_edge<CompactParents>(
-              v, compact_parent, wide_pred_edge);
-      if (candidate_is_better(candidate_distance,
-                              source_owner,
-                              candidate_hops,
-                              edge,
-                              dist[v],
-                              owner_source[v],
-                              hops[v],
-                              current_edge) &&
-          bump_version(version + v, input.status)) {
+      const float current_distance = dist[v];
+      bool better = candidate_distance < current_distance;
+      if (candidate_distance == current_distance) {
+        const Offset current_edge =
+            load_parent_edge<CompactParents>(
+                v, compact_parent, wide_pred_edge);
+        better = candidate_is_better(candidate_distance,
+                                     source_owner,
+                                     candidate_hops,
+                                     edge,
+                                     current_distance,
+                                     owner_source[v],
+                                     hops[v],
+                                     current_edge);
+      }
+      if (better && bump_version(version + v, input.status)) {
         dist[v] = candidate_distance;
         owner_source[v] = source_owner;
         hops[v] = candidate_hops;
@@ -1401,6 +1417,25 @@ __global__ void reset_checkpoint_status_kernel(SchedulerStatus* status,
   if (reset_changed) status->changed = 0;
 }
 
+__global__ void collect_queue_counts_kernel(QueueSetView queue_set,
+                                            SchedulerStatus* status) {
+  for (int queue_index = blockIdx.x * blockDim.x + threadIdx.x;
+       queue_index < kQueueCount;
+       queue_index += gridDim.x * blockDim.x) {
+    const DeviceQueueView queue = queue_set.queues[queue_index];
+    int total = 0;
+    for (int shard = 0; shard < queue.shards; ++shard) {
+      const int count = queue.shard_counts[shard];
+      if (count < 0 || count > queue.shard_capacity) {
+        set_device_error(status, kDeferredQueueOverflow);
+        return;
+      }
+      total += count;
+    }
+    status->queue_totals[queue_index] = total;
+  }
+}
+
 __global__ void collect_queue_status_kernel(
     QueueSetView queue_set,
     const float* dist,
@@ -1422,17 +1457,46 @@ __global__ void collect_queue_status_kernel(
     atomicAdd(status->queue_totals + queue_index, count);
   }
   if (!collect_minima) return;
+  const int first_index =
+      static_cast<int>(blockIdx.x) * static_cast<int>(blockDim.x);
+  if (first_index >= count) return;
+
+  // Queue entries are distributed across many blocks. Reduce within each
+  // block before touching the two global minima instead of issuing two global
+  // atomics for every live entry.
+  __shared__ unsigned int block_min_bits[kBlockSize];
+  unsigned int local_min_bits =
+      std::numeric_limits<unsigned int>::max();
   const int* vertices = queue.vertices + shard * queue.shard_capacity;
-  for (int index = blockIdx.x * blockDim.x + threadIdx.x;
+  for (int index = first_index + static_cast<int>(threadIdx.x);
        index < count;
        index += gridDim.x * blockDim.x) {
     const int vertex = vertices[index];
     if (state_is_current(queue.epoch_queue, vertex, queue.epoch) &&
         version[vertex] > processed_version[vertex]) {
       const unsigned int bits = __float_as_uint(dist[vertex]);
-      atomicMin(status->queue_min_bits + queue_index, bits);
-      atomicMin(&status->min_pending_bits, bits);
+      local_min_bits =
+          local_min_bits < bits ? local_min_bits : bits;
     }
+  }
+  block_min_bits[threadIdx.x] = local_min_bits;
+  __syncthreads();
+  for (int stride = blockDim.x / 2; stride > 0; stride /= 2) {
+    if (threadIdx.x < stride) {
+      block_min_bits[threadIdx.x] =
+          block_min_bits[threadIdx.x] <
+                  block_min_bits[threadIdx.x + stride]
+              ? block_min_bits[threadIdx.x]
+              : block_min_bits[threadIdx.x + stride];
+    }
+    __syncthreads();
+  }
+  if (threadIdx.x == 0 &&
+      block_min_bits[0] !=
+          std::numeric_limits<unsigned int>::max()) {
+    atomicMin(status->queue_min_bits + queue_index,
+              block_min_bits[0]);
+    atomicMin(&status->min_pending_bits, block_min_bits[0]);
   }
 }
 
@@ -1442,19 +1506,48 @@ __global__ void collect_target_bounds_kernel(const int* targets,
                                              const unsigned int* epoch_queue,
                                              unsigned int epoch,
                                              SchedulerStatus* status) {
+  __shared__ int block_unreached[kBlockSize];
+  __shared__ unsigned int block_max_bits[kBlockSize];
+  int local_unreached = 0;
+  unsigned int local_max_bits = 0;
   for (int index = blockIdx.x * blockDim.x + threadIdx.x;
        index < target_count;
        index += gridDim.x * blockDim.x) {
     const int target = targets[index];
     if (!state_is_current(epoch_queue, target, epoch)) {
-      atomicAdd(&status->unreached_targets, 1);
+      ++local_unreached;
       continue;
     }
     const float value = dist[target];
     if (!finite_float(value)) {
-      atomicAdd(&status->unreached_targets, 1);
+      ++local_unreached;
     } else {
-      atomicMax(&status->max_target_bits, __float_as_uint(value));
+      const unsigned int bits = __float_as_uint(value);
+      local_max_bits =
+          local_max_bits > bits ? local_max_bits : bits;
+    }
+  }
+  block_unreached[threadIdx.x] = local_unreached;
+  block_max_bits[threadIdx.x] = local_max_bits;
+  __syncthreads();
+  for (int stride = blockDim.x / 2; stride > 0; stride /= 2) {
+    if (threadIdx.x < stride) {
+      block_unreached[threadIdx.x] +=
+          block_unreached[threadIdx.x + stride];
+      block_max_bits[threadIdx.x] =
+          block_max_bits[threadIdx.x] >
+                  block_max_bits[threadIdx.x + stride]
+              ? block_max_bits[threadIdx.x]
+              : block_max_bits[threadIdx.x + stride];
+    }
+    __syncthreads();
+  }
+  if (threadIdx.x == 0) {
+    if (block_unreached[0] != 0) {
+      atomicAdd(&status->unreached_targets, block_unreached[0]);
+    }
+    if (block_max_bits[0] != 0) {
+      atomicMax(&status->max_target_bits, block_max_bits[0]);
     }
   }
 }
@@ -1955,18 +2048,24 @@ struct NearFarCsrWorkspace::Impl {
     reset_checkpoint_status_kernel<<<1, 1, 0, stream>>>(
         scratch.scheduler_status.get(), false);
     NEAR_FAR_HIP_CHECK(hipGetLastError());
-    collect_queue_status_kernel
-        <<<dim3(grid_for_shard(largest_queue_shard_capacity()),
-                 static_cast<unsigned int>(scratch.shards),
-                 static_cast<unsigned int>(kQueueCount)),
-           dim3(kBlockSize),
-           0,
-           stream>>>(queue_set_view(),
-                     scratch.dist.get(),
-                     scratch.version.get(),
-                     scratch.processed_version.get(),
-                     scratch.scheduler_status.get(),
-                     target_count > 0 || force_minima);
+    const bool collect_minima = target_count > 0 || force_minima;
+    if (collect_minima) {
+      collect_queue_status_kernel
+          <<<dim3(grid_for_shard(largest_queue_shard_capacity()),
+                   static_cast<unsigned int>(scratch.shards),
+                   static_cast<unsigned int>(kQueueCount)),
+             dim3(kBlockSize),
+             0,
+             stream>>>(queue_set_view(),
+                       scratch.dist.get(),
+                       scratch.version.get(),
+                       scratch.processed_version.get(),
+                       scratch.scheduler_status.get(),
+                       true);
+    } else {
+      collect_queue_counts_kernel<<<1, kQueueCount, 0, stream>>>(
+          queue_set_view(), scratch.scheduler_status.get());
+    }
     NEAR_FAR_HIP_CHECK(hipGetLastError());
     if (target_count > 0) {
       collect_target_bounds_kernel

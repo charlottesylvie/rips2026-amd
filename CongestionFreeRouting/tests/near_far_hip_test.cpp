@@ -679,6 +679,40 @@ void test_early_settlement_and_scalar_api(hipStream_t stream) {
           "safe early target settlement did not stop before distant work");
 }
 
+void test_large_target_checkpoint_reductions(hipStream_t stream) {
+  // One deferred shard and >1024 vertices force the queue-minimum scan across
+  // multiple blocks; the full target set independently exercises the target
+  // reduction across multiple blocks.
+  constexpr int vertex_count = 1200;
+  constexpr int reached_count = 1120;
+  std::vector<EdgeSpec> edges;
+  edges.reserve(reached_count - 1);
+  for (int vertex = 1; vertex < reached_count; ++vertex) {
+    const float weight =
+        vertex % 3 == 0 ? 0.25f : (vertex % 3 == 1 ? 1.0f : 8.0f);
+    edges.push_back({0, vertex, weight});
+  }
+  const HostCsrF32 graph = make_outgoing_csr(vertex_count, edges);
+  std::vector<int> targets;
+  targets.reserve(vertex_count);
+  for (int vertex = 0; vertex < vertex_count; ++vertex) {
+    targets.push_back(vertex);
+  }
+
+  NearFarCsrWorkspace workspace(
+      graph, stream, NearFarCsrWorkspaceOptions{1, 8});
+  const NearFarCsrResult result = run_targets_and_check(
+      "multi-block checkpoint reductions",
+      workspace,
+      graph,
+      {0},
+      targets,
+      1.0f,
+      stream);
+  require(!result.target_reached && result.converged,
+          "large target checkpoint lost unreachable-target state");
+}
+
 void test_validation_and_singleton() {
   const HostCsrF32 singleton = make_outgoing_csr(1, {});
   NearFarCsrWorkspace workspace(singleton, nullptr);
@@ -860,6 +894,7 @@ int main() {
     test_thresholds_stale_entries_and_spill(stream.get());
     test_limits_callbacks_reuse_and_costs(stream.get());
     test_early_settlement_and_scalar_api(stream.get());
+    test_large_target_checkpoint_reductions(stream.get());
     test_validation_and_singleton();
     test_shared_graph_stream_affinity_and_concurrency();
     std::cout << "Near-Far HIP test passed\n";

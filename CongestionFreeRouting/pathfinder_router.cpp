@@ -192,7 +192,7 @@ void print_usage(const char* program) {
       << "  --delta <float|auto>           Forwarded to pathfinder.\n"
       << "  --delta-multiplier <float>     Forwarded for an automatic-delta sweep.\n"
       << "  --delta-benchmark-weights <unit|all-light|all-heavy|mixed>\n"
-      << "                                 Forward a reproducible benchmark weight family.\n"
+      << "                                 Forward a reproducible Delta/Near-Far weight family.\n"
       << "  --delta-benchmark-weight-seed <nonnegative-int>\n"
       << "                                 Forward a seed; valid only with mixed weights.\n"
       << "  --max-sssp-iters <int>         Forwarded to pathfinder.\n"
