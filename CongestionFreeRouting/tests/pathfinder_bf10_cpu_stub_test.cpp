@@ -38,6 +38,9 @@ std::vector<int> g_unit_depth_limits;
 std::mutex g_capacity_hints_mutex;
 std::vector<SsspQueryCapacityHints> g_delta_capacity_hints;
 std::vector<SsspQueryCapacityHints> g_unit_capacity_hints;
+std::mutex g_delta_workspace_options_mutex;
+std::vector<DeltaSteppingCsrControllerMode> g_delta_controller_modes;
+std::vector<std::uint32_t> g_delta_controller_batch_sizes;
 
 void clear_recorded_deltas() {
   std::lock_guard<std::mutex> lock(g_delta_values_mutex);
@@ -79,6 +82,22 @@ std::vector<SsspQueryCapacityHints> recorded_delta_capacity_hints() {
 std::vector<SsspQueryCapacityHints> recorded_unit_capacity_hints() {
   std::lock_guard<std::mutex> lock(g_capacity_hints_mutex);
   return g_unit_capacity_hints;
+}
+
+void clear_recorded_delta_workspace_options() {
+  std::lock_guard<std::mutex> lock(g_delta_workspace_options_mutex);
+  g_delta_controller_modes.clear();
+  g_delta_controller_batch_sizes.clear();
+}
+
+std::vector<DeltaSteppingCsrControllerMode> recorded_delta_controller_modes() {
+  std::lock_guard<std::mutex> lock(g_delta_workspace_options_mutex);
+  return g_delta_controller_modes;
+}
+
+std::vector<std::uint32_t> recorded_delta_controller_batch_sizes() {
+  std::lock_guard<std::mutex> lock(g_delta_workspace_options_mutex);
+  return g_delta_controller_batch_sizes;
 }
 
 struct CpuSsspResult {
@@ -423,7 +442,12 @@ void populate_stub_delta_telemetry(
     float delta,
     bool force_generic,
     bool force_legacy_parent,
-    bool has_vertex_costs) {
+    bool has_vertex_costs,
+    DeltaSteppingCsrControllerMode requested_controller_mode =
+        DeltaSteppingCsrControllerMode::kHostChecked,
+    std::uint32_t requested_controller_batch_size =
+        kDeltaSteppingCsrRecommendedControllerBatchSize,
+    bool controller_fallback = false) {
   const std::uint64_t token =
       sources.empty()
           ? 1
@@ -463,6 +487,21 @@ void populate_stub_delta_telemetry(
   telemetry.heavy_queue_high_water = 21 * token;
   telemetry.controller_round_trips = 22 * token;
   telemetry.compact_parent_fallback_events = 23 * token;
+  telemetry.requested_controller_mode = requested_controller_mode;
+  telemetry.requested_controller_batch_size =
+      requested_controller_batch_size;
+  telemetry.controller_fallback = controller_fallback;
+  telemetry.effective_controller_mode =
+      requested_controller_mode ==
+                  DeltaSteppingCsrControllerMode::kReducedRoundTrip &&
+              !controller_fallback
+          ? DeltaSteppingCsrControllerMode::kReducedRoundTrip
+          : DeltaSteppingCsrControllerMode::kHostChecked;
+  telemetry.effective_controller_batch_size =
+      telemetry.effective_controller_mode ==
+              DeltaSteppingCsrControllerMode::kReducedRoundTrip
+          ? requested_controller_batch_size
+          : 1;
 }
 
 class ScopedCoutCapture {
@@ -1040,9 +1079,18 @@ DeltaSteppingCsrWorkspace::DeltaSteppingCsrWorkspace(
   parent_mode_ = options.parent_mode;
   execution_mode_ = options.execution_mode;
   current_membership_mode_ = options.current_membership_mode;
+  controller_mode_ = options.controller_mode;
+  controller_batch_size_ = options.controller_batch_size;
   sssp_capacity::validate_reservation(options.capacity_hints);
-  std::lock_guard<std::mutex> lock(g_capacity_hints_mutex);
-  g_delta_capacity_hints.push_back(options.capacity_hints);
+  {
+    std::lock_guard<std::mutex> lock(g_capacity_hints_mutex);
+    g_delta_capacity_hints.push_back(options.capacity_hints);
+  }
+  {
+    std::lock_guard<std::mutex> lock(g_delta_workspace_options_mutex);
+    g_delta_controller_modes.push_back(options.controller_mode);
+    g_delta_controller_batch_sizes.push_back(options.controller_batch_size);
+  }
 }
 
 DeltaSteppingCsrWorkspace::DeltaSteppingCsrWorkspace(
@@ -1053,9 +1101,18 @@ DeltaSteppingCsrWorkspace::DeltaSteppingCsrWorkspace(
   parent_mode_ = options.parent_mode;
   execution_mode_ = options.execution_mode;
   current_membership_mode_ = options.current_membership_mode;
+  controller_mode_ = options.controller_mode;
+  controller_batch_size_ = options.controller_batch_size;
   sssp_capacity::validate_reservation(options.capacity_hints);
-  std::lock_guard<std::mutex> lock(g_capacity_hints_mutex);
-  g_delta_capacity_hints.push_back(options.capacity_hints);
+  {
+    std::lock_guard<std::mutex> lock(g_capacity_hints_mutex);
+    g_delta_capacity_hints.push_back(options.capacity_hints);
+  }
+  {
+    std::lock_guard<std::mutex> lock(g_delta_workspace_options_mutex);
+    g_delta_controller_modes.push_back(options.controller_mode);
+    g_delta_controller_batch_sizes.push_back(options.controller_batch_size);
+  }
 }
 
 DeltaSteppingCsrWorkspace::~DeltaSteppingCsrWorkspace() = default;
@@ -1131,7 +1188,9 @@ DeltaSteppingCsrResult DeltaSteppingCsrWorkspace::run(
         delta,
         execution_mode_ == DeltaSteppingCsrExecutionMode::kForceGeneric,
         parent_mode_ == DeltaSteppingCsrParentMode::kForceLegacy,
-        impl_->has_vertex_costs);
+        impl_->has_vertex_costs,
+        controller_mode_,
+        controller_batch_size_);
   }
   return result;
 }
@@ -1199,7 +1258,9 @@ DeltaSteppingCsrResult DeltaSteppingCsrWorkspace::run(
         delta,
         execution_mode_ == DeltaSteppingCsrExecutionMode::kForceGeneric,
         parent_mode_ == DeltaSteppingCsrParentMode::kForceLegacy,
-        impl_->has_vertex_costs);
+        impl_->has_vertex_costs,
+        controller_mode_,
+        controller_batch_size_);
   }
   return result;
 }
@@ -1492,14 +1553,21 @@ int main() {
             "capacity hints must reject a routed prefix beyond metadata");
   }
 
-  require(routing::PathfinderOptions{}.delta == 1.0f,
+  const routing::PathfinderOptions default_pathfinder_options;
+  require(default_pathfinder_options.delta == 1.0f,
           "default delta-stepping bucket width must be one");
-  require(!routing::PathfinderOptions{}.delta_auto,
+  require(!default_pathfinder_options.delta_auto,
           "automatic delta must remain an explicit opt-in");
-  require(!routing::PathfinderOptions{}.delta_force_generic,
+  require(!default_pathfinder_options.delta_force_generic,
           "generic Delta forcing must remain disabled by default");
-  require(!routing::PathfinderOptions{}.delta_telemetry,
+  require(!default_pathfinder_options.delta_telemetry,
           "Delta telemetry must remain disabled by default");
+  require(default_pathfinder_options.delta_controller_mode ==
+              DeltaSteppingCsrControllerMode::kHostChecked &&
+              default_pathfinder_options.delta_controller_batch_size == 4 &&
+              !default_pathfinder_options.delta_controller_controls_explicit,
+          "the host-checked Delta controller and recommended batch must "
+          "remain the PathFinder defaults");
   const routing::PathfinderOptions legacy_positional_options{
       routing::SsspEngine::kDeltaStep, 2.0f, 7, true, 3, 4, 5};
   require(legacy_positional_options.max_sssp_iterations == 7 &&
@@ -1510,7 +1578,11 @@ int main() {
               !legacy_positional_options.delta_auto &&
               legacy_positional_options.delta_multiplier == 1.0f &&
               !legacy_positional_options.delta_force_generic &&
-              !legacy_positional_options.delta_telemetry,
+              !legacy_positional_options.delta_telemetry &&
+              legacy_positional_options.delta_controller_mode ==
+                  DeltaSteppingCsrControllerMode::kHostChecked &&
+              legacy_positional_options.delta_controller_batch_size == 4 &&
+              !legacy_positional_options.delta_controller_controls_explicit,
           "new delta controls must preserve legacy aggregate field positions");
 
   HostCsrF32 delta_stats_graph;
@@ -1611,6 +1683,46 @@ int main() {
   require(invalid_delta_text_rejected,
           "--delta must reject strings other than exact 'auto'");
 
+  require(routing::parse_delta_controller_arg("host-checked") ==
+                  DeltaSteppingCsrControllerMode::kHostChecked &&
+              routing::parse_delta_controller_arg("reduced-round-trip") ==
+                  DeltaSteppingCsrControllerMode::kReducedRoundTrip,
+          "Delta controller parser must retain both explicit A/B modes");
+  bool invalid_controller_text_rejected = false;
+  try {
+    (void)routing::parse_delta_controller_arg("reduced");
+  } catch (const std::runtime_error&) {
+    invalid_controller_text_rejected = true;
+  }
+  require(invalid_controller_text_rejected,
+          "Delta controller parser accepted an unknown mode");
+
+  routing::PathfinderOptions reduced_controller_cli_options;
+  reduced_controller_cli_options.delta_controller_mode =
+      DeltaSteppingCsrControllerMode::kReducedRoundTrip;
+  routing::validate_delta_controller_cli_controls(
+      reduced_controller_cli_options, true, true);
+  for (const int invalid_cli_case : {0, 1, 2}) {
+    routing::PathfinderOptions invalid_cli_options;
+    bool controller_seen = false;
+    if (invalid_cli_case == 1) {
+      controller_seen = true;
+    } else if (invalid_cli_case == 2) {
+      invalid_cli_options.delta_controller_mode =
+          DeltaSteppingCsrControllerMode::kReducedRoundTrip;
+    }
+    bool rejected = false;
+    try {
+      routing::validate_delta_controller_cli_controls(
+          invalid_cli_options, controller_seen, true);
+    } catch (const std::runtime_error&) {
+      rejected = true;
+    }
+    require(rejected,
+            "controller batch size must require an explicitly selected "
+            "reduced-round-trip controller");
+  }
+
   routing::PathfinderOptions invalid_multiplier_options;
   invalid_multiplier_options.sssp_engine = routing::SsspEngine::kDeltaStep;
   invalid_multiplier_options.delta_multiplier = 2.0f;
@@ -1623,7 +1735,7 @@ int main() {
   require(explicit_multiplier_rejected,
           "a multiplier with explicit delta must not be silently ignored");
 
-  for (const int invalid_control : {0, 1, 2, 3}) {
+  for (const int invalid_control : {0, 1, 2, 3, 4, 5, 6}) {
     routing::PathfinderOptions invalid_engine_options;
     if (invalid_control == 0) {
       invalid_engine_options.delta_force_generic = true;
@@ -1631,8 +1743,15 @@ int main() {
       invalid_engine_options.delta_force_legacy_parent = true;
     } else if (invalid_control == 2) {
       invalid_engine_options.delta_controls_explicit = true;
-    } else {
+    } else if (invalid_control == 3) {
       invalid_engine_options.delta_telemetry = true;
+    } else if (invalid_control == 4) {
+      invalid_engine_options.delta_controller_controls_explicit = true;
+    } else if (invalid_control == 5) {
+      invalid_engine_options.delta_controller_mode =
+          DeltaSteppingCsrControllerMode::kReducedRoundTrip;
+    } else {
+      invalid_engine_options.delta_controller_batch_size = 7;
     }
     bool rejected = false;
     try {
@@ -1643,6 +1762,28 @@ int main() {
     require(rejected,
             "a non-Delta engine must reject Delta-specific controls");
   }
+
+  routing::PathfinderOptions invalid_controller_batch_options;
+  invalid_controller_batch_options.sssp_engine =
+      routing::SsspEngine::kDeltaStep;
+  invalid_controller_batch_options.delta_controller_batch_size = 0;
+  bool invalid_controller_batch_rejected = false;
+  try {
+    routing::validate_options(invalid_controller_batch_options);
+  } catch (const std::invalid_argument&) {
+    invalid_controller_batch_rejected = true;
+  }
+  require(invalid_controller_batch_rejected,
+          "Delta controller batch size must be positive");
+  invalid_controller_batch_options.delta_controller_batch_size = 7;
+  invalid_controller_batch_rejected = false;
+  try {
+    routing::validate_options(invalid_controller_batch_options);
+  } catch (const std::invalid_argument&) {
+    invalid_controller_batch_rejected = true;
+  }
+  require(invalid_controller_batch_rejected,
+          "a controller batch override must require reduced-round-trip mode");
 
   HostCsrF32 benchmark_weights_graph = make_tree_graph();
   routing::apply_delta_benchmark_weights(
@@ -1921,6 +2062,16 @@ int main() {
     aggregate_records.push_back(record);
   }
   aggregate_records[1].completed = false;
+  aggregate_records[2].requested_controller_mode =
+      DeltaSteppingCsrControllerMode::kReducedRoundTrip;
+  aggregate_records[2].effective_controller_mode =
+      DeltaSteppingCsrControllerMode::kReducedRoundTrip;
+  aggregate_records[2].requested_controller_batch_size = 7;
+  aggregate_records[2].effective_controller_batch_size = 7;
+  aggregate_records[3].requested_controller_mode =
+      DeltaSteppingCsrControllerMode::kReducedRoundTrip;
+  aggregate_records[3].requested_controller_batch_size = 7;
+  aggregate_records[3].controller_fallback = true;
   DeltaSteppingCsrTelemetry ignored_record;
   ignored_record.outer_buckets_processed = 100000;
   ignored_record.current_queue_high_water = 100000;
@@ -1931,7 +2082,10 @@ int main() {
   require(telemetry_totals.queries == 4 &&
               telemetry_totals.completed_queries == 3 &&
               telemetry_totals.path_counts ==
-                  std::array<std::uint64_t, 4>{1, 1, 1, 1},
+                  std::array<std::uint64_t, 4>{1, 1, 1, 1} &&
+              telemetry_totals.effective_controller_counts ==
+                  std::array<std::uint64_t, 2>{3, 1} &&
+              telemetry_totals.controller_fallback_queries == 1,
           "telemetry aggregation must count collected, completed, and path records");
   const DeltaSteppingCsrTelemetry& telemetry_sums = telemetry_totals.sums;
   require(telemetry_sums.outer_buckets_processed == 10 &&
@@ -1966,11 +2120,24 @@ int main() {
   aggregate_json_options.delta_multiplier = 0.25f;
   aggregate_json_options.delta_force_generic = true;
   aggregate_json_options.delta_force_legacy_parent = true;
+  aggregate_json_options.delta_controller_mode =
+      DeltaSteppingCsrControllerMode::kReducedRoundTrip;
+  aggregate_json_options.delta_controller_batch_size = 7;
   const std::string aggregate_json = routing::delta_telemetry_aggregate_json(
       aggregate_records, aggregate_json_options, 2.5f, 64, 3);
   require(aggregate_json.find('\n') == std::string::npos &&
+              aggregate_json.find("\"schema_version\":2") !=
+                  std::string::npos &&
               aggregate_json.find("\"queries\":4") != std::string::npos &&
               aggregate_json.find("\"completed_queries\":3") !=
+                  std::string::npos &&
+              aggregate_json.find(
+                  "\"controller_mode\":\"reduced_round_trip\","
+                  "\"controller_batch_size\":7") != std::string::npos &&
+              aggregate_json.find(
+                  "\"effective_controller_modes\":{\"host_checked\":3,"
+                  "\"reduced_round_trip\":1}") != std::string::npos &&
+              aggregate_json.find("\"controller_fallback_queries\":1") !=
                   std::string::npos &&
               aggregate_json.find(
                   "\"execution_paths\":{\"exact_unit\":1,"
@@ -2082,6 +2249,7 @@ int main() {
   g_delta_graph_uploads = 0;
   clear_recorded_deltas();
   clear_recorded_capacity_hints();
+  clear_recorded_delta_workspace_options();
   routing::PathfinderResult parallel_delta_result =
       routing::run_pathfinder(congestion_graph,
                               congestion_metadata,
@@ -2114,6 +2282,55 @@ int main() {
                           explicit_deltas.end(),
                           [](float value) { return value == 2.5f; }),
           "an explicit numeric delta must reach every worker unchanged");
+  const std::vector<DeltaSteppingCsrControllerMode>
+      default_controller_modes = recorded_delta_controller_modes();
+  const std::vector<std::uint32_t> default_controller_batch_sizes =
+      recorded_delta_controller_batch_sizes();
+  require(default_controller_modes.size() == 2 &&
+              std::all_of(default_controller_modes.begin(),
+                          default_controller_modes.end(),
+                          [](DeltaSteppingCsrControllerMode mode) {
+                            return mode ==
+                                   DeltaSteppingCsrControllerMode::kHostChecked;
+                          }) &&
+              default_controller_batch_sizes ==
+                  std::vector<std::uint32_t>({4, 4}),
+          "every default Delta worker must retain host-checked controller "
+          "options");
+
+  routing::PathfinderOptions reduced_controller_options =
+      parallel_delta_options;
+  reduced_controller_options.delta_force_generic = true;
+  reduced_controller_options.delta_controller_mode =
+      DeltaSteppingCsrControllerMode::kReducedRoundTrip;
+  reduced_controller_options.delta_controller_batch_size = 7;
+  reduced_controller_options.delta_controller_controls_explicit = true;
+  clear_recorded_delta_workspace_options();
+  const routing::PathfinderResult reduced_controller_result =
+      routing::run_pathfinder(congestion_graph,
+                              congestion_metadata,
+                              reduced_controller_options,
+                              nullptr);
+  require(reduced_controller_result.routed &&
+              reduced_controller_result.nets.size() ==
+                  parallel_delta_result.nets.size(),
+          "reduced controller selection must preserve fake-HIP routing "
+          "correctness");
+  const std::vector<DeltaSteppingCsrControllerMode>
+      reduced_controller_modes = recorded_delta_controller_modes();
+  const std::vector<std::uint32_t> reduced_controller_batch_sizes =
+      recorded_delta_controller_batch_sizes();
+  require(reduced_controller_modes.size() == 2 &&
+              std::all_of(reduced_controller_modes.begin(),
+                          reduced_controller_modes.end(),
+                          [](DeltaSteppingCsrControllerMode mode) {
+                            return mode == DeltaSteppingCsrControllerMode::
+                                               kReducedRoundTrip;
+                          }) &&
+              reduced_controller_batch_sizes ==
+                  std::vector<std::uint32_t>({7, 7}),
+          "every parallel Delta workspace must receive reduced controller "
+          "mode and batch size");
 
   routing::PathfinderOptions parallel_telemetry_options =
       parallel_delta_options;
@@ -2135,6 +2352,8 @@ int main() {
       single_delta_telemetry_json_line(parallel_telemetry_stdout);
   require(parallel_telemetry_json.find("\"queries\":2") !=
                   std::string::npos &&
+              parallel_telemetry_json.find("\"schema_version\":2") !=
+                  std::string::npos &&
               parallel_telemetry_json.find("\"completed_queries\":2") !=
                   std::string::npos &&
               parallel_telemetry_json.find("\"resolved_delta\":2.5") !=
@@ -2142,6 +2361,15 @@ int main() {
               parallel_telemetry_json.find("\"wavefront_size\":64") !=
                   std::string::npos &&
               parallel_telemetry_json.find("\"parallel_workers\":2") !=
+                  std::string::npos &&
+              parallel_telemetry_json.find(
+                  "\"controller_mode\":\"host_checked\","
+                  "\"controller_batch_size\":4") != std::string::npos &&
+              parallel_telemetry_json.find(
+                  "\"effective_controller_modes\":{\"host_checked\":2,"
+                  "\"reduced_round_trip\":0}") != std::string::npos &&
+              parallel_telemetry_json.find(
+                  "\"controller_fallback_queries\":0") !=
                   std::string::npos &&
               parallel_telemetry_json.find(
                   "\"execution_paths\":{\"exact_unit\":2,"

@@ -113,6 +113,20 @@ def nonnegative_int_arg(value: str) -> int:
     return numeric
 
 
+def positive_int_arg(value: str) -> int:
+    try:
+        numeric = int(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(
+            "value must be a positive 32-bit integer"
+        ) from exc
+    if numeric <= 0 or numeric > (1 << 31) - 1:
+        raise argparse.ArgumentTypeError(
+            "value must be a positive 32-bit integer"
+        )
+    return numeric
+
+
 def default_schema_dir() -> Path | None:
     env_schema = os.environ.get("FPGA_INTERCHANGE_SCHEMA_DIR")
     if env_schema:
@@ -200,6 +214,16 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         help="force legacy generic-delta predecessor recovery",
     )
     parser.add_argument(
+        "--delta-controller",
+        choices=("host-checked", "reduced-round-trip"),
+        help="generic delta-stepping controller mode",
+    )
+    parser.add_argument(
+        "--delta-controller-batch-size",
+        type=positive_int_arg,
+        help="positive batch size for the reduced-round-trip controller",
+    )
+    parser.add_argument(
         "--delta-benchmark-weights",
         choices=("unit", "all-light", "all-heavy", "mixed"),
         help="reproducible benchmark edge-weight family forwarded to PathFinder",
@@ -265,6 +289,8 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         or args.delta_force_generic
         or args.delta_force_legacy_parent
         or args.delta_telemetry
+        or args.delta_controller is not None
+        or args.delta_controller_batch_size is not None
         or args.delta_benchmark_weights is not None
         or args.delta_benchmark_weight_seed is not None
     )
@@ -275,6 +301,13 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         )
     if args.delta_multiplier is not None and args.delta != "auto":
         parser.error("--delta-multiplier requires --delta auto")
+    if args.delta_controller_batch_size is not None and (
+        args.delta_controller != "reduced-round-trip"
+    ):
+        parser.error(
+            "--delta-controller-batch-size requires "
+            "--delta-controller reduced-round-trip"
+        )
     if args.delta_benchmark_weights is not None and (
         args.delta is None or args.delta == "auto"
     ):
@@ -306,6 +339,8 @@ def pathfinder_args(args: argparse.Namespace) -> list[str]:
         ("sssp_engine", "--sssp-engine"),
         ("delta", "--delta"),
         ("delta_multiplier", "--delta-multiplier"),
+        ("delta_controller", "--delta-controller"),
+        ("delta_controller_batch_size", "--delta-controller-batch-size"),
         ("delta_benchmark_weights", "--delta-benchmark-weights"),
         ("delta_benchmark_weight_seed", "--delta-benchmark-weight-seed"),
         ("max_pathfinder_iters", "--max-pathfinder-iters"),

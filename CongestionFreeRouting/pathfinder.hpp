@@ -1,6 +1,7 @@
 #pragma once
 
 #include "../HIP_kernel/bellman_ford/src/bf_hip_CSR.hpp"
+#include "delta_stepping/delta_stepping_policy.hpp"
 #include "interchange/import_policy.hpp"
 #include "sssp_query_capacity.hpp"
 
@@ -113,6 +114,13 @@ struct PathfinderOptions {
   // explicitly supplied, so non-Delta engines cannot silently ignore it.
   bool delta_controls_explicit = false;
   bool delta_telemetry = false;
+  // The historical host-checked controller remains the default. These fields
+  // are appended so older positional aggregate initializers retain meaning.
+  DeltaSteppingCsrControllerMode delta_controller_mode =
+      DeltaSteppingCsrControllerMode::kHostChecked;
+  int delta_controller_batch_size =
+      static_cast<int>(kDeltaSteppingCsrRecommendedControllerBatchSize);
+  bool delta_controller_controls_explicit = false;
 };
 
 struct PathfinderResult {

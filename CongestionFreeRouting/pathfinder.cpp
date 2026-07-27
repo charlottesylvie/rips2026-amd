@@ -171,13 +171,39 @@ void validate_csr(const HostCsrF32& graph) {
 }
 
 void validate_options(const PathfinderOptions& options) {
+  switch (options.delta_controller_mode) {
+    case DeltaSteppingCsrControllerMode::kHostChecked:
+    case DeltaSteppingCsrControllerMode::kReducedRoundTrip:
+      break;
+    default:
+      throw std::invalid_argument("invalid Delta-Stepping controller mode");
+  }
+  if (options.delta_controller_batch_size <= 0) {
+    throw std::invalid_argument(
+        "Delta-Stepping controller batch size must be positive");
+  }
+  if (options.delta_controller_mode ==
+          DeltaSteppingCsrControllerMode::kHostChecked &&
+      options.delta_controller_batch_size !=
+          static_cast<int>(
+              kDeltaSteppingCsrRecommendedControllerBatchSize)) {
+    throw std::invalid_argument(
+        "Delta-Stepping controller batch size requires reduced-round-trip "
+        "controller mode");
+  }
   if (options.sssp_engine != SsspEngine::kDeltaStep) {
     if (options.delta_force_generic ||
         options.delta_force_legacy_parent ||
         options.delta_telemetry ||
         options.delta_auto ||
         options.delta_multiplier != 1.0f ||
-        options.delta_controls_explicit) {
+        options.delta_controls_explicit ||
+        options.delta_controller_controls_explicit ||
+        options.delta_controller_mode !=
+            DeltaSteppingCsrControllerMode::kHostChecked ||
+        options.delta_controller_batch_size !=
+            static_cast<int>(
+                kDeltaSteppingCsrRecommendedControllerBatchSize)) {
       throw std::invalid_argument(
           "Delta-Stepping controls require --sssp-engine delta-step or "
           "--use-delta-step");
@@ -1532,6 +1558,8 @@ struct DeltaTelemetryTotals {
   std::uint64_t queries = 0;
   std::uint64_t completed_queries = 0;
   std::array<std::uint64_t, 4> path_counts{};
+  std::array<std::uint64_t, 2> effective_controller_counts{};
+  std::uint64_t controller_fallback_queries = 0;
   DeltaSteppingCsrTelemetry sums;
   std::uint64_t current_queue_high_water = 0;
   std::uint64_t pending_queue_high_water = 0;
@@ -1560,6 +1588,19 @@ DeltaTelemetryTotals aggregate_delta_telemetry(
         break;
       case DeltaSteppingCsrExecutionPath::kNotRun:
         break;
+    }
+    switch (record.effective_controller_mode) {
+      case DeltaSteppingCsrControllerMode::kHostChecked:
+        ++totals.effective_controller_counts[0];
+        break;
+      case DeltaSteppingCsrControllerMode::kReducedRoundTrip:
+        ++totals.effective_controller_counts[1];
+        break;
+      default:
+        break;
+    }
+    if (record.controller_fallback) {
+      ++totals.controller_fallback_queries;
     }
     totals.sums.outer_buckets_processed +=
         record.outer_buckets_processed;
@@ -1619,7 +1660,7 @@ std::string delta_telemetry_aggregate_json(
   std::ostringstream out;
   out.precision(std::numeric_limits<float>::max_digits10);
   out << "{\"type\":\"delta_stepping_telemetry\""
-      << ",\"schema_version\":1"
+      << ",\"schema_version\":2"
       << ",\"scope\":\"pathfinder_run\""
       << ",\"queries\":" << totals.queries
       << ",\"completed_queries\":" << totals.completed_queries
@@ -1632,6 +1673,21 @@ std::string delta_telemetry_aggregate_json(
       << (options.delta_force_generic ? "true" : "false")
       << ",\"force_legacy_parent\":"
       << (options.delta_force_legacy_parent ? "true" : "false")
+      << ",\"controller_mode\":\""
+      << (options.delta_controller_mode ==
+                  DeltaSteppingCsrControllerMode::kReducedRoundTrip
+              ? "reduced_round_trip"
+              : "host_checked")
+      << "\""
+      << ",\"controller_batch_size\":"
+      << options.delta_controller_batch_size
+      << ",\"effective_controller_modes\":{"
+      << "\"host_checked\":" << totals.effective_controller_counts[0]
+      << ",\"reduced_round_trip\":"
+      << totals.effective_controller_counts[1]
+      << "}"
+      << ",\"controller_fallback_queries\":"
+      << totals.controller_fallback_queries
       << ",\"execution_paths\":{"
       << "\"exact_unit\":" << totals.path_counts[0]
       << ",\"compact_generic\":" << totals.path_counts[1]
@@ -1846,6 +1902,31 @@ void parse_delta_arg(const char* text, PathfinderOptions* options) {
   options->delta_controls_explicit = true;
 }
 
+DeltaSteppingCsrControllerMode parse_delta_controller_arg(const char* text) {
+  const std::string value(text);
+  if (value == "host-checked") {
+    return DeltaSteppingCsrControllerMode::kHostChecked;
+  }
+  if (value == "reduced-round-trip") {
+    return DeltaSteppingCsrControllerMode::kReducedRoundTrip;
+  }
+  throw std::runtime_error("invalid delta-controller: " + value);
+}
+
+void validate_delta_controller_cli_controls(
+    const PathfinderOptions& options,
+    bool controller_seen,
+    bool controller_batch_size_seen) {
+  if (controller_batch_size_seen &&
+      (!controller_seen ||
+       options.delta_controller_mode !=
+           DeltaSteppingCsrControllerMode::kReducedRoundTrip)) {
+    throw std::runtime_error(
+        "--delta-controller-batch-size requires --delta-controller "
+        "reduced-round-trip");
+  }
+}
+
 SsspEngine parse_sssp_engine_arg(const char* text) {
   const std::string value(text);
   if (value == "unit-bfs" || value == "bfs") {
@@ -1887,6 +1968,10 @@ void print_usage(const char* program) {
       << "  --max-sssp-iters <int>          Delta rounds, BFS depth, or Bellman-Ford rounds; -1 for default.\n"
       << "  --delta-force-generic           Bypass exact-unit specialization; retain weights and delta.\n"
       << "  --delta-force-legacy-parent     Force generic Delta predecessor recovery for A/B comparison.\n"
+      << "  --delta-controller <host-checked|reduced-round-trip>\n"
+      << "                                  Generic Delta controller. Default: host-checked\n"
+      << "  --delta-controller-batch-size <positive-int>\n"
+      << "                                  Reduced-round-trip controller batch size. Default: 4\n"
       << "  --delta-telemetry               Emit one aggregate Delta-Stepping telemetry JSON record.\n"
       << "  --delta-benchmark-weights <unit|all-light|all-heavy|mixed>\n"
       << "                                  Replace CSR weights deterministically for numeric-delta benchmarks.\n"
@@ -2386,6 +2471,10 @@ PathfinderResult run_pathfinder(const HostCsrF32& base_graph,
           delta_options.delta_force_generic
               ? DeltaSteppingCsrExecutionMode::kForceGeneric
               : DeltaSteppingCsrExecutionMode::kAutomatic;
+      workspace_options.controller_mode =
+          delta_options.delta_controller_mode;
+      workspace_options.controller_batch_size =
+          delta_options.delta_controller_batch_size;
       workspace_options.capacity_hints = query_capacity_hints;
       if (workspace_options.execution_mode ==
           DeltaSteppingCsrExecutionMode::kForceGeneric) {
@@ -2708,6 +2797,8 @@ int main(int argc, char** argv) {
     bool allow_unrouted_routes = false;
     bool sssp_engine_control_seen = false;
     bool delta_option_seen = false;
+    bool delta_controller_seen = false;
+    bool delta_controller_batch_size_seen = false;
     bool delta_benchmark_weights_seen = false;
     bool delta_benchmark_weight_seed_seen = false;
     bool net_limit_seen = false;
@@ -2770,6 +2861,18 @@ int main(int argc, char** argv) {
         options.delta_force_legacy_parent = true;
       } else if (option == "--delta-force-generic") {
         options.delta_force_generic = true;
+      } else if (option == "--delta-controller") {
+        options.delta_controller_mode =
+            routing::parse_delta_controller_arg(
+                require_value("--delta-controller"));
+        options.delta_controller_controls_explicit = true;
+        delta_controller_seen = true;
+      } else if (option == "--delta-controller-batch-size") {
+        options.delta_controller_batch_size = routing::parse_int_arg(
+            require_value("--delta-controller-batch-size"),
+            "delta-controller-batch-size");
+        options.delta_controller_controls_explicit = true;
+        delta_controller_batch_size_seen = true;
       } else if (option == "--delta-telemetry") {
         options.delta_telemetry = true;
       } else if (option == "--delta-benchmark-weights") {
@@ -2845,6 +2948,10 @@ int main(int argc, char** argv) {
           "--delta-benchmark-weight-seed requires "
           "--delta-benchmark-weights mixed");
     }
+    routing::validate_delta_controller_cli_controls(
+        options,
+        delta_controller_seen,
+        delta_controller_batch_size_seen);
     if (diagnose_net_seen != diagnose_sink_seen) {
       throw std::runtime_error(
           "--diagnose-net and --diagnose-sink must be specified together");

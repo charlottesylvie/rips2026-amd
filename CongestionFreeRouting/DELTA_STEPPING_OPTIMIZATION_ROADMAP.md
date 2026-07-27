@@ -1,8 +1,9 @@
 # Classic Delta-Stepping Optimization Roadmap
 
-Updated 2026-07-24 for the bounded optimization pass. Compact row offsets,
-generation-tagged current membership, and capacity pre-reservation are
-implemented and host-tested, but not compiled or run with HIP.
+Updated 2026-07-27 for the bounded controller pass. Compact row offsets,
+generation-tagged current membership, capacity pre-reservation, and the
+optional reduced-round-trip controller are implemented and host-tested, but
+not compiled or run with HIP.
 
 ## Scope
 
@@ -28,10 +29,13 @@ path, and cannot rank genuinely mixed-weight behavior.
 - Future work occupies one flat pending set. Every bucket transition reduces
   the full pending set to find the next bucket and then scans it again to
   compact the selected bucket.
-- The controller copies frontier counts after light rounds, settled-target
-  counts after buckets, next-bucket state, and compacted frontier counts to the
-  host. Explicit worker streams retain extra completion boundaries for gfx1151
-  correctness.
+- The established/default controller copies frontier counts after light
+  rounds, settled-target counts after buckets, next-bucket state, and compacted
+  frontier counts to the host. Explicit worker streams retain extra completion
+  boundaries for gfx1151 correctness. An opt-in capability-gated controller
+  keeps those dependent phases in one grid-synchronized cooperative kernel for
+  a bounded batch and publishes one compact descriptor; callbacks and
+  unsupported kernels use the full host fallback.
 - Scalar global atomics publish every competing distance update, queue claim,
   and queue reservation.
 - Compact vector-target runs use a 64-bit `{distance_bits,
@@ -46,7 +50,7 @@ path, and cannot rank genuinely mixed-weight behavior.
 - Six queues and three membership arrays are each sized to `V` in the generic
   path. Boolean `in_current` plus its clear kernel remains the default. An
   opt-in generation-tagged representation removes that clear and its dependent
-  synchronization only in the new path, with a full reset before token reuse.
+  synchronization in either controller, with a full reset before token reuse.
 - Deterministic weighted families, force-generic and force-legacy controls,
   opt-in telemetry, distances-only storage, and an exclusive distance bound
   are implemented and covered by test source.
@@ -54,6 +58,49 @@ path, and cannot rank genuinely mixed-weight behavior.
   path buffers grow geometrically and retain high-water capacity; compact paths
   are never guessed from graph size. Compact-parent queries avoid legacy parent
   arrays, and strict distances-only storage ignores target/path hints.
+
+### Controller boundary inventory
+
+The two modes own the same classic-Delta queues and distance/parent state but
+publish them at different boundaries. This is a structural inventory, not a
+hardware result:
+
+| Dependency boundary | Host-checked/default | Reduced-round-trip/opt-in |
+| --- | --- | --- |
+| Same-bucket light round | Boolean mode launches a membership clear, preserves its explicit-stream completion boundary, launches relaxation, copies the next-frontier count to host, and synchronizes. Generation mode removes only the clear. | Boolean clear and light relaxation are grid phases; generation uses a fresh reserved token. Queue payloads and counts cross a device fence plus cooperative grid barrier. |
+| Target settlement | A vector target launches mark/count then copies the count; a scalar target copies its distance. Each host decision synchronizes. | Settlement follows completed light closure in the cooperative grid and becomes a sticky terminal descriptor status before any future-bucket heavy work. |
+| Heavy phase | A separate relaxation launch runs after closure; vector-target consumers retain an explicit-stream dependency boundary. | Heavy relaxation is another grid phase in the same launch. |
+| Pending minimum | The host initializes the minimum, synchronizes explicit streams, launches the full pending reduction, then copies/synchronizes the scalar minimum. | The leader initializes the minimum; the grid reduces it and crosses a grid barrier without a host scalar. |
+| Pending compaction | The host resets two counters, synchronizes explicit streams, launches compaction, copies/synchronizes the current count, copies the pending count device-to-device, and preserves the next dependency boundary. | The grid compacts into ping-pong current/pending queues, validates bounded counts, advances queue parity, and resumes the successor bucket. |
+| Bounded publication | Several independent scalar copies and synchronizations per bucket, plus one frontier-count decision per explicit-stream light round. | At most the configured number of light actions (including atomic bucket advancement) execute before one fixed-layout descriptor copy and host synchronization. |
+| Failure/cleanup ownership | Allocation failures throw before traversal; predecessor/path validation throws after traversal; sparse cleanup and final reuse synchronization remain host-controlled. | The same pre/post boundaries apply. Queue capacity/invalid controller state are sticky during the batch; either forces a full-state reset before throwing. Allocation and invalid-predecessor failures therefore cannot be overwritten by a batched descriptor. |
+
+```text
+host: validate + allocate + initialize
+                      |
+                      v
+device: [light closure -> settle -> heavy -> pending min -> compaction]
+        [              repeat for at most B light actions              ]
+                      |
+                      v
+host: one descriptor check -> stop, relaunch, extract, or full-reset error
+```
+
+The retained four-worker gfx1151 host baseline averaged about 133 dispatches
+and 65 `hipStreamSynchronize` calls per query, with 34.09 seconds of zero
+active-kernel time. The reduced-controller cells are deliberately marked “not
+run”; the local host has no HIP toolchain or AMD GPU.
+
+| Metric per query | Host-checked retained trace | Reduced controller |
+| --- | ---: | ---: |
+| Kernel dispatches | about 133 | not run |
+| `hipStreamSynchronize` calls | about 65 | not run |
+| True kernel-union idle | 34.09 s total (20.6% of span) | not run |
+
+The current measured classic Delta-Stepping routing control uses
+`--parallel-net-workers 4`. Keep that count explicit for comparable timing and
+profiling runs; it is workload-specific and is not a portable algorithm
+default.
 
 The shared-capacity and Delta policy/model tests, both fake-HIP PathFinder
 suites, and ASan+UBSan variants pass locally. The production Delta translation
@@ -67,7 +114,7 @@ workload, with broader weighted-graph upside called out separately.
 
 | Rank | Optimization | Status | Expected speed improvement | Difficulty | Why it ranks here |
 | ---: | --- | --- | --- | --- | --- |
-| 1 | Keep classic-Delta bucket and light-closure control on the GPU | Not implemented | 20--50% end-to-end on control-bound searches; potentially larger for many shallow buckets | Very high | The retained trace attributed most host time to tiny copies/synchronizations and 41.7% of aggregate device-dispatch duration to runtime status/copy kernels. Current code still performs several scalar host decisions per bucket and checks every explicit-stream light round. |
+| 1 | Keep classic-Delta bucket and light-closure control on the GPU | Implemented, opt-in, HIP-unvalidated | 20--50% end-to-end on control-bound searches; potentially larger for many shallow buckets | Very high | The reduced controller fuses dependent light/bucket phases behind cooperative grid barriers and publishes one descriptor per bounded batch. The host-checked path remains default, and target-gfx1151 correctness/performance gates are outstanding. |
 | 2 | Generation-tagged `in_current` | Implemented, opt-in, HIP-unvalidated | 10--30% end-to-end, 15--40% traversal when many vertices are touched | High | The new representation removes only the current-membership clear path. Sparse reset of distance, parent, pending, and heavy state remains necessary. Boolean/clear remains default until AMD validation. |
 | 3 | Eligible 32-bit device row offsets with forced-wide A/B | Implemented, automatic, HIP-unvalidated | 5--15% traversal plus 4 B/V shared-graph savings | Medium | Complete-range eligibility is exact at `UINT32_MAX`; every row-reading kernel is typed, while the public CSR/path edge identity remains 64-bit. |
 | 4 | Add a degree-aware outgoing-edge expander | Not implemented | 0--15% on the mostly short-row routing graph; 10--40% on skewed weighted graphs | High | Thread-per-row is appropriate for short rows but serializes long rows. Use lane groups, wave-per-row, and CTA/edge-balanced paths only above measured reached-degree thresholds. |
@@ -91,7 +138,7 @@ Before enabling or tuning the new kernel paths:
    distances-only storage.
 3. Record profiler-free medians for all-light, all-heavy, seeded mixed, and a
    representative real weighted CSR in both path-producing and distances-only
-   modes. Use two PathFinder workers for the future routing baseline; worker
+   modes. Use four PathFinder workers for the current routing baseline; worker
    count is a benchmark control, not a portable algorithm default.
 4. Capture telemetry with reached-degree histograms and
    candidate-to-unique-destination ratios added to a diagnostic build. Keep
@@ -132,20 +179,29 @@ Evaluate queue-buffer aliasing or bounded growth separately. The six queues
 overlap only partially in lifetime, and touched vertices are needed until
 cleanup, so unsafe buffer reuse is not acceptable.
 
-### Phase 3: device-resident classic-Delta controller
+### Phase 3: device-resident classic-Delta controller — implemented, opt-in,
+HIP-unvalidated
 
-Move light closure, heavy-phase completion, target settlement, next-bucket
-selection, and pending compaction continuation into a resident or bounded
-cooperative controller. Preserve an instrumented host fallback for unsupported
-devices and progress callbacks.
+The reduced-round-trip mode moves light closure, target settlement,
+heavy-phase completion, next-bucket selection, and pending compaction into one
+bounded cooperative controller. Its queue/count dependencies cross only
+grid-wide barriers inside that kernel; release publication exposes one
+fixed-layout descriptor at the host boundary. Runtime capability/occupancy
+checks and callback policy select the unchanged host controller when the fused
+path cannot be used. Queue overflow and invalid state are sticky terminal
+statuses followed by full cleanup before workspace reuse.
 
-Do not treat HIP Graph capture alone as the solution: the current launch
-sequence depends on scalar device results. Capture becomes useful only after
-those decisions no longer return to the host.
+The batch bound is configurable, and batch size one is the host-model
+equivalence control. Boolean membership and the optional generation-tagged
+representation are both retained; generation rollover clears tags before
+token reuse. The implementation does not use HIP Graph capture or hard-code
+the four-worker benchmark control into portable workspace behavior.
 
-Acceptance: identical bucket/iteration semantics, correct concurrent explicit
-streams on gfx1151, no scalar D2H dependency inside steady-state traversal,
-and a measured end-to-end win with compact-parent reset included.
+Acceptance remains outstanding: compile on ROCm, pass the full controller ×
+offset × membership × parent/output matrix, survive repeated concurrent
+explicit-stream stress on gfx1151, preserve callback/iteration/target cleanup,
+and demonstrate fewer dispatches/synchronizations plus a profiler-free
+end-to-end win with identical route results.
 
 ### Phase 4: shared edge expansion and contention control
 

@@ -70,6 +70,14 @@ struct DeltaSteppingCsrTelemetry {
   std::uint64_t heavy_queue_high_water = 0;
   std::uint64_t controller_round_trips = 0;
   std::uint64_t compact_parent_fallback_events = 0;
+  DeltaSteppingCsrControllerMode requested_controller_mode =
+      DeltaSteppingCsrControllerMode::kHostChecked;
+  DeltaSteppingCsrControllerMode effective_controller_mode =
+      DeltaSteppingCsrControllerMode::kHostChecked;
+  std::uint32_t requested_controller_batch_size =
+      kDeltaSteppingCsrRecommendedControllerBatchSize;
+  std::uint32_t effective_controller_batch_size = 1;
+  bool controller_fallback = false;
 };
 
 struct DeltaSteppingCsrRunOptions {
@@ -132,8 +140,21 @@ struct DeltaSteppingCsrWorkspaceOptions {
   // until the generation path is validated on the target AMD GPU.
   DeltaSteppingCsrCurrentMembershipMode current_membership_mode =
       DeltaSteppingCsrCurrentMembershipMode::kBoolean;
-  // Zero fields preserve lazy growth for low-level callers.
+  // Zero fields preserve lazy growth for low-level callers. Keep this field in
+  // its historical aggregate position for source compatibility.
   SsspQueryCapacityHints capacity_hints{};
+  // The existing host-checked controller remains the default.  The reduced
+  // round-trip path is capability-gated and falls back to it when cooperative
+  // grid launch is unavailable for the selected kernel specialization.
+  DeltaSteppingCsrControllerMode controller_mode =
+      DeltaSteppingCsrControllerMode::kHostChecked;
+  std::uint32_t controller_batch_size =
+      kDeltaSteppingCsrRecommendedControllerBatchSize;
+  // Test-only rollover hook. Zero preserves the workspace's natural
+  // generation sequence; a nonzero value clears current-membership tags and
+  // seeds the next generic generation advance. It has no effect in Boolean
+  // membership mode.
+  std::uint32_t controller_generation_seed_for_testing = 0;
 };
 
 struct DeltaSteppingCsrGraphOptions {
@@ -413,6 +434,11 @@ class DeltaSteppingCsrWorkspace {
       DeltaSteppingCsrExecutionMode::kAutomatic;
   DeltaSteppingCsrCurrentMembershipMode current_membership_mode_ =
       DeltaSteppingCsrCurrentMembershipMode::kBoolean;
+  DeltaSteppingCsrControllerMode controller_mode_ =
+      DeltaSteppingCsrControllerMode::kHostChecked;
+  std::uint32_t controller_batch_size_ =
+      kDeltaSteppingCsrRecommendedControllerBatchSize;
+  std::uint32_t controller_generation_seed_for_testing_ = 0;
   DeltaSteppingCsrTelemetry* active_telemetry_ = nullptr;
   float active_distance_limit_ = std::numeric_limits<float>::infinity();
   std::unique_ptr<Impl> impl_;

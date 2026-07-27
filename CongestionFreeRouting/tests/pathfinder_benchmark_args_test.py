@@ -52,6 +52,11 @@ def main() -> None:
         "benchmark weights and seed must remain unset by default",
     )
     require(
+        defaults.delta_controller is None
+        and defaults.delta_controller_batch_size is None,
+        "controller controls must remain unset by default",
+    )
+    require(
         benchmark.pathfinder_args(defaults) == [],
         "default wrapper arguments must not select or tune delta-stepping",
     )
@@ -113,6 +118,10 @@ def main() -> None:
             "--delta-telemetry",
             "--delta-telemetry",
             "--delta-force-legacy-parent",
+            "--delta-controller",
+            "reduced-round-trip",
+            "--delta-controller-batch-size",
+            "7",
             "--delta-benchmark-weights",
             "mixed",
             "--delta-benchmark-weight-seed",
@@ -128,6 +137,10 @@ def main() -> None:
             "--delta-force-legacy-parent",
             "--delta",
             "0.75",
+            "--delta-controller",
+            "reduced-round-trip",
+            "--delta-controller-batch-size",
+            "7",
             "--delta-benchmark-weights",
             "mixed",
             "--delta-benchmark-weight-seed",
@@ -169,6 +182,12 @@ def main() -> None:
     )
     for invalid in ("-1", "1.5", "seed", "18446744073709551616"):
         require_arg_rejected(benchmark.nonnegative_int_arg, invalid)
+    require(
+        benchmark.positive_int_arg("2147483647") == (1 << 31) - 1,
+        "controller batch parser rejected the maximum 32-bit int",
+    )
+    for invalid in ("0", "-1", "1.5", "batch", "2147483648"):
+        require_arg_rejected(benchmark.positive_int_arg, invalid)
 
     for delta_controls in (
         ["--delta", "1"],
@@ -176,6 +195,14 @@ def main() -> None:
         ["--delta-force-generic"],
         ["--delta-telemetry"],
         ["--delta-force-legacy-parent"],
+        ["--delta-controller", "host-checked"],
+        ["--delta-controller", "reduced-round-trip"],
+        [
+            "--delta-controller",
+            "reduced-round-trip",
+            "--delta-controller-batch-size",
+            "4",
+        ],
         ["--delta", "1", "--delta-benchmark-weights", "mixed"],
         [
             "--delta",
@@ -203,6 +230,50 @@ def main() -> None:
     require_parse_rejected(
         ["--sssp-engine", "delta-step", "--delta-multiplier", "2"],
         "delta multiplier was accepted without --delta auto",
+    )
+    require_parse_rejected(
+        [
+            "--sssp-engine",
+            "delta-step",
+            "--delta-controller-batch-size",
+            "4",
+        ],
+        "controller batch size was accepted without an explicit controller",
+    )
+    require_parse_rejected(
+        [
+            "--sssp-engine",
+            "delta-step",
+            "--delta-controller",
+            "host-checked",
+            "--delta-controller-batch-size",
+            "4",
+        ],
+        "controller batch size was accepted with host-checked mode",
+    )
+    reduced_default_batch = benchmark.parse_args(
+        [
+            "input.phys",
+            "output.phys",
+            "--sssp-engine",
+            "delta-step",
+            "--delta-controller",
+            "reduced-round-trip",
+        ]
+    )
+    require(
+        benchmark.pathfinder_args(reduced_default_batch)[-2:]
+        == ["--delta-controller", "reduced-round-trip"],
+        "reduced controller mode without a batch override was not forwarded",
+    )
+    require_parse_rejected(
+        [
+            "--sssp-engine",
+            "delta-step",
+            "--delta-controller",
+            "fast",
+        ],
+        "unknown controller mode was accepted",
     )
     require_parse_rejected(
         [

@@ -126,6 +126,86 @@ int multi_queue_reuse_runs() {
   return static_cast<int>(parsed);
 }
 
+bool require_reduced_controller_selection() {
+  const char* configured =
+      std::getenv("DELTA_REQUIRE_REDUCED_CONTROLLER");
+  if (configured == nullptr || *configured == '\0') {
+    return false;
+  }
+  require(std::string(configured) == "1",
+          "DELTA_REQUIRE_REDUCED_CONTROLLER must be unset or 1");
+  return true;
+}
+
+struct ControllerTestCase {
+  DeltaSteppingCsrControllerMode mode;
+  std::uint32_t batch_size;
+  const char* label;
+};
+
+constexpr ControllerTestCase kHostCheckedControllerTestCase{
+    DeltaSteppingCsrControllerMode::kHostChecked,
+    kDeltaSteppingCsrRecommendedControllerBatchSize,
+    "host-checked"};
+constexpr ControllerTestCase kReducedBatchOneControllerTestCase{
+    DeltaSteppingCsrControllerMode::kReducedRoundTrip,
+    1,
+    "reduced-batch-1"};
+constexpr ControllerTestCase kReducedBatchFourControllerTestCase{
+    DeltaSteppingCsrControllerMode::kReducedRoundTrip,
+    4,
+    "reduced-batch-4"};
+constexpr ControllerTestCase kControllerTestCases[] = {
+    kHostCheckedControllerTestCase,
+    kReducedBatchOneControllerTestCase,
+    kReducedBatchFourControllerTestCase,
+};
+
+void require_controller_telemetry(
+    const std::string& label,
+    const DeltaSteppingCsrTelemetry& telemetry,
+    const ControllerTestCase& requested,
+    bool require_host_fallback = false) {
+  require(telemetry.requested_controller_mode == requested.mode,
+          label + ": telemetry lost the requested controller mode");
+  require(telemetry.requested_controller_batch_size == requested.batch_size,
+          label + ": telemetry lost the requested controller batch size");
+
+  if (requested.mode == DeltaSteppingCsrControllerMode::kHostChecked) {
+    require(telemetry.effective_controller_mode ==
+                    DeltaSteppingCsrControllerMode::kHostChecked &&
+                telemetry.effective_controller_batch_size == 1 &&
+                !telemetry.controller_fallback,
+            label + ": host-checked controller telemetry is inconsistent");
+    return;
+  }
+
+  const bool reduced_selected =
+      telemetry.effective_controller_mode ==
+          DeltaSteppingCsrControllerMode::kReducedRoundTrip &&
+      telemetry.effective_controller_batch_size == requested.batch_size &&
+      !telemetry.controller_fallback;
+  const bool capability_fallback =
+      telemetry.effective_controller_mode ==
+          DeltaSteppingCsrControllerMode::kHostChecked &&
+      telemetry.effective_controller_batch_size == 1 &&
+      telemetry.controller_fallback;
+  if (require_host_fallback) {
+    require(capability_fallback,
+            label + ": reduced request did not report required host fallback");
+  } else if (require_reduced_controller_selection()) {
+    require(reduced_selected,
+            label +
+                ": DELTA_REQUIRE_REDUCED_CONTROLLER=1 rejected a host "
+                "capability fallback");
+  } else {
+    require(reduced_selected || capability_fallback,
+            label +
+                ": reduced request reported neither selection nor capability "
+                "fallback");
+  }
+}
+
 struct EdgeSpec {
   int from = -1;
   int to = -1;
@@ -666,6 +746,61 @@ void run_full_and_target_checks(
   }
 }
 
+void test_scalar_target_preserves_heavy_phase(hipStream_t stream) {
+  // The scalar target is settled by a light edge in bucket zero.  The heavy
+  // edge from the same settled source must still publish its tentative
+  // distance and predecessor before either controller reports the target
+  // boundary; these full-size arrays are part of the scalar-target result.
+  const HostCsrF32 graph = make_outgoing_csr(
+      3,
+      {{0, 1, 0.5f},
+       {0, 2, 3.0f}});
+  constexpr int kTarget = 1;
+  constexpr int kHeavyDestination = 2;
+  constexpr float kDelta = 2.0f;
+
+  for (const ControllerTestCase& controller : {
+           kHostCheckedControllerTestCase,
+           kReducedBatchOneControllerTestCase}) {
+    const std::string label =
+        std::string("scalar-target heavy phase ") + controller.label;
+    DeltaSteppingCsrWorkspaceOptions options;
+    options.parent_mode = DeltaSteppingCsrParentMode::kForceLegacy;
+    options.execution_mode =
+        DeltaSteppingCsrExecutionMode::kForceGeneric;
+    options.controller_mode = controller.mode;
+    options.controller_batch_size = controller.batch_size;
+    DeltaSteppingCsrWorkspace workspace(graph, stream, options);
+
+    DeltaSteppingCsrTelemetry telemetry;
+    const DeltaSteppingCsrResult result = workspace.run(
+        std::vector<int>{0},
+        kTarget,
+        kDelta,
+        -1,
+        DeltaSteppingCsrRunOptions{&telemetry},
+        stream,
+        nullptr,
+        nullptr);
+    validate_single_target_predecessors(
+        label, graph, std::vector<int>{0}, kTarget, 0.5f, result);
+    require(close_enough(result.dist[kHeavyDestination], 3.0f),
+            label + ": target stop skipped the settled bucket's heavy edge");
+    require(result.pred_node[kHeavyDestination] == 0,
+            label + ": heavy relaxation lost its predecessor vertex");
+    const Offset predecessor_edge = result.pred_edge[kHeavyDestination];
+    require(predecessor_edge >= graph.rowptr[0] &&
+                predecessor_edge < graph.rowptr[1] &&
+                graph.colind[static_cast<std::size_t>(predecessor_edge)] ==
+                    kHeavyDestination,
+            label + ": heavy relaxation published an invalid edge identity");
+    require(telemetry.collected && telemetry.completed &&
+                telemetry.heavy_edge_visits == 2,
+            label + ": target stop changed heavy-phase telemetry");
+    require_controller_telemetry(label, telemetry, controller);
+  }
+}
+
 HostCsrF32 make_weighted_corner_graph() {
   // Rows are intentionally supplied out of column order and include parallel
   // edges, harmless self-loops, a one-way zero edge, and disconnected nodes.
@@ -700,6 +835,10 @@ void test_offset_and_membership_ab_matrix(hipStream_t stream) {
   for (const DeltaSteppingCsrOffsetMode offset_mode : {
            DeltaSteppingCsrOffsetMode::kAuto,
            DeltaSteppingCsrOffsetMode::kForce64Bit}) {
+    const std::string offset_label =
+        offset_mode == DeltaSteppingCsrOffsetMode::kAuto
+            ? "compact-offset"
+            : "wide-offset";
     auto shared_graph =
         std::make_shared<DeltaSteppingCsrGraph>(graph, stream, offset_mode);
     require(shared_graph->uses_32_bit_offsets() ==
@@ -708,35 +847,100 @@ void test_offset_and_membership_ab_matrix(hipStream_t stream) {
     for (const DeltaSteppingCsrCurrentMembershipMode membership_mode : {
              DeltaSteppingCsrCurrentMembershipMode::kBoolean,
              DeltaSteppingCsrCurrentMembershipMode::kGeneration}) {
-      DeltaSteppingCsrWorkspaceOptions options;
-      options.execution_mode = DeltaSteppingCsrExecutionMode::kForceGeneric;
-      options.current_membership_mode = membership_mode;
-      options.capacity_hints = {8, 8};
-      DeltaSteppingCsrWorkspace workspace(shared_graph, stream, options);
-      const DeltaSteppingCsrAllocationState reserved =
-          workspace.allocation_state();
-      require(reserved.target_storage && !reserved.path_nodes &&
-                  !reserved.path_edges && !reserved.parent_key &&
-                  !reserved.predecessor_nodes && !reserved.predecessor_edges,
-              "Delta capacity hint allocated paths or parents eagerly");
+      const std::string membership_label =
+          membership_mode ==
+                  DeltaSteppingCsrCurrentMembershipMode::kBoolean
+              ? "Boolean"
+              : "generation";
+      for (const DeltaSteppingCsrParentMode parent_mode : {
+               DeltaSteppingCsrParentMode::kAutomatic,
+               DeltaSteppingCsrParentMode::kForceLegacy}) {
+        const std::string parent_label =
+            parent_mode == DeltaSteppingCsrParentMode::kAutomatic
+                ? "compact-parent"
+                : "legacy-parent";
+        for (const ControllerTestCase& controller : kControllerTestCases) {
+          const std::string label =
+              "Delta controller A/B " + offset_label + " " +
+              membership_label + " " + parent_label + " " +
+              controller.label;
+          DeltaSteppingCsrWorkspaceOptions options;
+          options.parent_mode = parent_mode;
+          options.execution_mode =
+              DeltaSteppingCsrExecutionMode::kForceGeneric;
+          options.current_membership_mode = membership_mode;
+          options.capacity_hints = {8, 8};
+          options.controller_mode = controller.mode;
+          options.controller_batch_size = controller.batch_size;
+          DeltaSteppingCsrWorkspace workspace(shared_graph, stream, options);
+          const DeltaSteppingCsrAllocationState reserved =
+              workspace.allocation_state();
+          require(reserved.target_storage && !reserved.path_nodes &&
+                      !reserved.path_edges,
+                  label + ": capacity hint allocated paths eagerly");
+          if (parent_mode == DeltaSteppingCsrParentMode::kAutomatic) {
+            require(!reserved.parent_key && !reserved.predecessor_nodes &&
+                        !reserved.predecessor_edges,
+                    label + ": capacity hint allocated parents eagerly");
+          }
 
-      const DeltaSteppingCsrResult result = workspace.run(
-          sources, targets, 1.0f, -1, stream, nullptr, nullptr);
-      validate_compact_target_paths("Delta offset/membership A/B", graph,
-                                    sources, targets, expected, result);
-      require(!workspace.allocation_state().predecessor_nodes &&
-                  !workspace.allocation_state().predecessor_edges,
-              "compact-parent A/B run allocated legacy parents");
+          DeltaSteppingCsrTelemetry telemetry;
+          const DeltaSteppingCsrResult result = workspace.run(
+              sources,
+              targets,
+              1.0f,
+              -1,
+              DeltaSteppingCsrRunOptions{&telemetry},
+              stream,
+              nullptr,
+              nullptr);
+          validate_compact_target_paths(
+              label, graph, sources, targets, expected, result);
+          const DeltaSteppingCsrExecutionPath expected_path =
+              parent_mode == DeltaSteppingCsrParentMode::kAutomatic
+                  ? DeltaSteppingCsrExecutionPath::kCompactGeneric
+                  : DeltaSteppingCsrExecutionPath::kLegacyGeneric;
+          require(telemetry.collected && telemetry.completed &&
+                      telemetry.force_generic &&
+                      telemetry.execution_path == expected_path &&
+                      telemetry.force_legacy_parent ==
+                          (parent_mode ==
+                           DeltaSteppingCsrParentMode::kForceLegacy),
+                  label + ": telemetry reported the wrong generic path");
+          require_controller_telemetry(label, telemetry, controller);
 
-      const std::vector<int> reuse_sources = {10, 10};
-      const std::vector<int> reuse_targets = {11, 0, 11};
-      const std::vector<float> reuse_expected =
-          cpu_dijkstra_outgoing_multi_source(graph, reuse_sources);
-      const DeltaSteppingCsrResult reused = workspace.run(
-          reuse_sources, reuse_targets, 0.5f, -1, stream, nullptr, nullptr);
-      validate_compact_target_paths("Delta offset/membership A/B reuse",
-                                    graph, reuse_sources, reuse_targets,
-                                    reuse_expected, reused);
+          const DeltaSteppingCsrAllocationState after_run =
+              workspace.allocation_state();
+          if (parent_mode == DeltaSteppingCsrParentMode::kAutomatic) {
+            require(!after_run.predecessor_nodes &&
+                        !after_run.predecessor_edges,
+                    label + ": compact-parent run allocated legacy parents");
+
+            const std::vector<int> reuse_sources = {10, 10};
+            const std::vector<int> reuse_targets = {11, 0, 11};
+            const std::vector<float> reuse_expected =
+                cpu_dijkstra_outgoing_multi_source(graph, reuse_sources);
+            const DeltaSteppingCsrResult reused = workspace.run(
+                reuse_sources,
+                reuse_targets,
+                0.5f,
+                -1,
+                stream,
+                nullptr,
+                nullptr);
+            validate_compact_target_paths(label + ": reuse",
+                                          graph,
+                                          reuse_sources,
+                                          reuse_targets,
+                                          reuse_expected,
+                                          reused);
+          } else {
+            require(after_run.predecessor_nodes &&
+                        after_run.predecessor_edges,
+                    label + ": legacy-parent run omitted predecessors");
+          }
+        }
+      }
     }
 
     HostCsrF32 unit_graph = graph;
@@ -761,16 +965,42 @@ void test_offset_and_membership_ab_matrix(hipStream_t stream) {
     for (const DeltaSteppingCsrCurrentMembershipMode membership_mode : {
              DeltaSteppingCsrCurrentMembershipMode::kBoolean,
              DeltaSteppingCsrCurrentMembershipMode::kGeneration}) {
-      DeltaSteppingCsrWorkspaceOptions distances_options;
-      distances_options.current_membership_mode = membership_mode;
-      DeltaSteppingCsrWorkspace distances_workspace(
-          typed_distances_graph, stream, distances_options);
-      run_distances_and_check("Delta distances-only row/membership A/B",
-                              distances_workspace,
-                              graph,
-                              sources,
-                              1.0f,
-                              stream);
+      const std::string membership_label =
+          membership_mode ==
+                  DeltaSteppingCsrCurrentMembershipMode::kBoolean
+              ? "Boolean"
+              : "generation";
+      for (const ControllerTestCase& controller : kControllerTestCases) {
+        const std::string label =
+            "Delta distances-only controller A/B " + offset_label + " " +
+            membership_label + " " + controller.label;
+        DeltaSteppingCsrWorkspaceOptions distances_options;
+        distances_options.execution_mode =
+            DeltaSteppingCsrExecutionMode::kForceGeneric;
+        distances_options.current_membership_mode = membership_mode;
+        distances_options.controller_mode = controller.mode;
+        distances_options.controller_batch_size = controller.batch_size;
+        DeltaSteppingCsrWorkspace distances_workspace(
+            typed_distances_graph, stream, distances_options);
+        DeltaSteppingCsrTelemetry telemetry;
+        const DeltaSteppingCsrResult result =
+            distances_workspace.run_distances(
+                sources,
+                1.0f,
+                -1,
+                DeltaSteppingCsrRunOptions{&telemetry},
+                stream,
+                nullptr,
+                nullptr);
+        validate_distances_only_result(label, expected, result);
+        require_no_mutable_path_storage(label, distances_workspace);
+        require(telemetry.collected && telemetry.completed &&
+                    telemetry.force_generic &&
+                    telemetry.execution_path ==
+                        DeltaSteppingCsrExecutionPath::kGenericDistancesOnly,
+                label + ": telemetry reported the wrong distances-only path");
+        require_controller_telemetry(label, telemetry, controller);
+      }
     }
   }
 
@@ -787,6 +1017,69 @@ void test_offset_and_membership_ab_matrix(hipStream_t stream) {
               !distances_only.allocation_state().path_nodes &&
               !distances_only.allocation_state().path_edges,
           "strict distances-only workspace applied target/path hints");
+}
+
+void test_generation_controller_repeated_rollover(hipStream_t stream) {
+  const HostCsrF32 graph = make_weighted_corner_graph();
+  auto shared_graph =
+      std::make_shared<DeltaSteppingCsrGraph>(graph, stream);
+  DeltaSteppingCsrWorkspaceOptions options;
+  options.execution_mode = DeltaSteppingCsrExecutionMode::kForceGeneric;
+  options.current_membership_mode =
+      DeltaSteppingCsrCurrentMembershipMode::kGeneration;
+  options.controller_mode =
+      DeltaSteppingCsrControllerMode::kReducedRoundTrip;
+  options.controller_batch_size = 4;
+  // Source initialization advances this to UINT32_MAX-1. Reserving the next
+  // reduced-controller batch therefore must clear tags and roll over before
+  // it can publish any new generation. The test hook reapplies the seed at the
+  // start of every generic run, so this exercises rollover during reuse rather
+  // than only once per workspace lifetime.
+  options.controller_generation_seed_for_testing =
+      std::numeric_limits<std::uint32_t>::max() - 2;
+  DeltaSteppingCsrWorkspace workspace(shared_graph, stream, options);
+
+  struct RolloverQuery {
+    std::vector<int> sources;
+    std::vector<int> targets;
+    float delta;
+  };
+  const std::vector<RolloverQuery> queries = {
+      {{0, 8, 0}, {7, 4, 9, 7}, 1.0f},
+      {{10, 10}, {11, 0, 11}, 0.5f},
+      {{8}, {7, 9, 8}, 1.25f},
+  };
+
+  constexpr int kRolloverRuns = 9;
+  for (int repetition = 0; repetition < kRolloverRuns; ++repetition) {
+    const RolloverQuery& query =
+        queries[static_cast<std::size_t>(repetition) % queries.size()];
+    const std::vector<float> expected =
+        cpu_dijkstra_outgoing_multi_source(graph, query.sources);
+    DeltaSteppingCsrTelemetry telemetry;
+    const DeltaSteppingCsrResult result = workspace.run(
+        query.sources,
+        query.targets,
+        query.delta,
+        -1,
+        DeltaSteppingCsrRunOptions{&telemetry},
+        stream,
+        nullptr,
+        nullptr);
+    const std::string label =
+        "generation controller forced rollover reuse " +
+        std::to_string(repetition);
+    validate_compact_target_paths(
+        label, graph, query.sources, query.targets, expected, result);
+    require(telemetry.collected && telemetry.completed &&
+                telemetry.outer_buckets_processed > 0 &&
+                telemetry.light_relaxation_rounds > 0 &&
+                telemetry.execution_path ==
+                    DeltaSteppingCsrExecutionPath::kCompactGeneric,
+            label + ": telemetry reported the wrong execution path");
+    require_controller_telemetry(
+        label, telemetry, kReducedBatchFourControllerTestCase);
+  }
 }
 
 void test_distances_only_graph_families(hipStream_t stream) {
@@ -1462,7 +1755,8 @@ void test_forced_generic_increasing_distance_reuse(hipStream_t stream) {
 
 void test_forced_generic_multi_queue_reuse(
     DeltaSteppingCsrCurrentMembershipMode membership_mode,
-    const std::string& membership_label) {
+    const std::string& membership_label,
+    const ControllerTestCase& controller) {
   // Every path is unique. Sources zero and one reach vertex six with sharply
   // different distances, while source sixteen reaches the deep target through
   // a separate short edge. Alternating these queries forces sparse reset to
@@ -1492,6 +1786,10 @@ void test_forced_generic_multi_queue_reuse(
   options.parent_mode = DeltaSteppingCsrParentMode::kAutomatic;
   options.execution_mode = DeltaSteppingCsrExecutionMode::kForceGeneric;
   options.current_membership_mode = membership_mode;
+  options.controller_mode = controller.mode;
+  options.controller_batch_size = controller.batch_size;
+  const std::string stress_label =
+      membership_label + " " + controller.label;
 
   const std::vector<int> source_zero{0};
   const std::vector<int> source_one{1};
@@ -1559,7 +1857,7 @@ void test_forced_generic_multi_queue_reuse(
             nullptr,
             nullptr);
         validate_compact_target_paths(
-            "forced-generic " + membership_label +
+            "forced-generic " + stress_label +
                 " multi-queue instrumented worker " +
                 std::to_string(worker),
             graph,
@@ -1570,7 +1868,14 @@ void test_forced_generic_multi_queue_reuse(
         require(telemetry.collected && telemetry.completed &&
                     telemetry.execution_path ==
                         DeltaSteppingCsrExecutionPath::kCompactGeneric,
-                "forced-generic multi-queue telemetry used the wrong path");
+                "forced-generic " + stress_label +
+                    " multi-queue telemetry used the wrong path");
+        require_controller_telemetry(
+            "forced-generic " + stress_label +
+                " multi-queue instrumented worker " +
+                std::to_string(worker),
+            telemetry,
+            controller);
 
         for (int repetition = 0; repetition < runs_per_worker;
              ++repetition) {
@@ -1590,7 +1895,7 @@ void test_forced_generic_multi_queue_reuse(
                 nullptr,
                 nullptr);
             validate_compact_target_paths(
-                "forced-generic " + membership_label +
+                "forced-generic " + stress_label +
                     " multi-queue worker " +
                     std::to_string(worker) + " reuse " +
                     std::to_string(repetition) + ": " + query.name,
@@ -2723,15 +3028,23 @@ void test_callback_exception_cleanup(hipStream_t stream) {
       cpu_dijkstra_outgoing_multi_source(graph, {3});
 
   auto exercise = [&](const std::string& label,
-                      DeltaSteppingCsrWorkspace& workspace) {
+                      DeltaSteppingCsrWorkspace& workspace,
+                      const ControllerTestCase& controller) {
     for (const int throw_on_call : {1, 2}) {
       ThrowingProgressState throwing_state;
       throwing_state.throw_on_call = throw_on_call;
+      DeltaSteppingCsrTelemetry aborted_telemetry;
       bool caught_original = false;
       try {
-        (void)workspace.run(std::vector<int>{0}, std::vector<int>{3}, 1.0f,
-                            -1, stream, throw_progress_on_selected_call,
-                            &throwing_state);
+        (void)workspace.run(
+            std::vector<int>{0},
+            std::vector<int>{3},
+            1.0f,
+            -1,
+            DeltaSteppingCsrRunOptions{&aborted_telemetry},
+            stream,
+            throw_progress_on_selected_call,
+            &throwing_state);
       } catch (const ExpectedProgressCallbackError&) {
         caught_original = true;
       } catch (const std::exception& error) {
@@ -2740,10 +3053,25 @@ void test_callback_exception_cleanup(hipStream_t stream) {
       }
       require(caught_original && throwing_state.calls == throw_on_call,
               label + ": selected callback exception was not preserved");
+      require(aborted_telemetry.collected && !aborted_telemetry.completed,
+              label + ": aborted callback telemetry completion is wrong");
+      require_controller_telemetry(
+          label + ": aborted callback " + std::to_string(throw_on_call),
+          aborted_telemetry,
+          controller,
+          controller.mode ==
+              DeltaSteppingCsrControllerMode::kReducedRoundTrip);
 
+      DeltaSteppingCsrTelemetry recovered_telemetry;
       const DeltaSteppingCsrResult recovered = workspace.run(
-          std::vector<int>{3}, std::vector<int>{0}, 1.0f, -1,
-          stream, nullptr, nullptr);
+          std::vector<int>{3},
+          std::vector<int>{0},
+          1.0f,
+          -1,
+          DeltaSteppingCsrRunOptions{&recovered_telemetry},
+          stream,
+          nullptr,
+          nullptr);
       const std::string recovery_label =
           label + ": reuse after callback " + std::to_string(throw_on_call);
       validate_compact_target_paths(recovery_label,
@@ -2754,14 +3082,23 @@ void test_callback_exception_cleanup(hipStream_t stream) {
                                     recovered);
       require(recovered.stopped_on_target && !recovered.converged,
               recovery_label + ": workspace state was not restored");
+      require(recovered_telemetry.collected &&
+                  recovered_telemetry.completed,
+              recovery_label + ": telemetry did not complete");
+      require_controller_telemetry(
+          recovery_label, recovered_telemetry, controller);
     }
   };
 
   DeltaSteppingCsrWorkspace automatic(graph, stream);
   DeltaSteppingCsrWorkspace legacy(
       graph, stream, DeltaSteppingCsrParentMode::kForceLegacy);
-  exercise("automatic callback cleanup", automatic);
-  exercise("forced-legacy callback cleanup", legacy);
+  exercise("automatic callback cleanup",
+           automatic,
+           kHostCheckedControllerTestCase);
+  exercise("forced-legacy callback cleanup",
+           legacy,
+           kHostCheckedControllerTestCase);
 
   DeltaSteppingCsrWorkspaceOptions generation_options;
   generation_options.current_membership_mode =
@@ -2771,8 +3108,28 @@ void test_callback_exception_cleanup(hipStream_t stream) {
   generation_options.parent_mode = DeltaSteppingCsrParentMode::kForceLegacy;
   DeltaSteppingCsrWorkspace generation_legacy(
       graph, stream, generation_options);
-  exercise("generation automatic callback cleanup", generation_automatic);
-  exercise("generation forced-legacy callback cleanup", generation_legacy);
+  exercise("generation automatic callback cleanup",
+           generation_automatic,
+           kHostCheckedControllerTestCase);
+  exercise("generation forced-legacy callback cleanup",
+           generation_legacy,
+           kHostCheckedControllerTestCase);
+
+  generation_options.parent_mode = DeltaSteppingCsrParentMode::kAutomatic;
+  generation_options.controller_mode =
+      DeltaSteppingCsrControllerMode::kReducedRoundTrip;
+  generation_options.controller_batch_size = 4;
+  DeltaSteppingCsrWorkspace reduced_generation_automatic(
+      graph, stream, generation_options);
+  generation_options.parent_mode = DeltaSteppingCsrParentMode::kForceLegacy;
+  DeltaSteppingCsrWorkspace reduced_generation_legacy(
+      graph, stream, generation_options);
+  exercise("reduced-requested generation automatic callback cleanup",
+           reduced_generation_automatic,
+           kReducedBatchFourControllerTestCase);
+  exercise("reduced-requested generation forced-legacy callback cleanup",
+           reduced_generation_legacy,
+           kReducedBatchFourControllerTestCase);
 }
 
 void test_wave_boundary_contention(hipStream_t stream) {
@@ -3261,6 +3618,12 @@ HostCsrF32 make_random_graph(int vertex_count,
   for (int vertex = 0; vertex + 1 < active_vertex_count; ++vertex) {
     edges.push_back({vertex, vertex + 1, weight(random)});
   }
+  // Seed every randomized case with a parallel zero-weight pair and a
+  // two-vertex zero-weight SCC. This keeps the concurrent random stress on
+  // the most delicate same-bucket re-enqueue path as well as ordinary
+  // positive-weight relaxations.
+  edges.push_back({0, 1, 0.0f});
+  edges.push_back({1, 0, 0.0f});
   for (int edge_index = 0; edge_index < extra_edges; ++edge_index) {
     int from = active_vertex(random);
     int to = active_vertex(random);
@@ -3294,7 +3657,6 @@ void test_seeded_random_graphs(hipStream_t stream) {
         static_cast<std::uint32_t>(0xC0FFEEu + 7919u * case_index);
     const HostCsrF32 graph =
         make_random_graph(vertex_count, active_count, active_count * 6, seed);
-    DeltaSteppingCsrWorkspace workspace(graph, stream);
     const std::vector<int> sources = {0, active_count / 2, 0};
     const std::vector<int> targets = {
         0,
@@ -3306,18 +3668,156 @@ void test_seeded_random_graphs(hipStream_t stream) {
         active_count - 1,
     };
 
-    std::ostringstream label;
-    label << "random case " << case_index << " seed " << seed;
-    run_full_and_target_checks(label.str(),
-                               workspace,
-                               graph,
-                               sources,
-                               targets,
-                               deltas[static_cast<std::size_t>(case_index) %
-                                      deltas.size()],
-                               stream,
-                               nullptr,
-                               case_index % 3 == 0);
+    for (const ControllerTestCase& controller : {
+             kHostCheckedControllerTestCase,
+             kReducedBatchFourControllerTestCase}) {
+      DeltaSteppingCsrWorkspaceOptions options;
+      options.execution_mode = DeltaSteppingCsrExecutionMode::kForceGeneric;
+      options.current_membership_mode =
+          case_index % 2 == 0
+              ? DeltaSteppingCsrCurrentMembershipMode::kBoolean
+              : DeltaSteppingCsrCurrentMembershipMode::kGeneration;
+      options.controller_mode = controller.mode;
+      options.controller_batch_size = controller.batch_size;
+      DeltaSteppingCsrWorkspace workspace(graph, stream, options);
+      std::ostringstream label;
+      label << "random case " << case_index << " seed " << seed << " "
+            << controller.label;
+      run_full_and_target_checks(
+          label.str(),
+          workspace,
+          graph,
+          sources,
+          targets,
+          deltas[static_cast<std::size_t>(case_index) % deltas.size()],
+          stream,
+          nullptr,
+          case_index % 3 == 0);
+    }
+  }
+}
+
+void test_parallel_randomized_explicit_streams() {
+  int device = 0;
+  check_hip(hipGetDevice(&device), "hipGetDevice");
+  constexpr int kWorkers = 4;
+  const int reuse_runs = multi_queue_reuse_runs();
+  std::promise<void> start_promise;
+  const std::shared_future<void> start = start_promise.get_future().share();
+  std::atomic<int> ready{0};
+  std::vector<std::future<void>> workers;
+  workers.reserve(kWorkers);
+
+  for (int worker = 0; worker < kWorkers; ++worker) {
+    workers.push_back(std::async(std::launch::async, [&, worker]() {
+      bool readiness_reported = false;
+      try {
+        check_hip(hipSetDevice(device), "hipSetDevice");
+        HipStream stream;
+        const int vertex_count = 43 + worker * 3;
+        const int active_count = vertex_count - 3;
+        const std::uint32_t seed =
+            static_cast<std::uint32_t>(0x51A115u + 104729u * worker);
+        const HostCsrF32 graph = make_random_graph(
+            vertex_count, active_count, active_count * 5, seed);
+
+        const std::vector<int> mixed_sources = {0, active_count / 2, 0};
+        const std::vector<int> mixed_targets = {
+            active_count - 1,
+            active_count,
+            active_count + 1,
+            vertex_count - 1,
+            active_count - 1,
+        };
+        const std::vector<int> reachable_sources = {0, 0};
+        const std::vector<int> reachable_targets = {
+            active_count / 3,
+            active_count - 1,
+            active_count / 3,
+        };
+        const std::vector<float> mixed_expected =
+            cpu_dijkstra_outgoing_multi_source(graph, mixed_sources);
+        const std::vector<float> reachable_expected =
+            cpu_dijkstra_outgoing_multi_source(graph, reachable_sources);
+
+        DeltaSteppingCsrWorkspaceOptions options;
+        options.execution_mode =
+            DeltaSteppingCsrExecutionMode::kForceGeneric;
+        options.current_membership_mode =
+            worker % 2 == 0
+                ? DeltaSteppingCsrCurrentMembershipMode::kBoolean
+                : DeltaSteppingCsrCurrentMembershipMode::kGeneration;
+        options.controller_mode =
+            DeltaSteppingCsrControllerMode::kReducedRoundTrip;
+        options.controller_batch_size = 4;
+        DeltaSteppingCsrWorkspace workspace(graph, stream.get(), options);
+
+        ready.fetch_add(1, std::memory_order_release);
+        readiness_reported = true;
+        start.wait();
+
+        DeltaSteppingCsrTelemetry telemetry;
+        const DeltaSteppingCsrResult instrumented = workspace.run(
+            mixed_sources,
+            mixed_targets,
+            1.25f,
+            -1,
+            DeltaSteppingCsrRunOptions{&telemetry},
+            stream.get(),
+            nullptr,
+            nullptr);
+        const std::string base_label =
+            "parallel randomized worker " + std::to_string(worker) +
+            " seed " + std::to_string(seed);
+        validate_compact_target_paths(base_label + ": instrumented",
+                                      graph,
+                                      mixed_sources,
+                                      mixed_targets,
+                                      mixed_expected,
+                                      instrumented);
+        require_controller_telemetry(
+            base_label, telemetry, kReducedBatchFourControllerTestCase);
+
+        for (int repetition = 0; repetition < reuse_runs; ++repetition) {
+          for (const bool reachable_query : {false, true}) {
+            const std::vector<int>& sources =
+                reachable_query ? reachable_sources : mixed_sources;
+            const std::vector<int>& targets =
+                reachable_query ? reachable_targets : mixed_targets;
+            const std::vector<float>& expected =
+                reachable_query ? reachable_expected : mixed_expected;
+            const DeltaSteppingCsrResult result = workspace.run(
+                sources,
+                targets,
+                1.25f,
+                -1,
+                stream.get(),
+                nullptr,
+                nullptr);
+            validate_compact_target_paths(
+                base_label + ": reuse " + std::to_string(repetition) +
+                    (reachable_query ? " reachable" : " mixed"),
+                graph,
+                sources,
+                targets,
+                expected,
+                result);
+          }
+        }
+      } catch (...) {
+        if (!readiness_reported) {
+          ready.fetch_add(1, std::memory_order_release);
+        }
+        throw;
+      }
+    }));
+  }
+  while (ready.load(std::memory_order_acquire) != kWorkers) {
+    std::this_thread::yield();
+  }
+  start_promise.set_value();
+  for (std::future<void>& worker : workers) {
+    worker.get();
   }
 }
 
@@ -3329,7 +3829,9 @@ int main() {
     test_braced_default_stream_constructor_compatibility();
     HipStream stream;
     test_empty_and_singleton_graphs(stream.get());
+    test_scalar_target_preserves_heavy_phase(stream.get());
     test_offset_and_membership_ab_matrix(stream.get());
+    test_generation_controller_repeated_rollover(stream.get());
     test_distances_only_graph_families(stream.get());
     test_distances_only_path_state_transitions(stream.get());
     test_distances_only_strict_storage_and_validation(stream.get());
@@ -3338,9 +3840,21 @@ int main() {
     test_compact_early_settlement_reset(stream.get());
     test_forced_generic_increasing_distance_reuse(stream.get());
     test_forced_generic_multi_queue_reuse(
-        DeltaSteppingCsrCurrentMembershipMode::kBoolean, "Boolean");
+        DeltaSteppingCsrCurrentMembershipMode::kBoolean,
+        "Boolean",
+        kHostCheckedControllerTestCase);
     test_forced_generic_multi_queue_reuse(
-        DeltaSteppingCsrCurrentMembershipMode::kGeneration, "generation");
+        DeltaSteppingCsrCurrentMembershipMode::kGeneration,
+        "generation",
+        kHostCheckedControllerTestCase);
+    test_forced_generic_multi_queue_reuse(
+        DeltaSteppingCsrCurrentMembershipMode::kBoolean,
+        "Boolean",
+        kReducedBatchFourControllerTestCase);
+    test_forced_generic_multi_queue_reuse(
+        DeltaSteppingCsrCurrentMembershipMode::kGeneration,
+        "generation",
+        kReducedBatchFourControllerTestCase);
     test_compact_weight_class_updates(stream.get());
     test_compact_to_unit_storage_transition(stream.get());
     test_unit_weight_specialization(stream.get());
@@ -3358,6 +3872,7 @@ int main() {
     test_workspace_reuse_and_updates(stream.get());
     test_compact_legacy_mode_alternation(stream.get());
     test_seeded_random_graphs(stream.get());
+    test_parallel_randomized_explicit_streams();
     test_stream_affinity(stream.get());
     check_hip(hipStreamSynchronize(stream.get()), "final hipStreamSynchronize");
     std::cout << "Delta-Stepping outgoing-CSR HIP regression test passed\n";

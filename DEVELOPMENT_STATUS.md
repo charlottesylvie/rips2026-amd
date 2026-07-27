@@ -1,7 +1,8 @@
 # GPU SSSP Development Status
 
-Updated 2026-07-27 for the bounded UnitBFS/classic-Delta optimization pass and
-the FPGA Interchange import correctness audit.
+Updated 2026-07-27 for the bounded UnitBFS/classic-Delta optimization pass,
+the optional reduced-round-trip Delta controller, and the FPGA Interchange
+import correctness audit.
 All GPU changes below are implemented but HIP-unvalidated.
 
 This file is the concise source of truth for landed work, confidence, and the
@@ -49,9 +50,10 @@ throughput, so the real multi-sink result remains provisional.
 | UnitBFS state | Private stream-affine workspaces, automatic 32-bit row/predecessor-edge offsets when `nnz <= INT32_MAX`, a forced-64-bit test mode, one append-only frontier/visited queue, geometrically retained source/target/metadata/offset/path buffers, and compact validated target paths. Sparse reset remains the default; packed generation-stamped visitation is opt-in and performs a safe full reset on rollover. |
 | UnitBFS controller | Cooperative-capable devices run at most 32 levels per grid-synchronized launch on the null/default stream. Explicit worker streams always use the synchronized host-controlled level handoff required on gfx1151; unsupported devices and progress callbacks retain their fallbacks, and the null-stream noncooperative fallback can batch four levels. |
 | UnitBFS extraction | Host-built offsets remain the default. An opt-in two-pass device path measures target lengths, scans deterministic offsets, publishes one totals/status descriptor, grows demand-sized compact buffers, validates paths, and copies the result without the host prefix sum or two H2D offset copies. |
-| Generic Delta | Multi-source/multi-target classic Delta-Stepping with one thread per active row, separate light/heavy passes, a flat pending set with minimum reduction and compaction, sparse touched reset, and frequent host-visible controller decisions. Immutable CSR row offsets are automatically `uint32_t` only when the complete range fits; `kForce64Bit` retains the wide A/B path and public edge IDs stay 64-bit. |
+| Generic Delta | Multi-source/multi-target classic Delta-Stepping with one thread per active row, separate light/heavy semantics, a flat pending set with minimum reduction and compaction, and sparse touched reset. Immutable CSR row offsets are automatically `uint32_t` only when the complete range fits; `kForce64Bit` retains the wide A/B path and public edge IDs stay 64-bit. |
+| Delta controller | The established host-checked controller remains the default. An opt-in reduced-round-trip mode uses a capability-gated cooperative grid to keep dependent light closure, target settlement, heavy work, pending minimum, and compaction state on the device for a bounded batch, then publishes one descriptor. Unsupported kernels and progress callbacks retain a complete host fallback; requested/effective mode and fallback are visible in telemetry. |
 | Delta parents | Automatic vector-target runs use a compact 64-bit `{distance_bits, original_edge_id}` key and a shared 32-bit edge-to-source map when eligible. Legacy predecessor arrays are lazy fallback state. |
-| Delta modes | Exact-unit specialization for eligible small graphs, compile-time no-parent `run_distances()`, strict distances-only graph storage, exclusive distance bounds, exact-unit automatic width `1 * multiplier`, weighted graph-aware seeding, deterministic weight families, force controls, and opt-in telemetry are implemented. Boolean `in_current` plus its guarded clear remains the default; generation-tagged membership is opt-in and rollover-safe. |
+| Delta modes | Exact-unit specialization for eligible small graphs, compile-time no-parent `run_distances()`, strict distances-only graph storage, exclusive distance bounds, exact-unit automatic width `1 * multiplier`, weighted graph-aware seeding, deterministic weight families, force/controller controls, and opt-in telemetry are implemented. Boolean `in_current` plus its guarded clear remains the default; generation-tagged membership is opt-in and rollover-safe. |
 | Delta capacity | Source/target hints pre-reserve only applicable state. Query and compact-path buffers retain geometric high-water capacity; compact-parent runs avoid legacy predecessor arrays, and strict distances-only storage ignores target/path hints. |
 | Bellman--Ford | BF10 is wired as the Bellman--Ford engine and retained as a reference/fallback, not a current optimization target. |
 
@@ -89,7 +91,10 @@ two-mask reference policy.
 
 ASan+UBSan builds pass for both fake-HIP PathFinder suites and the host
 policy/model suites with `ASAN_OPTIONS=detect_leaks=0`; this macOS ASan runtime
-does not support leak detection. `git diff --check` also passes.
+does not support leak detection. The Delta model covers bounded controller
+publication, sticky failure precedence, target/iteration stops, batch-size-one
+equivalence, callback-style abort/reuse, membership reuse, and rollover.
+`git diff --check` also passes.
 
 `hipcc`, ROCm, and an AMD GPU are unavailable on this host. Consequently the
 production `unit_bfs_hip_CSR.cpp`, `delta_stepping_hip_CSR.cpp`, the linked
@@ -99,7 +104,7 @@ those implementations remain uncompiled and unexecuted. The Bellman--Ford
 files received fake-HIP preprocessing only. No production speedup or
 GPU-memory reduction has been measured. The exact later-hardware
 commands and acceptance checklist are in
-[GPU_PROFILING.md](CongestionFreeRouting/GPU_PROFILING.md#amd-validation-checklist-for-the-bounded-optimizations).
+[GPU_PROFILING.md](CongestionFreeRouting/GPU_PROFILING.md#amd-validation-checklist-for-the-bounded-controller).
 
 The generated FPGA Interchange Cap'n Proto C++ headers/libraries and compiler
 are also unavailable on this host. Therefore `device_to_routing_graph.cpp`,
@@ -117,10 +122,11 @@ Python reconstruction coverage, not a substitute compile claim.
    long enough to expose reuse failures rather than accepting one successful
    run. Use four workers for the future production timing baseline.
 3. Establish weighted Delta correctness against CPU Dijkstra and record AMD
-   baselines for compact/wide rows and Boolean/generation membership in both
-   path-producing and distances-only modes, including all-light, all-heavy,
-   mixed, zero-weight, and skewed-degree cases. Use two workers for the future
-   production timing baseline.
+   baselines for host/reduced controllers, compact/wide rows, and
+   Boolean/generation membership in compact-parent, legacy-parent, and
+   distances-only modes. Include all-light, all-heavy, mixed, zero-weight, and
+   skewed-degree cases plus callback abort/reuse and explicit-stream stress.
+   Use four workers for the current controlled timing baseline.
 4. Reprofile current compact-parent Delta. The retained profile used all-unit
    weights and the legacy parent materialization path, so its percentages are
    historical evidence rather than a measurement of current code.
@@ -137,18 +143,21 @@ Python reconstruction coverage, not a substitute compile claim.
 - Generic Delta serially scans each active row, scans mixed rows in both light
   and heavy phases, scans the flat pending set to find the next bucket, and
   scans it again to compact that bucket.
-- Explicit-stream generic Delta checks every light-closure round on the host
-  because dependent batched dispatches previously exposed controller-state
-  failures on gfx1151.
+- The default explicit-stream generic Delta path checks every light-closure
+  round on the host because dependent batched dispatches previously exposed
+  controller-state failures on gfx1151. The opt-in controller avoids that
+  cross-dispatch handoff only inside one cooperative, grid-synchronized kernel;
+  it remains HIP-unvalidated and may select the host fallback.
 - Default UnitBFS still has host-visible per-query setup, status,
   compact-offset, and extraction boundaries even when its inner level loop is
   cooperative. The device-offset alternative is opt-in pending AMD validation.
 - UnitBFS and Delta capacity hints cover source/target-derived storage only.
   Compact paths remain demand-sized because graph-sized or otherwise
   speculative path reservation is intentionally prohibited.
-- Generation-stamped UnitBFS visitation and generation-tagged Delta current
-  membership are opt-in. Sparse reset and Boolean/clear membership remain the
-  enabled defaults until the AMD checklist passes.
+- Generation-stamped UnitBFS visitation, generation-tagged Delta current
+  membership, and the reduced-round-trip Delta controller are opt-in. Sparse
+  reset, Boolean/clear membership, and host-checked control remain the enabled
+  defaults until the AMD checklist passes.
 - The production full-device graph has more than `2^24` rows, so Delta's
   exact-unit specialization is ineligible and Delta selection exercises the
   generic scheduler even though the converter emits unit weights.

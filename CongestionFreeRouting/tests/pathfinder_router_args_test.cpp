@@ -57,6 +57,10 @@ int main() {
          "--delta-telemetry",
          "--delta-telemetry",
          "--delta-force-legacy-parent",
+         "--delta-controller",
+         "reduced-round-trip",
+         "--delta-controller-batch-size",
+         "7",
          "--delta-benchmark-weights",
          "mixed",
          "--delta-benchmark-weight-seed",
@@ -69,6 +73,10 @@ int main() {
                                           "--delta-force-generic",
                                           "--delta-telemetry",
                                           "--delta-force-legacy-parent",
+                                          "--delta-controller",
+                                          "reduced-round-trip",
+                                          "--delta-controller-batch-size",
+                                          "7",
                                           "--delta-benchmark-weights",
                                           "mixed",
                                           "--delta-benchmark-weight-seed",
@@ -101,6 +109,18 @@ int main() {
     }
     require(missing_seed_rejected,
             "router accepted a benchmark seed option without its value");
+
+    bool missing_controller_batch_rejected = false;
+    try {
+      (void)parse({"PathFinderFile",
+                   "design_unrouted.phys",
+                   "design_routed.phys",
+                   "--delta-controller-batch-size"});
+    } catch (const std::runtime_error&) {
+      missing_controller_batch_rejected = true;
+    }
+    require(missing_controller_batch_rejected,
+            "router accepted a controller batch option without its value");
 
     for (const std::string& weight_family :
          std::vector<std::string>({"unit", "all-light", "all-heavy"})) {

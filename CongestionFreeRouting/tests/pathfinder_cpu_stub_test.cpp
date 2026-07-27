@@ -456,6 +456,8 @@ DeltaSteppingCsrWorkspace::DeltaSteppingCsrWorkspace(
   parent_mode_ = options.parent_mode;
   execution_mode_ = options.execution_mode;
   current_membership_mode_ = options.current_membership_mode;
+  controller_mode_ = options.controller_mode;
+  controller_batch_size_ = options.controller_batch_size;
   sssp_capacity::validate_reservation(options.capacity_hints);
 }
 
@@ -467,6 +469,8 @@ DeltaSteppingCsrWorkspace::DeltaSteppingCsrWorkspace(
   parent_mode_ = options.parent_mode;
   execution_mode_ = options.execution_mode;
   current_membership_mode_ = options.current_membership_mode;
+  controller_mode_ = options.controller_mode;
+  controller_batch_size_ = options.controller_batch_size;
   sssp_capacity::validate_reservation(options.capacity_hints);
 }
 

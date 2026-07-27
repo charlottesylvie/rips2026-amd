@@ -79,11 +79,18 @@ wrapper path:
 make ROUTER=PathFinderFile BENCHMARKS="boom_med_pb" VERBOSE=1 \
   PATHFINDER_SSSP_ENGINE=unit-bfs
 make ROUTER=PathFinderFile BENCHMARKS="boom_med_pb" VERBOSE=1 \
-  PATHFINDER_SSSP_ENGINE=delta-step
+  PATHFINDER_SSSP_ENGINE=delta-step \
+  PATHFINDER_ARGS="--parallel-net-workers 4"
 ```
 
+The current measured classic Delta-Stepping benchmark control is
+`--parallel-net-workers 4`. Keep that count explicit in performance runs so
+results remain comparable. It is an empirical control for the tested workload,
+not a portable algorithm default; automatic selection and low-level workspace
+behavior remain unchanged.
+
 The delta backend also accepts a graph-aware bucket-width seed and a sweep
-multiplier while retaining numeric widths as explicit overrides:
+multiplier while retaining numeric widths as an explicit override:
 
 ```bash
 make ROUTER=PathFinderFile BENCHMARKS="boom_med_pb" VERBOSE=1 \
@@ -99,6 +106,31 @@ make ROUTER=PathFinderFile BENCHMARKS="boom_med_pb" VERBOSE=1 \
   PATHFINDER_SSSP_ENGINE=delta-step \
   PATHFINDER_ARGS="--delta 1 --delta-force-generic"
 ```
+
+The generic controller has an explicit correctness-first A/B control. The
+existing host-checked controller remains the default. The reduced-round-trip
+controller is opt-in, uses a bounded device batch, and reports whether runtime
+cooperative-launch checks selected it or fell back to the host path:
+
+```bash
+# Existing/default controller.
+make ROUTER=PathFinderFile BENCHMARKS="boom_med_pb" VERBOSE=1 \
+  PATHFINDER_SSSP_ENGINE=delta-step \
+  PATHFINDER_ARGS="--delta 1 --delta-force-generic \
+    --parallel-net-workers 4 --delta-controller host-checked"
+
+# Opt-in controller candidate.
+make ROUTER=PathFinderFile BENCHMARKS="boom_med_pb" VERBOSE=1 \
+  PATHFINDER_SSSP_ENGINE=delta-step \
+  PATHFINDER_ARGS="--delta 1 --delta-force-generic \
+    --parallel-net-workers 4 --delta-controller reduced-round-trip \
+    --delta-controller-batch-size 4"
+```
+
+Batch size one is the state-machine equivalence control. Progress callbacks
+and unsupported cooperative kernels use the complete host-checked fallback;
+use Delta telemetry to confirm the effective controller before interpreting a
+profile or timing run.
 
 Synthetic weighted runs are reproducible without rebuilding the CSR. This
 example uses a fixed mixed-family seed and emits one aggregate telemetry JSON
@@ -356,6 +388,8 @@ Tuning options:
 | `--delta-multiplier <float>` | `1` | Positive multiplier for sweeping around `--delta auto`; rejected with an explicit numeric width. |
 | `--delta-force-generic` | unset | Bypass only the exact-unit Delta dispatch while preserving weights, delta, destination costs, and automatic compact-parent selection. |
 | `--delta-force-legacy-parent` | unset | Select legacy predecessor recovery for generic vector-target Delta runs; combine with force-generic for a parent-policy A/B test. |
+| `--delta-controller <host-checked\|reduced-round-trip>` | `host-checked` | Select the established generic host controller or the capability-gated bounded device controller. |
+| `--delta-controller-batch-size <int>` | `4` in reduced mode | Positive device-control budget; valid only with an explicitly selected reduced-round-trip controller. |
 | `--delta-telemetry` | unset | Emit one aggregate Delta-Stepping telemetry JSON record after all net workers join. |
 | `--delta-benchmark-weights <unit\|all-light\|all-heavy\|mixed>` | unset | Deterministically replace in-memory CSR weights for a benchmark; requires an explicit numeric delta. |
 | `--delta-benchmark-weight-seed <uint>` | `0` | Seed the `mixed` family; rejected for every other family. |
@@ -372,7 +406,10 @@ Every Delta-specific control requires `--sssp-engine delta-step` or
 `--use-delta-step`; other engines reject rather than ignore it. Force-generic
 works with numeric or automatic delta. The multiplier requires automatic
 delta, benchmark weight families require an explicit numeric delta, and the
-seed is valid only with `mixed`. Force-generic and force-legacy-parent may be
+seed is valid only with `mixed`. A controller batch size requires an explicit
+`--delta-controller reduced-round-trip`; host-checked mode preserves the
+existing null-stream and explicit-stream behavior exactly. Force-generic and
+force-legacy-parent may be
 combined: the first chooses generic execution and the second chooses its
 parent representation. Force-legacy-parent by itself also makes the fixed
 exact-unit parent path ineligible, so use force-generic with automatic parents
@@ -417,11 +454,14 @@ uninstrumented kernel instantiations and does not allocate, reset, or copy the
 device counter buffer. `--delta-telemetry` selects instrumented kernels and is
 intended for diagnosis, not clean wall-time measurement. After a successful
 worker join, PathFinder writes one JSON line to standard output with
-`type="delta_stepping_telemetry"` and `schema_version=1`; filter mixed logs on
+`type="delta_stepping_telemetry"` and `schema_version=2`; filter mixed logs on
 that type. `queries` counts actual collected net searches, counter fields are
 sums across searches, and queue fields under `maxima` are per-search maxima
 combined with `max`, not sums. Execution-path counts distinguish exact-unit,
-compact generic, legacy generic, and generic distances-only work.
+compact generic, legacy generic, and generic distances-only work. The record
+also includes the configured controller and batch, effective host/reduced query
+counts, and `controller_fallback_queries`; this prevents a capability fallback
+from being mistaken for a reduced-controller measurement.
 
 The counters measure bucket/light/heavy rounds, frontier and edge visits,
 distance atomic attempts/successes/CAS retries, logical queue insertions and
@@ -509,7 +549,7 @@ Useful wrapper options:
 | `--interchange-to-csr <path>` | Override converter executable. Env: `INTERCHANGE_TO_CSR`. |
 | `--pathfinder <path>` | Override PathFinder executable. Env: `PATHFINDER_BIN`. |
 | `--routes-to-phys <path>` | Override route reconstructor. Env: `ROUTES_TO_PHYS`. |
-| `--sssp-engine`, `--use-delta-step`, `--delta`, `--delta-multiplier`, `--delta-force-generic`, `--delta-force-legacy-parent`, `--delta-telemetry`, `--delta-benchmark-weights`, `--delta-benchmark-weight-seed`, `--max-sssp-iters`, `--net-limit`, `--parallel-net-workers`, `--capacity` | Forwarded to `pathfinder`. |
+| `--sssp-engine`, `--use-delta-step`, `--delta`, `--delta-multiplier`, `--delta-force-generic`, `--delta-force-legacy-parent`, `--delta-controller`, `--delta-controller-batch-size`, `--delta-telemetry`, `--delta-benchmark-weights`, `--delta-benchmark-weight-seed`, `--max-sssp-iters`, `--net-limit`, `--parallel-net-workers`, `--capacity` | Forwarded to `pathfinder`. |
 | `--max-pathfinder-iters`, `--present-factor`, `--present-multiplier`, `--history-factor`, `--route-batch-size` | Compatibility-only; forwarded to `pathfinder` and ignored. |
 
 ## File Formats And Artifacts
@@ -611,6 +651,17 @@ Delta benchmark argument parsing/forwarding test:
 
 ```bash
 python3 CongestionFreeRouting/tests/pathfinder_benchmark_args_test.py
+```
+
+Host-only Delta controller, membership, compact-offset, allocation, and
+batch-boundary policy test:
+
+```bash
+g++ -std=c++17 -O2 -Wall -Wextra -Wpedantic -Werror \
+  CongestionFreeRouting/tests/delta_stepping_policy_test.cpp \
+  -o /tmp/delta_stepping_policy_test
+
+/tmp/delta_stepping_policy_test
 ```
 
 C++ router forwarding test:
