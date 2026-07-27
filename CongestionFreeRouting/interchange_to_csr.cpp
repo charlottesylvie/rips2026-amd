@@ -196,12 +196,16 @@ struct RoutingGraph : DeviceRoutingGraph {
     // exception because its traversal carries connection ownership and intent;
     // this graph currently cannot.
     sink_node_stops.assign(node_device_ids.size(), 0);
-    exclusive_source_nodes.assign(node_device_ids.size(), 0);
+    unavailable_destination_nodes.assign(node_device_ids.size(), 0);
   }
 
   std::vector<std::uint8_t> blocked_node;
   std::vector<std::uint8_t> sink_node_stops;
-  std::vector<std::uint8_t> exclusive_source_nodes;
+  // Exclusive route sources while physical endpoints are being validated.
+  // Blocked resources are ORed into this mask exactly once before final CSR
+  // filtering, when source/sink overlap checks no longer need to distinguish
+  // the two policies. The filter then needs one random destination-mask read.
+  std::vector<std::uint8_t> unavailable_destination_nodes;
   std::vector<SitePinNode> site_pin_attrs;
   std::vector<RouteRequest> route_requests;
 
@@ -228,6 +232,10 @@ struct SitePinName {
 // different device nodes.
 class ActiveSiteTypes {
  public:
+  void reserve(std::size_t site_count) {
+    type_by_site_.reserve(site_count);
+  }
+
   void insert(const std::string& site, const std::string& type) {
     const auto [found, inserted] = type_by_site_.emplace(site, type);
     if (!inserted && found->second != type) {
@@ -508,110 +516,121 @@ void add_site_pin_attr(RoutingGraph& graph,
   graph.site_pin_attrs.push_back(attr);
 }
 
-// Walk a PhysicalNetlist route-branch forest and collect every sitePin segment.
-// For unrouted signal nets, stubs hold sinks and sources hold legal starts.
-std::vector<SitePinName> extract_site_pins(
-    capnp::List<PhysicalNetlist::PhysNetlist::RouteBranch>::Reader branches,
-    TextCache& strings) {
-  using RouteBranch = PhysicalNetlist::PhysNetlist::RouteBranch;
+using PhysicalRouteBranch = PhysicalNetlist::PhysNetlist::RouteBranch;
+using RouteBranchStack = std::vector<PhysicalRouteBranch::Reader>;
 
-  std::vector<RouteBranch::Reader> queue;
-  queue.reserve(branches.size());
-  for (std::uint32_t i = 0; i < branches.size(); ++i) {
-    queue.push_back(branches[i]);
+void seed_route_branch_stack(
+    capnp::List<PhysicalRouteBranch>::Reader branches,
+    RouteBranchStack& stack) {
+  stack.clear();
+  if (stack.capacity() < branches.size()) {
+    stack.reserve(branches.size());
   }
+  for (std::uint32_t i = 0; i < branches.size(); ++i) {
+    stack.push_back(branches[i]);
+  }
+}
 
-  std::vector<SitePinName> pins;
-  while (!queue.empty()) {
-    const RouteBranch::Reader branch = queue.back();
-    queue.pop_back();
+struct SourceForestAnalysis {
+  bool site_pins_are_leaves = true;
+  bool has_pip = false;
+};
+
+// Collect source pins and the two source-forest classification facts in one
+// LIFO traversal. The previous correctness checks walked the same forest three
+// times; retaining the original root/child push order preserves serialized
+// source order exactly.
+SourceForestAnalysis analyze_source_forest(
+    capnp::List<PhysicalRouteBranch>::Reader branches,
+    TextCache& strings,
+    std::vector<SitePinName>& pins,
+    RouteBranchStack& stack) {
+  pins.clear();
+  if (pins.capacity() < branches.size()) {
+    pins.reserve(branches.size());
+  }
+  seed_route_branch_stack(branches, stack);
+
+  SourceForestAnalysis analysis;
+  while (!stack.empty()) {
+    const PhysicalRouteBranch::Reader branch = stack.back();
+    stack.pop_back();
 
     const auto segment = branch.getRouteSegment();
+    const auto children = branch.getBranches();
     if (segment.isSitePin()) {
       const auto site_pin = segment.getSitePin();
       pins.push_back(
           {strings.get(site_pin.getSite()), strings.get(site_pin.getPin())});
+      if (children.size() != 0) {
+        analysis.site_pins_are_leaves = false;
+      }
+    } else if (segment.isPip()) {
+      analysis.has_pip = true;
     }
 
-    const auto child_branches = branch.getBranches();
-    for (std::uint32_t i = 0; i < child_branches.size(); ++i) {
-      queue.push_back(child_branches[i]);
+    for (std::uint32_t i = 0; i < children.size(); ++i) {
+      stack.push_back(children[i]);
     }
   }
 
-  return pins;
+  return analysis;
 }
 
 bool route_forest_has_pip(
-    capnp::List<PhysicalNetlist::PhysNetlist::RouteBranch>::Reader branches) {
-  using RouteBranch = PhysicalNetlist::PhysNetlist::RouteBranch;
-  std::vector<RouteBranch::Reader> queue;
-  queue.reserve(branches.size());
-  for (std::uint32_t i = 0; i < branches.size(); ++i) {
-    queue.push_back(branches[i]);
-  }
-  while (!queue.empty()) {
-    const RouteBranch::Reader branch = queue.back();
-    queue.pop_back();
+    capnp::List<PhysicalRouteBranch>::Reader branches,
+    RouteBranchStack& stack) {
+  seed_route_branch_stack(branches, stack);
+  while (!stack.empty()) {
+    const PhysicalRouteBranch::Reader branch = stack.back();
+    stack.pop_back();
     if (branch.getRouteSegment().isPip()) {
       return true;
     }
     const auto children = branch.getBranches();
     for (std::uint32_t i = 0; i < children.size(); ++i) {
-      queue.push_back(children[i]);
+      stack.push_back(children[i]);
     }
   }
   return false;
 }
 
-bool route_forest_site_pins_are_leaves(
-    capnp::List<PhysicalNetlist::PhysNetlist::RouteBranch>::Reader branches) {
-  using RouteBranch = PhysicalNetlist::PhysNetlist::RouteBranch;
-  std::vector<RouteBranch::Reader> queue;
-  queue.reserve(branches.size());
-  for (std::uint32_t i = 0; i < branches.size(); ++i) {
-    queue.push_back(branches[i]);
-  }
-  while (!queue.empty()) {
-    const RouteBranch::Reader branch = queue.back();
-    queue.pop_back();
-    const auto children = branch.getBranches();
-    if (branch.getRouteSegment().isSitePin() && children.size() != 0) {
-      return false;
-    }
-    for (std::uint32_t i = 0; i < children.size(); ++i) {
-      queue.push_back(children[i]);
-    }
-  }
-  return true;
-}
+struct SitePinStringIndices {
+  std::uint32_t site = 0;
+  std::uint32_t pin = 0;
+};
 
-bool top_level_stubs_are_site_pins(
-    capnp::List<PhysicalNetlist::PhysNetlist::RouteBranch>::Reader stubs) {
-  for (std::uint32_t i = 0; i < stubs.size(); ++i) {
-    if (!stubs[i].getRouteSegment().isSitePin()) {
-      return false;
-    }
+// Validate the routable-stub shape and retain its site/pin indices in one
+// Cap'n Proto list traversal. Decode names only after every top-level branch
+// has passed the shape check. That preserves the old failure behavior for an
+// unsupported non-sitePin stub while avoiding a second branch-list scan for a
+// routable net.
+bool analyze_top_level_site_pin_stubs(
+    capnp::List<PhysicalRouteBranch>::Reader branches,
+    TextCache& strings,
+    std::vector<SitePinStringIndices>& pin_indices,
+    std::vector<SitePinName>& pins) {
+  pin_indices.clear();
+  pins.clear();
+  if (pin_indices.capacity() < branches.size()) {
+    pin_indices.reserve(branches.size());
   }
-  return true;
-}
-
-std::vector<SitePinName> extract_top_level_site_pins(
-    capnp::List<PhysicalNetlist::PhysNetlist::RouteBranch>::Reader branches,
-    TextCache& strings) {
-  std::vector<SitePinName> pins;
-  pins.reserve(branches.size());
+  if (pins.capacity() < branches.size()) {
+    pins.reserve(branches.size());
+  }
   for (std::uint32_t i = 0; i < branches.size(); ++i) {
     const auto segment = branches[i].getRouteSegment();
     if (!segment.isSitePin()) {
-      throw std::runtime_error(
-          "routable net contains a non-sitePin top-level stub");
+      return false;
     }
     const auto site_pin = segment.getSitePin();
-    pins.push_back(
-        {strings.get(site_pin.getSite()), strings.get(site_pin.getPin())});
+    pin_indices.push_back({site_pin.getSite(), site_pin.getPin()});
   }
-  return pins;
+  for (const SitePinStringIndices& site_pin : pin_indices) {
+    pins.push_back(
+        {strings.get(site_pin.site), strings.get(site_pin.pin)});
+  }
+  return true;
 }
 
 // Look up a graph node directly from a tile/wire pair. This is used when an
@@ -730,24 +749,20 @@ void preserve_fixed_site_pin(const std::string& site,
 }
 
 void preserve_route_forest(
-    capnp::List<PhysicalNetlist::PhysNetlist::RouteBranch>::Reader branches,
+    capnp::List<PhysicalRouteBranch>::Reader branches,
     TextCache& strings,
     const ActiveSiteTypes& active_site_types,
     const RouteEndpointOwners& endpoint_owners,
     RoutingGraph& graph,
     const std::string& net_name,
     bool preserve_static_output_pair,
-    PhysicalImportStats* stats) {
-  using RouteBranch = PhysicalNetlist::PhysNetlist::RouteBranch;
-  std::vector<RouteBranch::Reader> queue;
-  queue.reserve(branches.size());
-  for (std::uint32_t i = 0; i < branches.size(); ++i) {
-    queue.push_back(branches[i]);
-  }
+    PhysicalImportStats* stats,
+    RouteBranchStack& stack) {
+  seed_route_branch_stack(branches, stack);
 
-  while (!queue.empty()) {
-    const RouteBranch::Reader branch = queue.back();
-    queue.pop_back();
+  while (!stack.empty()) {
+    const PhysicalRouteBranch::Reader branch = stack.back();
+    stack.pop_back();
     const auto segment = branch.getRouteSegment();
     if (segment.isSitePin()) {
       const auto site_pin = segment.getSitePin();
@@ -798,7 +813,7 @@ void preserve_route_forest(
 
     const auto children = branch.getBranches();
     for (std::uint32_t i = 0; i < children.size(); ++i) {
-      queue.push_back(children[i]);
+      stack.push_back(children[i]);
     }
   }
 }
@@ -810,13 +825,16 @@ void preserve_physical_net(
     const RouteEndpointOwners& endpoint_owners,
     RoutingGraph& graph,
     const std::string& net_name,
-    PhysicalImportStats* stats) {
+    PhysicalImportStats* stats,
+    RouteBranchStack& stack) {
   const bool is_static =
       net.getType() != PhysicalNetlist::PhysNetlist::NetType::SIGNAL;
   preserve_route_forest(net.getSources(), strings, active_site_types,
-                        endpoint_owners, graph, net_name, is_static, stats);
+                        endpoint_owners, graph, net_name, is_static, stats,
+                        stack);
   preserve_route_forest(net.getStubs(), strings, active_site_types,
-                        endpoint_owners, graph, net_name, is_static, stats);
+                        endpoint_owners, graph, net_name, is_static, stats,
+                        stack);
   const auto stub_nodes = net.getStubNodes();
   for (std::uint32_t i = 0; i < stub_nodes.size(); ++i) {
     const auto stub_node = stub_nodes[i];
@@ -1001,6 +1019,7 @@ PhysicalImportStats parse_physical_netlist(
 
   ActiveSiteTypes active_site_types;
   const auto site_instances = netlist.getSiteInsts();
+  active_site_types.reserve(site_instances.size());
   for (std::uint32_t index = 0; index < site_instances.size(); ++index) {
     const auto site_instance = site_instances[index];
     active_site_types.insert(strings.get(site_instance.getSite()),
@@ -1012,6 +1031,12 @@ PhysicalImportStats parse_physical_netlist(
   PhysicalImportStats stats;
   RouteEndpointOwners endpoint_owners;
   std::unordered_map<std::string, std::size_t> physical_net_name_owners;
+  endpoint_owners.reserve(phys_nets.size());
+  physical_net_name_owners.reserve(phys_nets.size());
+  RouteBranchStack route_branch_stack;
+  std::vector<SitePinName> source_pins;
+  std::vector<SitePinName> sink_pins;
+  std::vector<SitePinStringIndices> sink_pin_indices;
   auto claim_endpoint = [&](NodeId node, std::size_t owner,
                             const std::string& net_name) {
     if (graph.blocked_node[static_cast<std::size_t>(node)] != 0) {
@@ -1037,28 +1062,64 @@ PhysicalImportStats parse_physical_netlist(
     }
     const auto sources = net.getSources();
     const auto stubs = net.getStubs();
-    const std::vector<SitePinName> source_pins =
-        extract_site_pins(sources, strings);
     routing::interchange::PhysicalNetRoutingFacts facts;
     facts.is_signal = net.getType() == PhysNetlist::NetType::SIGNAL;
     facts.top_level_source_count = sources.size();
     facts.top_level_stub_count = stubs.size();
-    facts.source_site_pin_count = source_pins.size();
-    facts.source_site_pins_are_leaves =
-        route_forest_site_pins_are_leaves(sources);
-    facts.has_inter_site_pip =
-        route_forest_has_pip(sources) || route_forest_has_pip(stubs);
-    facts.has_stub_nodes = net.getStubNodes().size() != 0;
-    facts.top_level_stubs_are_site_pins =
-        top_level_stubs_are_site_pins(stubs);
-    const auto disposition =
-        routing::interchange::classify_physical_net(facts);
+
+    // GLOBAL_USEDNET is RapidWright's signal-net occupancy sentinel, not a
+    // logical connection. Its arbitrary routing shape is supported here by
+    // preserving every represented resource without creating a route request.
+    if (routing::interchange::is_reserved_used_resource_net(
+            physical_net_name, facts.is_signal)) {
+      preserve_physical_net(net, strings, active_site_types,
+                            endpoint_owners, graph, physical_net_name,
+                            &stats, route_branch_stack);
+      ++stats.preserved_nets;
+      continue;
+    }
+
+    source_pins.clear();
+    sink_pins.clear();
+    sink_pin_indices.clear();
+    routing::interchange::PhysicalNetDisposition disposition;
+    // Match classify_physical_net's decision order so nets already known to
+    // be preservation-only do not pay to scan large routed forests merely to
+    // compute facts that cannot affect their disposition.
+    if (!facts.is_signal || facts.top_level_stub_count == 0 ||
+        facts.top_level_source_count == 0) {
+      disposition = routing::interchange::classify_physical_net(facts);
+    } else {
+      const SourceForestAnalysis source_analysis = analyze_source_forest(
+          sources, strings, source_pins, route_branch_stack);
+      facts.source_site_pin_count = source_pins.size();
+      facts.source_site_pins_are_leaves =
+          source_analysis.site_pins_are_leaves;
+
+      if (facts.source_site_pin_count == 0 ||
+          !facts.source_site_pins_are_leaves) {
+        disposition = routing::interchange::classify_physical_net(facts);
+      } else {
+        facts.has_stub_nodes = net.getStubNodes().size() != 0;
+        facts.has_inter_site_pip = source_analysis.has_pip;
+        if (!facts.has_inter_site_pip && !facts.has_stub_nodes) {
+          facts.has_inter_site_pip =
+              route_forest_has_pip(stubs, route_branch_stack);
+        }
+        if (!facts.has_inter_site_pip && !facts.has_stub_nodes) {
+          facts.top_level_stubs_are_site_pins =
+              analyze_top_level_site_pin_stubs(
+                  stubs, strings, sink_pin_indices, sink_pins);
+        }
+        disposition = routing::interchange::classify_physical_net(facts);
+      }
+    }
 
     if (disposition !=
         routing::interchange::PhysicalNetDisposition::kRouteSignal) {
       preserve_physical_net(net, strings, active_site_types,
                             endpoint_owners, graph, physical_net_name,
-                            &stats);
+                            &stats, route_branch_stack);
       switch (disposition) {
         case routing::interchange::PhysicalNetDisposition::
             kPreserveCompleteOrLoadless:
@@ -1094,8 +1155,6 @@ PhysicalImportStats parse_physical_netlist(
       continue;
     }
 
-    const std::vector<SitePinName> sink_pins =
-        extract_top_level_site_pins(stubs, strings);
     RouteRequest request;
     request.net_string = graph.string_table.intern(physical_net_name);
     const auto logical_match =
@@ -1122,7 +1181,7 @@ PhysicalImportStats parse_physical_netlist(
         source.node = *source_node;
         claim_endpoint(*source_node, net_index, physical_net_name);
         routing::interchange::mark_source_exclusive(
-            graph.exclusive_source_nodes, *source_node);
+            graph.unavailable_destination_nodes, *source_node);
         has_valid_source = true;
       }
       request.sources.push_back(source);
@@ -1144,7 +1203,7 @@ PhysicalImportStats parse_physical_netlist(
         claim_endpoint(*sink_node, net_index, physical_net_name);
         if (has_valid_source) {
           const bool is_source_of_same_net =
-              graph.exclusive_source_nodes[
+              graph.unavailable_destination_nodes[
                   static_cast<std::size_t>(*sink_node)] != 0;
           if (routing::interchange::sink_requires_terminal_row(
                   is_source_of_same_net)) {
@@ -1169,10 +1228,20 @@ PhysicalImportStats parse_physical_netlist(
   return stats;
 }
 
-CsrGraph make_outgoing_csr(const RoutingGraph& graph) {
+CsrGraph make_outgoing_csr(RoutingGraph& graph) {
+  if (graph.unavailable_destination_nodes.size() !=
+      graph.blocked_node.size()) {
+    throw std::runtime_error(
+        "destination-unavailability mask does not match blocked-node mask");
+  }
+  for (std::size_t node = 0; node < graph.blocked_node.size(); ++node) {
+    graph.unavailable_destination_nodes[node] = static_cast<std::uint8_t>(
+        graph.unavailable_destination_nodes[node] |
+        graph.blocked_node[node]);
+  }
   return filter_device_routing_graph(graph, graph.blocked_node,
                                      graph.sink_node_stops,
-                                     graph.exclusive_source_nodes);
+                                     graph.unavailable_destination_nodes);
 }
 
 void write_csr_graph(const CsrGraph& graph,
@@ -1591,7 +1660,7 @@ int main(int argc, char** argv) {
     release_storage(graph.rowptr);
     release_storage(graph.colind);
     release_storage(graph.edge_attrs);
-    release_storage(graph.exclusive_source_nodes);
+    release_storage(graph.unavailable_destination_nodes);
 
     const std::uint64_t rowptr_bytes = static_cast<std::uint64_t>(
         checked_array_bytes<std::int64_t>(csr.rowptr.size(),

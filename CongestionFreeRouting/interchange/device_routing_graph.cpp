@@ -939,14 +939,25 @@ void sort_and_deduplicate_static_csr(
         "raw static CSR row pointers do not match its entries");
   }
 
-  std::vector<std::int64_t> unique_rowptr(rowptr.size(), 0);
   std::size_t output_edge = 0;
+  std::size_t input_begin = 0;
   for (std::size_t row = 0; row + 1 < rowptr.size(); ++row) {
-    if (rowptr[row] < 0 || rowptr[row + 1] < rowptr[row]) {
+    // rowptr[row] may already contain the compacted output boundary. Retain
+    // the untouched next raw boundary before overwriting it, so the original
+    // CSR can be consumed sequentially without allocating a second full
+    // row-pointer array.
+    const std::int64_t raw_end = rowptr[row + 1];
+    if (raw_end < 0) {
       throw std::runtime_error("raw static CSR row pointers are not monotone");
     }
-    const std::size_t begin = static_cast<std::size_t>(rowptr[row]);
-    const std::size_t end = static_cast<std::size_t>(rowptr[row + 1]);
+    if (static_cast<std::uint64_t>(raw_end) > entries.size()) {
+      throw std::runtime_error("raw static CSR row pointers are not monotone");
+    }
+    const std::size_t begin = input_begin;
+    const std::size_t end = static_cast<std::size_t>(raw_end);
+    if (end < input_begin) {
+      throw std::runtime_error("raw static CSR row pointers are not monotone");
+    }
     if (end - begin > 1) {
       std::sort(entries.begin() + static_cast<std::ptrdiff_t>(begin),
                 entries.begin() + static_cast<std::ptrdiff_t>(end),
@@ -967,21 +978,21 @@ void sort_and_deduplicate_static_csr(
       ++output_edge;
       group_begin = group_end;
     }
-    unique_rowptr[row + 1] = static_cast<std::int64_t>(output_edge);
+    rowptr[row + 1] = static_cast<std::int64_t>(output_edge);
+    input_begin = end;
   }
   entries.resize(output_edge);
-  rowptr.swap(unique_rowptr);
 }
 
 CsrGraph filter_device_routing_graph(
     const DeviceRoutingGraph& graph,
     const std::vector<std::uint8_t>& blocked_node,
     const std::vector<std::uint8_t>& sink_node_stops,
-    const std::vector<std::uint8_t>& exclusive_source_nodes) {
+    const std::vector<std::uint8_t>& unavailable_destination_nodes) {
   const std::size_t node_count = graph.node_device_ids.size();
   if (blocked_node.size() != node_count ||
       sink_node_stops.size() != node_count ||
-      exclusive_source_nodes.size() != node_count) {
+      unavailable_destination_nodes.size() != node_count) {
     throw std::runtime_error("design masks do not match device graph rows");
   }
   if (graph.rowptr.size() != node_count + 1 || graph.rowptr.front() != 0 ||
@@ -1015,6 +1026,10 @@ CsrGraph filter_device_routing_graph(
       throw std::runtime_error("device graph row pointers are not monotone");
     }
     std::int32_t previous = -1;
+    if (blocked_node[row] && !unavailable_destination_nodes[row]) {
+      throw std::runtime_error(
+          "blocked graph node is available as an edge destination");
+    }
     const bool source_is_active =
         !blocked_node[row] && !sink_node_stops[row];
     for (std::int64_t edge = begin; edge < end; ++edge) {
@@ -1030,8 +1045,7 @@ CsrGraph filter_device_routing_graph(
       }
       previous = col;
       if (source_is_active &&
-          !blocked_node[static_cast<std::size_t>(col)] &&
-          !exclusive_source_nodes[static_cast<std::size_t>(col)]) {
+          !unavailable_destination_nodes[static_cast<std::size_t>(col)]) {
         csr.colind.push_back(col);
         csr.edge_attrs.push_back(attr);
       }

@@ -94,6 +94,15 @@ constexpr bool fixed_site_pin_candidate_fallback_allowed(
   return !has_active_site_type;
 }
 
+// RapidWright uses this exact signal-net sentinel to serialize site resources
+// that are occupied without representing an ordinary logical connection. It
+// is preservation-only routing state: keep its resources blocked, but never
+// turn its apparent branches/stubs into a source-to-sink routing request.
+constexpr bool is_reserved_used_resource_net(std::string_view net_name,
+                                             bool is_signal) {
+  return is_signal && net_name == "GLOBAL_USEDNET";
+}
+
 inline bool claim_unique_physical_net_name(
     std::unordered_map<std::string, std::size_t>& owners,
     const std::string& name,

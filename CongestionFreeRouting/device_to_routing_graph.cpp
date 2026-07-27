@@ -34,6 +34,7 @@
 #include <optional>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -225,34 +226,10 @@ void check_device_payload_size(const std::filesystem::path& path,
   }
 }
 
-class TextCache {
- public:
-  explicit TextCache(capnp::List<capnp::Text>::Reader strings)
-      : strings_(strings), cache_(strings.size()) {}
-
-  const std::string& get(std::uint32_t index) {
-    if (index >= cache_.size()) {
-      throw std::runtime_error("FPGAIF string index is out of range");
-    }
-    std::optional<std::string>& cached = cache_[index];
-    if (!cached.has_value()) {
-      const capnp::Text::Reader text = strings_[index];
-      cached.emplace(text.cStr(), text.size());
-    }
-    return *cached;
-  }
-
-  std::size_t size() const { return cache_.size(); }
-
- private:
-  capnp::List<capnp::Text>::Reader strings_;
-  std::vector<std::optional<std::string>> cache_;
-};
-
 std::optional<std::pair<std::int32_t, std::int32_t>> parse_tile_xy(
-    const std::string& tile_name) {
+    std::string_view tile_name) {
   const std::size_t marker = tile_name.rfind("_X");
-  if (marker == std::string::npos) {
+  if (marker == std::string_view::npos) {
     return std::nullopt;
   }
   std::size_t pos = marker + 2;
@@ -295,12 +272,6 @@ std::uint64_t mix_key(std::uint64_t value) {
   value = (value ^ (value >> 27)) * 0x94d049bb133111ebULL;
   return value ^ (value >> 31);
 }
-
-struct NumericPairNode {
-  std::uint32_t first = 0;
-  std::uint32_t second = 0;
-  NodeId node = kInvalidRouteNode;
-};
 
 // Open-addressed numeric lookup used only while preprocessing. It replaces
 // nested unordered_map<string, unordered_map<string, NodeId>> and therefore
@@ -398,7 +369,6 @@ struct TileInstance {
   std::uint32_t tile_index = 0;
   std::uint32_t tile_name = 0;
   std::uint32_t tile_type = 0;
-  std::uint64_t tile_string = 0;
 };
 
 struct BuildResult {
@@ -429,7 +399,7 @@ BuildResult build_device_routing_graph(const Options& options) {
   capnp::FlatArrayMessageReader reader(
       kj::arrayPtr(payload.words.data(), payload.words.size()), reader_options);
   const auto device = reader.getRoot<DeviceResources::Device>();
-  TextCache strings(device.getStrList());
+  const auto device_strings = device.getStrList();
 
   const auto tile_list = device.getTileList();
   const auto tile_types = device.getTileTypeList();
@@ -453,22 +423,31 @@ BuildResult build_device_routing_graph(const Options& options) {
   graph.device_name_string = graph.string_table.intern(
       std::string(device_name.cStr(), device_name.size()));
 
-  std::vector<std::uint64_t> local_string_by_device_id(strings.size(),
-                                                        kNoStringIndex);
+  // All serialized lookup string IDs are required to fit below UINT32_MAX.
+  // Use that otherwise-invalid value as the dense cache sentinel, cutting this
+  // DeviceResources-sized array in half. The local string table is the only
+  // decoded-string cache: keeping a second optional<string> for every FPGAIF
+  // string consumed substantial memory on full devices.
+  constexpr std::uint32_t kUnmappedLocalString =
+      std::numeric_limits<std::uint32_t>::max();
+  std::vector<std::uint32_t> local_string_by_device_id(
+      device_strings.size(), kUnmappedLocalString);
   auto intern_device_string = [&](std::uint32_t device_string) {
     if (device_string >= local_string_by_device_id.size()) {
       throw std::runtime_error("FPGAIF string index is out of range");
     }
-    std::uint64_t& local = local_string_by_device_id[device_string];
-    if (local == kNoStringIndex) {
-      local = graph.string_table.intern(strings.get(device_string));
+    std::uint32_t& local = local_string_by_device_id[device_string];
+    if (local == kUnmappedLocalString) {
+      const capnp::Text::Reader text = device_strings[device_string];
+      local = checked_lookup_string_id(graph.string_table.intern(
+          std::string(text.cStr(), text.size())));
     }
     return local;
   };
 
   // Parse each tile coordinate once and retain a dense StringIdx-indexed table.
   // The old implementation reparsed a tile name for every wire in every node.
-  std::vector<TileInfo> tile_info(strings.size());
+  std::vector<TileInfo> tile_info(device_strings.size());
   std::vector<std::uint32_t> in_bounds_tile_indices;
   in_bounds_tile_indices.reserve(tile_list.size());
   for (std::uint32_t tile_index = 0; tile_index < tile_list.size();
@@ -479,7 +458,9 @@ BuildResult build_device_routing_graph(const Options& options) {
     }
     TileInfo& info = tile_info[tile.getName()];
     info.tile_index = tile_index;
-    const auto xy = parse_tile_xy(strings.get(tile.getName()));
+    const capnp::Text::Reader tile_name = device_strings[tile.getName()];
+    const auto xy = parse_tile_xy(
+        std::string_view(tile_name.cStr(), tile_name.size()));
     if (!xy.has_value()) {
       continue;
     }
@@ -504,8 +485,10 @@ BuildResult build_device_routing_graph(const Options& options) {
   graph.node_tile_type_strings.reserve(node_capacity);
   graph.node_wire_type_strings.reserve(node_capacity);
 
-  std::vector<NumericPairNode> numeric_tile_wire_nodes;
-  numeric_tile_wire_nodes.reserve(static_cast<std::size_t>(wires.size()));
+  // Build the final compact lookup records directly. A separate numeric
+  // staging vector held the same key/node triples and briefly doubled this
+  // per-wire storage while it was copied into graph.tile_wire_nodes.
+  graph.tile_wire_nodes.reserve(static_cast<std::size_t>(wires.size()));
 
   for (std::uint32_t node_index = 0; node_index < nodes.size(); ++node_index) {
     const auto node_wires = nodes[node_index].getWires();
@@ -567,12 +550,13 @@ BuildResult build_device_routing_graph(const Options& options) {
           max_y = std::max(max_y, info.y);
         }
       }
-      numeric_tile_wire_nodes.push_back(
+      graph.tile_wire_nodes.push_back(
           {checked_lookup_string_id(
                intern_device_string(wire.getTile())),
            checked_lookup_string_id(
                intern_device_string(wire.getWire())),
-           compact_node});
+           compact_node,
+           0});
     }
     if (!has_xy) {
       min_x = max_x = min_y = max_y = -1;
@@ -609,19 +593,13 @@ BuildResult build_device_routing_graph(const Options& options) {
   }
   release_storage(tile_info);
 
-  FlatPairNodeMap tile_wire_map(numeric_tile_wire_nodes.size());
-  for (const NumericPairNode& record : numeric_tile_wire_nodes) {
-    tile_wire_map.insert(record.first, record.second, record.node);
-  }
-
-  graph.tile_wire_nodes.reserve(numeric_tile_wire_nodes.size());
-  for (const NumericPairNode& record : numeric_tile_wire_nodes) {
-    graph.tile_wire_nodes.push_back(
-        {record.first, record.second, record.node, 0});
+  FlatPairNodeMap tile_wire_map(graph.tile_wire_nodes.size());
+  for (const PairNodeLookup& record : graph.tile_wire_nodes) {
+    tile_wire_map.insert(record.first_string, record.second_string,
+                         record.node);
   }
   (void)sort_and_deduplicate_pair_node_lookups(
       graph.tile_wire_nodes, LookupConflictPolicy::kReject, "tile-wire");
-  release_storage(numeric_tile_wire_nodes);
 
   std::vector<TileInstance> tile_instances;
   tile_instances.reserve(in_bounds_tile_indices.size());
@@ -631,10 +609,10 @@ BuildResult build_device_routing_graph(const Options& options) {
     if (tile.getType() >= tile_types.size()) {
       throw std::runtime_error("tile type index is out of range");
     }
-    const std::uint64_t tile_string = intern_device_string(tile.getName());
+    const std::uint32_t tile_string =
+        intern_device_string(tile.getName());
     tile_instances.push_back(
-        {tile_index, checked_lookup_string_id(tile_string), tile.getType(),
-         tile_string});
+        {tile_index, tile_string, tile.getType()});
     used_tile_type[tile.getType()] = 1;
   }
   release_storage(in_bounds_tile_indices);
@@ -706,14 +684,14 @@ BuildResult build_device_routing_graph(const Options& options) {
           pip.forward_pip_data =
               intern_pip_data(pip.wire0, pip.wire1, true);
         }
-        callback(*node0, *node1, tile.tile_string,
+        callback(*node0, *node1, tile.tile_name,
                  pip.forward_pip_data);
         if (pip.bidirectional) {
           if (pip.reverse_pip_data == kNoIndex) {
             pip.reverse_pip_data =
                 intern_pip_data(pip.wire0, pip.wire1, false);
           }
-          callback(*node1, *node0, tile.tile_string,
+          callback(*node1, *node0, tile.tile_name,
                    pip.reverse_pip_data);
         }
       }

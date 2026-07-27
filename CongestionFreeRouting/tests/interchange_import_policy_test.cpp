@@ -144,6 +144,12 @@ int main() {
     require(ri::fixed_site_pin_candidate_fallback_allowed(false) &&
                 !ri::fixed_site_pin_candidate_fallback_allowed(true),
             "typed fixed-site fallback policy is wrong");
+    require(ri::is_reserved_used_resource_net("GLOBAL_USEDNET", true) &&
+                !ri::is_reserved_used_resource_net("GLOBAL_USEDNET", false) &&
+                !ri::is_reserved_used_resource_net("global_usednet", true) &&
+                !ri::is_reserved_used_resource_net("GLOBAL_USEDNET_suffix",
+                                                    true),
+            "RapidWright used-resource sentinel policy is wrong");
     std::unordered_map<std::string, std::size_t> physical_net_names;
     require(ri::claim_unique_physical_net_name(
                 physical_net_names, "net_a", 0) &&

@@ -43,6 +43,57 @@ bool reachable(const ri::CsrGraph& graph, std::int32_t source,
   return false;
 }
 
+ri::CsrGraph reference_filter_with_separate_destination_masks(
+    const ri::DeviceRoutingGraph& graph,
+    const std::vector<std::uint8_t>& blocked,
+    const std::vector<std::uint8_t>& sink_stops,
+    const std::vector<std::uint8_t>& exclusive_sources) {
+  ri::CsrGraph filtered;
+  const std::size_t node_count = graph.node_device_ids.size();
+  filtered.rows = static_cast<std::int64_t>(node_count);
+  filtered.cols = filtered.rows;
+  filtered.declared_edges = graph.declared_edges;
+  filtered.loaded_edges = graph.loaded_edges;
+  filtered.rowptr.resize(node_count + 1, 0);
+  for (std::size_t row = 0; row < node_count; ++row) {
+    if (!blocked[row] && !sink_stops[row]) {
+      for (std::int64_t edge = graph.rowptr[row];
+           edge < graph.rowptr[row + 1]; ++edge) {
+        const std::size_t index = static_cast<std::size_t>(edge);
+        const std::size_t destination =
+            static_cast<std::size_t>(graph.colind[index]);
+        if (!blocked[destination] && !exclusive_sources[destination]) {
+          filtered.colind.push_back(graph.colind[index]);
+          filtered.edge_attrs.push_back(graph.edge_attrs[index]);
+        }
+      }
+    }
+    filtered.rowptr[row + 1] =
+        static_cast<std::int64_t>(filtered.colind.size());
+  }
+  filtered.values.assign(filtered.colind.size(), 1.0f);
+  return filtered;
+}
+
+bool same_csr(const ri::CsrGraph& lhs, const ri::CsrGraph& rhs) {
+  if (lhs.rows != rhs.rows || lhs.cols != rhs.cols ||
+      lhs.declared_edges != rhs.declared_edges ||
+      lhs.loaded_edges != rhs.loaded_edges || lhs.rowptr != rhs.rowptr ||
+      lhs.colind != rhs.colind || lhs.values != rhs.values ||
+      lhs.edge_attrs.size() != rhs.edge_attrs.size()) {
+    return false;
+  }
+  for (std::size_t edge = 0; edge < lhs.edge_attrs.size(); ++edge) {
+    if (lhs.edge_attrs[edge].tile_string !=
+            rhs.edge_attrs[edge].tile_string ||
+        lhs.edge_attrs[edge].pip_data_index !=
+            rhs.edge_attrs[edge].pip_data_index) {
+      return false;
+    }
+  }
+  return true;
+}
+
 ri::DeviceRoutingGraph make_graph() {
   ri::DeviceRoutingGraph graph;
   graph.device_fingerprint = 0x123456789abcdef0ULL;
@@ -240,6 +291,23 @@ int main() {
                 raw_entries[2].col == 0,
             "row-local deduplication did not keep latest sorted edges");
 
+    std::vector<std::int64_t> empty_rowptr = {0, 0, 4, 4, 5, 5};
+    std::vector<ri::StaticCsrEntry> empty_row_entries = {
+        {2, 0, {10, 10}},
+        {1, 1, {11, 11}},
+        {2, 2, {12, 12}},
+        {1, 3, {13, 13}},
+        {0, 0, {14, 14}},
+    };
+    ri::sort_and_deduplicate_static_csr(empty_rowptr, empty_row_entries);
+    require(empty_rowptr ==
+                std::vector<std::int64_t>({0, 0, 2, 2, 3, 3}) &&
+                empty_row_entries.size() == 3 &&
+                empty_row_entries[0].attr.tile_string == 13 &&
+                empty_row_entries[1].attr.tile_string == 12 &&
+                empty_row_entries[2].attr.tile_string == 14,
+            "in-place row compaction lost boundaries around empty rows");
+
     std::vector<ri::PairNodeLookup> identical_aliases = {
         {2, 3, 7, 0}, {1, 4, 8, 0}, {2, 3, 7, 0}};
     require(ri::sort_and_deduplicate_pair_node_lookups(
@@ -435,10 +503,12 @@ int main() {
 
     std::vector<std::uint8_t> blocked = {0, 0, 1, 0};
     std::vector<std::uint8_t> sink_stop = {0, 1, 0, 0};
-    std::vector<std::uint8_t> exclusive_sources = {0, 0, 0, 0};
+    // Destination unavailability is the union of blocked resources and
+    // exclusive route sources. Rows remain governed by blocked/sink_stop.
+    std::vector<std::uint8_t> unavailable_destinations = blocked;
     const ri::CsrGraph filtered =
         ri::filter_device_routing_graph(deferred, blocked, sink_stop,
-                                        exclusive_sources);
+                                        unavailable_destinations);
     require(filtered.rowptr == std::vector<std::int64_t>({0, 1, 1, 1, 1}),
             "filtered row pointers are wrong");
     require(filtered.colind == std::vector<std::int32_t>({1}),
@@ -463,14 +533,15 @@ int main() {
     // would need 0 -> sink(1) -> 3 through a PINBOUNCE node. RWRoute can make
     // that ownership-aware exception; this representation cannot do so yet.
 
-    exclusive_sources[1] = 1;
+    unavailable_destinations[1] = 1;
     // When one node is both a source and sink of the same net, importer policy
     // deliberately leaves its row live while the exclusive-source mask still
     // removes incoming edges from every other row.
     const ri::CsrGraph source_sink_overlap =
         ri::filter_device_routing_graph(
             deferred, std::vector<std::uint8_t>({0, 0, 0, 0}),
-            std::vector<std::uint8_t>({0, 0, 0, 0}), exclusive_sources);
+            std::vector<std::uint8_t>({0, 0, 0, 0}),
+            unavailable_destinations);
     require(!reachable(source_sink_overlap, 0, 1),
             "another net entered an exclusive source node");
     require(reachable(source_sink_overlap, 1, 3),
@@ -482,12 +553,59 @@ int main() {
       invalid.colind[0] = 99;
       (void)ri::filter_device_routing_graph(
           invalid, blocked, sink_stop,
-          std::vector<std::uint8_t>({0, 0, 0, 0}));
+          unavailable_destinations);
     } catch (const std::runtime_error&) {
       rejected_invalid_edge = true;
     }
     require(rejected_invalid_edge,
             "deferred edge validation accepted an invalid destination");
+
+    bool rejected_uncombined_destination_mask = false;
+    try {
+      (void)ri::filter_device_routing_graph(
+          deferred, blocked, sink_stop,
+          std::vector<std::uint8_t>({0, 0, 0, 0}));
+    } catch (const std::runtime_error&) {
+      rejected_uncombined_destination_mask = true;
+    }
+    require(rejected_uncombined_destination_mask,
+            "filter accepted a destination mask missing a blocked node");
+
+    // Exhaust every combination of the three four-node masks. This compares
+    // the precombined production representation against the original policy:
+    // blocked nodes lose incoming and outgoing edges, sink-stop nodes lose
+    // only outgoing edges, and exclusive sources lose only incoming edges.
+    const auto four_node_mask = [](unsigned bits) {
+      std::vector<std::uint8_t> result(4, 0);
+      for (unsigned node = 0; node < 4; ++node) {
+        result[node] = static_cast<std::uint8_t>((bits >> node) & 1U);
+      }
+      return result;
+    };
+    for (unsigned blocked_bits = 0; blocked_bits < 16; ++blocked_bits) {
+      for (unsigned sink_bits = 0; sink_bits < 16; ++sink_bits) {
+        for (unsigned exclusive_bits = 0; exclusive_bits < 16;
+             ++exclusive_bits) {
+          const std::vector<std::uint8_t> case_blocked =
+              four_node_mask(blocked_bits);
+          const std::vector<std::uint8_t> case_sink_stops =
+              four_node_mask(sink_bits);
+          const std::vector<std::uint8_t> case_exclusive =
+              four_node_mask(exclusive_bits);
+          std::vector<std::uint8_t> case_unavailable = case_exclusive;
+          for (std::size_t node = 0; node < case_unavailable.size(); ++node) {
+            case_unavailable[node] |= case_blocked[node];
+          }
+          const ri::CsrGraph reference =
+              reference_filter_with_separate_destination_masks(
+                  deferred, case_blocked, case_sink_stops, case_exclusive);
+          const ri::CsrGraph production = ri::filter_device_routing_graph(
+              deferred, case_blocked, case_sink_stops, case_unavailable);
+          require(same_csr(reference, production),
+                  "precombined destination mask changed filter semantics");
+        }
+      }
+    }
 
     ri::DeviceRoutingGraph streamed_source = make_graph();
     std::vector<ri::StaticCsrEntry> entries;

@@ -225,6 +225,8 @@ CsrGraph filter_device_routing_graph(
     const DeviceRoutingGraph& graph,
     const std::vector<std::uint8_t>& blocked_node,
     const std::vector<std::uint8_t>& sink_node_stops,
-    const std::vector<std::uint8_t>& exclusive_source_nodes);
+    // Union of blocked nodes and exclusive route-source nodes. Keeping this
+    // precombined avoids two unrelated random mask reads per destination edge.
+    const std::vector<std::uint8_t>& unavailable_destination_nodes);
 
 }  // namespace routing::interchange
