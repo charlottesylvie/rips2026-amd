@@ -155,7 +155,11 @@ Options parse_options(int argc, char** argv) {
 }
 
 struct DevicePayload {
-  std::vector<capnp::word> words;
+  // capnp::word is intentionally non-movable in recent Cap'n Proto releases,
+  // so it cannot be used as a std::vector element with libc++. Store the
+  // aligned raw words as uint64_t and expose them as opaque capnp::word values
+  // only when constructing the reader.
+  std::vector<std::uint64_t> words;
   std::size_t decoded_bytes = 0;
   std::uint64_t fingerprint = 1469598103934665603ULL;
 };
@@ -397,7 +401,9 @@ BuildResult build_device_routing_graph(const Options& options) {
       std::numeric_limits<std::uint64_t>::max();
   reader_options.nestingLimit = 1 << 20;
   capnp::FlatArrayMessageReader reader(
-      kj::arrayPtr(payload.words.data(), payload.words.size()), reader_options);
+      kj::arrayPtr(reinterpret_cast<const capnp::word*>(payload.words.data()),
+                   payload.words.size()),
+      reader_options);
   const auto device = reader.getRoot<DeviceResources::Device>();
   const auto device_strings = device.getStrList();
 
