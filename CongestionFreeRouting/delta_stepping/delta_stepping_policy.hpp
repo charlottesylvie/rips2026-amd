@@ -27,6 +27,37 @@ enum class DeltaSteppingCsrDeviceRowOffsetWidth {
   k64Bit,
 };
 
+// One transaction retains a shared device reserve rather than charging
+// headroom separately for every buffer in that transaction. Pathfinder's
+// automatic worker selector already limits aggregate worker storage to 75% of
+// post-graph free memory; this cap therefore describes the same residual
+// reserve instead of stacking another 25% per worker or per allocation.
+inline constexpr std::size_t kDeltaSteppingMinimumDeviceReserve =
+    static_cast<std::size_t>(256) * 1024 * 1024;
+
+constexpr std::size_t delta_stepping_device_memory_reserve(
+    std::size_t free_bytes,
+    std::size_t total_bytes) noexcept {
+  const std::size_t desired =
+      std::max(kDeltaSteppingMinimumDeviceReserve, total_bytes / 20);
+  return std::min(desired, free_bytes / 4);
+}
+
+constexpr std::size_t delta_stepping_device_memory_usable(
+    std::size_t free_bytes,
+    std::size_t total_bytes) noexcept {
+  return free_bytes -
+         delta_stepping_device_memory_reserve(free_bytes, total_bytes);
+}
+
+constexpr bool delta_stepping_device_memory_request_fits(
+    std::size_t requested_bytes,
+    std::size_t free_bytes,
+    std::size_t total_bytes) noexcept {
+  return requested_bytes <=
+         delta_stepping_device_memory_usable(free_bytes, total_bytes);
+}
+
 // rowptr includes the terminal nnz value.  UINT32_MAX edges are eligible, but
 // 2^32 edges are not: the latter terminal offset does not fit in uint32_t.
 constexpr bool delta_stepping_compact_row_offsets_eligible(

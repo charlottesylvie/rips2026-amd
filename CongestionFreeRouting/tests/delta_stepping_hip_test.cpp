@@ -91,6 +91,21 @@ void check_hip(hipError_t status, const char* operation) {
   }
 }
 
+bool cooperative_launch_supported() {
+  int device = 0;
+  check_hip(hipGetDevice(&device), "hipGetDevice");
+  int supported = 0;
+  const hipError_t status =
+      hipDeviceGetAttribute(&supported,
+                            hipDeviceAttributeCooperativeLaunch,
+                            device);
+  if (status != hipSuccess) {
+    (void)hipGetLastError();
+    return false;
+  }
+  return supported != 0;
+}
+
 class HipStream {
  public:
   HipStream() {
@@ -458,6 +473,56 @@ void validate_compact_target_paths(
           label + ": final compact edge offset mismatch");
   require(result.target_reached == all_targets_reached,
           label + ": aggregate target_reached flag mismatch");
+
+  // Deduplicated traversal reconstructs each unique target once and fans its
+  // result back to every original position. Require duplicate entries to be
+  // exact copies, including source choice and compact path slices.
+  for (std::size_t duplicate = 1; duplicate < target_count; ++duplicate) {
+    std::size_t first = 0;
+    while (first < duplicate &&
+           targets[first] != targets[duplicate]) {
+      ++first;
+    }
+    if (first == duplicate) {
+      continue;
+    }
+    const std::string duplicate_label =
+        label + ": duplicate target index " + std::to_string(duplicate);
+    require(result.target_distances[duplicate] ==
+                result.target_distances[first],
+            duplicate_label + ": distance differs from first occurrence");
+    require(result.target_sources[duplicate] == result.target_sources[first],
+            duplicate_label + ": source differs from first occurrence");
+
+    const int first_node_begin = result.target_path_offsets[first];
+    const int first_node_end = result.target_path_offsets[first + 1];
+    const int duplicate_node_begin =
+        result.target_path_offsets[duplicate];
+    const int duplicate_node_end =
+        result.target_path_offsets[duplicate + 1];
+    const int first_edge_begin = result.target_edge_offsets[first];
+    const int first_edge_end = result.target_edge_offsets[first + 1];
+    const int duplicate_edge_begin =
+        result.target_edge_offsets[duplicate];
+    const int duplicate_edge_end =
+        result.target_edge_offsets[duplicate + 1];
+    require(duplicate_node_end - duplicate_node_begin ==
+                first_node_end - first_node_begin,
+            duplicate_label + ": node count differs from first occurrence");
+    require(duplicate_edge_end - duplicate_edge_begin ==
+                first_edge_end - first_edge_begin,
+            duplicate_label + ": edge count differs from first occurrence");
+    require(std::equal(
+                result.target_path_nodes.begin() + first_node_begin,
+                result.target_path_nodes.begin() + first_node_end,
+                result.target_path_nodes.begin() + duplicate_node_begin),
+            duplicate_label + ": node path differs from first occurrence");
+    require(std::equal(
+                result.target_path_edges.begin() + first_edge_begin,
+                result.target_path_edges.begin() + first_edge_end,
+                result.target_path_edges.begin() + duplicate_edge_begin),
+            duplicate_label + ": edge path differs from first occurrence");
+  }
 }
 
 void validate_parent_mode_agreement(
@@ -690,6 +755,65 @@ HostCsrF32 make_weighted_corner_graph() {
        {11, 10, 1.5f}});
 }
 
+void test_stable_target_deduplication_fanout(hipStream_t stream) {
+  const std::vector<int> sources = {0, 8, 0};
+  // First-seen unique order is {7, 0, 9, 8}. Duplicates are deliberately
+  // interleaved and cover a reached non-source, two sources, and an
+  // unreachable vertex.
+  const std::vector<int> targets = {7, 0, 9, 7, 8, 9, 0, 7, 8};
+
+  const HostCsrF32 weighted_graph = make_weighted_corner_graph();
+  const std::vector<float> weighted_expected =
+      cpu_dijkstra_outgoing_multi_source(weighted_graph, sources);
+  DeltaSteppingCsrWorkspaceOptions generic_options;
+  generic_options.execution_mode =
+      DeltaSteppingCsrExecutionMode::kForceGeneric;
+  DeltaSteppingCsrWorkspace generic_workspace(
+      weighted_graph, stream, generic_options);
+  DeltaSteppingCsrTelemetry generic_telemetry;
+  DeltaSteppingCsrRunOptions generic_run_options;
+  generic_run_options.telemetry = &generic_telemetry;
+  const DeltaSteppingCsrResult generic_result = generic_workspace.run(
+      sources, targets, 1.0f, -1, generic_run_options,
+      stream, nullptr, nullptr);
+  validate_compact_target_paths(
+      "stable target fan-out generic",
+      weighted_graph,
+      sources,
+      targets,
+      weighted_expected,
+      generic_result);
+  require(generic_telemetry.completed &&
+              (generic_telemetry.execution_path ==
+                   DeltaSteppingCsrExecutionPath::kCompactGeneric ||
+               generic_telemetry.execution_path ==
+                   DeltaSteppingCsrExecutionPath::kLegacyGeneric),
+          "stable target fan-out did not exercise generic Delta");
+
+  HostCsrF32 unit_graph = weighted_graph;
+  std::fill(unit_graph.values.begin(), unit_graph.values.end(), 1.0f);
+  const std::vector<float> unit_expected =
+      cpu_dijkstra_outgoing_multi_source(unit_graph, sources);
+  DeltaSteppingCsrWorkspace unit_workspace(unit_graph, stream);
+  DeltaSteppingCsrTelemetry unit_telemetry;
+  DeltaSteppingCsrRunOptions unit_run_options;
+  unit_run_options.telemetry = &unit_telemetry;
+  const DeltaSteppingCsrResult unit_result = unit_workspace.run(
+      sources, targets, 1.0f, -1, unit_run_options,
+      stream, nullptr, nullptr);
+  validate_compact_target_paths(
+      "stable target fan-out exact unit",
+      unit_graph,
+      sources,
+      targets,
+      unit_expected,
+      unit_result);
+  require(unit_telemetry.completed &&
+              unit_telemetry.execution_path ==
+                  DeltaSteppingCsrExecutionPath::kExactUnit,
+          "stable target fan-out did not exercise exact-unit Delta");
+}
+
 void test_offset_and_membership_ab_matrix(hipStream_t stream) {
   const HostCsrF32 graph = make_weighted_corner_graph();
   const std::vector<int> sources = {0, 8, 0};
@@ -724,9 +848,12 @@ void test_offset_and_membership_ab_matrix(hipStream_t stream) {
           sources, targets, 1.0f, -1, stream, nullptr, nullptr);
       validate_compact_target_paths("Delta offset/membership A/B", graph,
                                     sources, targets, expected, result);
-      require(!workspace.allocation_state().predecessor_nodes &&
-                  !workspace.allocation_state().predecessor_edges,
+      const DeltaSteppingCsrAllocationState used =
+          workspace.allocation_state();
+      require(!used.predecessor_nodes && !used.predecessor_edges,
               "compact-parent A/B run allocated legacy parents");
+      require(used.path_edges && used.compact_path_edges_32_bit,
+              "compact-parent A/B run did not use 32-bit path-edge staging");
 
       const std::vector<int> reuse_sources = {10, 10};
       const std::vector<int> reuse_targets = {11, 0, 11};
@@ -1695,6 +1822,174 @@ void test_compact_to_unit_storage_transition(hipStream_t stream) {
       unit_result);
 }
 
+void test_implicit_unit_weight_storage_and_fallbacks(hipStream_t stream) {
+  const HostCsrF32 unit_graph = make_outgoing_csr(
+      10,
+      {{0, 2, 1.0f},
+       {0, 1, 1.0f},
+       {1, 3, 1.0f},
+       {2, 3, 1.0f},
+       {2, 5, 1.0f},
+       {3, 4, 1.0f},
+       {4, 6, 1.0f},
+       {5, 6, 1.0f},
+       {6, 7, 1.0f},
+       {7, 7, 1.0f},
+       {8, 6, 1.0f}});
+  const std::vector<int> sources = {0, 8, 0};
+  const std::vector<int> targets = {7, 4, 0, 9, 7};
+  const std::vector<float> unit_expected =
+      cpu_dijkstra_outgoing_multi_source(unit_graph, sources);
+
+  {
+    DeltaSteppingCsrWorkspace exact_workspace(unit_graph, stream);
+    const DeltaSteppingCsrAllocationState initial =
+        exact_workspace.allocation_state();
+    require(initial.implicit_unit_weights && !initial.edge_values,
+            "fresh exact-unit graph allocated an explicit values array");
+    DeltaSteppingCsrTelemetry telemetry;
+    const DeltaSteppingCsrResult result = exact_workspace.run(
+        sources, targets, 2.0f, -1,
+        DeltaSteppingCsrRunOptions{&telemetry}, stream, nullptr, nullptr);
+    validate_compact_target_paths("implicit exact-unit storage",
+                                  unit_graph,
+                                  sources,
+                                  targets,
+                                  unit_expected,
+                                  result);
+    require(telemetry.completed &&
+                telemetry.execution_path ==
+                    DeltaSteppingCsrExecutionPath::kExactUnit,
+            "implicit unit graph did not select the exact-unit path");
+  }
+
+  DeltaSteppingCsrWorkspaceOptions generic_options;
+  generic_options.execution_mode =
+      DeltaSteppingCsrExecutionMode::kForceGeneric;
+  DeltaSteppingCsrWorkspace generic_workspace(
+      unit_graph, stream, generic_options);
+  require(generic_workspace.allocation_state().implicit_unit_weights &&
+              !generic_workspace.allocation_state().edge_values,
+          "forced-generic unit graph allocated an explicit values array");
+  DeltaSteppingCsrTelemetry generic_telemetry;
+  const DeltaSteppingCsrResult generic_result = generic_workspace.run(
+      sources, targets, 1.25f, -1,
+      DeltaSteppingCsrRunOptions{&generic_telemetry}, stream, nullptr,
+      nullptr);
+  validate_compact_target_paths("implicit forced-generic compact parent",
+                                unit_graph,
+                                sources,
+                                targets,
+                                unit_expected,
+                                generic_result);
+  {
+    const DeltaSteppingCsrAllocationState state =
+        generic_workspace.allocation_state();
+    require(state.implicit_unit_weights && !state.edge_values &&
+                state.compact_path_edges_32_bit &&
+                !state.predecessor_nodes && !state.predecessor_edges,
+            "forced-generic implicit unit storage used the wrong buffers");
+  }
+  require(generic_telemetry.completed &&
+              generic_telemetry.execution_path ==
+                  DeltaSteppingCsrExecutionPath::kCompactGeneric,
+          "forced-generic implicit unit run used the wrong execution path");
+
+  HostCsrF32 weighted_graph = unit_graph;
+  weighted_graph.values =
+      {2.0f, 0.5f, 1.5f, 0.25f, 3.0f, 2.0f,
+       0.75f, 1.25f, 0.5f, 1.0f, 2.0f};
+  generic_workspace.update_values(weighted_graph.values, stream);
+  {
+    const DeltaSteppingCsrAllocationState state =
+        generic_workspace.allocation_state();
+    require(!state.implicit_unit_weights && state.edge_values,
+            "unit-to-weighted update did not materialize edge values");
+  }
+  const DeltaSteppingCsrResult weighted_result = generic_workspace.run(
+      sources, targets, 1.25f, -1, stream, nullptr, nullptr);
+  validate_compact_target_paths(
+      "implicit unit-to-weighted update",
+      weighted_graph,
+      sources,
+      targets,
+      cpu_dijkstra_outgoing_multi_source(weighted_graph, sources),
+      weighted_result);
+
+  generic_workspace.update_values(unit_graph.values, stream);
+  {
+    const DeltaSteppingCsrAllocationState state =
+        generic_workspace.allocation_state();
+    require(state.implicit_unit_weights && state.edge_values,
+            "weighted-to-unit update did not retain high-water values storage");
+  }
+  const DeltaSteppingCsrResult restored_unit_result = generic_workspace.run(
+      sources, targets, 1.25f, -1, stream, nullptr, nullptr);
+  validate_compact_target_paths("implicit weighted-to-unit update",
+                                unit_graph,
+                                sources,
+                                targets,
+                                unit_expected,
+                                restored_unit_result);
+
+  DeltaSteppingCsrWorkspaceOptions legacy_options = generic_options;
+  legacy_options.parent_mode = DeltaSteppingCsrParentMode::kForceLegacy;
+  DeltaSteppingCsrWorkspace legacy_workspace(unit_graph, stream,
+                                             legacy_options);
+  DeltaSteppingCsrTelemetry legacy_telemetry;
+  const DeltaSteppingCsrResult legacy_result = legacy_workspace.run(
+      sources, targets, 1.25f, -1,
+      DeltaSteppingCsrRunOptions{&legacy_telemetry}, stream, nullptr,
+      nullptr);
+  validate_compact_target_paths("implicit forced-legacy parent",
+                                unit_graph,
+                                sources,
+                                targets,
+                                unit_expected,
+                                legacy_result);
+  {
+    const DeltaSteppingCsrAllocationState state =
+        legacy_workspace.allocation_state();
+    require(state.implicit_unit_weights && !state.edge_values &&
+                state.predecessor_nodes && state.predecessor_edges &&
+                !state.compact_path_edges_32_bit,
+            "forced-legacy implicit unit storage used the wrong buffers");
+  }
+  require(legacy_telemetry.completed &&
+              legacy_telemetry.execution_path ==
+                  DeltaSteppingCsrExecutionPath::kLegacyGeneric,
+          "forced-legacy implicit unit run used the wrong execution path");
+
+  DeltaSteppingCsrWorkspace vertex_cost_workspace(unit_graph, stream);
+  std::vector<float> vertex_costs(
+      static_cast<std::size_t>(unit_graph.rows), 1.0f);
+  vertex_costs[3] = 2.0f;
+  vertex_costs[4] = 0.5f;
+  vertex_costs[6] = 1.5f;
+  vertex_costs[7] = 0.75f;
+  vertex_cost_workspace.update_vertex_costs(vertex_costs, stream);
+  DeltaSteppingCsrTelemetry vertex_cost_telemetry;
+  const DeltaSteppingCsrResult vertex_cost_result =
+      vertex_cost_workspace.run(
+          sources, targets, 1.25f, -1,
+          DeltaSteppingCsrRunOptions{&vertex_cost_telemetry}, stream,
+          nullptr, nullptr);
+  validate_compact_target_paths(
+      "implicit unit vertex-cost fallback",
+      unit_graph,
+      sources,
+      targets,
+      cpu_dijkstra_outgoing_multi_source(unit_graph, sources, &vertex_costs),
+      vertex_cost_result,
+      &vertex_costs);
+  require(vertex_cost_workspace.allocation_state().implicit_unit_weights &&
+              !vertex_cost_workspace.allocation_state().edge_values &&
+              vertex_cost_telemetry.completed &&
+              vertex_cost_telemetry.execution_path ==
+                  DeltaSteppingCsrExecutionPath::kCompactGeneric,
+          "vertex-cost fallback did not preserve implicit unit storage");
+}
+
 void test_empty_and_singleton_graphs(hipStream_t stream) {
   {
     const HostCsrF32 graph = make_outgoing_csr(1, {});
@@ -1800,6 +2095,68 @@ void validate_deep_wide_result(const std::string& label,
                 result.converged,
             label + ": isolated target did not exhaust the traversal");
   }
+}
+
+void test_exact_unit_cooperative_controller(hipStream_t explicit_stream) {
+  constexpr int kDepth = 70;
+  constexpr int kLevelsPerCooperativeLaunch = 32;
+  constexpr float kDelta = 4.0f;
+  std::vector<EdgeSpec> edges;
+  edges.reserve(kDepth);
+  for (int vertex = 0; vertex < kDepth; ++vertex) {
+    edges.push_back({vertex, vertex + 1, 1.0f});
+  }
+  const HostCsrF32 graph = make_outgoing_csr(kDepth + 1, edges);
+  const std::vector<float> expected =
+      cpu_dijkstra_outgoing_multi_source(graph, {0});
+  const bool cooperative_capable = cooperative_launch_supported();
+
+  const auto run_and_check = [&](const std::string& label,
+                                 hipStream_t run_stream) {
+    DeltaSteppingCsrWorkspace workspace(graph, run_stream);
+    DeltaSteppingCsrTelemetry telemetry;
+    const DeltaSteppingCsrResult result = workspace.run(
+        std::vector<int>{0},
+        std::vector<int>{kDepth},
+        kDelta,
+        -1,
+        DeltaSteppingCsrRunOptions{&telemetry},
+        run_stream,
+        nullptr,
+        nullptr);
+    validate_compact_target_paths(
+        label, graph, {0}, {kDepth}, expected, result);
+
+    constexpr std::uint64_t kExpectedBuckets = 18;
+    require(result.iterations_used ==
+                static_cast<int>(kExpectedBuckets) &&
+                telemetry.outer_buckets_processed == kExpectedBuckets &&
+                telemetry.light_relaxation_rounds == kDepth,
+            label + ": cooperative depth/bucket accounting mismatch");
+    if (telemetry.gpu_resident_controller) {
+      require(cooperative_capable,
+              label + ": cooperative controller ran without device support");
+    }
+    const std::uint64_t expected_round_trips =
+        telemetry.gpu_resident_controller
+            ? static_cast<std::uint64_t>(
+                  (kDepth + kLevelsPerCooperativeLaunch - 1) /
+                  kLevelsPerCooperativeLaunch)
+            : (run_stream == nullptr
+                   ? UINT64_C(1) + static_cast<std::uint64_t>(
+                                         (kDepth - 1 + 3) / 4)
+                   : static_cast<std::uint64_t>(kDepth));
+    require(telemetry.controller_round_trips == expected_round_trips,
+            label + ": controller launch/round-trip accounting mismatch");
+  };
+
+  // Cooperative launches must use the same persistent state machine on both
+  // stream kinds. Unsupported devices retain the null-stream batched and
+  // explicit-stream host-controlled paths, whose transfer counts are checked
+  // by the same assertions.
+  run_and_check("exact-unit cooperative controller explicit stream",
+                explicit_stream);
+  run_and_check("exact-unit cooperative controller default stream", nullptr);
 }
 
 void test_default_stream_deep_wide_batching() {
@@ -2920,8 +3277,16 @@ void test_shared_graph_workspaces(hipStream_t construction_stream) {
                                               construction_stream);
   DeltaSteppingCsrWorkspace unit_first(shared_unit_graph,
                                        construction_stream);
-  DeltaSteppingCsrWorkspace unit_second(shared_unit_graph,
-                                        other_stream.get());
+  DeltaSteppingCsrWorkspaceOptions shared_unit_generic_options;
+  shared_unit_generic_options.execution_mode =
+      DeltaSteppingCsrExecutionMode::kForceGeneric;
+  DeltaSteppingCsrWorkspace unit_second(
+      shared_unit_graph, other_stream.get(), shared_unit_generic_options);
+  require(unit_first.allocation_state().implicit_unit_weights &&
+              !unit_first.allocation_state().edge_values &&
+              unit_second.allocation_state().implicit_unit_weights &&
+              !unit_second.allocation_state().edge_values,
+          "shared unit graph did not omit its explicit values allocation");
   auto unit_first_run = std::async(std::launch::async, [&]() {
     return unit_first.run({0}, std::vector<int>{3}, 2.0f, -1,
                           construction_stream, nullptr, nullptr);
@@ -2951,6 +3316,8 @@ void test_shared_graph_workspaces(hipStream_t construction_stream) {
               !unit_first_result.converged &&
               !unit_second_result.converged,
           "shared lazy unit workspaces did not stop on reachable targets");
+  require(unit_second.allocation_state().compact_path_edges_32_bit,
+          "shared implicit-unit generic workspace did not use compact edges");
 
   // A workspace retains the immutable allocation it was constructed from,
   // even if the caller later replaces the movable public graph wrapper.
@@ -3329,6 +3696,7 @@ int main() {
     test_braced_default_stream_constructor_compatibility();
     HipStream stream;
     test_empty_and_singleton_graphs(stream.get());
+    test_stable_target_deduplication_fanout(stream.get());
     test_offset_and_membership_ab_matrix(stream.get());
     test_distances_only_graph_families(stream.get());
     test_distances_only_path_state_transitions(stream.get());
@@ -3343,7 +3711,9 @@ int main() {
         DeltaSteppingCsrCurrentMembershipMode::kGeneration, "generation");
     test_compact_weight_class_updates(stream.get());
     test_compact_to_unit_storage_transition(stream.get());
+    test_implicit_unit_weight_storage_and_fallbacks(stream.get());
     test_unit_weight_specialization(stream.get());
+    test_exact_unit_cooperative_controller(stream.get());
     test_default_stream_deep_wide_batching();
     test_zero_weight_scc_predecessors(stream.get());
     test_float_bucket_boundaries_and_saturation(stream.get());

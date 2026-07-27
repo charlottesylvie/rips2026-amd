@@ -69,6 +69,10 @@ struct DeltaSteppingCsrTelemetry {
   std::uint64_t pending_queue_high_water = 0;
   std::uint64_t heavy_queue_high_water = 0;
   std::uint64_t controller_round_trips = 0;
+  // True only when this invocation actually launched the cooperative,
+  // GPU-resident exact-unit controller. Device capability alone is not
+  // sufficient because kernel-specific occupancy can still require fallback.
+  bool gpu_resident_controller = false;
   std::uint64_t compact_parent_fallback_events = 0;
 };
 
@@ -121,6 +125,14 @@ struct DeltaSteppingCsrAllocationState {
   bool path_nodes = false;
   bool path_edges = false;
   bool telemetry_counters = false;
+  // Exact-unit graphs do not need an explicit device values array. A weighted
+  // array retained after a later weighted-to-unit update is reported
+  // separately from the active implicit-unit representation.
+  bool edge_values = false;
+  bool implicit_unit_weights = false;
+  // Compact edge-parent extraction stages original CSR edge IDs as uint32_t
+  // and widens them only when constructing the public Offset result.
+  bool compact_path_edges_32_bit = false;
 };
 
 struct DeltaSteppingCsrWorkspaceOptions {
@@ -401,6 +413,12 @@ class DeltaSteppingCsrWorkspace {
       active_distance_limit_ = std::numeric_limits<float>::infinity();
       return result;
     } catch (...) {
+      if (run_options.telemetry != nullptr) {
+        // Result fan-out and other outer-API work can still fail after the
+        // traversal helper has populated its record. The public contract marks
+        // completion only when the complete invocation returns successfully.
+        run_options.telemetry->completed = false;
+      }
       active_telemetry_ = nullptr;
       active_distance_limit_ = std::numeric_limits<float>::infinity();
       throw;
