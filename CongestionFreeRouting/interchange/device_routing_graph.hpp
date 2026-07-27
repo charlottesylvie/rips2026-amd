@@ -34,6 +34,12 @@ struct Bounds {
 const char* node_bounds_mode_name(NodeBoundsMode mode);
 NodeBoundsMode parse_node_bounds_mode(const std::string& text);
 
+// Create one empty, exclusively named temporary file next to a final output.
+// Keeping staging on the same filesystem makes the eventual rename atomic and
+// avoids temporary-file clobbering between concurrent converter processes.
+std::filesystem::path create_unique_staging_path(
+    const std::filesystem::path& final_path);
+
 // The cache owns one stable string-ID namespace. The per-design converter
 // appends benchmark strings to this table, so all static node/PIP/lookup IDs
 // remain valid without a remapping pass.
@@ -71,6 +77,40 @@ struct PairNodeLookup {
 
 bool operator<(const PairNodeLookup& lhs, const PairNodeLookup& rhs);
 
+// A physical site can legally be instantiated as its primary type or as one
+// of several alternate types.  Pin names are meaningful only together with
+// that active type: the same (site, pin) spelling can map to different device
+// nodes for two possible types.  Keep the type in the reusable cache so the
+// per-design importer can resolve against PhysicalNetlist.siteInsts.
+struct SitePinNodeLookup {
+  std::uint32_t site_string = 0;
+  std::uint32_t site_type_string = 0;
+  std::uint32_t pin_string = 0;
+  NodeId node = kInvalidRouteNode;
+};
+
+bool operator<(const SitePinNodeLookup& lhs,
+               const SitePinNodeLookup& rhs);
+
+enum class LookupConflictPolicy {
+  kReject,
+  kDropAmbiguous,
+};
+
+// Sort lookup keys, collapse identical key->node aliases, and either reject
+// or omit keys that map to more than one node.  Silently selecting one of two
+// physical nodes can fabricate a route, so callers must make the ambiguity
+// policy explicit.
+std::size_t sort_and_deduplicate_pair_node_lookups(
+    std::vector<PairNodeLookup>& records,
+    LookupConflictPolicy conflict_policy,
+    const char* lookup_name);
+
+// Typed site-pin keys must be unique.  Multiple possible site types may still
+// contain the same pin spelling; those are distinct keys and are retained.
+void sort_and_deduplicate_site_pin_lookups(
+    std::vector<SitePinNodeLookup>& records);
+
 // Preprocessor-only interleaved entry used while sorting/deduplicating rows.
 // The cache writer gathers its columns and attributes into compact contiguous
 // sections without materializing another full multi-gigabyte edge copy.
@@ -85,6 +125,7 @@ struct DeviceRoutingGraph {
   StringTable string_table;
   std::uint64_t device_fingerprint = 0;
   std::uint64_t device_path_string = 0;
+  std::uint64_t device_name_string = 0;
   Bounds bounds;
   NodeBoundsMode node_bounds_mode = NodeBoundsMode::kPocBaseWire;
   std::uint64_t declared_edges = 0;
@@ -106,7 +147,7 @@ struct DeviceRoutingGraph {
   // Sorted lexicographically for allocation-free binary-search lookups during
   // physical-netlist parsing.
   std::vector<PairNodeLookup> tile_wire_nodes;
-  std::vector<PairNodeLookup> site_pin_nodes;
+  std::vector<SitePinNodeLookup> site_pin_nodes;
 };
 
 // Design-filtered outgoing CSR. Values are always exact unit weights.
@@ -128,6 +169,26 @@ std::optional<NodeId> find_pair_node(
     const StringTable& strings,
     const std::string& first,
     const std::string& second);
+
+// Resolve an exact active-type key.  If active_site_type is absent, accept an
+// untyped fallback only when every possible type maps (site, pin) to the same
+// node.  This makes incomplete legacy PhysicalNetlists usable without ever
+// guessing between distinct physical resources.
+std::optional<NodeId> find_site_pin_node(
+    const std::vector<SitePinNodeLookup>& records,
+    const StringTable& strings,
+    const std::string& site,
+    const std::optional<std::string>& active_site_type,
+    const std::string& pin);
+
+// Return all distinct possible nodes for an untyped site/pin.  Fixed-resource
+// preservation uses this as a conservative fallback when siteInst metadata is
+// missing or inconsistent.
+std::vector<NodeId> find_site_pin_candidates(
+    const std::vector<SitePinNodeLookup>& records,
+    const StringTable& strings,
+    const std::string& site,
+    const std::string& pin);
 
 void validate_device_routing_graph(const DeviceRoutingGraph& graph);
 
@@ -163,6 +224,7 @@ void sort_and_deduplicate_static_csr(
 CsrGraph filter_device_routing_graph(
     const DeviceRoutingGraph& graph,
     const std::vector<std::uint8_t>& blocked_node,
-    const std::vector<std::uint8_t>& sink_node_stops);
+    const std::vector<std::uint8_t>& sink_node_stops,
+    const std::vector<std::uint8_t>& exclusive_source_nodes);
 
 }  // namespace routing::interchange

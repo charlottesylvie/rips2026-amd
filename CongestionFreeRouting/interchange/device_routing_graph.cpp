@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cerrno>
 #include <cstddef>
 #include <cstring>
 #include <fstream>
@@ -9,11 +10,16 @@
 #include <stdexcept>
 #include <type_traits>
 
+#include <unistd.h>
+
 namespace routing::interchange {
 namespace {
 
 constexpr char DEVICE_GRAPH_MAGIC[8] = {'R', 'I', 'P', 'S', 'D', 'R', 'G', '1'};
-constexpr std::uint64_t DEVICE_GRAPH_VERSION = 1;
+// Version 3 changes graph-builder semantics and the lookup layout: pseudo PIPs
+// are excluded unless their site occupancy can be represented, and site-pin
+// aliases retain the possible site type for design-specific resolution.
+constexpr std::uint64_t DEVICE_GRAPH_VERSION = 3;
 
 static_assert(sizeof(std::int64_t) == 8, "int64_t must be 8 bytes");
 static_assert(sizeof(std::int32_t) == 4, "int32_t must be 4 bytes");
@@ -25,6 +31,10 @@ static_assert(sizeof(PairNodeLookup) == 16,
               "PairNodeLookup disk layout changed");
 static_assert(std::is_trivially_copyable<PairNodeLookup>::value,
               "PairNodeLookup must support bulk I/O");
+static_assert(sizeof(SitePinNodeLookup) == 16,
+              "SitePinNodeLookup disk layout changed");
+static_assert(std::is_trivially_copyable<SitePinNodeLookup>::value,
+              "SitePinNodeLookup must support bulk I/O");
 
 struct PipDataDisk {
   std::uint64_t wire0_string = 0;
@@ -40,6 +50,20 @@ std::size_t checked_size(std::uint64_t count, const char* name) {
     throw std::runtime_error(std::string(name) + " exceeds host size_t");
   }
   return static_cast<std::size_t>(count);
+}
+
+template <typename T>
+std::size_t checked_array_bytes(std::size_t count, const char* name) {
+  if (count > std::numeric_limits<std::size_t>::max() / sizeof(T)) {
+    throw std::runtime_error(std::string(name) + " byte count overflows size_t");
+  }
+  const std::size_t bytes = count * sizeof(T);
+  if (bytes > static_cast<std::size_t>(
+                  std::numeric_limits<std::streamsize>::max())) {
+    throw std::runtime_error(std::string(name) +
+                             " byte count exceeds streamsize");
+  }
+  return bytes;
 }
 
 void write_u64(std::ofstream& out, std::uint64_t value, const char* name) {
@@ -83,7 +107,8 @@ void write_array(std::ofstream& out,
   if (values.empty()) {
     return;
   }
-  const std::size_t byte_count = values.size() * sizeof(T);
+  const std::size_t byte_count =
+      checked_array_bytes<T>(values.size(), name);
   out.write(reinterpret_cast<const char*>(values.data()),
             static_cast<std::streamsize>(byte_count));
   if (!out) {
@@ -102,7 +127,8 @@ void read_array(std::ifstream& in,
   if (values.empty()) {
     return;
   }
-  const std::size_t byte_count = values.size() * sizeof(T);
+  const std::size_t byte_count =
+      checked_array_bytes<T>(values.size(), name);
   in.read(reinterpret_cast<char*>(values.data()),
           static_cast<std::streamsize>(byte_count));
   if (!in) {
@@ -113,7 +139,9 @@ void read_array(std::ifstream& in,
 void write_string(std::ofstream& out, const std::string& text) {
   write_u64(out, static_cast<std::uint64_t>(text.size()), "string length");
   if (!text.empty()) {
-    out.write(text.data(), static_cast<std::streamsize>(text.size()));
+    const std::size_t bytes =
+        checked_array_bytes<char>(text.size(), "string");
+    out.write(text.data(), static_cast<std::streamsize>(bytes));
   }
   if (!out) {
     throw std::runtime_error("failed while writing device-graph string");
@@ -122,9 +150,11 @@ void write_string(std::ofstream& out, const std::string& text) {
 
 std::string read_string(std::ifstream& in) {
   const std::uint64_t byte_count = read_u64(in, "string length");
-  std::string text(checked_size(byte_count, "string length"), '\0');
+  const std::size_t size = checked_size(byte_count, "string length");
+  const std::size_t bytes = checked_array_bytes<char>(size, "string");
+  std::string text(size, '\0');
   if (!text.empty()) {
-    in.read(text.data(), static_cast<std::streamsize>(text.size()));
+    in.read(text.data(), static_cast<std::streamsize>(bytes));
   }
   if (!in) {
     throw std::runtime_error("failed while reading device-graph string");
@@ -200,6 +230,33 @@ void validate_lookup_records(const std::vector<PairNodeLookup>& records,
   }
 }
 
+void validate_site_pin_lookup_records(
+    const std::vector<SitePinNodeLookup>& records,
+    std::size_t string_count,
+    std::size_t node_count) {
+  if (!std::is_sorted(records.begin(), records.end())) {
+    throw std::runtime_error("site-pin lookup is not sorted");
+  }
+  for (std::size_t index = 0; index < records.size(); ++index) {
+    const SitePinNodeLookup& record = records[index];
+    if (record.site_string >= string_count ||
+        record.site_type_string >= string_count ||
+        record.pin_string >= string_count || record.node < 0 ||
+        static_cast<std::size_t>(record.node) >= node_count) {
+      throw std::runtime_error(
+          "site-pin lookup contains an invalid record");
+    }
+    if (index > 0 &&
+        record.site_string == records[index - 1].site_string &&
+        record.site_type_string ==
+            records[index - 1].site_type_string &&
+        record.pin_string == records[index - 1].pin_string) {
+      throw std::runtime_error(
+          "site-pin lookup contains a duplicate typed key");
+    }
+  }
+}
+
 void validate_static_metadata(const DeviceRoutingGraph& graph) {
   validate_node_arrays(graph);
   const std::size_t node_count = graph.node_device_ids.size();
@@ -218,8 +275,12 @@ void validate_static_metadata(const DeviceRoutingGraph& graph) {
       graph.bounds.min_y > graph.bounds.max_y) {
     throw std::runtime_error("device graph has invalid coordinate bounds");
   }
-  if (graph.device_path_string >= string_count) {
-    throw std::runtime_error("device path string is out of range");
+  if (graph.device_path_string >= string_count ||
+      graph.device_name_string >= string_count) {
+    throw std::runtime_error("device identity string is out of range");
+  }
+  if (graph.string_table.strings[graph.device_name_string].empty()) {
+    throw std::runtime_error("device graph has an empty device name");
   }
   if (graph.loaded_edges > graph.declared_edges) {
     throw std::runtime_error(
@@ -247,8 +308,8 @@ void validate_static_metadata(const DeviceRoutingGraph& graph) {
   }
   validate_lookup_records(graph.tile_wire_nodes, string_count, node_count,
                           "tile-wire");
-  validate_lookup_records(graph.site_pin_nodes, string_count, node_count,
-                          "site-pin");
+  validate_site_pin_lookup_records(graph.site_pin_nodes, string_count,
+                                   node_count);
 }
 
 std::size_t validate_row_pointers(const DeviceRoutingGraph& graph) {
@@ -307,6 +368,7 @@ void write_header_and_static_prefix(std::ofstream& out,
   write_u64(out, graph.declared_edges, "declared edge count");
   write_u64(out, graph.loaded_edges, "loaded edge count");
   write_u64(out, graph.device_path_string, "device path string");
+  write_u64(out, graph.device_name_string, "device name string");
 
   for (const std::string& text : graph.string_table.strings) {
     write_string(out, text);
@@ -382,6 +444,34 @@ NodeBoundsMode parse_node_bounds_mode(const std::string& text) {
   throw std::runtime_error("unknown node bounds mode: " + text);
 }
 
+std::filesystem::path create_unique_staging_path(
+    const std::filesystem::path& final_path) {
+  if (final_path.has_parent_path()) {
+    std::filesystem::create_directories(final_path.parent_path());
+  }
+  std::filesystem::path pattern = final_path;
+  pattern += ".tmp.XXXXXX";
+  const std::string pattern_string = pattern.string();
+  std::vector<char> mutable_pattern(pattern_string.begin(),
+                                    pattern_string.end());
+  mutable_pattern.push_back('\0');
+  const int descriptor = ::mkstemp(mutable_pattern.data());
+  if (descriptor < 0) {
+    throw std::runtime_error(
+        "could not create unique staging output for " +
+        final_path.string() + ": " + std::strerror(errno));
+  }
+  if (::close(descriptor) != 0) {
+    const int close_error = errno;
+    std::error_code ignored;
+    std::filesystem::remove(mutable_pattern.data(), ignored);
+    throw std::runtime_error(
+        "could not close staging output for " + final_path.string() +
+        ": " + std::strerror(close_error));
+  }
+  return std::filesystem::path(mutable_pattern.data());
+}
+
 std::uint64_t StringTable::intern(const std::string& text) {
   const auto found = ids.find(text);
   if (found != ids.end()) {
@@ -422,6 +512,76 @@ bool operator<(const PairNodeLookup& lhs, const PairNodeLookup& rhs) {
   return lhs.node < rhs.node;
 }
 
+bool operator<(const SitePinNodeLookup& lhs,
+               const SitePinNodeLookup& rhs) {
+  if (lhs.site_string != rhs.site_string) {
+    return lhs.site_string < rhs.site_string;
+  }
+  if (lhs.site_type_string != rhs.site_type_string) {
+    return lhs.site_type_string < rhs.site_type_string;
+  }
+  if (lhs.pin_string != rhs.pin_string) {
+    return lhs.pin_string < rhs.pin_string;
+  }
+  return lhs.node < rhs.node;
+}
+
+std::size_t sort_and_deduplicate_pair_node_lookups(
+    std::vector<PairNodeLookup>& records,
+    LookupConflictPolicy conflict_policy,
+    const char* lookup_name) {
+  std::sort(records.begin(), records.end());
+  std::size_t write = 0;
+  std::size_t ambiguous = 0;
+  for (std::size_t begin = 0; begin < records.size();) {
+    std::size_t end = begin + 1;
+    bool conflict = false;
+    while (end < records.size() &&
+           records[end].first_string == records[begin].first_string &&
+           records[end].second_string == records[begin].second_string) {
+      conflict = conflict || records[end].node != records[begin].node;
+      ++end;
+    }
+    if (conflict) {
+      ++ambiguous;
+      if (conflict_policy == LookupConflictPolicy::kReject) {
+        throw std::runtime_error(std::string(lookup_name) +
+                                 " lookup maps one key to multiple nodes");
+      }
+    } else {
+      records[write++] = records[begin];
+    }
+    begin = end;
+  }
+  records.resize(write);
+  return ambiguous;
+}
+
+void sort_and_deduplicate_site_pin_lookups(
+    std::vector<SitePinNodeLookup>& records) {
+  std::sort(records.begin(), records.end());
+  std::size_t write = 0;
+  for (std::size_t begin = 0; begin < records.size();) {
+    std::size_t end = begin + 1;
+    bool conflict = false;
+    while (end < records.size() &&
+           records[end].site_string == records[begin].site_string &&
+           records[end].site_type_string ==
+               records[begin].site_type_string &&
+           records[end].pin_string == records[begin].pin_string) {
+      conflict = conflict || records[end].node != records[begin].node;
+      ++end;
+    }
+    if (conflict) {
+      throw std::runtime_error(
+          "site-pin lookup maps one typed key to multiple nodes");
+    }
+    records[write++] = records[begin];
+    begin = end;
+  }
+  records.resize(write);
+}
+
 std::uint32_t checked_lookup_string_id(std::uint64_t id) {
   if (id >= static_cast<std::uint64_t>(
                 std::numeric_limits<std::uint32_t>::max())) {
@@ -451,6 +611,79 @@ std::optional<NodeId> find_pair_node(
   const auto found = std::lower_bound(records.begin(), records.end(), key);
   if (found == records.end() || found->first_string != key.first_string ||
       found->second_string != key.second_string) {
+    return std::nullopt;
+  }
+  return found->node;
+}
+
+std::vector<NodeId> find_site_pin_candidates(
+    const std::vector<SitePinNodeLookup>& records,
+    const StringTable& strings,
+    const std::string& site,
+    const std::string& pin) {
+  const std::optional<std::uint64_t> site_id = strings.find(site);
+  const std::optional<std::uint64_t> pin_id = strings.find(pin);
+  if (!site_id.has_value() || !pin_id.has_value() ||
+      *site_id > std::numeric_limits<std::uint32_t>::max() ||
+      *pin_id > std::numeric_limits<std::uint32_t>::max()) {
+    return {};
+  }
+
+  SitePinNodeLookup site_key;
+  site_key.site_string = static_cast<std::uint32_t>(*site_id);
+  const auto first = std::lower_bound(records.begin(), records.end(),
+                                      site_key);
+  std::vector<NodeId> candidates;
+  for (auto record = first;
+       record != records.end() &&
+       record->site_string == site_key.site_string;
+       ++record) {
+    if (record->pin_string == static_cast<std::uint32_t>(*pin_id)) {
+      candidates.push_back(record->node);
+    }
+  }
+  std::sort(candidates.begin(), candidates.end());
+  candidates.erase(std::unique(candidates.begin(), candidates.end()),
+                   candidates.end());
+  return candidates;
+}
+
+std::optional<NodeId> find_site_pin_node(
+    const std::vector<SitePinNodeLookup>& records,
+    const StringTable& strings,
+    const std::string& site,
+    const std::optional<std::string>& active_site_type,
+    const std::string& pin) {
+  if (!active_site_type.has_value()) {
+    const std::vector<NodeId> candidates =
+        find_site_pin_candidates(records, strings, site, pin);
+    if (candidates.size() == 1) {
+      return candidates.front();
+    }
+    return std::nullopt;
+  }
+
+  const std::optional<std::uint64_t> site_id = strings.find(site);
+  const std::optional<std::uint64_t> type_id =
+      strings.find(*active_site_type);
+  const std::optional<std::uint64_t> pin_id = strings.find(pin);
+  if (!site_id.has_value() || !type_id.has_value() ||
+      !pin_id.has_value() ||
+      *site_id > std::numeric_limits<std::uint32_t>::max() ||
+      *type_id > std::numeric_limits<std::uint32_t>::max() ||
+      *pin_id > std::numeric_limits<std::uint32_t>::max()) {
+    return std::nullopt;
+  }
+
+  SitePinNodeLookup key;
+  key.site_string = static_cast<std::uint32_t>(*site_id);
+  key.site_type_string = static_cast<std::uint32_t>(*type_id);
+  key.pin_string = static_cast<std::uint32_t>(*pin_id);
+  key.node = std::numeric_limits<NodeId>::min();
+  const auto found = std::lower_bound(records.begin(), records.end(), key);
+  if (found == records.end() || found->site_string != key.site_string ||
+      found->site_type_string != key.site_type_string ||
+      found->pin_string != key.pin_string) {
     return std::nullopt;
   }
   return found->node;
@@ -536,6 +769,7 @@ DeviceRoutingGraph read_device_routing_graph_impl(
   graph.declared_edges = read_u64(in, "declared edge count");
   graph.loaded_edges = read_u64(in, "loaded edge count");
   graph.device_path_string = read_u64(in, "device path string");
+  graph.device_name_string = read_u64(in, "device name string");
 
   if (node_count == 0 ||
       node_count > static_cast<std::uint64_t>(
@@ -577,6 +811,17 @@ DeviceRoutingGraph read_device_routing_graph_impl(
   }
   read_array(in, graph.tile_wire_nodes, tile_wire_count, "tile-wire lookup");
   read_array(in, graph.site_pin_nodes, site_pin_count, "site-pin lookup");
+
+  char trailing_byte = 0;
+  in.read(&trailing_byte, 1);
+  if (in.gcount() != 0) {
+    throw std::runtime_error(
+        "device-routing graph contains trailing bytes");
+  }
+  if (!in.eof()) {
+    throw std::runtime_error(
+        "failed while checking the end of device-routing graph");
+  }
 
   if (validate_edge_records) {
     validate_device_routing_graph(graph);
@@ -731,10 +976,12 @@ void sort_and_deduplicate_static_csr(
 CsrGraph filter_device_routing_graph(
     const DeviceRoutingGraph& graph,
     const std::vector<std::uint8_t>& blocked_node,
-    const std::vector<std::uint8_t>& sink_node_stops) {
+    const std::vector<std::uint8_t>& sink_node_stops,
+    const std::vector<std::uint8_t>& exclusive_source_nodes) {
   const std::size_t node_count = graph.node_device_ids.size();
   if (blocked_node.size() != node_count ||
-      sink_node_stops.size() != node_count) {
+      sink_node_stops.size() != node_count ||
+      exclusive_source_nodes.size() != node_count) {
     throw std::runtime_error("design masks do not match device graph rows");
   }
   if (graph.rowptr.size() != node_count + 1 || graph.rowptr.front() != 0 ||
@@ -783,7 +1030,8 @@ CsrGraph filter_device_routing_graph(
       }
       previous = col;
       if (source_is_active &&
-          !blocked_node[static_cast<std::size_t>(col)]) {
+          !blocked_node[static_cast<std::size_t>(col)] &&
+          !exclusive_source_nodes[static_cast<std::size_t>(col)]) {
         csr.colind.push_back(col);
         csr.edge_attrs.push_back(attr);
       }

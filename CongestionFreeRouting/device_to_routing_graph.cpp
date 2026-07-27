@@ -20,6 +20,7 @@
 #include "DeviceResources.capnp.h"
 #include "interchange/device_routing_graph.hpp"
 #include "interchange/gzip_io.hpp"
+#include "interchange/import_policy.hpp"
 
 #include <capnp/serialize.h>
 #include <kj/array.h>
@@ -44,16 +45,21 @@ using routing::interchange::DeviceRoutingGraph;
 using routing::interchange::EdgeAttr;
 using routing::interchange::NodeBoundsMode;
 using routing::interchange::NodeId;
+using routing::interchange::LookupConflictPolicy;
 using routing::interchange::PairNodeLookup;
 using routing::interchange::PipData;
 using routing::interchange::StaticCsrEntry;
 using routing::interchange::checked_lookup_string_id;
+using routing::interchange::create_unique_staging_path;
 using routing::interchange::kInvalidRouteNode;
 using routing::interchange::kNoIndex;
 using routing::interchange::kNoStringIndex;
 using routing::interchange::node_bounds_mode_name;
 using routing::interchange::parse_node_bounds_mode;
 using routing::interchange::read_gzip_or_plain_chunks;
+using routing::interchange::require_distinct_interchange_paths;
+using routing::interchange::sort_and_deduplicate_pair_node_lookups;
+using routing::interchange::sort_and_deduplicate_site_pin_lookups;
 using routing::interchange::sort_and_deduplicate_static_csr;
 using routing::interchange::write_device_routing_graph;
 
@@ -168,6 +174,12 @@ DevicePayload read_device_payload(const std::filesystem::path& path) {
         }
         const std::size_t old_size = payload.decoded_bytes;
         payload.decoded_bytes += chunk_size;
+        if (payload.decoded_bytes >
+            std::numeric_limits<std::size_t>::max() -
+                (sizeof(capnp::word) - 1)) {
+          throw std::runtime_error(
+              "decoded device word count overflows size_t");
+        }
         const std::size_t word_count =
             (payload.decoded_bytes + sizeof(capnp::word) - 1) /
             sizeof(capnp::word);
@@ -273,11 +285,6 @@ std::optional<std::pair<std::int32_t, std::int32_t>> parse_tile_xy(
                         static_cast<std::int32_t>(y));
 }
 
-bool has_prefix(const std::string& text, const char* prefix) {
-  const std::size_t size = std::strlen(prefix);
-  return text.size() >= size && text.compare(0, size, prefix) == 0;
-}
-
 std::uint64_t pair_key(std::uint32_t first, std::uint32_t second) {
   return (static_cast<std::uint64_t>(first) << 32) | second;
 }
@@ -323,6 +330,10 @@ class FlatPairNodeMap {
     std::size_t slot = static_cast<std::size_t>(mix_key(key)) & mask_;
     while (values_[slot] != kInvalidRouteNode && keys_[slot] != key) {
       slot = (slot + 1) & mask_;
+    }
+    if (values_[slot] != kInvalidRouteNode && values_[slot] != node) {
+      throw std::runtime_error(
+          "tile-wire lookup maps one key to multiple nodes");
     }
     keys_[slot] = key;
     values_[slot] = node;
@@ -388,29 +399,7 @@ struct TileInstance {
   std::uint32_t tile_name = 0;
   std::uint32_t tile_type = 0;
   std::uint64_t tile_string = 0;
-  bool restrict_to_conventional = false;
 };
-
-struct SitePinTemplate {
-  std::uint32_t pin_name = 0;
-  std::uint32_t tile_wire = 0;
-};
-
-void sort_and_deduplicate_lookups(std::vector<PairNodeLookup>& records) {
-  std::sort(records.begin(), records.end());
-  std::size_t write = 0;
-  for (std::size_t begin = 0; begin < records.size();) {
-    std::size_t end = begin + 1;
-    while (end < records.size() &&
-           records[end].first_string == records[begin].first_string &&
-           records[end].second_string == records[begin].second_string) {
-      ++end;
-    }
-    records[write++] = records[end - 1];
-    begin = end;
-  }
-  records.resize(write);
-}
 
 struct BuildResult {
   DeviceRoutingGraph graph;
@@ -460,6 +449,9 @@ BuildResult build_device_routing_graph(const Options& options) {
   graph.node_bounds_mode = options.node_bounds_mode;
   graph.device_path_string =
       graph.string_table.intern(options.device_path.string());
+  const capnp::Text::Reader device_name = device.getName();
+  graph.device_name_string = graph.string_table.intern(
+      std::string(device_name.cStr(), device_name.size()));
 
   std::vector<std::uint64_t> local_string_by_device_id(strings.size(),
                                                         kNoStringIndex);
@@ -519,6 +511,12 @@ BuildResult build_device_routing_graph(const Options& options) {
     const auto node_wires = nodes[node_index].getWires();
     if (node_wires.size() == 0) {
       continue;
+    }
+    for (std::uint32_t offset = 0; offset < node_wires.size(); ++offset) {
+      if (node_wires[offset] >= wires.size()) {
+        throw std::runtime_error(
+            "device node refers to an out-of-range wire");
+      }
     }
     const auto base_wire = wires[node_wires[0]];
     const bool base_in_bounds =
@@ -621,7 +619,8 @@ BuildResult build_device_routing_graph(const Options& options) {
     graph.tile_wire_nodes.push_back(
         {record.first, record.second, record.node, 0});
   }
-  sort_and_deduplicate_lookups(graph.tile_wire_nodes);
+  (void)sort_and_deduplicate_pair_node_lookups(
+      graph.tile_wire_nodes, LookupConflictPolicy::kReject, "tile-wire");
   release_storage(numeric_tile_wire_nodes);
 
   std::vector<TileInstance> tile_instances;
@@ -632,12 +631,10 @@ BuildResult build_device_routing_graph(const Options& options) {
     if (tile.getType() >= tile_types.size()) {
       throw std::runtime_error("tile type index is out of range");
     }
-    const std::string& tile_name = strings.get(tile.getName());
     const std::uint64_t tile_string = intern_device_string(tile.getName());
     tile_instances.push_back(
         {tile_index, checked_lookup_string_id(tile_string), tile.getType(),
-         tile_string,
-         has_prefix(tile_name, "CLE") || has_prefix(tile_name, "RCLK")});
+         tile_string});
     used_tile_type[tile.getType()] = 1;
   }
   release_storage(in_bounds_tile_indices);
@@ -689,7 +686,13 @@ BuildResult build_device_routing_graph(const Options& options) {
   auto for_each_edge = [&](auto&& callback) {
     for (const TileInstance& tile : tile_instances) {
       for (PipTemplate& pip : pip_templates[tile.tile_type]) {
-        if (tile.restrict_to_conventional && !pip.conventional) {
+        // Pseudo PIPs require traversed-site metadata and availability checks.
+        // The compact graph stores neither, and routes_to_phys cannot emit the
+        // required PhysPIP.site field, so accepting one could create a
+        // physically invalid route.  RWRoute likewise leaves route-throughs
+        // disabled unless their site resources are modeled explicitly.
+        if (!routing::interchange::include_pip_in_static_graph(
+                pip.conventional)) {
           continue;
         }
         const std::optional<NodeId> node0 =
@@ -770,8 +773,11 @@ BuildResult build_device_routing_graph(const Options& options) {
   const auto site_type_list = device.getSiteTypeList();
   std::vector<std::vector<std::uint32_t>> site_type_pin_names(
       site_type_list.size());
+  std::vector<std::uint32_t> site_type_name_strings(site_type_list.size());
   for (std::uint32_t type_index = 0; type_index < site_type_list.size();
        ++type_index) {
+    site_type_name_strings[type_index] = checked_lookup_string_id(
+        intern_device_string(site_type_list[type_index].getName()));
     const auto pins = site_type_list[type_index].getPins();
     auto& names = site_type_pin_names[type_index];
     names.reserve(pins.size());
@@ -781,8 +787,8 @@ BuildResult build_device_routing_graph(const Options& options) {
     }
   }
 
-  std::vector<std::vector<std::vector<SitePinTemplate>>> site_pin_templates(
-      tile_types.size());
+  std::vector<std::vector<std::vector<routing::interchange::SitePinTemplate>>>
+      site_pin_templates(tile_types.size());
   for (std::uint32_t tile_type_index = 0;
        tile_type_index < tile_types.size(); ++tile_type_index) {
     if (!used_tile_type[tile_type_index]) {
@@ -796,19 +802,54 @@ BuildResult build_device_routing_graph(const Options& options) {
       const auto site_type = site_types[site_type_index];
       const std::uint32_t primary_type = site_type.getPrimaryType();
       if (primary_type >= site_type_pin_names.size()) {
-        continue;
+        throw std::runtime_error(
+            "tile site type has an invalid primary site type");
       }
       const auto wires_for_pins = site_type.getPrimaryPinsToTileWires();
       const auto& pin_names = site_type_pin_names[primary_type];
-      const std::uint32_t count = std::min<std::uint32_t>(
-          wires_for_pins.size(), pin_names.size());
-      auto& templates = by_site_type[site_type_index];
-      templates.reserve(count);
-      for (std::uint32_t pin = 0; pin < count; ++pin) {
-        templates.push_back(
-            {pin_names[pin], checked_lookup_string_id(
-                                 intern_device_string(wires_for_pins[pin]))});
+      if (wires_for_pins.size() != pin_names.size()) {
+        throw std::runtime_error(
+            "primary site-pin and tile-wire counts do not match");
       }
+      std::vector<std::uint32_t> primary_wires;
+      primary_wires.reserve(wires_for_pins.size());
+      for (std::uint32_t pin = 0; pin < wires_for_pins.size(); ++pin) {
+        primary_wires.push_back(checked_lookup_string_id(
+            intern_device_string(wires_for_pins[pin])));
+      }
+
+      const auto primary_site_type = site_type_list[primary_type];
+      const auto alternate_types = primary_site_type.getAltSiteTypes();
+      const auto alternate_parent_maps =
+          site_type.getAltPinsToPrimaryPins();
+      if (alternate_types.size() != alternate_parent_maps.size()) {
+        throw std::runtime_error(
+            "alternate site-type and parent-map counts do not match");
+      }
+      std::vector<routing::interchange::AlternateSitePinMap> alternates;
+      alternates.reserve(alternate_types.size());
+      for (std::uint32_t alternate = 0;
+           alternate < alternate_types.size(); ++alternate) {
+        const std::uint32_t alternate_type = alternate_types[alternate];
+        if (alternate_type >= site_type_pin_names.size()) {
+          throw std::runtime_error(
+              "alternate site type index is out of range");
+        }
+        routing::interchange::AlternateSitePinMap alternate_map;
+        alternate_map.site_type_string =
+            site_type_name_strings[alternate_type];
+        alternate_map.pin_strings = site_type_pin_names[alternate_type];
+        const auto parent_pins = alternate_parent_maps[alternate].getPins();
+        alternate_map.primary_pin_indices.reserve(parent_pins.size());
+        for (std::uint32_t pin = 0; pin < parent_pins.size(); ++pin) {
+          alternate_map.primary_pin_indices.push_back(parent_pins[pin]);
+        }
+        alternates.push_back(std::move(alternate_map));
+      }
+      by_site_type[site_type_index] =
+          routing::interchange::build_site_pin_templates(
+              site_type_name_strings[primary_type], pin_names,
+              primary_wires, alternates);
     }
   }
 
@@ -819,23 +860,27 @@ BuildResult build_device_routing_graph(const Options& options) {
     for (std::uint32_t site_index = 0; site_index < sites.size(); ++site_index) {
       const auto site = sites[site_index];
       if (site.getType() >= by_site_type.size()) {
-        continue;
+        throw std::runtime_error(
+            "tile site refers to an invalid tile-site-type index");
       }
-      for (const SitePinTemplate& pin : by_site_type[site.getType()]) {
+      for (const routing::interchange::SitePinTemplate& pin :
+           by_site_type[site.getType()]) {
         const std::optional<NodeId> node =
-            tile_wire_map.find(tile_instance.tile_name, pin.tile_wire);
+            tile_wire_map.find(tile_instance.tile_name,
+                               pin.tile_wire_string);
         if (!node.has_value()) {
           continue;
         }
         graph.site_pin_nodes.push_back(
             {checked_lookup_string_id(
                  intern_device_string(site.getName())),
-             pin.pin_name,
-             *node, 0});
+             pin.site_type_string,
+             pin.pin_string,
+             *node});
       }
     }
   }
-  sort_and_deduplicate_lookups(graph.site_pin_nodes);
+  sort_and_deduplicate_site_pin_lookups(graph.site_pin_nodes);
 
   return result;
 }
@@ -847,8 +892,8 @@ double mib(std::uint64_t bytes) {
 void write_graph_atomically(const DeviceRoutingGraph& graph,
                             const std::vector<StaticCsrEntry>& entries,
                             const std::filesystem::path& output_path) {
-  std::filesystem::path temporary = output_path;
-  temporary += ".tmp";
+  const std::filesystem::path temporary =
+      create_unique_staging_path(output_path);
   try {
     write_device_routing_graph(graph, entries, temporary);
     std::filesystem::rename(temporary, output_path);
@@ -864,6 +909,8 @@ void write_graph_atomically(const DeviceRoutingGraph& graph,
 int main(int argc, char** argv) {
   try {
     const Options options = parse_options(argc, argv);
+    require_distinct_interchange_paths(
+        {options.device_path, options.output_path});
     std::cout << "device: " << options.device_path << '\n'
               << "bounds: X" << options.bounds.min_x << "..X"
               << options.bounds.max_x << ", Y" << options.bounds.min_y
@@ -884,6 +931,8 @@ int main(int argc, char** argv) {
               << "imported_nodes: " << node_count << '\n'
               << "declared_edges: " << result.graph.declared_edges << '\n'
               << "unique_edges: " << edge_count << '\n'
+              << "typed_site_pin_aliases: "
+              << result.graph.site_pin_nodes.size() << '\n'
               << "base_csr_and_attrs_mib: " << mib(compact_bytes) << '\n'
               << "wrote_device_graph: " << options.output_path << '\n';
     return 0;
