@@ -107,6 +107,20 @@ void test_capacity_policy() {
       "allocation byte overflow must be rejected");
 }
 
+void test_controller_policy() {
+  using unit_bfs_policy::use_cooperative_controller;
+  require(use_cooperative_controller(false, false, 1),
+          "null-stream callback-free runs may use cooperative control");
+  require(!use_cooperative_controller(false, false, 0),
+          "cooperative control requires a resident launch grid");
+  require(!use_cooperative_controller(true, false, 1),
+          "progress callbacks require host-visible level control");
+  require(!use_cooperative_controller(false, true, 1),
+          "explicit streams must retain the gfx1151-safe host controller");
+  require(!use_cooperative_controller(true, true, 1),
+          "explicit callback runs must remain host controlled");
+}
+
 void test_generation_model() {
   unit_bfs_policy::GenerationVisitationModel model(6);
   require(!model.begin_query() && model.generation() == 1,
@@ -148,6 +162,7 @@ int main() {
   try {
     test_compact_offset_scan();
     test_capacity_policy();
+    test_controller_policy();
     test_generation_model();
     std::cout << "Unit-BFS host policy test passed\n";
     return 0;

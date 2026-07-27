@@ -1763,7 +1763,10 @@ UnitBfsCsrResult run_unit_bfs_with_offsets(
       UseGeneration ? scratch.generation_cooperative_launch_blocks
                     : outgoing.sparse_cooperative_launch_blocks;
   const bool use_cooperative_controller =
-      progress_callback == nullptr && cooperative_launch_blocks > 0;
+      unit_bfs_policy::use_cooperative_controller(
+          progress_callback != nullptr,
+          stream != nullptr,
+          cooperative_launch_blocks);
   const bool use_batched_device_controller =
       stream == nullptr && progress_callback == nullptr;
 

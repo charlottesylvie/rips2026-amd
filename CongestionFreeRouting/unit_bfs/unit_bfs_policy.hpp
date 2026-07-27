@@ -12,6 +12,16 @@
 
 namespace unit_bfs_policy {
 
+// Cooperative grids remain restricted to the null/default stream. PathFinder
+// workers use independent nonblocking streams, where gfx1151 requires the
+// established one-level host-controlled handoff and its synchronization.
+constexpr bool use_cooperative_controller(bool has_progress_callback,
+                                          bool has_explicit_stream,
+                                          int cooperative_launch_blocks) {
+  return !has_progress_callback && !has_explicit_stream &&
+         cooperative_launch_blocks > 0;
+}
+
 inline std::size_t bounded_geometric_capacity(std::size_t current,
                                               std::size_t required,
                                               std::size_t limit) {
