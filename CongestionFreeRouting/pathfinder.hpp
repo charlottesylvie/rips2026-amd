@@ -1,6 +1,7 @@
 #pragma once
 
 #include "../HIP_kernel/bellman_ford/src/bf_hip_CSR.hpp"
+#include "interchange/import_policy.hpp"
 #include "sssp_query_capacity.hpp"
 
 #include <hip/hip_runtime.h>
@@ -9,6 +10,7 @@
 #include <cstdint>
 #include <filesystem>
 #include <limits>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -41,6 +43,7 @@ struct RouteRequest {
 };
 
 struct RoutingMetadata {
+  std::optional<interchange::InterchangeArtifactPairId> artifact_pair_id;
   std::vector<std::string> strings;
   std::vector<std::uint64_t> node_device_ids;
   std::vector<std::int32_t> node_min_x;
@@ -159,7 +162,10 @@ struct UnitBfsPathDiagnostic {
   std::string classification;
 };
 
-HostCsrF32 load_csrbin(const std::filesystem::path& path);
+HostCsrF32 load_csrbin(
+    const std::filesystem::path& path,
+    std::optional<interchange::InterchangeArtifactPairId>* artifact_pair_id =
+        nullptr);
 RoutingMetadata load_interchange_metadata(const std::filesystem::path& path);
 
 // Derive conservative initial workspace reservations from exactly the routed

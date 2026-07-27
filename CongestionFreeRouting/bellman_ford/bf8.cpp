@@ -20,6 +20,7 @@
 // detailed source progress lines.
 
 #include "bf8.hpp"
+#include "../interchange/import_policy.hpp"
 
 #include <hip/hip_runtime.h>
 
@@ -35,6 +36,7 @@
 #include <iomanip>
 #include <iostream>
 #include <limits>
+#include <optional>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -666,10 +668,13 @@ using Index = rips_sssp_new::Index;
 
 constexpr char CSR_MAGIC[8] = {'R', 'I', 'P', 'S', 'C', 'S', 'R', '1'};
 constexpr char METADATA_MAGIC[8] = {'R', 'I', 'P', 'S', 'I', 'F', 'M', '1'};
-constexpr std::uint64_t EXPECTED_CSR_VERSION = 1;
+constexpr std::uint64_t MIN_CSR_VERSION = 1;
+constexpr std::uint64_t CURRENT_CSR_VERSION = 2;
+constexpr std::uint64_t ARTIFACT_PAIR_CSR_VERSION = 2;
 constexpr std::uint64_t MIN_METADATA_VERSION = 3;
-constexpr std::uint64_t CURRENT_METADATA_VERSION = 4;
+constexpr std::uint64_t CURRENT_METADATA_VERSION = 5;
 constexpr std::uint64_t NODE_PHYSICAL_METADATA_VERSION = 4;
+constexpr std::uint64_t ARTIFACT_PAIR_METADATA_VERSION = 5;
 constexpr std::uint64_t EXPECTED_OUTGOING_EDGE_ORIENTATION = 2;
 constexpr unsigned int kPackedNoPredEdge = 0xffffffffu;
 constexpr std::uint64_t kNoIndex = std::numeric_limits<std::uint64_t>::max();
@@ -684,6 +689,8 @@ struct HostOutgoingCsrF32 {
   std::vector<Index> to;
   std::vector<float> values;
   std::vector<Offset> edge_id;
+  std::optional<routing::interchange::InterchangeArtifactPairId>
+      artifact_pair_id;
 };
 
 struct DeviceOutgoingCsrOwner {
@@ -713,6 +720,8 @@ struct RoutingMetadata {
   std::uint64_t edge_attr_count = 0;
   std::vector<std::string> strings;
   std::vector<RouteRequest> route_requests;
+  std::optional<routing::interchange::InterchangeArtifactPairId>
+      artifact_pair_id;
 };
 
 struct Query {
@@ -975,13 +984,26 @@ HostOutgoingCsrF32 load_outgoing_csrbin(const std::filesystem::path& path) {
 
   const std::uint64_t version = read_u64(in, "outgoing CSR format version");
   const std::uint64_t orientation = read_u64(in, "outgoing CSR orientation");
-  if (version != EXPECTED_CSR_VERSION) {
+  if (version < MIN_CSR_VERSION || version > CURRENT_CSR_VERSION) {
     throw std::runtime_error(
-        "unsupported RIPSCSR1 format version (expected version 1)");
+        "unsupported RIPSCSR1 format version (expected version 1 or 2)");
   }
   if (orientation != EXPECTED_OUTGOING_EDGE_ORIENTATION) {
     throw std::runtime_error(
         "unsupported RIPSCSR1 orientation (expected outgoing orientation 2)");
+  }
+
+  std::optional<routing::interchange::InterchangeArtifactPairId>
+      artifact_pair_id;
+  if (version >= ARTIFACT_PAIR_CSR_VERSION) {
+    routing::interchange::InterchangeArtifactPairId id{
+        read_u64(in, "outgoing CSR artifact pair id high"),
+        read_u64(in, "outgoing CSR artifact pair id low")};
+    if (id.is_zero()) {
+      throw std::runtime_error(
+          "outgoing CSR artifact pair id must not be zero");
+    }
+    artifact_pair_id = id;
   }
 
   const std::uint64_t rows = read_u64(in, "outgoing CSR row count");
@@ -1022,6 +1044,7 @@ HostOutgoingCsrF32 load_outgoing_csrbin(const std::filesystem::path& path) {
   graph.rows = static_cast<Offset>(rows);
   graph.cols = static_cast<Offset>(cols);
   graph.nnz = static_cast<Offset>(nnz);
+  graph.artifact_pair_id = artifact_pair_id;
   read_array(in, graph.rowptr, rowptr_count, "outgoing CSR rowptr");
   read_array(in, graph.to, colind_count, "outgoing CSR colind destinations");
   read_array(in, graph.values, values_count, "outgoing CSR values");
@@ -1181,11 +1204,24 @@ RoutingMetadata load_routing_metadata(const std::filesystem::path& path,
   const std::uint64_t orientation = read_u64(in, "metadata orientation");
   if (version < MIN_METADATA_VERSION || version > CURRENT_METADATA_VERSION) {
     throw std::runtime_error(
-        "unsupported RIPSIFM1 metadata version (expected version 3 or 4)");
+        "unsupported RIPSIFM1 metadata version (expected version 3, 4, or 5)");
   }
   if (orientation != EXPECTED_OUTGOING_EDGE_ORIENTATION) {
     throw std::runtime_error(
         "unsupported RIPSIFM1 orientation (expected outgoing orientation 2)");
+  }
+
+  std::optional<routing::interchange::InterchangeArtifactPairId>
+      artifact_pair_id;
+  if (version >= ARTIFACT_PAIR_METADATA_VERSION) {
+    routing::interchange::InterchangeArtifactPairId id{
+        read_u64(in, "metadata artifact pair id high"),
+        read_u64(in, "metadata artifact pair id low")};
+    if (id.is_zero()) {
+      throw std::runtime_error(
+          "metadata artifact pair id must not be zero");
+    }
+    artifact_pair_id = id;
   }
 
   const std::uint64_t string_count = read_u64(in, "metadata string count");
@@ -1217,6 +1253,7 @@ RoutingMetadata load_routing_metadata(const std::filesystem::path& path,
   RoutingMetadata metadata;
   metadata.metadata_node_count = node_count;
   metadata.edge_attr_count = edge_attr_count;
+  metadata.artifact_pair_id = artifact_pair_id;
   metadata.strings.reserve(checked_size(string_count, "metadata string"));
   for (std::uint64_t i = 0; i < string_count; ++i) {
     metadata.strings.push_back(read_string(in));
@@ -1903,6 +1940,11 @@ int main_impl(int argc, char** argv) {
   const bool emit_paths = !args.paths_output_path.empty();
   const bool print_jsonl_entry_ids = args.options.print_jsonl_entry_ids;
 
+  const routing::interchange::InterchangePublicationSnapshot
+      publication_snapshot =
+          routing::interchange::snapshot_interchange_publication(
+              args.csr_path, args.metadata_path);
+
   std::cout << "[bf6] loading outgoing CSR: " << args.csr_path.string() << '\n';
   HostOutgoingCsrF32 graph = load_outgoing_csrbin(args.csr_path);
   std::cout << "[bf6] graph rows=" << graph.rows
@@ -1911,6 +1953,11 @@ int main_impl(int argc, char** argv) {
 
   std::cout << "[bf6] loading metadata: " << args.metadata_path.string() << '\n';
   RoutingMetadata metadata = load_routing_metadata(args.metadata_path, graph.nnz);
+  routing::interchange::verify_interchange_publication(
+      args.csr_path, args.metadata_path, publication_snapshot);
+  routing::interchange::require_matching_interchange_pair_ids(
+      graph.artifact_pair_id, metadata.artifact_pair_id,
+      publication_snapshot.generation);
   if (metadata.metadata_node_count != static_cast<std::uint64_t>(graph.rows)) {
     throw std::runtime_error("metadata node count does not match outgoing CSR rows");
   }

@@ -50,6 +50,7 @@
 #include "PhysicalNetlist.capnp.h"
 #include "interchange/device_routing_graph.hpp"
 #include "interchange/gzip_io.hpp"
+#include "interchange/import_policy.hpp"
 
 #include <capnp/serialize.h>
 #include <kj/array.h>
@@ -65,6 +66,7 @@
 #include <stdexcept>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -88,17 +90,20 @@ static_assert(sizeof(PipDataDisk) == 3 * sizeof(std::uint64_t),
 
 constexpr char CSR_MAGIC[8] = {'R', 'I', 'P', 'S', 'C', 'S', 'R', '1'};
 constexpr char METADATA_MAGIC[8] = {'R', 'I', 'P', 'S', 'I', 'F', 'M', '1'};
-constexpr std::uint64_t CSR_FORMAT_VERSION = 1;
-constexpr std::uint64_t METADATA_FORMAT_VERSION = 4;
+constexpr std::uint64_t CSR_FORMAT_VERSION = 2;
+constexpr std::uint64_t METADATA_FORMAT_VERSION = 5;
 constexpr std::uint64_t OUTGOING_EDGE_ORIENTATION = 2;
 using routing::interchange::CsrGraph;
 using routing::interchange::DeviceRoutingGraph;
 using routing::interchange::EdgeAttr;
+using routing::interchange::InterchangeArtifactPairId;
 using routing::interchange::NodeId;
 using routing::interchange::PipData;
 using routing::interchange::StringTable;
 using routing::interchange::filter_device_routing_graph;
 using routing::interchange::find_pair_node;
+using routing::interchange::find_site_pin_candidates;
+using routing::interchange::find_site_pin_node;
 using routing::interchange::kInvalidRouteNode;
 using routing::interchange::kNoIndex;
 using routing::interchange::kNoLogicalNetIndex;
@@ -185,13 +190,18 @@ struct RoutingGraph : DeviceRoutingGraph {
   explicit RoutingGraph(DeviceRoutingGraph&& device_graph)
       : DeviceRoutingGraph(std::move(device_graph)) {
     blocked_node.assign(node_device_ids.size(), 0);
+    // With a shared immutable CSR, terminal rows are the conservative guard
+    // against one net traversing another net's exclusive sink site pin.  This
+    // matches the contest POC.  RWRoute can make a narrower same-net pinbounce
+    // exception because its traversal carries connection ownership and intent;
+    // this graph currently cannot.
     sink_node_stops.assign(node_device_ids.size(), 0);
-    site_pin_attr_by_node.assign(node_device_ids.size(), -1);
+    exclusive_source_nodes.assign(node_device_ids.size(), 0);
   }
 
   std::vector<std::uint8_t> blocked_node;
   std::vector<std::uint8_t> sink_node_stops;
-  std::vector<std::int64_t> site_pin_attr_by_node;
+  std::vector<std::uint8_t> exclusive_source_nodes;
   std::vector<SitePinNode> site_pin_attrs;
   std::vector<RouteRequest> route_requests;
 
@@ -213,6 +223,32 @@ struct SitePinName {
   std::string pin;
 };
 
+// PhysicalNetlist.siteInsts gives the active type for each concrete site.  A
+// type is required to distinguish primary/alternate pin names that can map to
+// different device nodes.
+class ActiveSiteTypes {
+ public:
+  void insert(const std::string& site, const std::string& type) {
+    const auto [found, inserted] = type_by_site_.emplace(site, type);
+    if (!inserted && found->second != type) {
+      throw std::runtime_error(
+          "PhysicalNetlist assigns conflicting active types to site " +
+          site);
+    }
+  }
+
+  std::optional<std::string> find(const std::string& site) const {
+    const auto found = type_by_site_.find(site);
+    if (found == type_by_site_.end()) {
+      return std::nullopt;
+    }
+    return found->second;
+  }
+
+ private:
+  std::unordered_map<std::string, std::string> type_by_site_;
+};
+
 // The static device graph is an explicit positional input so a benchmark can
 // never silently pay the DeviceResources build cost.
 struct Options {
@@ -221,6 +257,7 @@ struct Options {
   std::filesystem::path logical_path;
   std::filesystem::path output_path;
   std::filesystem::path metadata_path;
+  bool allow_unsupported_preserved_nets = false;
 };
 
 void print_usage(const char* program) {
@@ -231,6 +268,9 @@ void print_usage(const char* program) {
          "<output.csrbin> [options]\n\n"
       << "Options:\n"
       << "  --metadata <path>              Sidecar FPGA metadata output.\n\n"
+      << "  --allow-unsupported-preserved-nets\n"
+      << "                                 Keep unsupported partial/static "
+         "work unchanged.\n\n"
       << "Generate <device.devicegraph> once with device_to_routing_graph.\n";
 }
 
@@ -254,6 +294,11 @@ Options parse_options(int argc, char** argv) {
         throw std::runtime_error("--metadata requires a path");
       }
       options.metadata_path = argv[++i];
+      continue;
+    }
+
+    if (arg == "--allow-unsupported-preserved-nets") {
+      options.allow_unsupported_preserved_nets = true;
       continue;
     }
 
@@ -350,6 +395,56 @@ void write_route_node(std::ofstream& out, NodeId node, const char* name) {
   write_u64(out, encoded, name);
 }
 
+template <typename T>
+std::size_t checked_array_bytes(std::size_t count, const char* name) {
+  if (count > std::numeric_limits<std::size_t>::max() / sizeof(T)) {
+    throw std::runtime_error(std::string(name) + " byte count overflows size_t");
+  }
+  const std::size_t bytes = count * sizeof(T);
+  if (bytes > static_cast<std::size_t>(
+                  std::numeric_limits<std::streamsize>::max())) {
+    throw std::runtime_error(std::string(name) +
+                             " byte count exceeds streamsize");
+  }
+  return bytes;
+}
+
+std::uint64_t checked_add_u64(std::uint64_t lhs,
+                              std::uint64_t rhs,
+                              const char* name) {
+  if (rhs > std::numeric_limits<std::uint64_t>::max() - lhs) {
+    throw std::runtime_error(std::string(name) + " overflows uint64");
+  }
+  return lhs + rhs;
+}
+
+void finish_output(std::ofstream& out,
+                   const std::filesystem::path& path) {
+  out.flush();
+  if (!out) {
+    throw std::runtime_error("failed while flushing output: " +
+                             path.string());
+  }
+  out.close();
+  if (!out) {
+    throw std::runtime_error("failed while closing output: " +
+                             path.string());
+  }
+}
+
+InterchangeArtifactPairId make_artifact_pair_id() {
+  static_assert(sizeof(InterchangeArtifactPairId) == 16,
+                "artifact pair id layout changed");
+  std::ifstream entropy("/dev/urandom", std::ios::binary);
+  InterchangeArtifactPairId result;
+  entropy.read(reinterpret_cast<char*>(&result), sizeof(result));
+  if (!entropy || result.is_zero()) {
+    throw std::runtime_error(
+        "could not obtain a nonzero artifact pair id from /dev/urandom");
+  }
+  return result;
+}
+
 // Arrays are written raw after explicit count fields in the header. The file
 // format therefore depends on the fixed-width type checks near the top.
 template <typename T>
@@ -360,7 +455,7 @@ void write_array(std::ofstream& out,
     return;
   }
 
-  const std::size_t bytes = values.size() * sizeof(T);
+  const std::size_t bytes = checked_array_bytes<T>(values.size(), name);
   out.write(reinterpret_cast<const char*>(values.data()),
             static_cast<std::streamsize>(bytes));
   if (!out) {
@@ -373,38 +468,39 @@ void write_array(std::ofstream& out,
 void write_string(std::ofstream& out, const std::string& text) {
   write_u64(out, static_cast<std::uint64_t>(text.size()), "string length");
   if (!text.empty()) {
-    out.write(text.data(), static_cast<std::streamsize>(text.size()));
+    const std::size_t bytes =
+        checked_array_bytes<char>(text.size(), "metadata string");
+    out.write(text.data(), static_cast<std::streamsize>(bytes));
   }
   if (!out) {
     throw std::runtime_error("failed while writing metadata string");
   }
 }
 
-// Direct lookup records were resolved once by device_to_routing_graph.
-std::optional<NodeId> get_node_from_site_pin(const RoutingGraph& graph,
-                                             const std::string& site_name,
-                                             const std::string& pin_name) {
-  return find_pair_node(graph.site_pin_nodes, graph.string_table, site_name,
-                        pin_name);
+// Direct lookup records were resolved once by device_to_routing_graph.  Use
+// the design's active site type when present; the low-level lookup permits an
+// untyped fallback only if every possible type agrees on one node.
+std::optional<NodeId> get_node_from_site_pin(
+    const RoutingGraph& graph,
+    const ActiveSiteTypes& active_site_types,
+    const std::string& site_name,
+    const std::string& pin_name) {
+  return find_site_pin_node(graph.site_pin_nodes, graph.string_table,
+                            site_name, active_site_types.find(site_name),
+                            pin_name);
 }
 
-// Record the sink-site-pin node attribute once. The sidecar stores this as the
-// equivalent of NetworkX's node attribute "sp".
+// Preserve every sink alias. Multiple physical site pins can intentionally
+// resolve to one routing node (for example pinbounce/alternate endpoints), so
+// silently retaining only the first name loses reconstruction metadata.
 void add_site_pin_attr(RoutingGraph& graph,
                        NodeId node,
                        std::uint64_t site_string,
                        std::uint64_t pin_string) {
   if (node < 0 ||
-      static_cast<std::size_t>(node) >= graph.site_pin_attr_by_node.size()) {
+      static_cast<std::size_t>(node) >= graph.node_device_ids.size()) {
     throw std::runtime_error("site pin node is outside graph");
   }
-
-  std::int64_t& attr_index = graph.site_pin_attr_by_node[node];
-  if (attr_index >= 0) {
-    return;
-  }
-
-  attr_index = static_cast<std::int64_t>(graph.site_pin_attrs.size());
   SitePinNode attr;
   attr.node = node;
   attr.site_string = site_string;
@@ -446,6 +542,78 @@ std::vector<SitePinName> extract_site_pins(
   return pins;
 }
 
+bool route_forest_has_pip(
+    capnp::List<PhysicalNetlist::PhysNetlist::RouteBranch>::Reader branches) {
+  using RouteBranch = PhysicalNetlist::PhysNetlist::RouteBranch;
+  std::vector<RouteBranch::Reader> queue;
+  queue.reserve(branches.size());
+  for (std::uint32_t i = 0; i < branches.size(); ++i) {
+    queue.push_back(branches[i]);
+  }
+  while (!queue.empty()) {
+    const RouteBranch::Reader branch = queue.back();
+    queue.pop_back();
+    if (branch.getRouteSegment().isPip()) {
+      return true;
+    }
+    const auto children = branch.getBranches();
+    for (std::uint32_t i = 0; i < children.size(); ++i) {
+      queue.push_back(children[i]);
+    }
+  }
+  return false;
+}
+
+bool route_forest_site_pins_are_leaves(
+    capnp::List<PhysicalNetlist::PhysNetlist::RouteBranch>::Reader branches) {
+  using RouteBranch = PhysicalNetlist::PhysNetlist::RouteBranch;
+  std::vector<RouteBranch::Reader> queue;
+  queue.reserve(branches.size());
+  for (std::uint32_t i = 0; i < branches.size(); ++i) {
+    queue.push_back(branches[i]);
+  }
+  while (!queue.empty()) {
+    const RouteBranch::Reader branch = queue.back();
+    queue.pop_back();
+    const auto children = branch.getBranches();
+    if (branch.getRouteSegment().isSitePin() && children.size() != 0) {
+      return false;
+    }
+    for (std::uint32_t i = 0; i < children.size(); ++i) {
+      queue.push_back(children[i]);
+    }
+  }
+  return true;
+}
+
+bool top_level_stubs_are_site_pins(
+    capnp::List<PhysicalNetlist::PhysNetlist::RouteBranch>::Reader stubs) {
+  for (std::uint32_t i = 0; i < stubs.size(); ++i) {
+    if (!stubs[i].getRouteSegment().isSitePin()) {
+      return false;
+    }
+  }
+  return true;
+}
+
+std::vector<SitePinName> extract_top_level_site_pins(
+    capnp::List<PhysicalNetlist::PhysNetlist::RouteBranch>::Reader branches,
+    TextCache& strings) {
+  std::vector<SitePinName> pins;
+  pins.reserve(branches.size());
+  for (std::uint32_t i = 0; i < branches.size(); ++i) {
+    const auto segment = branches[i].getRouteSegment();
+    if (!segment.isSitePin()) {
+      throw std::runtime_error(
+          "routable net contains a non-sitePin top-level stub");
+    }
+    const auto site_pin = segment.getSitePin();
+    pins.push_back(
+        {strings.get(site_pin.getSite()), strings.get(site_pin.getPin())});
+  }
+  return pins;
+}
+
 // Look up a graph node directly from a tile/wire pair. This is used when an
 // already-routed PhysPIP names its driven wire and that node must be blocked.
 std::optional<NodeId> find_tile_wire_node(const RoutingGraph& graph,
@@ -453,6 +621,218 @@ std::optional<NodeId> find_tile_wire_node(const RoutingGraph& graph,
                                           const std::string& wire_name) {
   return find_pair_node(graph.tile_wire_nodes, graph.string_table, tile_name,
                         wire_name);
+}
+
+bool is_full_device_graph(const RoutingGraph& graph) {
+  return graph.bounds.min_x == 0 && graph.bounds.min_y == 0 &&
+         graph.bounds.max_x == std::numeric_limits<std::int32_t>::max() &&
+         graph.bounds.max_y == std::numeric_limits<std::int32_t>::max();
+}
+
+void require_or_count_route_endpoint(bool resolved,
+                                     const RoutingGraph& graph,
+                                     std::size_t* unresolved_count,
+                                     const std::string& description) {
+  if (resolved) {
+    return;
+  }
+  ++*unresolved_count;
+  if (is_full_device_graph(graph)) {
+    throw std::runtime_error("full-device graph cannot resolve " +
+                             description);
+  }
+}
+
+void require_or_count_fixed_resource(bool resolved,
+                                     const RoutingGraph& graph,
+                                     std::size_t* unresolved_count,
+                                     const std::string& description) {
+  if (resolved) {
+    return;
+  }
+  ++*unresolved_count;
+  if (routing::interchange::unresolved_resource_is_fatal(
+          is_full_device_graph(graph))) {
+    throw std::runtime_error("full-device graph cannot resolve " +
+                             description);
+  }
+}
+
+struct PhysicalImportStats {
+  std::size_t route_requests = 0;
+  std::size_t excluded_driverless_nets = 0;
+  std::size_t preserved_nets = 0;
+  std::size_t unsupported_partial_signal_nets = 0;
+  std::size_t unsupported_signal_shape_nets = 0;
+  std::size_t unsupported_static_nets = 0;
+  std::size_t unresolved_endpoints = 0;
+  std::size_t unresolved_fixed_resources = 0;
+  std::size_t conservative_fixed_site_pin_fallbacks = 0;
+};
+
+using RouteEndpointOwners =
+    std::unordered_map<std::int32_t, std::size_t>;
+
+void preserve_unowned_node(RoutingGraph& graph,
+                           const RouteEndpointOwners& endpoint_owners,
+                           NodeId node,
+                           const std::string& preserving_net) {
+  const auto owner = endpoint_owners.find(node);
+  if (owner != endpoint_owners.end()) {
+    throw std::runtime_error(
+        "preserved net " + preserving_net +
+        " overlaps a routable endpoint owned by physical net index " +
+        std::to_string(owner->second));
+  }
+  routing::interchange::preserve_node(graph.blocked_node, node);
+}
+
+void preserve_fixed_site_pin(const std::string& site,
+                             const std::string& pin,
+                             const ActiveSiteTypes& active_site_types,
+                             const RouteEndpointOwners& endpoint_owners,
+                             RoutingGraph& graph,
+                             const std::string& net_name,
+                             PhysicalImportStats* stats) {
+  const std::optional<std::string> active_site_type =
+      active_site_types.find(site);
+  const std::optional<NodeId> exact = find_site_pin_node(
+      graph.site_pin_nodes, graph.string_table, site, active_site_type, pin);
+  if (exact.has_value()) {
+    preserve_unowned_node(graph, endpoint_owners, *exact, net_name);
+    return;
+  }
+
+  if (!routing::interchange::fixed_site_pin_candidate_fallback_allowed(
+          active_site_type.has_value())) {
+    require_or_count_fixed_resource(
+        false, graph, &stats->unresolved_fixed_resources,
+        "typed fixed site pin " + site + "/" + pin + " on net " +
+            net_name);
+    return;
+  }
+
+  // If siteInst metadata is missing, blocking every possible typed alias is
+  // conservative. Silently dropping an ambiguous alias would
+  // leave a live fixed resource available to a newly routed net.
+  const std::vector<NodeId> candidates = find_site_pin_candidates(
+      graph.site_pin_nodes, graph.string_table, site, pin);
+  if (candidates.empty()) {
+    require_or_count_fixed_resource(
+        false, graph, &stats->unresolved_fixed_resources,
+        "fixed site pin " + site + "/" + pin + " on net " + net_name);
+    return;
+  }
+  for (const NodeId candidate : candidates) {
+    preserve_unowned_node(graph, endpoint_owners, candidate, net_name);
+  }
+  ++stats->conservative_fixed_site_pin_fallbacks;
+}
+
+void preserve_route_forest(
+    capnp::List<PhysicalNetlist::PhysNetlist::RouteBranch>::Reader branches,
+    TextCache& strings,
+    const ActiveSiteTypes& active_site_types,
+    const RouteEndpointOwners& endpoint_owners,
+    RoutingGraph& graph,
+    const std::string& net_name,
+    bool preserve_static_output_pair,
+    PhysicalImportStats* stats) {
+  using RouteBranch = PhysicalNetlist::PhysNetlist::RouteBranch;
+  std::vector<RouteBranch::Reader> queue;
+  queue.reserve(branches.size());
+  for (std::uint32_t i = 0; i < branches.size(); ++i) {
+    queue.push_back(branches[i]);
+  }
+
+  while (!queue.empty()) {
+    const RouteBranch::Reader branch = queue.back();
+    queue.pop_back();
+    const auto segment = branch.getRouteSegment();
+    if (segment.isSitePin()) {
+      const auto site_pin = segment.getSitePin();
+      const std::string& site = strings.get(site_pin.getSite());
+      const std::string& pin = strings.get(site_pin.getPin());
+      preserve_fixed_site_pin(site, pin, active_site_types, endpoint_owners,
+                              graph, net_name, stats);
+      if (preserve_static_output_pair) {
+        const std::string& device_name =
+            graph.string_table.strings[graph.device_name_string];
+        const std::optional<std::string> paired_pin =
+            routing::interchange::paired_static_slice_output_pin(
+                device_name, site, active_site_types.find(site), pin);
+        if (paired_pin.has_value()) {
+          preserve_fixed_site_pin(site, *paired_pin, active_site_types,
+                                  endpoint_owners, graph, net_name, stats);
+        }
+      }
+    } else if (segment.isPip()) {
+      const auto pip = segment.getPip();
+      const std::string& tile = strings.get(pip.getTile());
+      const std::string& wire0 = strings.get(pip.getWire0());
+      const std::string& wire1 = strings.get(pip.getWire1());
+      const std::optional<NodeId> node0 =
+          find_tile_wire_node(graph, tile, wire0);
+      const std::optional<NodeId> node1 =
+          find_tile_wire_node(graph, tile, wire1);
+      require_or_count_fixed_resource(
+          node0.has_value(), graph, &stats->unresolved_fixed_resources,
+          "fixed PIP endpoint " + tile + "/" + wire0 + " on net " +
+              net_name);
+      require_or_count_fixed_resource(
+          node1.has_value(), graph, &stats->unresolved_fixed_resources,
+          "fixed PIP endpoint " + tile + "/" + wire1 + " on net " +
+              net_name);
+      if (node0.has_value() && node1.has_value()) {
+        preserve_unowned_node(graph, endpoint_owners, *node0, net_name);
+        preserve_unowned_node(graph, endpoint_owners, *node1, net_name);
+      } else {
+        if (node0.has_value()) {
+          preserve_unowned_node(graph, endpoint_owners, *node0, net_name);
+        }
+        if (node1.has_value()) {
+          preserve_unowned_node(graph, endpoint_owners, *node1, net_name);
+        }
+      }
+    }
+
+    const auto children = branch.getBranches();
+    for (std::uint32_t i = 0; i < children.size(); ++i) {
+      queue.push_back(children[i]);
+    }
+  }
+}
+
+void preserve_physical_net(
+    PhysicalNetlist::PhysNetlist::PhysNet::Reader net,
+    TextCache& strings,
+    const ActiveSiteTypes& active_site_types,
+    const RouteEndpointOwners& endpoint_owners,
+    RoutingGraph& graph,
+    const std::string& net_name,
+    PhysicalImportStats* stats) {
+  const bool is_static =
+      net.getType() != PhysicalNetlist::PhysNetlist::NetType::SIGNAL;
+  preserve_route_forest(net.getSources(), strings, active_site_types,
+                        endpoint_owners, graph, net_name, is_static, stats);
+  preserve_route_forest(net.getStubs(), strings, active_site_types,
+                        endpoint_owners, graph, net_name, is_static, stats);
+  const auto stub_nodes = net.getStubNodes();
+  for (std::uint32_t i = 0; i < stub_nodes.size(); ++i) {
+    const auto stub_node = stub_nodes[i];
+    const std::string& tile = strings.get(stub_node.getTile());
+    const std::string& wire = strings.get(stub_node.getWire());
+    const std::optional<NodeId> node =
+        find_tile_wire_node(graph, tile, wire);
+    if (node.has_value()) {
+      preserve_unowned_node(graph, endpoint_owners, *node, net_name);
+    } else {
+      require_or_count_fixed_resource(
+          false, graph, &stats->unresolved_fixed_resources,
+          "fixed stub node " + tile + "/" + wire + " on net " +
+              net_name);
+    }
+  }
 }
 
 // Convert Cap'n Proto text into an owned string. strList entries use TextCache,
@@ -492,6 +872,7 @@ void parse_logical_netlist(const std::filesystem::path& logical_path,
   const auto cell_decls = netlist.getCellDecls();
   const auto inst_list = netlist.getInstList();
   const auto cell_list = netlist.getCellList();
+  std::unordered_set<std::string> ambiguous_logical_net_names;
 
   // Walk every logical cell. Each cell summary stores a slice into the flat
   // logical_nets array, keeping metadata compact and easy to stream from disk.
@@ -500,15 +881,17 @@ void parse_logical_netlist(const std::filesystem::path& logical_path,
        ++cell_index) {
     const auto cell = cell_list[cell_index];
     const std::uint32_t declaration_index = cell.getIndex();
+    if (declaration_index >= cell_decls.size()) {
+      throw std::runtime_error(
+          "LogicalNetlist cell refers to an invalid declaration");
+    }
 
     LogicalCellSummary cell_summary;
     cell_summary.net_begin =
         static_cast<std::uint64_t>(graph.logical_nets.size());
-    if (declaration_index < cell_decls.size()) {
-      const auto declaration = cell_decls[declaration_index];
-      cell_summary.declaration_name_string =
-          graph.string_table.intern(strings.get(declaration.getName()));
-    }
+    const auto declaration = cell_decls[declaration_index];
+    cell_summary.declaration_name_string =
+        graph.string_table.intern(strings.get(declaration.getName()));
 
     // Walk every logical net in this cell. Physical net names usually match
     // logical net names; the name index map below lets route requests point
@@ -537,11 +920,13 @@ void parse_logical_netlist(const std::filesystem::path& logical_path,
         LogicalPortInstanceSummary port_summary;
         port_summary.port_index = port_inst.getPort();
 
-        if (port_summary.port_index < port_list.size()) {
-          const auto port = port_list[port_summary.port_index];
-          port_summary.port_string =
-              graph.string_table.intern(strings.get(port.getName()));
+        if (port_summary.port_index >= port_list.size()) {
+          throw std::runtime_error(
+              "LogicalNetlist port instance refers to an invalid port");
         }
+        const auto port = port_list[port_summary.port_index];
+        port_summary.port_string =
+            graph.string_table.intern(strings.get(port.getName()));
 
         const auto bus_idx = port_inst.getBusIdx();
         if (bus_idx.isIdx()) {
@@ -551,11 +936,14 @@ void parse_logical_netlist(const std::filesystem::path& logical_path,
 
         if (port_inst.isInst()) {
           port_summary.instance_index = port_inst.getInst();
-          if (port_summary.instance_index < inst_list.size()) {
-            const auto inst = inst_list[port_summary.instance_index];
-            port_summary.instance_string =
-                graph.string_table.intern(strings.get(inst.getName()));
+          if (port_summary.instance_index >= inst_list.size()) {
+            throw std::runtime_error(
+                "LogicalNetlist port instance refers to an invalid cell "
+                "instance");
           }
+          const auto inst = inst_list[port_summary.instance_index];
+          port_summary.instance_string =
+              graph.string_table.intern(strings.get(inst.getName()));
         } else {
           port_summary.is_external_port = true;
         }
@@ -571,10 +959,9 @@ void parse_logical_netlist(const std::filesystem::path& logical_path,
           static_cast<std::uint64_t>(graph.logical_nets.size());
       graph.logical_nets.push_back(net_summary);
 
-      // If duplicate logical net names exist in different scopes, keep the
-      // first match for the simple physical-net-name bridge and still serialize
-      // every logical net summary in full.
-      graph.logical_net_index_by_name.emplace(net_name, logical_net_index);
+      routing::interchange::index_unambiguous_logical_net_name(
+          graph.logical_net_index_by_name, ambiguous_logical_net_names,
+          net_name, logical_net_index);
     }
 
     cell_summary.net_count =
@@ -584,14 +971,11 @@ void parse_logical_netlist(const std::filesystem::path& logical_path,
   }
 }
 
-void parse_physical_netlist(const std::filesystem::path& phys_path,
-                            RoutingGraph& graph) {
+PhysicalImportStats parse_physical_netlist(
+    const std::filesystem::path& phys_path,
+    RoutingGraph& graph) {
   using PhysNetlist = PhysicalNetlist::PhysNetlist;
-  using RouteBranch = PhysNetlist::RouteBranch;
 
-  // PhysicalNetlist is design-specific. It supplies unrouted signal stubs,
-  // legal source site pins, and already-occupied routing from fixed or
-  // pre-routed nets.
   std::vector<std::uint8_t> bytes = read_gzip_or_plain_file(phys_path);
   std::vector<capnp::word> words = bytes_to_words(bytes, phys_path);
   graph.physical_netlist_bytes = std::move(bytes);
@@ -600,153 +984,206 @@ void parse_physical_netlist(const std::filesystem::path& phys_path,
   reader_options.traversalLimitInWords =
       std::numeric_limits<std::uint64_t>::max();
   reader_options.nestingLimit = 1 << 20;
-
   capnp::FlatArrayMessageReader reader(
       kj::arrayPtr(words.data(), words.size()), reader_options);
   const auto netlist = reader.getRoot<PhysNetlist>();
   TextCache strings(netlist.getStrList());
 
+  const std::string physical_part = capnp_text_to_string(netlist.getPart());
+  const std::string& device_name =
+      graph.string_table.strings[graph.device_name_string];
+  if (!routing::interchange::physical_part_matches_device(device_name,
+                                                           physical_part)) {
+    throw std::runtime_error("PhysicalNetlist part " + physical_part +
+                             " does not match cached device " +
+                             device_name);
+  }
+
+  ActiveSiteTypes active_site_types;
+  const auto site_instances = netlist.getSiteInsts();
+  for (std::uint32_t index = 0; index < site_instances.size(); ++index) {
+    const auto site_instance = site_instances[index];
+    active_site_types.insert(strings.get(site_instance.getSite()),
+                             strings.get(site_instance.getType()));
+  }
+
   const auto phys_nets = netlist.getPhysNets();
   graph.route_requests.reserve(phys_nets.size());
+  PhysicalImportStats stats;
+  RouteEndpointOwners endpoint_owners;
+  std::unordered_map<std::string, std::size_t> physical_net_name_owners;
+  auto claim_endpoint = [&](NodeId node, std::size_t owner,
+                            const std::string& net_name) {
+    if (graph.blocked_node[static_cast<std::size_t>(node)] != 0) {
+      throw std::runtime_error("routable endpoint on net " + net_name +
+                               " overlaps a preserved resource");
+    }
+    const auto claim = routing::interchange::claim_route_endpoint(
+        endpoint_owners, node, owner);
+    if (claim == routing::interchange::EndpointClaim::kDifferentOwner) {
+      throw std::runtime_error(
+          "routable endpoint node is claimed by multiple physical nets; "
+          "second claimant is " + net_name);
+    }
+  };
   for (std::uint32_t net_index = 0; net_index < phys_nets.size();
        ++net_index) {
     const auto net = phys_nets[net_index];
+    const std::string& physical_net_name = strings.get(net.getName());
+    if (!routing::interchange::claim_unique_physical_net_name(
+            physical_net_name_owners, physical_net_name, net_index)) {
+      throw std::runtime_error("duplicate PhysicalNetlist net name: " +
+                               physical_net_name);
+    }
+    const auto sources = net.getSources();
+    const auto stubs = net.getStubs();
+    const std::vector<SitePinName> source_pins =
+        extract_site_pins(sources, strings);
+    routing::interchange::PhysicalNetRoutingFacts facts;
+    facts.is_signal = net.getType() == PhysNetlist::NetType::SIGNAL;
+    facts.top_level_source_count = sources.size();
+    facts.top_level_stub_count = stubs.size();
+    facts.source_site_pin_count = source_pins.size();
+    facts.source_site_pins_are_leaves =
+        route_forest_site_pins_are_leaves(sources);
+    facts.has_inter_site_pip =
+        route_forest_has_pip(sources) || route_forest_has_pip(stubs);
+    facts.has_stub_nodes = net.getStubNodes().size() != 0;
+    facts.top_level_stubs_are_site_pins =
+        top_level_stubs_are_site_pins(stubs);
+    const auto disposition =
+        routing::interchange::classify_physical_net(facts);
 
-    // Signal nets with stubs are the nets still needing routing. Stubs are
-    // interpreted as sink site pins; sources are interpreted as start pins.
-    const bool is_signal = net.getType() == PhysNetlist::NetType::SIGNAL;
-    if (is_signal && net.getStubs().size() > 0) {
-      const std::vector<SitePinName> sink_pins =
-          extract_site_pins(net.getStubs(), strings);
-      if (sink_pins.empty()) {
-        continue;
-      }
-
-      RouteRequest request;
-      const std::string& physical_net_name = strings.get(net.getName());
-      request.net_string = graph.string_table.intern(physical_net_name);
-      const auto logical_match =
-          graph.logical_net_index_by_name.find(physical_net_name);
-      if (logical_match != graph.logical_net_index_by_name.end()) {
-        request.logical_net_index = logical_match->second;
-      }
-
-      // Map each source site pin to the routing node that drives/enters the
-      // inter-site routing fabric.
-      const std::vector<SitePinName> source_pins =
-          extract_site_pins(net.getSources(), strings);
-      request.sources.reserve(source_pins.size());
-      request.sinks.reserve(sink_pins.size());
-      bool has_valid_source = false;
-      for (const SitePinName& source_pin : source_pins) {
-        SitePinNode source;
-        source.node = kInvalidRouteNode;
-        source.site_string = graph.string_table.intern(source_pin.site);
-        source.pin_string = graph.string_table.intern(source_pin.pin);
-
-        const std::optional<NodeId> source_node =
-            get_node_from_site_pin(graph, source_pin.site, source_pin.pin);
-        if (source_node.has_value()) {
-          source.node = *source_node;
-          has_valid_source = true;
-        }
-
-        request.sources.push_back(source);
-      }
-
-      // Preserve every physical sink stub in the request. If bounds exclude
-      // its routing node, keep the site pin with an invalid node so routing
-      // reports the net as unreached instead of emitting a partial route.
-      for (const SitePinName& sink_pin : sink_pins) {
-        SitePinNode sink;
-        sink.node = kInvalidRouteNode;
-        sink.site_string = graph.string_table.intern(sink_pin.site);
-        sink.pin_string = graph.string_table.intern(sink_pin.pin);
-
-        const std::optional<NodeId> sink_node =
-            get_node_from_site_pin(graph, sink_pin.site, sink_pin.pin);
-        if (sink_node.has_value()) {
-          const NodeId node = *sink_node;
-          sink.node = node;
-          if (!has_valid_source) {
-            graph.blocked_node[node] = 1;
-          } else {
-            graph.sink_node_stops[node] = 1;
-            add_site_pin_attr(graph, node, sink.site_string, sink.pin_string);
-          }
-        }
-        request.sinks.push_back(sink);
-      }
-
-      if (!request.sinks.empty()) {
-        graph.route_requests.push_back(std::move(request));
+    if (disposition !=
+        routing::interchange::PhysicalNetDisposition::kRouteSignal) {
+      preserve_physical_net(net, strings, active_site_types,
+                            endpoint_owners, graph, physical_net_name,
+                            &stats);
+      switch (disposition) {
+        case routing::interchange::PhysicalNetDisposition::
+            kPreserveCompleteOrLoadless:
+          ++stats.preserved_nets;
+          break;
+        case routing::interchange::PhysicalNetDisposition::
+            kExcludeDriverlessSignal:
+          ++stats.excluded_driverless_nets;
+          std::cout << "excluded_driverless_net: " << physical_net_name
+                    << '\n';
+          break;
+        case routing::interchange::PhysicalNetDisposition::
+            kPreserveUnsupportedPartialSignal:
+          ++stats.unsupported_partial_signal_nets;
+          std::cout << "preserved_unsupported_partial_signal_net: "
+                    << physical_net_name << '\n';
+          break;
+        case routing::interchange::PhysicalNetDisposition::
+            kPreserveUnsupportedSignalShape:
+          ++stats.unsupported_signal_shape_nets;
+          std::cout << "preserved_unsupported_signal_shape_net: "
+                    << physical_net_name << '\n';
+          break;
+        case routing::interchange::PhysicalNetDisposition::
+            kPreserveUnsupportedStatic:
+          ++stats.unsupported_static_nets;
+          std::cout << "preserved_unsupported_static_net: "
+                    << physical_net_name << '\n';
+          break;
+        case routing::interchange::PhysicalNetDisposition::kRouteSignal:
+          break;
       }
       continue;
     }
 
-    // Nets without stubs are already routed, and non-signal nets are treated
-    // as fixed resources. RapidWright's PhysNetlistReader imports both source
-    // branches and stub branches, then adds explicit stubNodes as null-end
-    // PIPs. Mirror that occupancy here by blocking the driven node of every
-    // PhysPIP we can resolve, plus every explicit stub node.
-    std::vector<RouteBranch::Reader> queue;
-    const auto sources = net.getSources();
-    const auto stubs = net.getStubs();
-    queue.reserve(sources.size() + stubs.size());
-    for (std::uint32_t i = 0; i < sources.size(); ++i) {
-      queue.push_back(sources[i]);
+    const std::vector<SitePinName> sink_pins =
+        extract_top_level_site_pins(stubs, strings);
+    RouteRequest request;
+    request.net_string = graph.string_table.intern(physical_net_name);
+    const auto logical_match =
+        graph.logical_net_index_by_name.find(physical_net_name);
+    if (logical_match != graph.logical_net_index_by_name.end()) {
+      request.logical_net_index = logical_match->second;
     }
-    for (std::uint32_t i = 0; i < stubs.size(); ++i) {
-      queue.push_back(stubs[i]);
+    request.sources.reserve(source_pins.size());
+    request.sinks.reserve(sink_pins.size());
+    bool has_valid_source = false;
+    for (const SitePinName& source_pin : source_pins) {
+      SitePinNode source;
+      source.node = kInvalidRouteNode;
+      source.site_string = graph.string_table.intern(source_pin.site);
+      source.pin_string = graph.string_table.intern(source_pin.pin);
+      const std::optional<NodeId> source_node =
+          get_node_from_site_pin(graph, active_site_types, source_pin.site,
+                                 source_pin.pin);
+      require_or_count_route_endpoint(
+          source_node.has_value(), graph, &stats.unresolved_endpoints,
+          "route source " + source_pin.site + "/" + source_pin.pin +
+              " on net " + physical_net_name);
+      if (source_node.has_value()) {
+        source.node = *source_node;
+        claim_endpoint(*source_node, net_index, physical_net_name);
+        routing::interchange::mark_source_exclusive(
+            graph.exclusive_source_nodes, *source_node);
+        has_valid_source = true;
+      }
+      request.sources.push_back(source);
     }
-
-    while (!queue.empty()) {
-      const RouteBranch::Reader branch = queue.back();
-      queue.pop_back();
-
-      const auto segment = branch.getRouteSegment();
-      if (segment.isPip()) {
-        const auto pip = segment.getPip();
-        const std::string& tile_name = strings.get(pip.getTile());
-        const std::string& driven_wire =
-            strings.get(pip.getForward() ? pip.getWire1() : pip.getWire0());
-        const std::optional<NodeId> blocked =
-            find_tile_wire_node(graph, tile_name, driven_wire);
-        if (blocked.has_value()) {
-          graph.blocked_node[*blocked] = 1;
+    for (const SitePinName& sink_pin : sink_pins) {
+      SitePinNode sink;
+      sink.node = kInvalidRouteNode;
+      sink.site_string = graph.string_table.intern(sink_pin.site);
+      sink.pin_string = graph.string_table.intern(sink_pin.pin);
+      const std::optional<NodeId> sink_node =
+          get_node_from_site_pin(graph, active_site_types, sink_pin.site,
+                                 sink_pin.pin);
+      require_or_count_route_endpoint(
+          sink_node.has_value(), graph, &stats.unresolved_endpoints,
+          "route sink " + sink_pin.site + "/" + sink_pin.pin +
+              " on net " + physical_net_name);
+      if (sink_node.has_value()) {
+        sink.node = *sink_node;
+        claim_endpoint(*sink_node, net_index, physical_net_name);
+        if (has_valid_source) {
+          const bool is_source_of_same_net =
+              graph.exclusive_source_nodes[
+                  static_cast<std::size_t>(*sink_node)] != 0;
+          if (routing::interchange::sink_requires_terminal_row(
+                  is_source_of_same_net)) {
+            routing::interchange::mark_sink_terminal(
+                graph.sink_node_stops, *sink_node);
+          }
+          add_site_pin_attr(graph, *sink_node, sink.site_string,
+                            sink.pin_string);
+        } else {
+          // A syntactically present source may lie outside a bounded cache.
+          // Keep the request so strict routing reports it as unreachable, and
+          // fully reserve any in-bounds sinks from use by other nets.
+          routing::interchange::preserve_node(graph.blocked_node,
+                                              *sink_node);
         }
       }
-
-      const auto child_branches = branch.getBranches();
-      for (std::uint32_t i = 0; i < child_branches.size(); ++i) {
-        queue.push_back(child_branches[i]);
-      }
+      request.sinks.push_back(sink);
     }
-
-    const auto stub_nodes = net.getStubNodes();
-    for (std::uint32_t i = 0; i < stub_nodes.size(); ++i) {
-      const auto stub_node = stub_nodes[i];
-      const std::string& tile_name = strings.get(stub_node.getTile());
-      const std::string& wire_name = strings.get(stub_node.getWire());
-      const std::optional<NodeId> blocked =
-          find_tile_wire_node(graph, tile_name, wire_name);
-      if (blocked.has_value()) {
-        graph.blocked_node[*blocked] = 1;
-      }
-    }
+    graph.route_requests.push_back(std::move(request));
+    ++stats.route_requests;
   }
+  return stats;
 }
 
 CsrGraph make_outgoing_csr(const RoutingGraph& graph) {
   return filter_device_routing_graph(graph, graph.blocked_node,
-                                     graph.sink_node_stops);
+                                     graph.sink_node_stops,
+                                     graph.exclusive_source_nodes);
 }
 
 void write_csr_graph(const CsrGraph& graph,
+                     const InterchangeArtifactPairId& artifact_pair_id,
                      const std::filesystem::path& output_path) {
   // This binary file intentionally contains only the generic graph structure:
   // rowptr, colind, and unit weights. FPGA routing names and PIP details live
   // in the RIPSIFM1 metadata sidecar.
+  if (artifact_pair_id.is_zero()) {
+    throw std::runtime_error("cannot write CSR with a zero artifact pair id");
+  }
   if (output_path.has_parent_path()) {
     std::filesystem::create_directories(output_path.parent_path());
   }
@@ -765,6 +1202,8 @@ void write_csr_graph(const CsrGraph& graph,
   const std::uint64_t nnz = static_cast<std::uint64_t>(graph.values.size());
   write_u64(out, CSR_FORMAT_VERSION, "format version");
   write_u64(out, OUTGOING_EDGE_ORIENTATION, "orientation");
+  write_u64(out, artifact_pair_id.high, "artifact pair id high");
+  write_u64(out, artifact_pair_id.low, "artifact pair id low");
   write_u64(out, as_u64(graph.rows, "rows"), "row count");
   write_u64(out, as_u64(graph.cols, "cols"), "column count");
   write_u64(out, graph.declared_edges, "declared edge count");
@@ -780,14 +1219,16 @@ void write_csr_graph(const CsrGraph& graph,
   write_array(out, graph.rowptr, "rowptr");
   write_array(out, graph.colind, "colind");
   write_array(out, graph.values, "values");
+  finish_output(out, output_path);
 }
 
 void write_metadata(const RoutingGraph& graph,
                     const CsrGraph& csr,
+                    const InterchangeArtifactPairId& artifact_pair_id,
                     const std::filesystem::path& metadata_path) {
   // RIPSIFM1 sidecar layout:
   //   char[8] magic
-  //   u64 version, orientation
+  //   u64 version, orientation, artifact_pair_id_high, artifact_pair_id_low
   //   u64 string_count, node_count, edge_attr_count, pip_data_count
   //   u64 site_pin_attr_count, route_request_count
   //   u64 blocked_node_count, sink_stop_node_count
@@ -811,6 +1252,10 @@ void write_metadata(const RoutingGraph& graph,
   //   u64[blocked_node_count], u64[sink_stop_node_count]
   //   physical_netlist_byte_count raw bytes from decompressed .phys
   //   logical_netlist_byte_count raw bytes from decompressed .netlist
+  if (artifact_pair_id.is_zero()) {
+    throw std::runtime_error(
+        "cannot write metadata with a zero artifact pair id");
+  }
   if (metadata_path.has_parent_path()) {
     std::filesystem::create_directories(metadata_path.parent_path());
   }
@@ -850,6 +1295,8 @@ void write_metadata(const RoutingGraph& graph,
 
   write_u64(out, METADATA_FORMAT_VERSION, "metadata format version");
   write_u64(out, OUTGOING_EDGE_ORIENTATION, "metadata orientation");
+  write_u64(out, artifact_pair_id.high, "metadata artifact pair id high");
+  write_u64(out, artifact_pair_id.low, "metadata artifact pair id low");
   write_u64(out, static_cast<std::uint64_t>(graph.string_table.strings.size()),
             "string count");
   write_u64(out, static_cast<std::uint64_t>(graph.node_device_ids.size()),
@@ -997,6 +1444,7 @@ void write_metadata(const RoutingGraph& graph,
   // correlation during that process.
   write_array(out, graph.physical_netlist_bytes, "physical netlist bytes");
   write_array(out, graph.logical_netlist_bytes, "logical netlist bytes");
+  finish_output(out, metadata_path);
 }
 
 double mib(std::uint64_t bytes) {
@@ -1014,6 +1462,55 @@ void release_storage(Container& container) {
 int main(int argc, char** argv) {
   try {
     const Options options = parse_options(argc, argv);
+    const std::filesystem::path csr_publication_marker_path =
+        routing::interchange::interchange_publication_marker_path(
+            options.output_path);
+    const std::filesystem::path metadata_publication_marker_path =
+        routing::interchange::interchange_publication_marker_path(
+            options.metadata_path);
+    const std::filesystem::path publication_generation_path =
+        routing::interchange::interchange_publication_generation_path(
+            options.metadata_path);
+    routing::interchange::require_distinct_interchange_paths(
+        {options.device_graph_path, options.phys_path,
+         options.logical_path, options.output_path, options.metadata_path,
+         csr_publication_marker_path, metadata_publication_marker_path,
+         publication_generation_path});
+    for (const std::filesystem::path& publication_marker_path :
+         {csr_publication_marker_path, metadata_publication_marker_path}) {
+      std::error_code marker_error;
+      const bool marker_exists =
+          std::filesystem::exists(publication_marker_path, marker_error);
+      if (marker_error) {
+        throw std::runtime_error(
+            "could not inspect interchange publication marker: " +
+            marker_error.message());
+      }
+      if (marker_exists) {
+        throw std::runtime_error(
+            "an interrupted interchange publication marker requires "
+            "inspection before conversion: " +
+            publication_marker_path.string());
+      }
+    }
+    for (const std::filesystem::path& output :
+         {options.output_path, options.metadata_path,
+          publication_generation_path}) {
+      std::error_code error;
+      const bool exists = std::filesystem::exists(output, error);
+      if (error) {
+        throw std::runtime_error("could not inspect output path: " +
+                                 output.string() + ": " + error.message());
+      }
+      if (exists && !std::filesystem::is_regular_file(output, error)) {
+        throw std::runtime_error("output path is not a regular file: " +
+                                 output.string());
+      }
+      if (error) {
+        throw std::runtime_error("could not inspect output path type: " +
+                                 output.string() + ": " + error.message());
+      }
+    }
 
     std::cout << "device_graph: " << options.device_graph_path << "\n";
     std::cout << "physical_netlist: " << options.phys_path << "\n";
@@ -1044,7 +1541,38 @@ int main(int argc, char** argv) {
     // PhysicalNetlist parsing adds design-specific route requests and blockage.
     // It also stores the original .phys payload so later code can patch routes
     // into that exact physical netlist structure.
-    parse_physical_netlist(options.phys_path, graph);
+    const PhysicalImportStats import_stats =
+        parse_physical_netlist(options.phys_path, graph);
+    std::cout << "route_requests: " << import_stats.route_requests << "\n";
+    std::cout << "excluded_driverless_nets: "
+              << import_stats.excluded_driverless_nets << "\n";
+    std::cout << "preserved_nets: " << import_stats.preserved_nets << "\n";
+    std::cout << "preserved_unsupported_partial_signal_nets: "
+              << import_stats.unsupported_partial_signal_nets << "\n";
+    std::cout << "preserved_unsupported_signal_shape_nets: "
+              << import_stats.unsupported_signal_shape_nets << "\n";
+    std::cout << "preserved_unsupported_static_nets: "
+              << import_stats.unsupported_static_nets << "\n";
+    std::cout << "unresolved_route_endpoints: "
+              << import_stats.unresolved_endpoints << "\n";
+    std::cout << "unresolved_fixed_resources: "
+              << import_stats.unresolved_fixed_resources << "\n";
+    std::cout << "conservative_fixed_site_pin_fallbacks: "
+              << import_stats.conservative_fixed_site_pin_fallbacks << "\n";
+
+    const std::size_t unsupported_net_count =
+        import_stats.unsupported_partial_signal_nets +
+        import_stats.unsupported_signal_shape_nets +
+        import_stats.unsupported_static_nets;
+    if (unsupported_net_count != 0 &&
+        !options.allow_unsupported_preserved_nets) {
+      throw std::runtime_error(
+          "PhysicalNetlist contains " +
+          std::to_string(unsupported_net_count) +
+          " unsupported net(s); no CSR was written. Use "
+          "--allow-unsupported-preserved-nets only to preserve those nets "
+          "unchanged for diagnostics");
+    }
 
     // These indexes exist only to resolve names while parsing the two design
     // netlists. Release them before allocating the filtered CSR; on a full
@@ -1053,7 +1581,6 @@ int main(int argc, char** argv) {
     release_storage(graph.site_pin_nodes);
     release_storage(graph.string_table.ids);
     release_storage(graph.logical_net_index_by_name);
-    release_storage(graph.site_pin_attr_by_node);
 
     // CSR is the GPU-facing graph. Metadata is the CPU-facing FPGA context
     // needed to map CSR edges back to tile/wire PIPs and site-pin targets.
@@ -1064,27 +1591,158 @@ int main(int argc, char** argv) {
     release_storage(graph.rowptr);
     release_storage(graph.colind);
     release_storage(graph.edge_attrs);
+    release_storage(graph.exclusive_source_nodes);
 
-    const std::uint64_t rowptr_bytes =
-        static_cast<std::uint64_t>(csr.rowptr.size() * sizeof(std::int64_t));
-    const std::uint64_t colind_bytes =
-        static_cast<std::uint64_t>(csr.colind.size() * sizeof(std::int32_t));
-    const std::uint64_t values_bytes =
-        static_cast<std::uint64_t>(csr.values.size() * sizeof(float));
-    const std::uint64_t attr_bytes =
-        static_cast<std::uint64_t>(csr.edge_attrs.size() * sizeof(EdgeAttr));
-    const std::uint64_t csr_bytes = rowptr_bytes + colind_bytes + values_bytes;
+    const std::uint64_t rowptr_bytes = static_cast<std::uint64_t>(
+        checked_array_bytes<std::int64_t>(csr.rowptr.size(),
+                                          "CSR row pointers"));
+    const std::uint64_t colind_bytes = static_cast<std::uint64_t>(
+        checked_array_bytes<std::int32_t>(csr.colind.size(),
+                                          "CSR destinations"));
+    const std::uint64_t values_bytes = static_cast<std::uint64_t>(
+        checked_array_bytes<float>(csr.values.size(), "CSR values"));
+    const std::uint64_t attr_bytes = static_cast<std::uint64_t>(
+        checked_array_bytes<EdgeAttr>(csr.edge_attrs.size(),
+                                      "metadata edge attributes"));
+    const std::uint64_t csr_bytes = checked_add_u64(
+        checked_add_u64(rowptr_bytes, colind_bytes, "CSR byte count"),
+        values_bytes, "CSR byte count");
     const std::int64_t csr_rows = csr.rows;
     const std::size_t csr_nnz = csr.values.size();
 
-    write_csr_graph(csr, options.output_path);
+    const std::filesystem::path staged_csr_path =
+        routing::interchange::create_unique_staging_path(
+            options.output_path);
+    std::filesystem::path staged_metadata_path;
+    std::filesystem::path staged_generation_path;
+    try {
+      staged_metadata_path =
+          routing::interchange::create_unique_staging_path(
+              options.metadata_path);
+      staged_generation_path =
+          routing::interchange::create_unique_staging_path(
+              publication_generation_path);
+      const InterchangeArtifactPairId artifact_pair_id =
+          make_artifact_pair_id();
+      write_csr_graph(csr, artifact_pair_id, staged_csr_path);
 
-    // The metadata sidecar needs edge attributes, but not the three generic
-    // CSR arrays that were just written.
-    release_storage(csr.rowptr);
-    release_storage(csr.colind);
-    release_storage(csr.values);
-    write_metadata(graph, csr, options.metadata_path);
+      // The metadata sidecar needs edge attributes, but not the three generic
+      // CSR arrays that were just written.
+      release_storage(csr.rowptr);
+      release_storage(csr.colind);
+      release_storage(csr.values);
+      write_metadata(graph, csr, artifact_pair_id, staged_metadata_path);
+      std::ofstream generation(staged_generation_path,
+                               std::ios::binary | std::ios::trunc);
+      if (!generation) {
+        throw std::runtime_error(
+            "could not open interchange publication generation: " +
+            staged_generation_path.string());
+      }
+      generation << routing::interchange::interchange_artifact_pair_id_string(
+                        artifact_pair_id)
+                 << '\n';
+      finish_output(generation, staged_generation_path);
+    } catch (...) {
+      std::error_code ignored;
+      std::filesystem::remove(staged_csr_path, ignored);
+      if (!staged_metadata_path.empty()) {
+        std::filesystem::remove(staged_metadata_path, ignored);
+      }
+      if (!staged_generation_path.empty()) {
+        std::filesystem::remove(staged_generation_path, ignored);
+      }
+      throw;
+    }
+
+    std::vector<std::filesystem::path> publication_marker_paths = {
+        csr_publication_marker_path, metadata_publication_marker_path};
+    std::sort(publication_marker_paths.begin(),
+              publication_marker_paths.end(),
+              [](const std::filesystem::path& lhs,
+                 const std::filesystem::path& rhs) {
+                return routing::interchange::normalized_interchange_path(lhs)
+                           .string() <
+                       routing::interchange::normalized_interchange_path(rhs)
+                           .string();
+              });
+    std::vector<std::filesystem::path> created_publication_markers;
+    bool csr_published = false;
+    bool metadata_published = false;
+    bool generation_published = false;
+    bool publication_complete = false;
+    try {
+      for (const std::filesystem::path& publication_marker_path :
+           publication_marker_paths) {
+        std::error_code marker_error;
+        const bool marker_created =
+            std::filesystem::create_directory(publication_marker_path,
+                                              marker_error);
+        if (!marker_created || marker_error) {
+          throw std::runtime_error(
+              "another interchange publication is active, or an interrupted "
+              "publication marker requires inspection: " +
+              publication_marker_path.string());
+        }
+        created_publication_markers.push_back(publication_marker_path);
+      }
+      std::filesystem::rename(staged_csr_path, options.output_path);
+      csr_published = true;
+      std::filesystem::rename(staged_metadata_path,
+                              options.metadata_path);
+      metadata_published = true;
+      std::filesystem::rename(staged_generation_path,
+                              publication_generation_path);
+      generation_published = true;
+      publication_complete = true;
+      for (const std::filesystem::path& publication_marker_path :
+           created_publication_markers) {
+        std::error_code marker_error;
+        if (!std::filesystem::remove(publication_marker_path, marker_error) ||
+            marker_error) {
+          throw std::runtime_error(
+              "could not clear interchange publication marker: " +
+              publication_marker_path.string());
+        }
+      }
+    } catch (...) {
+      std::error_code ignored;
+      std::filesystem::remove(staged_csr_path, ignored);
+      std::filesystem::remove(staged_metadata_path, ignored);
+      std::filesystem::remove(staged_generation_path, ignored);
+
+      // Once all three files are in place they are a coherent generation. If
+      // marker cleanup itself fails, retain the remaining marker so readers
+      // fail closed and leave the valid pair for manual inspection. For a
+      // partial publication, remove every exposed new file and clear markers
+      // only if every removal succeeded.
+      if (!publication_complete) {
+        bool exposed_files_removed = true;
+        const auto remove_published = [&](bool published,
+                                          const std::filesystem::path& path) {
+          if (!published) {
+            return;
+          }
+          std::error_code remove_error;
+          (void)std::filesystem::remove(path, remove_error);
+          if (remove_error) {
+            exposed_files_removed = false;
+          }
+        };
+        remove_published(csr_published, options.output_path);
+        remove_published(metadata_published, options.metadata_path);
+        remove_published(generation_published, publication_generation_path);
+        if (exposed_files_removed) {
+          for (const std::filesystem::path& publication_marker_path :
+               created_publication_markers) {
+            std::error_code marker_error;
+            (void)std::filesystem::remove(publication_marker_path,
+                                          marker_error);
+          }
+        }
+      }
+      throw;
+    }
 
     std::cout << "csr_rows: " << csr_rows << "\n";
     std::cout << "csr_nnz: " << csr_nnz << "\n";

@@ -2,6 +2,7 @@
 
 #include "bellman_ford/bf10.hpp"
 #include "delta_stepping/delta_stepping_hip_CSR.hpp"
+#include "interchange/import_policy.hpp"
 #include "profiling/roctx_ranges.hpp"
 #include "unit_bfs/unit_bfs_hip_CSR.hpp"
 
@@ -53,8 +54,10 @@ namespace {
 
 constexpr char CSR_MAGIC[8] = {'R', 'I', 'P', 'S', 'C', 'S', 'R', '1'};
 constexpr char METADATA_MAGIC[8] = {'R', 'I', 'P', 'S', 'I', 'F', 'M', '1'};
-constexpr std::uint64_t EXPECTED_CSR_VERSION = 1;
-constexpr std::uint64_t EXPECTED_METADATA_VERSION = 4;
+constexpr std::uint64_t LEGACY_CSR_VERSION = 1;
+constexpr std::uint64_t CURRENT_CSR_VERSION = 2;
+constexpr std::uint64_t LEGACY_METADATA_VERSION = 4;
+constexpr std::uint64_t CURRENT_METADATA_VERSION = 5;
 constexpr std::uint64_t EXPECTED_OUTGOING_EDGE_ORIENTATION = 2;
 
 std::uint64_t read_u64(std::ifstream& in, const char* name) {
@@ -1904,7 +1907,9 @@ void print_usage(const char* program) {
       << "  --route-batch-size <count>\n";
 }
 
-HostCsrF32 load_csrbin(const std::filesystem::path& path) {
+HostCsrF32 load_csrbin(
+    const std::filesystem::path& path,
+    std::optional<interchange::InterchangeArtifactPairId>* artifact_pair_id) {
   std::ifstream in(path, std::ios::binary);
   if (!in) {
     throw std::runtime_error("could not open CSR file: " + path.string());
@@ -1918,11 +1923,22 @@ HostCsrF32 load_csrbin(const std::filesystem::path& path) {
 
   const std::uint64_t version = read_u64(in, "CSR format version");
   const std::uint64_t orientation = read_u64(in, "CSR orientation");
-  if (version != EXPECTED_CSR_VERSION) {
+  if (version != LEGACY_CSR_VERSION && version != CURRENT_CSR_VERSION) {
     throw std::runtime_error("unsupported CSR format version");
   }
   if (orientation != EXPECTED_OUTGOING_EDGE_ORIENTATION) {
     throw std::runtime_error("unsupported CSR orientation");
+  }
+
+  std::optional<interchange::InterchangeArtifactPairId> parsed_pair_id;
+  if (version == CURRENT_CSR_VERSION) {
+    interchange::InterchangeArtifactPairId id;
+    id.high = read_u64(in, "CSR artifact pair id high");
+    id.low = read_u64(in, "CSR artifact pair id low");
+    if (id.is_zero()) {
+      throw std::runtime_error("CSR artifact pair id must not be zero");
+    }
+    parsed_pair_id = id;
   }
 
   const std::uint64_t rows = read_u64(in, "CSR row count");
@@ -1954,6 +1970,9 @@ HostCsrF32 load_csrbin(const std::filesystem::path& path) {
   read_array(in, graph.colind, colind_count, "CSR colind");
   read_array(in, graph.values, values_count, "CSR values");
   validate_csr(graph);
+  if (artifact_pair_id != nullptr) {
+    *artifact_pair_id = parsed_pair_id;
+  }
   return graph;
 }
 
@@ -1971,11 +1990,23 @@ RoutingMetadata load_interchange_metadata(const std::filesystem::path& path) {
 
   const std::uint64_t version = read_u64(in, "metadata format version");
   const std::uint64_t orientation = read_u64(in, "metadata orientation");
-  if (version != EXPECTED_METADATA_VERSION) {
+  if (version != LEGACY_METADATA_VERSION &&
+      version != CURRENT_METADATA_VERSION) {
     throw std::runtime_error("unsupported metadata format version");
   }
   if (orientation != EXPECTED_OUTGOING_EDGE_ORIENTATION) {
     throw std::runtime_error("unsupported metadata orientation");
+  }
+
+  std::optional<interchange::InterchangeArtifactPairId> parsed_pair_id;
+  if (version == CURRENT_METADATA_VERSION) {
+    interchange::InterchangeArtifactPairId id;
+    id.high = read_u64(in, "metadata artifact pair id high");
+    id.low = read_u64(in, "metadata artifact pair id low");
+    if (id.is_zero()) {
+      throw std::runtime_error("metadata artifact pair id must not be zero");
+    }
+    parsed_pair_id = id;
   }
 
   const std::uint64_t string_count = read_u64(in, "metadata string count");
@@ -1996,6 +2027,7 @@ RoutingMetadata load_interchange_metadata(const std::filesystem::path& path) {
       read_u64(in, "metadata logical byte count");
 
   RoutingMetadata metadata;
+  metadata.artifact_pair_id = parsed_pair_id;
   metadata.device_path_string = read_u64(in, "metadata device path string");
   metadata.physical_path_string = read_u64(in, "metadata physical path string");
   metadata.logical_path_string = read_u64(in, "metadata logical path string");
@@ -2559,7 +2591,15 @@ void write_routes_jsonl(const std::filesystem::path& path,
     const RouteRequest& request = metadata.route_requests[net_index];
     const RoutedNet& net = result.nets[net_index];
 
-    out << "{\"net\":";
+    out << '{';
+    if (metadata.artifact_pair_id.has_value()) {
+      out << "\"artifact_pair_id\":";
+      write_json_string(
+          out, interchange::interchange_artifact_pair_id_string(
+                   *metadata.artifact_pair_id));
+      out << ',';
+    }
+    out << "\"net\":";
     write_json_string(out, string_at(metadata, request.net_string));
     out << ",\"routed\":" << (net.reached_all_sinks ? "true" : "false");
 
@@ -2831,9 +2871,16 @@ int main(int argc, char** argv) {
     }
     routing::validate_options(options);
 
+    const routing::interchange::InterchangePublicationSnapshot
+        publication_snapshot =
+            routing::interchange::snapshot_interchange_publication(
+                csr_path, metadata_path);
+
+    std::optional<routing::interchange::InterchangeArtifactPairId>
+        csr_artifact_pair_id;
     HostCsrF32 graph = [&]() {
       PATHFINDER_PROFILE_RANGE("pathfinder.load_csr");
-      return routing::load_csrbin(csr_path);
+      return routing::load_csrbin(csr_path, &csr_artifact_pair_id);
     }();
     if (delta_benchmark_weights_seen) {
       routing::apply_delta_benchmark_weights(
@@ -2852,6 +2899,11 @@ int main(int argc, char** argv) {
       PATHFINDER_PROFILE_RANGE("pathfinder.load_metadata");
       return routing::load_interchange_metadata(metadata_path);
     }();
+    routing::interchange::verify_interchange_publication(
+        csr_path, metadata_path, publication_snapshot);
+    routing::interchange::require_matching_interchange_pair_ids(
+        csr_artifact_pair_id, metadata.artifact_pair_id,
+        publication_snapshot.generation);
 
     routing::PathfinderResult result =
         routing::run_pathfinder(

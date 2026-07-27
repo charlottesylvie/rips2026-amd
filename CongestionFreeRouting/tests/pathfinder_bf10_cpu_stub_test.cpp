@@ -14,6 +14,7 @@
 
 #include "../pathfinder.cpp"
 
+#include <chrono>
 #include <fstream>
 #include <queue>
 #include <sstream>
@@ -269,6 +270,149 @@ void require(bool condition, const char* message) {
   if (!condition) {
     throw std::runtime_error(message);
   }
+}
+
+void write_fixture_u64(std::ofstream& out, std::uint64_t value) {
+  out.write(reinterpret_cast<const char*>(&value), sizeof(value));
+  if (!out) {
+    throw std::runtime_error("failed to write binary loader fixture");
+  }
+}
+
+void write_minimal_csr_fixture(
+    const std::filesystem::path& path,
+    std::uint64_t version,
+    const std::optional<routing::interchange::InterchangeArtifactPairId>& id) {
+  std::ofstream out(path, std::ios::binary | std::ios::trunc);
+  const char magic[8] = {'R', 'I', 'P', 'S', 'C', 'S', 'R', '1'};
+  out.write(magic, sizeof(magic));
+  write_fixture_u64(out, version);
+  write_fixture_u64(out, 2);
+  if (version == 2) {
+    const auto value = id.value_or(
+        routing::interchange::InterchangeArtifactPairId{});
+    write_fixture_u64(out, value.high);
+    write_fixture_u64(out, value.low);
+  }
+  write_fixture_u64(out, 1);  // rows
+  write_fixture_u64(out, 1);  // cols
+  write_fixture_u64(out, 0);  // declared edges
+  write_fixture_u64(out, 0);  // loaded edges
+  write_fixture_u64(out, 0);  // nnz
+  write_fixture_u64(out, 2);  // rowptr count
+  write_fixture_u64(out, 0);  // colind count
+  write_fixture_u64(out, 0);  // values count
+  const std::int64_t rowptr[2] = {0, 0};
+  out.write(reinterpret_cast<const char*>(rowptr), sizeof(rowptr));
+}
+
+void write_minimal_metadata_fixture(
+    const std::filesystem::path& path,
+    std::uint64_t version,
+    const std::optional<routing::interchange::InterchangeArtifactPairId>& id) {
+  std::ofstream out(path, std::ios::binary | std::ios::trunc);
+  const char magic[8] = {'R', 'I', 'P', 'S', 'I', 'F', 'M', '1'};
+  out.write(magic, sizeof(magic));
+  write_fixture_u64(out, version);
+  write_fixture_u64(out, 2);
+  if (version == 5) {
+    const auto value = id.value_or(
+        routing::interchange::InterchangeArtifactPairId{});
+    write_fixture_u64(out, value.high);
+    write_fixture_u64(out, value.low);
+  }
+  for (int count = 0; count < 13; ++count) {
+    write_fixture_u64(out, 0);
+  }
+  for (int string_index = 0; string_index < 4; ++string_index) {
+    write_fixture_u64(out, routing::kNoIndex);
+  }
+}
+
+void test_interchange_artifact_pair_loaders() {
+  const auto nonce = std::chrono::steady_clock::now()
+                         .time_since_epoch()
+                         .count();
+  const std::filesystem::path directory =
+      std::filesystem::temp_directory_path() /
+      ("pathfinder_pair_loader_" + std::to_string(nonce));
+  std::filesystem::create_directory(directory);
+  struct Cleanup {
+    std::filesystem::path path;
+    ~Cleanup() {
+      std::error_code ignored;
+      std::filesystem::remove_all(path, ignored);
+    }
+  } cleanup{directory};
+
+  const routing::interchange::InterchangeArtifactPairId pair{
+      0x123456789abcdef0ULL, 0x0fedcba987654321ULL};
+  const std::filesystem::path csr = directory / "graph.csrbin";
+  const std::filesystem::path metadata = directory / "graph.ifmeta.bin";
+  write_minimal_csr_fixture(csr, 2, pair);
+  write_minimal_metadata_fixture(metadata, 5, pair);
+  std::optional<routing::interchange::InterchangeArtifactPairId> csr_id;
+  const HostCsrF32 graph = routing::load_csrbin(csr, &csr_id);
+  const routing::RoutingMetadata loaded_metadata =
+      routing::load_interchange_metadata(metadata);
+  require(graph.rows == 1 && graph.nnz == 0 && csr_id == pair &&
+              loaded_metadata.artifact_pair_id == pair,
+          "generation-tagged CSR/metadata fixture did not load exactly");
+  routing::interchange::require_matching_interchange_pair_ids(
+      csr_id, loaded_metadata.artifact_pair_id, pair);
+
+  write_minimal_csr_fixture(csr, 1, std::nullopt);
+  write_minimal_metadata_fixture(metadata, 4, std::nullopt);
+  csr_id = pair;
+  (void)routing::load_csrbin(csr, &csr_id);
+  const routing::RoutingMetadata legacy_metadata =
+      routing::load_interchange_metadata(metadata);
+  require(!csr_id.has_value() &&
+              !legacy_metadata.artifact_pair_id.has_value(),
+          "legacy CSR/metadata fixture fabricated an artifact pair id");
+  routing::interchange::require_matching_interchange_pair_ids(
+      csr_id, legacy_metadata.artifact_pair_id, std::nullopt);
+
+  const auto require_failure = [](auto&& callback, const char* message) {
+    bool failed = false;
+    try {
+      callback();
+    } catch (const std::exception&) {
+      failed = true;
+    }
+    require(failed, message);
+  };
+  require_failure(
+      [&] {
+        routing::interchange::require_matching_interchange_pair_ids(
+            pair, routing::interchange::InterchangeArtifactPairId{9, 10},
+            pair);
+      },
+      "mismatched artifact pair ids were accepted");
+  require_failure(
+      [&] {
+        routing::interchange::require_matching_interchange_pair_ids(
+            pair, std::nullopt, pair);
+      },
+      "mixed legacy/current artifact pair was accepted");
+
+  write_minimal_csr_fixture(csr, 2, std::nullopt);
+  require_failure(
+      [&] { (void)routing::load_csrbin(csr); },
+      "zero CSR artifact pair id was accepted");
+  write_minimal_metadata_fixture(metadata, 5, std::nullopt);
+  require_failure(
+      [&] { (void)routing::load_interchange_metadata(metadata); },
+      "zero metadata artifact pair id was accepted");
+  {
+    std::ofstream truncated(csr, std::ios::binary | std::ios::trunc);
+    truncated.write("RIPSCSR1", 8);
+    write_fixture_u64(truncated, 2);
+    write_fixture_u64(truncated, 2);
+  }
+  require_failure(
+      [&] { (void)routing::load_csrbin(csr); },
+      "truncated CSR artifact pair id was accepted");
 }
 
 void populate_stub_delta_telemetry(
@@ -1308,6 +1452,8 @@ UnitBfsCsrResult UnitBfsCsrWorkspace::run(
 }
 
 int main() {
+  test_interchange_artifact_pair_loaders();
+
   {
     const routing::RoutingMetadata empty_metadata;
     const SsspQueryCapacityHints empty_hints =
@@ -2624,12 +2770,18 @@ int main() {
           "invalid sink should be preserved as an unreached sink result");
 
   const std::filesystem::path routes_path = "/tmp/pathfinder_cpu_stub_routes.jsonl";
+  metadata.artifact_pair_id =
+      routing::interchange::InterchangeArtifactPairId{1, 2};
   routing::write_routes_jsonl(routes_path, unit_graph, metadata, result);
   std::ifstream routes_file(routes_path);
   const std::string routes_json((std::istreambuf_iterator<char>(routes_file)),
                                 std::istreambuf_iterator<char>());
   require(routes_json.find("\"net\":\"net0\"") != std::string::npos,
           "routes JSONL should include the routed net name");
+  require(routes_json.find(
+              "\"artifact_pair_id\":\"00000000000000010000000000000002\"") !=
+              std::string::npos,
+          "routes JSONL should preserve the artifact pair id");
   require(routes_json.find("\"site\":\"SINK_SITE_0\"") != std::string::npos,
           "routes JSONL should include sink site pins");
   require(routes_json.find("\"tile\":\"TILE_A\"") != std::string::npos,
