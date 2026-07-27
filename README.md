@@ -16,7 +16,8 @@ are reported as diagnostics; they do not make the one-shot router fail.
 - Main router path: `CongestionFreeRouting/pathfinder_router.cpp`.
 - Main shortest-path engine: unit-weight HIP BFS in
   `CongestionFreeRouting/unit_bfs`; Delta Stepping remains available for
-  comparison.
+  comparison and nonnegative weighted graphs. UnitBFS validates the full CSR
+  at graph construction and rejects any edge weight not exactly `1.0f`.
 - Main interchange flow: `device_to_routing_graph` once per device/bounds
   policy, then `interchange_to_csr -> pathfinder -> routes_to_phys` per test
   case.
@@ -24,6 +25,9 @@ are reported as diagnostics; they do not make the one-shot router fail.
   require ROCm/HIP, Cap'n Proto C++ support, and FPGA Interchange schema files.
 - Current implementation progress, validation gaps, and immediate priorities
   are tracked in [`DEVELOPMENT_STATUS.md`](DEVELOPMENT_STATUS.md).
+- Ranked remaining work is tracked in the
+  [classic Delta-Stepping roadmap](CongestionFreeRouting/DELTA_STEPPING_OPTIMIZATION_ROADMAP.md)
+  and [UnitBFS roadmap](CongestionFreeRouting/UNIT_BFS_OPTIMIZATION_ROADMAP.md).
 
 ## Benchmark Interface
 
