@@ -43,9 +43,13 @@ struct PhysicalNetRoutingFacts {
 constexpr PhysicalNetDisposition classify_physical_net(
     const PhysicalNetRoutingFacts& facts) {
   if (!facts.is_signal) {
-    return facts.top_level_stub_count == 0
-               ? PhysicalNetDisposition::kPreserveCompleteOrLoadless
-               : PhysicalNetDisposition::kPreserveUnsupportedStatic;
+    // Contest inputs arrive with global and static routing already present.
+    // PhysicalNetlist's `stubs` field is part of that serialized routing
+    // representation; it is not, by itself, proof that a GND/VCC net needs
+    // PathFinder work.  Static nets are therefore always preservation-only:
+    // the importer reserves every represented resource and reconstruction
+    // leaves the net structurally unchanged.
+    return PhysicalNetDisposition::kPreserveCompleteOrLoadless;
   }
   if (facts.top_level_stub_count == 0) {
     return PhysicalNetDisposition::kPreserveCompleteOrLoadless;

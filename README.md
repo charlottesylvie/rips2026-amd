@@ -301,16 +301,17 @@ formatting have already happened in `device_to_routing_graph`. This stage
 loads the two design netlists, extracts route requests and blockages, filters
 the shared graph, and writes design-specific CSR and metadata outputs. Its
 summary distinguishes eligible route requests, source-less OOC exclusions,
-already-preserved nets, and unsupported preserved work. Unsupported partial,
-static, or structurally incompatible work fails conversion by default; the
+already-preserved nets, and unsupported preserved work. Unsupported partial
+or structurally incompatible signal work fails conversion by default; the
 diagnostic-only `--allow-unsupported-preserved-nets` option keeps it unchanged
 but deliberately excludes it from PathFinder completion accounting.
 `PathFinderFile` intentionally does not expose this diagnostic escape hatch.
 RapidWright's exact case-sensitive signal sentinel `GLOBAL_USEDNET` is
 supported preservation-only occupancy and is not counted as an unsupported
-signal shape. An unrouted `GLOBAL_LOGIC0`/`GLOBAL_LOGIC1` remains unsupported:
-RWRoute uses dedicated static-net source and legality rules that an ordinary
-source-rooted UnitBFS/Delta request cannot reproduce safely.
+signal shape. GND/VCC nets such as `GLOBAL_LOGIC0`/`GLOBAL_LOGIC1` are also
+preservation-only: all represented resources remain blocked and the original
+physical-net records remain structurally unchanged; they are never submitted to the
+ordinary source-rooted UnitBFS/Delta algorithms.
 
 The per-design importer retains its route-branch and endpoint scratch capacity,
 analyzes each routable source forest once, reserves the large name/endpoint
@@ -733,15 +734,16 @@ output, and computes the benchmark score.
   driverless, and no source node is invented.
 - Only completely unrouted ordinary signal nets with top-level `sitePin` stubs
   are eligible route requests. Stub children are retained by reconstruction.
-  Partially routed signals containing PIPs or `stubNodes`, incompatible source
-  or top-level-stub shapes, and unrouted GND/VCC nets are preserved and
-  reported, then fail conversion by default. The explicit
+  Partially routed signals containing PIPs or `stubNodes` and incompatible
+  source or top-level-stub shapes are preserved and reported, then fail
+  conversion by default. The explicit
   `--allow-unsupported-preserved-nets` diagnostic mode leaves those nets
   unchanged; they are not covered by PathFinder's reached-all-sinks result.
-  Contest static and global routing is expected to arrive pre-routed. The exact
-  RapidWright `GLOBAL_USEDNET` sentinel is not a logical connection: its
-  represented resources are preserved as supported occupancy without creating
-  a route request.
+  Contest static/global routing is expected to arrive pre-routed, so GND/VCC
+  physical nets and RapidWright's exact `GLOBAL_USEDNET` occupancy sentinel
+  are supported preservation-only state: their represented resources are
+  reserved without creating route requests, and reconstruction retains their
+  original physical-net records.
 - Device preprocessing follows `altPinsToPrimaryPins`, retains site type in
   every cache key, and requires exact schema lengths. Per-design lookup uses
   `PhysicalNetlist.siteInsts` to select the active `(site,type,pin)` mapping.

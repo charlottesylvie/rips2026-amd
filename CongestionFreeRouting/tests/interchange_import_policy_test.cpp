@@ -115,12 +115,20 @@ int main() {
     F static_net = routable;
     static_net.is_signal = false;
     require(ri::classify_physical_net(static_net) ==
-                D::kPreserveUnsupportedStatic,
-            "unsupported static work was treated as a signal request");
+                D::kPreserveCompleteOrLoadless,
+            "pre-routed static net was not preserved");
+    static_net.source_site_pin_count = 0;
+    static_net.source_site_pins_are_leaves = false;
+    static_net.has_inter_site_pip = true;
+    static_net.has_stub_nodes = true;
+    static_net.top_level_stubs_are_site_pins = false;
+    require(ri::classify_physical_net(static_net) ==
+                D::kPreserveCompleteOrLoadless,
+            "static routing shape affected preservation policy");
     static_net.top_level_stub_count = 0;
     require(ri::classify_physical_net(static_net) ==
                 D::kPreserveCompleteOrLoadless,
-            "complete static net was not preserved");
+            "loadless static net was not preserved");
 
     require(ri::include_pip_in_static_graph(true) &&
                 !ri::include_pip_in_static_graph(false),
