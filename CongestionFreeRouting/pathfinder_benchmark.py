@@ -372,7 +372,59 @@ def load_physical_schema(schema_dir: Path):
     return schema
 
 
-def read_routes_jsonl(path: Path) -> dict[str, dict[str, Any]]:
+def read_metadata_artifact_pair_id(metadata_path: Path) -> str | None:
+    marker = Path(str(metadata_path) + ".publishing")
+    if marker.exists():
+        raise RuntimeError(
+            f"interchange metadata publication is incomplete or active: {marker}"
+        )
+    with metadata_path.open("rb") as metadata_file:
+        prefix = metadata_file.read(24)
+        if len(prefix) != 24 or prefix[:8] != b"RIPSIFM1":
+            raise ValueError(f"{metadata_path} is not RIPS interchange metadata")
+        version = int.from_bytes(prefix[8:16], byteorder=sys.byteorder)
+        orientation = int.from_bytes(prefix[16:24], byteorder=sys.byteorder)
+        if orientation != 2:
+            raise ValueError(f"{metadata_path} does not use outgoing CSR orientation")
+        if version == 4:
+            pair_id = None
+        elif version == 5:
+            raw_id = metadata_file.read(16)
+            if len(raw_id) != 16:
+                raise ValueError(f"{metadata_path} has a truncated artifact pair id")
+            high = int.from_bytes(raw_id[:8], byteorder=sys.byteorder)
+            low = int.from_bytes(raw_id[8:], byteorder=sys.byteorder)
+            if high == 0 and low == 0:
+                raise ValueError(f"{metadata_path} has a zero artifact pair id")
+            pair_id = f"{high:016x}{low:016x}"
+        else:
+            raise ValueError(
+                f"{metadata_path} has unsupported metadata version {version}"
+            )
+
+    generation_path = Path(str(metadata_path) + ".generation")
+    if pair_id is None:
+        if generation_path.exists():
+            raise ValueError("legacy metadata unexpectedly has a generation sidecar")
+    else:
+        try:
+            generation = generation_path.read_text(encoding="ascii")
+        except FileNotFoundError as exc:
+            raise ValueError(
+                f"generation-tagged metadata is missing {generation_path}"
+            ) from exc
+        if generation not in (pair_id, pair_id + "\n"):
+            raise ValueError("metadata and publication generation ids do not match")
+    if marker.exists():
+        raise RuntimeError(
+            f"interchange metadata publication changed while it was read: {marker}"
+        )
+    return pair_id
+
+
+def read_routes_jsonl(
+    path: Path, expected_artifact_pair_id: str | None = None
+) -> dict[str, dict[str, Any]]:
     routes: dict[str, dict[str, Any]] = {}
     with path.open("r", encoding="utf-8") as route_file:
         for line_no, line in enumerate(route_file, 1):
@@ -385,6 +437,11 @@ def read_routes_jsonl(path: Path) -> dict[str, dict[str, Any]]:
                 raise ValueError(f"{path}:{line_no}: route entry has no net name")
             if not route.get("routed", False):
                 raise ValueError(f"{path}:{line_no}: net {net_name} is not fully routed")
+            route_pair_id = route.get("artifact_pair_id")
+            if route_pair_id != expected_artifact_pair_id:
+                raise ValueError(
+                    f"{path}:{line_no}: route artifact pair id does not match metadata"
+                )
             if net_name in routes:
                 raise ValueError(f"{path}:{line_no}: duplicate route for net {net_name}")
             routes[net_name] = route
@@ -409,14 +466,22 @@ def site_pin_key(site: str, pin: str) -> tuple[str, str]:
     return (site, pin)
 
 
+def route_int(value: Any, field: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ValueError(f"route field {field} is not an integer")
+    if value < -(2**31) or value > 2**31 - 1:
+        raise ValueError(f"route field {field} exceeds the C++ node-id range")
+    return value
+
+
 def build_route_tables(route: dict[str, Any]):
     adjacency: dict[int, list[dict[str, Any]]] = defaultdict(list)
     incoming_parent: dict[int, int] = {}
     seen_edges: set[tuple[int, int]] = set()
 
     for edge in route.get("edges", []):
-        parent = int(edge["from"])
-        child = int(edge["to"])
+        parent = route_int(edge["from"], "edge.from")
+        child = route_int(edge["to"], "edge.to")
         key = (parent, child)
         if key in seen_edges:
             continue
@@ -433,16 +498,21 @@ def build_route_tables(route: dict[str, Any]):
     source_node_by_pin: dict[tuple[str, str], int] = {}
     for source in route.get("sources", []):
         key = site_pin_key(str(source["site"]), str(source["pin"]))
-        if key in source_node_by_pin:
-            raise ValueError(f"net {route['net']} has duplicate source {key}")
-        source_node_by_pin[key] = int(source["node"])
+        node = route_int(source["node"], "source.node")
+        previous = source_node_by_pin.get(key)
+        if previous is not None and previous != node:
+            raise ValueError(
+                f"net {route['net']} maps source {key} to both "
+                f"{previous} and {node}"
+            )
+        source_node_by_pin[key] = node
 
     sink_pins_by_node: dict[int, list[tuple[str, str]]] = defaultdict(list)
     for sink in route.get("sinks", []):
         if not sink.get("reached", False):
             raise ValueError(f"net {route['net']} has unreached sink {sink}")
         key = site_pin_key(str(sink["site"]), str(sink["pin"]))
-        sink_pins_by_node[int(sink["node"])].append(key)
+        sink_pins_by_node[route_int(sink["node"], "sink.node")].append(key)
 
     return adjacency, source_node_by_pin, sink_pins_by_node, seen_edges
 
@@ -474,7 +544,7 @@ def insert_route_tree(
     net_name: str,
     adjacency: dict[int, list[dict[str, Any]]],
     sink_pins_by_node: dict[int, list[tuple[str, str]]],
-    sink_pin_orphans: dict[tuple[str, str], Any],
+    sink_pin_orphans: dict[tuple[str, str], list[Any]],
     string_to_index: dict[str, int],
 ) -> int:
     emitted_pips = 0
@@ -506,15 +576,20 @@ def insert_route_tree(
             pip.wire0 = get_string_index(str(edge["wire0"]), string_to_index)
             pip.wire1 = get_string_index(str(edge["wire1"]), string_to_index)
             pip.forward = bool(edge["forward"])
-            stack.append((next_branch, int(edge["to"]), next_ancestors))
+            stack.append(
+                (next_branch, route_int(edge["to"], "edge.to"), next_ancestors)
+            )
             emitted_pips += 1
 
         for sink_key in sink_keys:
-            orphan = sink_pin_orphans.pop(sink_key, None)
-            if orphan is None:
+            orphans = sink_pin_orphans.get(sink_key)
+            if not orphans:
                 raise ValueError(
                     f"net {net_name} routed sink {sink_key} was not present in stubs"
                 )
+            orphan = orphans.pop(0)
+            if not orphans:
+                del sink_pin_orphans[sink_key]
             new_branches[branch_index] = orphan.get()
             branch_index += 1
 
@@ -541,9 +616,10 @@ def write_routed_physical_netlist(
     schema_dir: Path,
     routes_path: Path,
     allow_unrouted_stubs: bool,
+    expected_artifact_pair_id: str | None = None,
 ) -> None:
     schema = load_physical_schema(schema_dir)
-    routes_by_net = read_routes_jsonl(routes_path)
+    routes_by_net = read_routes_jsonl(routes_path, expected_artifact_pair_id)
     data = read_gzip_or_plain(input_phys)
 
     with schema.PhysNetlist.from_bytes(
@@ -565,7 +641,7 @@ def write_routed_physical_netlist(
             continue
 
         adjacency, source_node_by_pin, sink_pins_by_node, route_edges = build_route_tables(route)
-        sink_pin_orphans: dict[tuple[str, str], Any] = {}
+        sink_pin_orphans: dict[tuple[str, str], list[Any]] = defaultdict(list)
         unknown_stub_orphans: list[Any] = []
 
         for index, stub in enumerate(net.stubs):
@@ -579,14 +655,20 @@ def write_routed_physical_netlist(
                 string_at(str_list, site_pin.site),
                 string_at(str_list, site_pin.pin),
             )
-            if key in sink_pin_orphans:
-                raise ValueError(f"net {net_name} has duplicate stub {key}")
             orphan = net.stubs.disown(index)
-            sink_pin_orphans[key] = orphan
+            sink_pin_orphans[key].append(orphan)
+
+        original_site_stub_count = sum(
+            len(orphans) for orphans in sink_pin_orphans.values()
+        )
+        expected_reached_stub_count = sum(
+            len(sink_keys) for sink_keys in sink_pins_by_node.values()
+        )
 
         net.disown("stubs")
 
         emitted_edges = 0
+        emitted_source_nodes: set[int] = set()
         source_branches = collect_site_pin_branches(net.sources, str_list)
         for source_key, source_branch in source_branches:
             source_node = source_node_by_pin.get(source_key)
@@ -594,6 +676,9 @@ def write_routed_physical_netlist(
                 continue
             if source_node not in adjacency and source_node not in sink_pins_by_node:
                 continue
+            if source_node in emitted_source_nodes:
+                continue
+            emitted_source_nodes.add(source_node)
             emitted_edges += insert_route_tree(
                 source_branch,
                 source_node,
@@ -610,7 +695,23 @@ def write_routed_physical_netlist(
                 f"{len(route_edges)} PIPs"
             )
 
-        remaining_stubs = list(sink_pin_orphans.values()) + unknown_stub_orphans
+        remaining_site_stub_count = sum(
+            len(orphans) for orphans in sink_pin_orphans.values()
+        )
+        if (
+            original_site_stub_count - remaining_site_stub_count
+            != expected_reached_stub_count
+        ):
+            raise ValueError(
+                f"net {net_name} has a reached sink that was not attached "
+                "to a routed source"
+            )
+
+        remaining_stubs = [
+            orphan
+            for orphans in sink_pin_orphans.values()
+            for orphan in orphans
+        ] + unknown_stub_orphans
         if remaining_stubs and not allow_unrouted_stubs:
             raise ValueError(
                 f"net {net_name} still has {len(remaining_stubs)} unrouted stubs"
@@ -712,12 +813,14 @@ def main(argv: list[str]) -> int:
             "run CSR PathFinder",
         )
 
+        artifact_pair_id = read_metadata_artifact_pair_id(metadata_path)
         write_routed_physical_netlist(
             input_phys,
             output_phys,
             schema_dir,
             routes_path,
             args.allow_unrouted_stubs,
+            artifact_pair_id,
         )
         return 0
     finally:

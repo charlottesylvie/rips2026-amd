@@ -238,14 +238,22 @@ def site_pin_key(site: str, pin: str) -> tuple[str, str]:
     return (site, pin)
 
 
+def route_int(value: Any, field: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ValueError(f"route field {field} is not an integer")
+    if value < -(2**31) or value > 2**31 - 1:
+        raise ValueError(f"route field {field} exceeds the C++ node-id range")
+    return value
+
+
 def build_route_tables(route: dict[str, Any]):
     adjacency: dict[int, list[dict[str, Any]]] = defaultdict(list)
     incoming_parent: dict[int, int] = {}
     seen_edges: set[tuple[int, int]] = set()
 
     for edge in route.get("edges", []):
-        parent = int(edge["from"])
-        child = int(edge["to"])
+        parent = route_int(edge["from"], "edge.from")
+        child = route_int(edge["to"], "edge.to")
         key = (parent, child)
         if key in seen_edges:
             continue
@@ -262,16 +270,21 @@ def build_route_tables(route: dict[str, Any]):
     source_node_by_pin: dict[tuple[str, str], int] = {}
     for source in route.get("sources", []):
         key = site_pin_key(str(source["site"]), str(source["pin"]))
-        if key in source_node_by_pin:
-            raise ValueError(f"net {route['net']} has duplicate source {key}")
-        source_node_by_pin[key] = int(source["node"])
+        node = route_int(source["node"], "source.node")
+        previous = source_node_by_pin.get(key)
+        if previous is not None and previous != node:
+            raise ValueError(
+                f"net {route['net']} maps source {key} to both "
+                f"{previous} and {node}"
+            )
+        source_node_by_pin[key] = node
 
     sink_pins_by_node: dict[int, list[tuple[str, str]]] = defaultdict(list)
     for sink in route.get("sinks", []):
         if not sink.get("reached", False):
             raise ValueError(f"net {route['net']} has unreached sink {sink}")
         key = site_pin_key(str(sink["site"]), str(sink["pin"]))
-        sink_pins_by_node[int(sink["node"])].append(key)
+        sink_pins_by_node[route_int(sink["node"], "sink.node")].append(key)
 
     return adjacency, source_node_by_pin, sink_pins_by_node, seen_edges
 
@@ -303,7 +316,7 @@ def insert_route_tree(
     net_name: str,
     adjacency: dict[int, list[dict[str, Any]]],
     sink_pins_by_node: dict[int, list[tuple[str, str]]],
-    sink_pin_orphans: dict[tuple[str, str], Any],
+    sink_pin_orphans: dict[tuple[str, str], list[Any]],
     string_to_index: dict[str, int],
 ) -> int:
     emitted_pips = 0
@@ -335,15 +348,20 @@ def insert_route_tree(
             pip.wire0 = get_string_index(str(edge["wire0"]), string_to_index)
             pip.wire1 = get_string_index(str(edge["wire1"]), string_to_index)
             pip.forward = bool(edge["forward"])
-            stack.append((next_branch, int(edge["to"]), next_ancestors))
+            stack.append(
+                (next_branch, route_int(edge["to"], "edge.to"), next_ancestors)
+            )
             emitted_pips += 1
 
         for sink_key in sink_keys:
-            orphan = sink_pin_orphans.pop(sink_key, None)
-            if orphan is None:
+            orphans = sink_pin_orphans.get(sink_key)
+            if not orphans:
                 raise ValueError(
                     f"net {net_name} routed sink {sink_key} was not present in stubs"
                 )
+            orphan = orphans.pop(0)
+            if not orphans:
+                del sink_pin_orphans[sink_key]
             new_branches[branch_index] = orphan.get()
             branch_index += 1
 
@@ -394,7 +412,7 @@ def write_routed_physical_netlist(
             continue
 
         adjacency, source_node_by_pin, sink_pins_by_node, route_edges = build_route_tables(route)
-        sink_pin_orphans: dict[tuple[str, str], Any] = {}
+        sink_pin_orphans: dict[tuple[str, str], list[Any]] = defaultdict(list)
         unknown_stub_orphans: list[Any] = []
 
         for index, stub in enumerate(net.stubs):
@@ -408,14 +426,20 @@ def write_routed_physical_netlist(
                 string_at(str_list, site_pin.site),
                 string_at(str_list, site_pin.pin),
             )
-            if key in sink_pin_orphans:
-                raise ValueError(f"net {net_name} has duplicate stub {key}")
             orphan = net.stubs.disown(index)
-            sink_pin_orphans[key] = orphan
+            sink_pin_orphans[key].append(orphan)
+
+        original_site_stub_count = sum(
+            len(orphans) for orphans in sink_pin_orphans.values()
+        )
+        expected_reached_stub_count = sum(
+            len(sink_keys) for sink_keys in sink_pins_by_node.values()
+        )
 
         net.disown("stubs")
 
         emitted_edges = 0
+        emitted_source_nodes: set[int] = set()
         source_branches = collect_site_pin_branches(net.sources, str_list)
         for source_key, source_branch in source_branches:
             source_node = source_node_by_pin.get(source_key)
@@ -423,6 +447,9 @@ def write_routed_physical_netlist(
                 continue
             if source_node not in adjacency and source_node not in sink_pins_by_node:
                 continue
+            if source_node in emitted_source_nodes:
+                continue
+            emitted_source_nodes.add(source_node)
             emitted_edges += insert_route_tree(
                 source_branch,
                 source_node,
@@ -439,7 +466,23 @@ def write_routed_physical_netlist(
                 f"{len(route_edges)} PIPs"
             )
 
-        remaining_stubs = list(sink_pin_orphans.values()) + unknown_stub_orphans
+        remaining_site_stub_count = sum(
+            len(orphans) for orphans in sink_pin_orphans.values()
+        )
+        if (
+            original_site_stub_count - remaining_site_stub_count
+            != expected_reached_stub_count
+        ):
+            raise ValueError(
+                f"net {net_name} has a reached sink that was not attached "
+                "to a routed source"
+            )
+
+        remaining_stubs = [
+            orphan
+            for orphans in sink_pin_orphans.values()
+            for orphan in orphans
+        ] + unknown_stub_orphans
         if remaining_stubs and not allow_unrouted_stubs:
             raise ValueError(
                 f"net {net_name} still has {len(remaining_stubs)} unrouted stubs"

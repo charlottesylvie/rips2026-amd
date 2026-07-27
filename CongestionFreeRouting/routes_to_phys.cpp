@@ -17,6 +17,7 @@
 
 #include "PhysicalNetlist.capnp.h"
 #include "interchange/gzip_io.hpp"
+#include "interchange/import_policy.hpp"
 
 #include <capnp/serialize.h>
 #include <kj/array.h>
@@ -26,6 +27,7 @@
 #include <array>
 #include <cerrno>
 #include <cctype>
+#include <cmath>
 #include <cstdint>
 #include <cstring>
 #include <filesystem>
@@ -33,6 +35,8 @@
 #include <iostream>
 #include <limits>
 #include <map>
+#include <optional>
+#include <set>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -45,7 +49,8 @@
 namespace {
 
 constexpr char METADATA_MAGIC[8] = {'R', 'I', 'P', 'S', 'I', 'F', 'M', '1'};
-constexpr std::uint64_t EXPECTED_METADATA_VERSION = 4;
+constexpr std::uint64_t LEGACY_METADATA_VERSION = 4;
+constexpr std::uint64_t CURRENT_METADATA_VERSION = 5;
 constexpr std::uint64_t EXPECTED_OUTGOING_EDGE_ORIENTATION = 2;
 constexpr std::uint64_t kInvalidRouteNode =
     std::numeric_limits<std::uint64_t>::max();
@@ -77,6 +82,8 @@ struct RouteEdge {
 };
 
 struct NetRoute {
+  std::optional<routing::interchange::InterchangeArtifactPairId>
+      artifact_pair_id;
   std::string net;
   bool routed = false;
   std::vector<RouteSitePin> sources;
@@ -103,6 +110,8 @@ struct MetadataRouteRequest {
 };
 
 struct RoutingMetadataSummary {
+  std::optional<routing::interchange::InterchangeArtifactPairId>
+      artifact_pair_id;
   std::vector<std::string> strings;
   std::vector<MetadataRouteRequest> route_requests;
 };
@@ -286,23 +295,50 @@ class JsonParser {
     skip_ws();
     const std::size_t begin = pos_;
     if (pos_ < text_.size() && text_[pos_] == '-') ++pos_;
-    while (pos_ < text_.size() && std::isdigit(static_cast<unsigned char>(text_[pos_]))) {
+    if (pos_ >= text_.size() ||
+        !std::isdigit(static_cast<unsigned char>(text_[pos_]))) {
+      throw std::runtime_error("invalid JSON number");
+    }
+    if (text_[pos_] == '0') {
       ++pos_;
+      if (pos_ < text_.size() &&
+          std::isdigit(static_cast<unsigned char>(text_[pos_]))) {
+        throw std::runtime_error("JSON number has a leading zero");
+      }
+    } else {
+      while (pos_ < text_.size() &&
+             std::isdigit(static_cast<unsigned char>(text_[pos_]))) {
+        ++pos_;
+      }
     }
     if (pos_ < text_.size() && text_[pos_] == '.') {
       ++pos_;
+      const std::size_t fractional_begin = pos_;
       while (pos_ < text_.size() && std::isdigit(static_cast<unsigned char>(text_[pos_]))) {
         ++pos_;
+      }
+      if (pos_ == fractional_begin) {
+        throw std::runtime_error("JSON number has an empty fraction");
       }
     }
     if (pos_ < text_.size() && (text_[pos_] == 'e' || text_[pos_] == 'E')) {
       ++pos_;
       if (pos_ < text_.size() && (text_[pos_] == '+' || text_[pos_] == '-')) ++pos_;
+      const std::size_t exponent_begin = pos_;
       while (pos_ < text_.size() && std::isdigit(static_cast<unsigned char>(text_[pos_]))) {
         ++pos_;
       }
+      if (pos_ == exponent_begin) {
+        throw std::runtime_error("JSON number has an empty exponent");
+      }
     }
-    return std::stod(text_.substr(begin, pos_ - begin));
+    const std::string token = text_.substr(begin, pos_ - begin);
+    std::size_t consumed = 0;
+    const double value = std::stod(token, &consumed);
+    if (consumed != token.size() || !std::isfinite(value)) {
+      throw std::runtime_error("invalid finite JSON number");
+    }
+    return value;
   }
 
   void expect_literal(const char* literal) {
@@ -380,11 +416,24 @@ RoutingMetadataSummary load_metadata_summary(const std::filesystem::path& path) 
 
   const std::uint64_t version = read_u64(in, "metadata version");
   const std::uint64_t orientation = read_u64(in, "metadata orientation");
-  if (version != EXPECTED_METADATA_VERSION) {
+  if (version != LEGACY_METADATA_VERSION &&
+      version != CURRENT_METADATA_VERSION) {
     throw std::runtime_error("unsupported metadata version");
   }
   if (orientation != EXPECTED_OUTGOING_EDGE_ORIENTATION) {
     throw std::runtime_error("unsupported metadata orientation");
+  }
+
+  std::optional<routing::interchange::InterchangeArtifactPairId>
+      artifact_pair_id;
+  if (version == CURRENT_METADATA_VERSION) {
+    routing::interchange::InterchangeArtifactPairId id;
+    id.high = read_u64(in, "metadata artifact pair id high");
+    id.low = read_u64(in, "metadata artifact pair id low");
+    if (id.is_zero()) {
+      throw std::runtime_error("metadata artifact pair id must not be zero");
+    }
+    artifact_pair_id = id;
   }
 
   const std::uint64_t string_count = read_u64(in, "string count");
@@ -410,6 +459,7 @@ RoutingMetadataSummary load_metadata_summary(const std::filesystem::path& path) 
   (void)read_u64(in, "logical design name string");
 
   RoutingMetadataSummary metadata;
+  metadata.artifact_pair_id = artifact_pair_id;
   metadata.strings.reserve(static_cast<std::size_t>(string_count));
   for (std::uint64_t i = 0; i < string_count; ++i) {
     metadata.strings.push_back(read_metadata_string(in));
@@ -469,12 +519,28 @@ RoutingMetadataSummary load_metadata_summary(const std::filesystem::path& path) 
 int json_int(const JsonValue::Object& object, const char* key) {
   const auto found = object.find(key);
   if (found == object.end()) throw std::runtime_error(std::string("missing JSON key: ") + key);
-  return static_cast<int>(found->second.as_number(key));
+  const double value = found->second.as_number(key);
+  if (!std::isfinite(value) || std::trunc(value) != value ||
+      value < static_cast<double>(std::numeric_limits<int>::min()) ||
+      value > static_cast<double>(std::numeric_limits<int>::max())) {
+    throw std::runtime_error(std::string("JSON field is not an in-range integer: ") + key);
+  }
+  return static_cast<int>(value);
 }
 
 std::string json_string(const JsonValue::Object& object, const char* key) {
   const auto found = object.find(key);
   if (found == object.end()) throw std::runtime_error(std::string("missing JSON key: ") + key);
+  return found->second.as_string(key);
+}
+
+std::optional<std::string> optional_json_string(
+    const JsonValue::Object& object,
+    const char* key) {
+  const auto found = object.find(key);
+  if (found == object.end()) {
+    return std::nullopt;
+  }
   return found->second.as_string(key);
 }
 
@@ -501,6 +567,12 @@ NetRoute parse_route_line(const std::string& line) {
   const JsonValue root = JsonParser(line).parse();
   const auto& object = root.as_object("route");
   NetRoute route;
+  if (const std::optional<std::string> raw_id =
+          optional_json_string(object, "artifact_pair_id");
+      raw_id.has_value()) {
+    route.artifact_pair_id =
+        routing::interchange::parse_interchange_artifact_pair_id(*raw_id);
+  }
   route.net = json_string(object, "net");
   route.routed = json_bool(object, "routed", false);
 
@@ -553,7 +625,10 @@ void validate_routes_against_metadata(
     const RoutingMetadataSummary& metadata) {
   std::unordered_map<std::string, const MetadataRouteRequest*> requests_by_net;
   for (const MetadataRouteRequest& request : metadata.route_requests) {
-    requests_by_net.emplace(request.net, &request);
+    if (!requests_by_net.emplace(request.net, &request).second) {
+      throw std::runtime_error(
+          "metadata contains duplicate route request: " + request.net);
+    }
   }
 
   for (const auto& [net, route] : routes) {
@@ -562,11 +637,38 @@ void validate_routes_against_metadata(
       throw std::runtime_error("route file contains net not present in metadata: " + net);
     }
     const MetadataRouteRequest& request = *found->second;
+    if (route.sources.size() != request.sources.size()) {
+      std::ostringstream out;
+      out << "route source count for " << net << " is "
+          << route.sources.size() << " but metadata expects "
+          << request.sources.size();
+      throw std::runtime_error(out.str());
+    }
     if (route.sinks.size() != request.sinks.size()) {
       std::ostringstream out;
       out << "route sink count for " << net << " is " << route.sinks.size()
           << " but metadata expects " << request.sinks.size();
       throw std::runtime_error(out.str());
+    }
+    const auto require_same_endpoint = [&](const RouteSitePin& actual,
+                                           const RouteSitePin& expected,
+                                           const char* role,
+                                           std::size_t index) {
+      if (actual.node != expected.node || actual.site != expected.site ||
+          actual.pin != expected.pin) {
+        throw std::runtime_error(
+            "route " + std::string(role) + " " +
+            std::to_string(index) + " does not match metadata for net " +
+            net);
+      }
+    };
+    for (std::size_t index = 0; index < route.sources.size(); ++index) {
+      require_same_endpoint(route.sources[index], request.sources[index],
+                            "source", index);
+    }
+    for (std::size_t index = 0; index < route.sinks.size(); ++index) {
+      require_same_endpoint(route.sinks[index], request.sinks[index],
+                            "sink", index);
     }
   }
 }
@@ -813,8 +915,12 @@ RouteTables build_route_tables(const NetRoute& route) {
   for (const RouteSitePin& source : route.sources) {
     if (source.node < 0) continue;
     SitePinKey key{source.site, source.pin};
-    if (!tables.source_node_by_pin.emplace(key, source.node).second) {
-      throw std::runtime_error("duplicate source site pin in route: " + route.net);
+    const auto [found, inserted] =
+        tables.source_node_by_pin.emplace(key, source.node);
+    if (!inserted && found->second != source.node) {
+      throw std::runtime_error(
+          "one source site pin maps to multiple nodes in route: " +
+          route.net);
     }
   }
   for (const RouteSitePin& sink : route.sinks) {
@@ -973,12 +1079,20 @@ void write_routed_phys(const std::filesystem::path& input_phys,
     }
 
     int emitted_edges = 0;
+    std::set<int> emitted_source_nodes;
     for (const auto& [source_key, source_branch] : source_branches) {
       const auto source_node_it = tables.source_node_by_pin.find(source_key);
       if (source_node_it == tables.source_node_by_pin.end()) continue;
       const int source_node = source_node_it->second;
       if (tables.children_by_node.find(source_node) == tables.children_by_node.end() &&
           tables.sinks_by_node.find(source_node) == tables.sinks_by_node.end()) {
+        continue;
+      }
+      // Alternate or duplicate source site pins can legally resolve to the
+      // same routing node. Emit that node's tree from the first physical root
+      // only; inserting it below every alias duplicates PIPs and consumes the
+      // same sink stubs more than once.
+      if (!emitted_source_nodes.insert(source_node).second) {
         continue;
       }
       emitted_edges += insert_route_tree(source_branch,
@@ -997,6 +1111,21 @@ void write_routed_phys(const std::filesystem::path& input_phys,
       out << "emitted " << emitted_edges << " PIPs for " << net_name
           << " but route contains " << tables.edge_count;
       throw std::runtime_error(out.str());
+    }
+    const std::size_t expected_reached_stubs =
+        static_cast<std::size_t>(std::count_if(
+            route.sinks.begin(), route.sinks.end(),
+            [](const RouteSitePin& sink) {
+              return sink.reached;
+            }));
+    const std::size_t consumed_reached_stubs =
+        static_cast<std::size_t>(std::count_if(
+            stub_store.stubs.begin(), stub_store.stubs.end(),
+            [](const StoredStubBranch& stub) { return stub.consumed; }));
+    if (consumed_reached_stubs != expected_reached_stubs) {
+      throw std::runtime_error(
+          "one or more reached sinks were not attached to a routed source in " +
+          net_name);
     }
     std::size_t remaining_stub_count = 0;
     for (const StoredStubBranch& stub : stub_store.stubs) {
@@ -1068,8 +1197,20 @@ int main(int argc, char** argv) {
     const std::filesystem::path routes_path = argv[3];
     const std::filesystem::path output_phys = argv[4];
 
+    const routing::interchange::InterchangePublicationSnapshot
+        publication_snapshot =
+            routing::interchange::snapshot_interchange_publication(
+                metadata_path);
     RoutingMetadataSummary metadata = load_metadata_summary(metadata_path);
     std::unordered_map<std::string, NetRoute> routes = load_routes_jsonl(routes_path);
+    routing::interchange::verify_interchange_publication(
+        metadata_path, publication_snapshot);
+    for (const auto& [net, route] : routes) {
+      (void)net;
+      routing::interchange::require_matching_interchange_pair_ids(
+          route.artifact_pair_id, metadata.artifact_pair_id,
+          publication_snapshot.generation);
+    }
     validate_routes_against_metadata(routes, metadata);
     write_routed_phys(input_phys, output_phys, routes, allow_unrouted_stubs);
     return 0;

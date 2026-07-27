@@ -108,6 +108,56 @@ def assert_routed_output(schema, output_phys: Path) -> None:
         assert strings[sink.pin] == "SINK_PIN"
 
 
+def make_duplicate_endpoint_phys(schema, path: Path) -> None:
+    message = schema.PhysNetlist.new_message()
+    strings = [
+        "net0",
+        "SRC_SITE",
+        "SRC_PIN",
+        "SRC_PIN_ALT",
+        "SINK_SITE",
+        "SINK_PIN",
+    ]
+    str_list = message.init("strList", len(strings))
+    for index, text in enumerate(strings):
+        str_list[index] = text
+
+    net = message.init("physNets", 1)[0]
+    net.name = 0
+    net.type = "signal"
+    sources = net.init("sources", 3)
+    for index, pin_index in enumerate((2, 2, 3)):
+        source = sources[index].routeSegment.init("sitePin")
+        source.site = 1
+        source.pin = pin_index
+    stubs = net.init("stubs", 2)
+    for stub in stubs:
+        sink = stub.routeSegment.init("sitePin")
+        sink.site = 4
+        sink.pin = 5
+    path.write_bytes(message.to_bytes())
+
+
+def assert_duplicate_endpoint_output(schema, output_phys: Path) -> None:
+    with schema.PhysNetlist.from_bytes(
+        gzip.decompress(output_phys.read_bytes()),
+        traversal_limit_in_words=sys.maxsize,
+        nesting_limit=2**16,
+    ) as routed:
+        net = routed.physNets[0]
+        assert len(net.stubs) == 0
+        rooted = [source for source in net.sources if len(source.branches) != 0]
+        assert len(rooted) == 1
+        assert len(rooted[0].branches) == 1
+        pip_branch = rooted[0].branches[0]
+        assert pip_branch.routeSegment.which() == "pip"
+        assert len(pip_branch.branches) == 2
+        assert all(
+            child.routeSegment.which() == "sitePin"
+            for child in pip_branch.branches
+        )
+
+
 def main() -> int:
     with tempfile.TemporaryDirectory() as tmp:
         tmp_path = Path(tmp)
@@ -156,6 +206,72 @@ def main() -> int:
             allow_unrouted_stubs=False,
         )
         assert_routed_output(schema, output_phys)
+
+        detached_routes = tmp_path / "detached_routes.jsonl"
+        detached_routes.write_text(
+            json.dumps({**route, "edges": []}) + "\n", encoding="utf-8"
+        )
+        try:
+            benchmark.write_routed_physical_netlist(
+                input_phys,
+                tmp_path / "detached_output.phys",
+                schema_dir,
+                detached_routes,
+                allow_unrouted_stubs=True,
+            )
+        except ValueError as exc:
+            assert "reached sink" in str(exc)
+        else:
+            raise AssertionError("detached reached sink was accepted")
+
+        fractional_routes = tmp_path / "fractional_routes.jsonl"
+        fractional_routes.write_text(
+            json.dumps(
+                {
+                    **route,
+                    "edges": [{**route["edges"][0], "from": 0.5}],
+                }
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        try:
+            benchmark.write_routed_physical_netlist(
+                input_phys,
+                tmp_path / "fractional_output.phys",
+                schema_dir,
+                fractional_routes,
+                allow_unrouted_stubs=False,
+            )
+        except ValueError as exc:
+            assert "not an integer" in str(exc)
+        else:
+            raise AssertionError("fractional route node was accepted")
+
+        duplicate_input = tmp_path / "duplicate_input.phys"
+        duplicate_output = tmp_path / "duplicate_output.phys"
+        duplicate_routes = tmp_path / "duplicate_routes.jsonl"
+        make_duplicate_endpoint_phys(schema, duplicate_input)
+        duplicate_route = {
+            **route,
+            "sources": [
+                {"node": 0, "site": "SRC_SITE", "pin": "SRC_PIN"},
+                {"node": 0, "site": "SRC_SITE", "pin": "SRC_PIN"},
+                {"node": 0, "site": "SRC_SITE", "pin": "SRC_PIN_ALT"},
+            ],
+            "sinks": [route["sinks"][0], route["sinks"][0]],
+        }
+        duplicate_routes.write_text(
+            json.dumps(duplicate_route) + "\n", encoding="utf-8"
+        )
+        benchmark.write_routed_physical_netlist(
+            duplicate_input,
+            duplicate_output,
+            schema_dir,
+            duplicate_routes,
+            allow_unrouted_stubs=False,
+        )
+        assert_duplicate_endpoint_output(schema, duplicate_output)
 
         logical_netlist = tmp_path / "input.netlist"
         logical_netlist.write_bytes(b"logical")
