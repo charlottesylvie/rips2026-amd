@@ -310,13 +310,18 @@ Runs the CSR PathFinder prototype:
   --routes-out <routes.jsonl>
 ```
 
+Direct `pathfinder` runs refuse to write `--routes-out` when any sink remains
+unreached unless `--allow-unrouted` is supplied. The `PathFinderFile` wrapper
+adds that option by default; use `--strict-routing` on the wrapper only when a
+complete route is an explicit acceptance requirement.
+
 Tuning options:
 
 | Option | Default | Meaning |
 | --- | --- | --- |
 | `--sssp-engine <unit-bfs\|delta-step\|bellman-ford\|bf10>` | `unit-bfs` | Shortest-path backend; `bf8`, `bf9`, and `bf10` are Bellman-Ford compatibility aliases. |
 | `--use-delta-step` | unset | Shorthand for `--sssp-engine delta-step`. |
-| `--delta <float\|auto>` | `1` | Explicit Delta-Stepping bucket width, or a graph-aware seed based on runtime wavefront size, average edge weight, and average out-degree. |
+| `--delta <float\|auto>` | `1` | Explicit Delta-Stepping bucket width. Automatic mode uses `1` for exact-unit effective weights and otherwise uses a graph-aware seed based on runtime wavefront size, average effective weight, and average out-degree. |
 | `--delta-multiplier <float>` | `1` | Positive multiplier for sweeping around `--delta auto`; rejected with an explicit numeric width. |
 | `--delta-force-generic` | unset | Bypass only the exact-unit Delta dispatch while preserving weights, delta, destination costs, and automatic compact-parent selection. |
 | `--delta-force-legacy-parent` | unset | Select legacy predecessor recovery for generic vector-target Delta runs; combine with force-generic for a parent-policy A/B test. |
@@ -364,9 +369,11 @@ graph; the `.csrbin` file remains unchanged:
 | `mixed` | Each original CSR edge index makes a seeded deterministic choice from `{0, 0.25, 1, 4} * delta`. |
 
 Automatic delta is resolved once before worker dispatch, so every worker uses
-the same numeric width. Its graph-statistics scan is reported separately as
-the optional `pathfinder.delta_auto_stats` ROCTX range. The low-level helper
-also accepts destination vertex costs and computes the exact mean of
+the same numeric width. Exact-unit effective weights use the natural width
+`1 * multiplier`, independent of graph degree or wavefront size. Other
+nonzero weighted graphs use the graph-statistics heuristic. Its scan is
+reported separately as the optional `pathfinder.delta_auto_stats` ROCTX range.
+The low-level helper also accepts destination vertex costs and computes
 `edge_weight(u,v) * vertex_cost(v)`; the one-shot PathFinder currently has no
 dynamic vertex-cost state and therefore resolves from immutable edge weights.
 Low-level callers that update edge values or vertex costs must resolve a new

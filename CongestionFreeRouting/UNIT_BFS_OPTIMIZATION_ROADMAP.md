@@ -26,11 +26,11 @@ are workload-dependent, and must not be added.
 - Source claims use an authoritative atomic CAS. A successful claim reserves
   one queue slot and stores the original outgoing edge ID.
 - Cooperative-capable devices run up to 32 BFS levels in one resident
-  grid-synchronized kernel for null and explicit streams. Grid size is capped
-  for the expected 4--8 concurrent workers.
+  grid-synchronized kernel on the null/default stream.
 - Unsupported devices and progress callbacks retain proven fallbacks. The
-  null-stream fallback batches up to four levels; the explicit-stream fallback
-  checks every level on the host.
+  null-stream fallback batches up to four levels. Every explicit worker stream
+  checks each level through the gfx1151-safe host-controlled handoff; concurrent
+  cooperative grids are deliberately not selected.
 - Source, target, target-metadata, offset, and compact-path buffers grow
   geometrically and retain their high-water capacity. PathFinder supplies safe
   metadata-derived source/target hints; compact paths remain demand-sized and
@@ -48,8 +48,8 @@ are workload-dependent, and must not be added.
 The HIP regression source covers compact/wide rows, host/device extraction,
 sparse/generation visitation, exact-unit rejection, depth limits, callback
 abort/reuse, duplicate and unreachable targets, capacity high-water retention,
-wide/deep frontiers, four- and eight-worker explicit streams, cooperative
-control when supported, and device path validation.
+wide/deep frontiers, four- and eight-worker explicit streams, null-stream
+cooperative control when supported, and device path validation.
 
 That suite and the production UnitBFS translation unit have not been compiled
 or executed on an AMD GPU in this checkout. `hipcc` is unavailable locally.
