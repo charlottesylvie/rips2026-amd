@@ -416,6 +416,9 @@ Tuning options:
 | `--delta-multiplier <float>` | `1` | Positive multiplier for sweeping around `--delta auto`; rejected with an explicit numeric width. |
 | `--delta-force-generic` | unset | Bypass only the exact-unit Delta dispatch while preserving weights, delta, destination costs, and automatic compact-parent selection. |
 | `--delta-force-legacy-parent` | unset | Select legacy predecessor recovery for generic vector-target Delta runs; combine with force-generic for a parent-policy A/B test. |
+| `--delta-unit-weight-load-elision` | unset | On the exact profiled generic specialization only, use `1.0f` without loading the edge-value array after the uploaded payload has an exact-unit proof. |
+| `--delta-host-value-frontier-count` | unset | On an authoritative host-checked explicit-stream round, pass the validated host count by value instead of loading the device count and entering an initial block barrier. |
+| `--delta-wave-queue-reservations` | unset | On the proof-gated wave32 specialization, reserve touched/current/pending queue positions once per wave. Requires the unit-load-elision opt-in; unsupported cases use scalar reservations. |
 | `--delta-controller <host-checked\|reduced-round-trip>` | `host-checked` | Select the established generic host controller or the capability-gated bounded device controller. |
 | `--delta-controller-batch-size <int>` | `4` in reduced mode | Positive device-control budget; valid only with an explicitly selected reduced-round-trip controller. |
 | `--delta-telemetry` | unset | Emit one aggregate Delta-Stepping telemetry JSON record after all net workers join. |
@@ -436,7 +439,9 @@ works with numeric or automatic delta. The multiplier requires automatic
 delta, benchmark weight families require an explicit numeric delta, and the
 seed is valid only with `mixed`. A controller batch size requires an explicit
 `--delta-controller reduced-round-trip`; host-checked mode preserves the
-existing null-stream and explicit-stream behavior exactly. Force-generic and
+existing null-stream and explicit-stream behavior exactly. The reduced
+controller measured a severe regression in the profiled workload and remains
+an opt-in diagnostic path, not a performance recommendation. Force-generic and
 force-legacy-parent may be
 combined: the first chooses generic execution and the second chooses its
 parent representation. Force-legacy-parent by itself also makes the fixed
@@ -453,6 +458,17 @@ destination-cost semantics, or compact-versus-legacy parent policy. A finite
 iteration limit or nonnull low-level callback also makes the call generic, but
 those controls change execution semantics and should not be used as benchmark
 forcing tricks.
+
+The three generic-kernel optimization controls are independent review and A/B
+surfaces and remain default-off. Their only intended production candidate is
+the measured compact-row, Boolean-membership, compact-edge-parent, no-cost,
+all-light, telemetry-off, host-checked specialization. Unit status comes from
+an exact proof owned with the uploaded values; it is never inferred from
+`delta` or from the all-light predicate. Wide rows, nonunit/mixed/zero weights,
+vertex costs, heavy work, generation membership, legacy parents,
+distances-only output, telemetry, reduced control, and wave64 retain the
+established generic implementation. Host-value counts additionally require an
+explicit stream and the existing gfx1151 clear-to-relax synchronization.
 
 Benchmark families are applied after loading and change only the in-memory
 graph; the `.csrbin` file remains unchanged:
@@ -577,7 +593,7 @@ Useful wrapper options:
 | `--interchange-to-csr <path>` | Override converter executable. Env: `INTERCHANGE_TO_CSR`. |
 | `--pathfinder <path>` | Override PathFinder executable. Env: `PATHFINDER_BIN`. |
 | `--routes-to-phys <path>` | Override route reconstructor. Env: `ROUTES_TO_PHYS`. |
-| `--sssp-engine`, `--use-delta-step`, `--delta`, `--delta-multiplier`, `--delta-force-generic`, `--delta-force-legacy-parent`, `--delta-controller`, `--delta-controller-batch-size`, `--delta-telemetry`, `--delta-benchmark-weights`, `--delta-benchmark-weight-seed`, `--max-sssp-iters`, `--net-limit`, `--parallel-net-workers`, `--capacity` | Forwarded to `pathfinder`. |
+| `--sssp-engine`, `--use-delta-step`, `--delta`, `--delta-multiplier`, `--delta-force-generic`, `--delta-force-legacy-parent`, `--delta-unit-weight-load-elision`, `--delta-host-value-frontier-count`, `--delta-wave-queue-reservations`, `--delta-controller`, `--delta-controller-batch-size`, `--delta-telemetry`, `--delta-benchmark-weights`, `--delta-benchmark-weight-seed`, `--max-sssp-iters`, `--net-limit`, `--parallel-net-workers`, `--capacity` | Forwarded to `pathfinder`. |
 | `--max-pathfinder-iters`, `--present-factor`, `--present-multiplier`, `--history-factor`, `--route-batch-size` | Compatibility-only; forwarded to `pathfinder` and ignored. |
 
 ## File Formats And Artifacts

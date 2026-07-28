@@ -142,6 +142,11 @@ struct PathfinderOptions {
   int delta_controller_batch_size =
       static_cast<int>(kDeltaSteppingCsrRecommendedControllerBatchSize);
   bool delta_controller_controls_explicit = false;
+  // Default-off generic-kernel A/B controls, appended for aggregate source
+  // compatibility.
+  bool delta_verified_unit_weight_load_elision = false;
+  bool delta_host_value_frontier_count = false;
+  bool delta_wave_aggregated_queue_reservations = false;
 };
 
 struct PathfinderResult {

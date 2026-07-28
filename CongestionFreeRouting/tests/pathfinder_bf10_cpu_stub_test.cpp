@@ -41,6 +41,7 @@ std::vector<SsspQueryCapacityHints> g_unit_capacity_hints;
 std::mutex g_delta_workspace_options_mutex;
 std::vector<DeltaSteppingCsrControllerMode> g_delta_controller_modes;
 std::vector<std::uint32_t> g_delta_controller_batch_sizes;
+std::vector<std::array<bool, 3>> g_delta_kernel_optimization_flags;
 
 void clear_recorded_deltas() {
   std::lock_guard<std::mutex> lock(g_delta_values_mutex);
@@ -88,6 +89,7 @@ void clear_recorded_delta_workspace_options() {
   std::lock_guard<std::mutex> lock(g_delta_workspace_options_mutex);
   g_delta_controller_modes.clear();
   g_delta_controller_batch_sizes.clear();
+  g_delta_kernel_optimization_flags.clear();
 }
 
 std::vector<DeltaSteppingCsrControllerMode> recorded_delta_controller_modes() {
@@ -98,6 +100,11 @@ std::vector<DeltaSteppingCsrControllerMode> recorded_delta_controller_modes() {
 std::vector<std::uint32_t> recorded_delta_controller_batch_sizes() {
   std::lock_guard<std::mutex> lock(g_delta_workspace_options_mutex);
   return g_delta_controller_batch_sizes;
+}
+
+std::vector<std::array<bool, 3>> recorded_delta_kernel_optimization_flags() {
+  std::lock_guard<std::mutex> lock(g_delta_workspace_options_mutex);
+  return g_delta_kernel_optimization_flags;
 }
 
 struct CpuSsspResult {
@@ -1469,6 +1476,11 @@ DeltaSteppingCsrWorkspace::DeltaSteppingCsrWorkspace(
   current_membership_mode_ = options.current_membership_mode;
   controller_mode_ = options.controller_mode;
   controller_batch_size_ = options.controller_batch_size;
+  verified_unit_weight_load_elision_ =
+      options.verified_unit_weight_load_elision;
+  host_value_frontier_count_ = options.host_value_frontier_count;
+  wave_aggregated_queue_reservations_ =
+      options.wave_aggregated_queue_reservations;
   sssp_capacity::validate_reservation(options.capacity_hints);
   {
     std::lock_guard<std::mutex> lock(g_capacity_hints_mutex);
@@ -1478,6 +1490,10 @@ DeltaSteppingCsrWorkspace::DeltaSteppingCsrWorkspace(
     std::lock_guard<std::mutex> lock(g_delta_workspace_options_mutex);
     g_delta_controller_modes.push_back(options.controller_mode);
     g_delta_controller_batch_sizes.push_back(options.controller_batch_size);
+    g_delta_kernel_optimization_flags.push_back(
+        {options.verified_unit_weight_load_elision,
+         options.host_value_frontier_count,
+         options.wave_aggregated_queue_reservations});
   }
 }
 
@@ -1491,6 +1507,11 @@ DeltaSteppingCsrWorkspace::DeltaSteppingCsrWorkspace(
   current_membership_mode_ = options.current_membership_mode;
   controller_mode_ = options.controller_mode;
   controller_batch_size_ = options.controller_batch_size;
+  verified_unit_weight_load_elision_ =
+      options.verified_unit_weight_load_elision;
+  host_value_frontier_count_ = options.host_value_frontier_count;
+  wave_aggregated_queue_reservations_ =
+      options.wave_aggregated_queue_reservations;
   sssp_capacity::validate_reservation(options.capacity_hints);
   {
     std::lock_guard<std::mutex> lock(g_capacity_hints_mutex);
@@ -1500,6 +1521,10 @@ DeltaSteppingCsrWorkspace::DeltaSteppingCsrWorkspace(
     std::lock_guard<std::mutex> lock(g_delta_workspace_options_mutex);
     g_delta_controller_modes.push_back(options.controller_mode);
     g_delta_controller_batch_sizes.push_back(options.controller_batch_size);
+    g_delta_kernel_optimization_flags.push_back(
+        {options.verified_unit_weight_load_elision,
+         options.host_value_frontier_count,
+         options.wave_aggregated_queue_reservations});
   }
 }
 
@@ -1954,7 +1979,12 @@ int main() {
   require(default_pathfinder_options.delta_controller_mode ==
               DeltaSteppingCsrControllerMode::kHostChecked &&
               default_pathfinder_options.delta_controller_batch_size == 4 &&
-              !default_pathfinder_options.delta_controller_controls_explicit,
+              !default_pathfinder_options.delta_controller_controls_explicit &&
+              !default_pathfinder_options
+                   .delta_verified_unit_weight_load_elision &&
+              !default_pathfinder_options.delta_host_value_frontier_count &&
+              !default_pathfinder_options
+                   .delta_wave_aggregated_queue_reservations,
           "the host-checked Delta controller and recommended batch must "
           "remain the PathFinder defaults");
   const routing::PathfinderOptions legacy_positional_options{
@@ -1971,7 +2001,12 @@ int main() {
               legacy_positional_options.delta_controller_mode ==
                   DeltaSteppingCsrControllerMode::kHostChecked &&
               legacy_positional_options.delta_controller_batch_size == 4 &&
-              !legacy_positional_options.delta_controller_controls_explicit,
+              !legacy_positional_options.delta_controller_controls_explicit &&
+              !legacy_positional_options
+                   .delta_verified_unit_weight_load_elision &&
+              !legacy_positional_options.delta_host_value_frontier_count &&
+              !legacy_positional_options
+                   .delta_wave_aggregated_queue_reservations,
           "new delta controls must preserve legacy aggregate field positions");
 
   HostCsrF32 delta_stats_graph;
@@ -2124,7 +2159,7 @@ int main() {
   require(explicit_multiplier_rejected,
           "a multiplier with explicit delta must not be silently ignored");
 
-  for (const int invalid_control : {0, 1, 2, 3, 4, 5, 6}) {
+  for (const int invalid_control : {0, 1, 2, 3, 4, 5, 6, 7, 8, 9}) {
     routing::PathfinderOptions invalid_engine_options;
     if (invalid_control == 0) {
       invalid_engine_options.delta_force_generic = true;
@@ -2139,8 +2174,14 @@ int main() {
     } else if (invalid_control == 5) {
       invalid_engine_options.delta_controller_mode =
           DeltaSteppingCsrControllerMode::kReducedRoundTrip;
-    } else {
+    } else if (invalid_control == 6) {
       invalid_engine_options.delta_controller_batch_size = 7;
+    } else if (invalid_control == 7) {
+      invalid_engine_options.delta_verified_unit_weight_load_elision = true;
+    } else if (invalid_control == 8) {
+      invalid_engine_options.delta_host_value_frontier_count = true;
+    } else {
+      invalid_engine_options.delta_wave_aggregated_queue_reservations = true;
     }
     bool rejected = false;
     try {
@@ -2509,6 +2550,9 @@ int main() {
   aggregate_json_options.delta_multiplier = 0.25f;
   aggregate_json_options.delta_force_generic = true;
   aggregate_json_options.delta_force_legacy_parent = true;
+  aggregate_json_options.delta_verified_unit_weight_load_elision = true;
+  aggregate_json_options.delta_host_value_frontier_count = true;
+  aggregate_json_options.delta_wave_aggregated_queue_reservations = true;
   aggregate_json_options.delta_controller_mode =
       DeltaSteppingCsrControllerMode::kReducedRoundTrip;
   aggregate_json_options.delta_controller_batch_size = 7;
@@ -2519,6 +2563,11 @@ int main() {
                   std::string::npos &&
               aggregate_json.find("\"queries\":4") != std::string::npos &&
               aggregate_json.find("\"completed_queries\":3") !=
+                  std::string::npos &&
+              aggregate_json.find(
+                  "\"requested_unit_weight_load_elision\":true,"
+                  "\"requested_host_value_frontier_count\":true,"
+                  "\"requested_wave_queue_reservations\":true") !=
                   std::string::npos &&
               aggregate_json.find(
                   "\"controller_mode\":\"reduced_round_trip\","
@@ -2686,6 +2735,27 @@ int main() {
                   std::vector<std::uint32_t>({4, 4}),
           "every default Delta worker must retain host-checked controller "
           "options");
+  require(recorded_delta_kernel_optimization_flags() ==
+              std::vector<std::array<bool, 3>>(2, {false, false, false}),
+          "generic Delta kernel optimizations must remain default-off");
+
+  routing::PathfinderOptions optimized_kernel_options =
+      parallel_delta_options;
+  optimized_kernel_options.delta_force_generic = true;
+  optimized_kernel_options.delta_verified_unit_weight_load_elision = true;
+  optimized_kernel_options.delta_host_value_frontier_count = true;
+  optimized_kernel_options.delta_wave_aggregated_queue_reservations = true;
+  clear_recorded_delta_workspace_options();
+  const routing::PathfinderResult optimized_kernel_result =
+      routing::run_pathfinder(congestion_graph,
+                              congestion_metadata,
+                              optimized_kernel_options,
+                              nullptr);
+  require(optimized_kernel_result.routed &&
+              recorded_delta_kernel_optimization_flags() ==
+                  std::vector<std::array<bool, 3>>(
+                      2, {true, true, true}),
+          "PathFinder did not forward all generic kernel A/B controls");
 
   routing::PathfinderOptions reduced_controller_options =
       parallel_delta_options;

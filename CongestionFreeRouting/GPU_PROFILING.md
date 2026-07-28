@@ -800,3 +800,178 @@ report dispatch, `hipStreamSynchronize`, `hipMemcpyAsync`, and
 concurrency from zero through four active streams; top-kernel additive times;
 controller/queue telemetry; and peak tracked GPU memory. Overlapping additive
 kernel durations are not wall time.
+
+## AMD validation checklist for host-checked relaxation A/B paths
+
+The machine that implemented these paths had no `hipcc`, ROCm runtime, or AMD
+GPU. The commands below are documentation for a later gfx1151 run, not a local
+validation claim. They leave the reduced controller untouched and explicitly
+select `host-checked` in every performance cell.
+
+Build the production HIP router and the complete Delta correctness suite from
+the repository root:
+
+```bash
+set -euo pipefail
+mkdir -p amd-validation/bin amd-validation/logs \
+  amd-validation/results amd-validation/work amd-validation/timing
+
+make clean
+make ./PathFinderFile ./pathfinder
+
+hipcc -std=c++17 -O2 -pthread -x hip \
+  -I HIP_kernel/bellman_ford/src \
+  -I CongestionFreeRouting/delta_stepping \
+  CongestionFreeRouting/tests/delta_stepping_hip_test.cpp \
+  CongestionFreeRouting/delta_stepping/delta_stepping_hip_CSR.cpp \
+  -o amd-validation/bin/delta_stepping_hip_test
+```
+
+Run the suite once, then repeat the four-explicit-stream reuse stress. The
+suite's optimization matrix covers all eight new-flag combinations plus
+nonunit, wide-row, generation, telemetry, and legacy-parent fallbacks, and it
+compares target distance/source/node path/edge path and outgoing-row edge
+identity with the CPU reference:
+
+```bash
+./amd-validation/bin/delta_stepping_hip_test \
+  2>&1 | tee amd-validation/logs/delta-relaxation-matrix.log
+
+DELTA_MULTI_QUEUE_STRESS_RUNS=1200 \
+  ./amd-validation/bin/delta_stepping_hip_test \
+  2>&1 | tee amd-validation/logs/delta-relaxation-four-stream-stress.log
+```
+
+Create cumulative, separately reviewable host-checked end-to-end cells. All
+use four workers, numeric `delta=1`, force classic generic Delta, and telemetry
+off. The fourth flag requires the first because the wave kernel also elides
+the proved-unit load:
+
+```bash
+run_delta_relaxation_cell() {
+  local cell="$1"
+  local extra_flags="$2"
+  rm -f logicnets_jscl_PathFinderFile.phys \
+    logicnets_jscl_PathFinderFile.phys.log \
+    logicnets_jscl_PathFinderFile.check \
+    logicnets_jscl_PathFinderFile.check.log \
+    logicnets_jscl_PathFinderFile.wirelength
+  make ROUTER=PathFinderFile BENCHMARKS="logicnets_jscl" VERBOSE=1 \
+    PATHFINDER_SSSP_ENGINE=delta-step \
+    PATHFINDER_ARGS="--delta 1 --delta-force-generic \
+      --delta-controller host-checked --parallel-net-workers 4 \
+      --strict-routing --work-dir amd-validation/work/${cell} \
+      ${extra_flags}" \
+    run-PathFinderFile \
+    2>&1 | tee "amd-validation/logs/${cell}.log"
+  test "$(cat logicnets_jscl_PathFinderFile.check)" = PASS
+  cp logicnets_jscl_PathFinderFile.phys \
+    "amd-validation/results/${cell}.phys"
+  cp logicnets_jscl_PathFinderFile.wirelength \
+    "amd-validation/results/${cell}.wirelength"
+}
+
+run_delta_relaxation_cell delta-relax-baseline ""
+run_delta_relaxation_cell delta-relax-unit \
+  "--delta-unit-weight-load-elision"
+run_delta_relaxation_cell delta-relax-host-count \
+  "--delta-unit-weight-load-elision --delta-host-value-frontier-count"
+run_delta_relaxation_cell delta-relax-wave \
+  "--delta-unit-weight-load-elision --delta-host-value-frontier-count \
+   --delta-wave-queue-reservations"
+
+cmp amd-validation/results/delta-relax-baseline.wirelength \
+    amd-validation/results/delta-relax-unit.wirelength
+cmp amd-validation/results/delta-relax-baseline.wirelength \
+    amd-validation/results/delta-relax-host-count.wirelength
+cmp amd-validation/results/delta-relax-baseline.wirelength \
+    amd-validation/results/delta-relax-wave.wirelength
+```
+
+The low-level suite is the exact path-equivalence gate; the contest checker
+and wirelength comparisons are additional end-to-end gates. Do not accept a
+timing cell merely because its `.phys` file exists.
+
+After one warm-up per cell, collect five profiler-free samples with the same
+function and inputs. The output of `/usr/bin/time -p` is the end-to-end timing
+record; report every sample and the median rather than only the best run:
+
+```bash
+export -f run_delta_relaxation_cell
+for cell in baseline unit host-count wave; do
+  case "$cell" in
+    baseline) flags="" ;;
+    unit) flags="--delta-unit-weight-load-elision" ;;
+    host-count) flags="--delta-unit-weight-load-elision --delta-host-value-frontier-count" ;;
+    wave) flags="--delta-unit-weight-load-elision --delta-host-value-frontier-count --delta-wave-queue-reservations" ;;
+  esac
+  run_delta_relaxation_cell "timing-${cell}-warmup" "$flags"
+  for run in 1 2 3 4 5; do
+    /usr/bin/time -p \
+      -o "amd-validation/timing/${cell}-${run}.txt" \
+      bash -c 'run_delta_relaxation_cell "$1" "$2"' _ \
+      "timing-${cell}-${run}" "$flags"
+  done
+done
+```
+
+Because shell functions are not inherited by the nested `bash -c` by default,
+run `export -f run_delta_relaxation_cell` immediately before that timing loop.
+On shells without exported functions, place the function in a checked script
+and invoke that script instead.
+
+Run telemetry separately; telemetry intentionally makes the telemetry-off
+load/wave specializations ineligible, so this is a correctness and dispatch
+audit, not a timing cell:
+
+```bash
+run_delta_relaxation_cell delta-relax-telemetry \
+  "--delta-unit-weight-load-elision --delta-host-value-frontier-count \
+   --delta-wave-queue-reservations --delta-telemetry"
+
+grep '^{"type":"delta_stepping_telemetry"' \
+  amd-validation/logs/delta-relax-telemetry.log \
+  > amd-validation/results/delta-relax-telemetry.json
+grep -q '"controller_mode":"host_checked"' \
+  amd-validation/results/delta-relax-telemetry.json
+grep -q '"effective_controller_modes":{"host_checked":' \
+  amd-validation/results/delta-relax-telemetry.json
+grep -q '"controller_fallback_queries":0' \
+  amd-validation/results/delta-relax-telemetry.json
+grep -q '"requested_unit_weight_load_elision":true' \
+  amd-validation/results/delta-relax-telemetry.json
+grep -q '"requested_host_value_frontier_count":true' \
+  amd-validation/results/delta-relax-telemetry.json
+grep -q '"requested_wave_queue_reservations":true' \
+  amd-validation/results/delta-relax-telemetry.json
+```
+
+Finally reprofile baseline and cumulative wave cells with System SOL. The
+Makefile adapter profiles only the inner `pathfinder` process. Keep telemetry
+off and retain the raw rocprof-compute directories:
+
+```bash
+make ROUTER=PathFinderFile BENCHMARKS="logicnets_jscl" VERBOSE=1 \
+  PATHFINDER_SSSP_ENGINE=delta-step \
+  PATHFINDER_ARGS="--delta 1 --delta-force-generic \
+    --delta-controller host-checked --parallel-net-workers 4" \
+  PATHFINDER_PROFILE=rocprof-compute \
+  PATHFINDER_PROFILE_RUN=delta-relax-baseline-sol
+
+make ROUTER=PathFinderFile BENCHMARKS="logicnets_jscl" VERBOSE=1 \
+  PATHFINDER_SSSP_ENGINE=delta-step \
+  PATHFINDER_ARGS="--delta 1 --delta-force-generic \
+    --delta-controller host-checked --parallel-net-workers 4 \
+    --delta-unit-weight-load-elision \
+    --delta-host-value-frontier-count \
+    --delta-wave-queue-reservations" \
+  PATHFINDER_PROFILE=rocprof-compute \
+  PATHFINDER_PROFILE_RUN=delta-relax-wave-sol
+```
+
+Filter the reports to the scalar and wave32 relaxation kernels and compare:
+cumulative relaxation time, Wait for Any/wave dependency wait, GL1/L2 hit
+rates, L2 atomic requests, IPC, occupancy, and barrier wait. Treat “Wait for
+Counter” as an intensity, not an additive percentage. Also confirm logs and
+telemetry never report `reduced_round_trip`; that controller must remain
+opt-in and must not be credited for any host-checked result.

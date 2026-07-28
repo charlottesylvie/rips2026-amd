@@ -315,6 +315,9 @@ void validate_options(const PathfinderOptions& options) {
   if (options.sssp_engine != SsspEngine::kDeltaStep) {
     if (options.delta_force_generic ||
         options.delta_force_legacy_parent ||
+        options.delta_verified_unit_weight_load_elision ||
+        options.delta_host_value_frontier_count ||
+        options.delta_wave_aggregated_queue_reservations ||
         options.delta_telemetry ||
         options.delta_auto ||
         options.delta_multiplier != 1.0f ||
@@ -1794,6 +1797,12 @@ std::string delta_telemetry_aggregate_json(
       << (options.delta_force_generic ? "true" : "false")
       << ",\"force_legacy_parent\":"
       << (options.delta_force_legacy_parent ? "true" : "false")
+      << ",\"requested_unit_weight_load_elision\":"
+      << (options.delta_verified_unit_weight_load_elision ? "true" : "false")
+      << ",\"requested_host_value_frontier_count\":"
+      << (options.delta_host_value_frontier_count ? "true" : "false")
+      << ",\"requested_wave_queue_reservations\":"
+      << (options.delta_wave_aggregated_queue_reservations ? "true" : "false")
       << ",\"controller_mode\":\""
       << (options.delta_controller_mode ==
                   DeltaSteppingCsrControllerMode::kReducedRoundTrip
@@ -2089,6 +2098,12 @@ void print_usage(const char* program) {
       << "  --max-sssp-iters <int>          Delta rounds, BFS depth, or Bellman-Ford rounds; -1 for default.\n"
       << "  --delta-force-generic           Bypass exact-unit specialization; retain weights and delta.\n"
       << "  --delta-force-legacy-parent     Force generic Delta predecessor recovery for A/B comparison.\n"
+      << "  --delta-unit-weight-load-elision\n"
+      << "                                  Elide generic light-edge loads only with an exact uploaded-value proof.\n"
+      << "  --delta-host-value-frontier-count\n"
+      << "                                  Pass authoritative host counts on eligible explicit-stream launches.\n"
+      << "  --delta-wave-queue-reservations\n"
+      << "                                  Aggregate eligible generic queue reservations on wave32.\n"
       << "  --delta-controller <host-checked|reduced-round-trip>\n"
       << "                                  Generic Delta controller. Default: host-checked\n"
       << "  --delta-controller-batch-size <positive-int>\n"
@@ -2658,6 +2673,12 @@ PathfinderResult run_pathfinder(const HostCsrF32& base_graph,
           delta_options.delta_controller_mode;
       workspace_options.controller_batch_size =
           delta_options.delta_controller_batch_size;
+      workspace_options.verified_unit_weight_load_elision =
+          delta_options.delta_verified_unit_weight_load_elision;
+      workspace_options.host_value_frontier_count =
+          delta_options.delta_host_value_frontier_count;
+      workspace_options.wave_aggregated_queue_reservations =
+          delta_options.delta_wave_aggregated_queue_reservations;
       workspace_options.capacity_hints = query_capacity_hints;
       if (workspace_options.execution_mode ==
           DeltaSteppingCsrExecutionMode::kForceGeneric) {
@@ -3071,6 +3092,12 @@ int main(int argc, char** argv) {
         options.delta_force_legacy_parent = true;
       } else if (option == "--delta-force-generic") {
         options.delta_force_generic = true;
+      } else if (option == "--delta-unit-weight-load-elision") {
+        options.delta_verified_unit_weight_load_elision = true;
+      } else if (option == "--delta-host-value-frontier-count") {
+        options.delta_host_value_frontier_count = true;
+      } else if (option == "--delta-wave-queue-reservations") {
+        options.delta_wave_aggregated_queue_reservations = true;
       } else if (option == "--delta-controller") {
         options.delta_controller_mode =
             routing::parse_delta_controller_arg(

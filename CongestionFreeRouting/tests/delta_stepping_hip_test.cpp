@@ -3183,6 +3183,132 @@ void test_wave_boundary_contention(hipStream_t stream) {
   }
 }
 
+void test_profiled_generic_kernel_optimization_matrix(hipStream_t stream) {
+  const HostCsrF32 unit_graph = make_outgoing_csr(
+      14,
+      {{0, 1, 1.0f}, {0, 2, 1.0f}, {0, 3, 1.0f},
+       {0, 4, 1.0f}, {0, 5, 1.0f}, {0, 6, 1.0f},
+       {1, 7, 1.0f}, {2, 7, 1.0f}, {3, 7, 1.0f},
+       {4, 7, 1.0f}, {5, 7, 1.0f}, {6, 7, 1.0f},
+       {1, 8, 1.0f}, {1, 8, 1.0f}, {2, 9, 1.0f},
+       {7, 10, 1.0f}, {8, 10, 1.0f}, {9, 10, 1.0f},
+       {10, 11, 1.0f}, {11, 12, 1.0f}});
+  const std::vector<int> sources = {0, 0, 13};
+  const std::vector<int> targets = {12, 10, 8, 13, 6, 12};
+  const std::vector<float> expected =
+      cpu_dijkstra_outgoing_multi_source(unit_graph, sources);
+
+  for (unsigned int mask = 0; mask < 8; ++mask) {
+    DeltaSteppingCsrWorkspaceOptions options;
+    options.execution_mode = DeltaSteppingCsrExecutionMode::kForceGeneric;
+    options.verified_unit_weight_load_elision = (mask & 1U) != 0;
+    options.host_value_frontier_count = (mask & 2U) != 0;
+    options.wave_aggregated_queue_reservations = (mask & 4U) != 0;
+    DeltaSteppingCsrWorkspace workspace(unit_graph, stream, options);
+    const DeltaSteppingCsrResult result = workspace.run(
+        sources, targets, 4.0f, -1, stream, nullptr, nullptr);
+    validate_compact_target_paths(
+        "profiled generic optimization mask " + std::to_string(mask),
+        unit_graph, sources, targets, expected, result);
+    const DeltaSteppingCsrResult reused = workspace.run(
+        std::vector<int>{6}, std::vector<int>{12, 7, 13}, 4.0f, -1,
+        stream, nullptr, nullptr);
+    validate_compact_target_paths(
+        "profiled generic optimization reuse " + std::to_string(mask),
+        unit_graph, {6}, {12, 7, 13},
+        cpu_dijkstra_outgoing_multi_source(unit_graph, {6}), reused);
+  }
+
+  DeltaSteppingCsrWorkspaceOptions all_enabled;
+  all_enabled.execution_mode = DeltaSteppingCsrExecutionMode::kForceGeneric;
+  all_enabled.verified_unit_weight_load_elision = true;
+  all_enabled.host_value_frontier_count = true;
+  all_enabled.wave_aggregated_queue_reservations = true;
+
+  HostCsrF32 nonunit_graph = unit_graph;
+  nonunit_graph.values[3] = 1.25f;
+  nonunit_graph.values[4] = 0.0f;
+  DeltaSteppingCsrWorkspace nonunit(nonunit_graph, stream, all_enabled);
+  validate_compact_target_paths(
+      "nonunit proof fallback", nonunit_graph, sources, targets,
+      cpu_dijkstra_outgoing_multi_source(nonunit_graph, sources),
+      nonunit.run(sources, targets, 1.0f, -1, stream, nullptr, nullptr));
+
+  DeltaSteppingCsrWorkspace vertex_cost_workspace(
+      unit_graph, stream, all_enabled);
+  std::vector<float> vertex_costs(unit_graph.rows, 1.0f);
+  vertex_costs[7] = 2.0f;
+  vertex_costs[10] = 0.5f;
+  vertex_cost_workspace.update_vertex_costs(vertex_costs, stream);
+  validate_compact_target_paths(
+      "vertex-cost optimization fallback", unit_graph, sources, targets,
+      cpu_dijkstra_outgoing_multi_source(
+          unit_graph, sources, &vertex_costs),
+      vertex_cost_workspace.run(
+          sources, targets, 1.0f, -1, stream, nullptr, nullptr),
+      &vertex_costs);
+
+  DeltaSteppingCsrWorkspace distances_only(unit_graph, stream, all_enabled);
+  validate_distances_only_result(
+      "distances-only optimization fallback", expected,
+      distances_only.run_distances(
+          sources, 4.0f, -1, stream, nullptr, nullptr));
+
+  DeltaSteppingCsrWorkspaceOptions wide_options = all_enabled;
+  DeltaSteppingCsrGraphOptions wide_graph_options;
+  wide_graph_options.offset_mode = DeltaSteppingCsrOffsetMode::kForce64Bit;
+  auto wide_graph = std::make_shared<DeltaSteppingCsrGraph>(
+      unit_graph, stream, wide_graph_options);
+  DeltaSteppingCsrWorkspace wide(wide_graph, stream, wide_options);
+  validate_compact_target_paths(
+      "wide-row-offset optimization fallback", unit_graph, sources, targets,
+      expected,
+      wide.run(sources, targets, 4.0f, -1, stream, nullptr, nullptr));
+
+  DeltaSteppingCsrWorkspaceOptions generation_options = all_enabled;
+  generation_options.current_membership_mode =
+      DeltaSteppingCsrCurrentMembershipMode::kGeneration;
+  DeltaSteppingCsrWorkspace generation(unit_graph, stream,
+                                       generation_options);
+  validate_compact_target_paths(
+      "generation-membership optimization fallback", unit_graph, sources,
+      targets, expected,
+      generation.run(sources, targets, 4.0f, -1, stream, nullptr, nullptr));
+
+  DeltaSteppingCsrWorkspaceOptions reduced_options = all_enabled;
+  reduced_options.controller_mode =
+      DeltaSteppingCsrControllerMode::kReducedRoundTrip;
+  reduced_options.controller_batch_size = 4;
+  DeltaSteppingCsrWorkspace reduced(unit_graph, stream, reduced_options);
+  validate_compact_target_paths(
+      "reduced-controller optimization fallback", unit_graph, sources,
+      targets, expected,
+      reduced.run(sources, targets, 4.0f, -1, stream, nullptr, nullptr));
+
+  DeltaSteppingCsrWorkspace telemetry_workspace(
+      unit_graph, stream, all_enabled);
+  DeltaSteppingCsrTelemetry telemetry;
+  const DeltaSteppingCsrResult telemetry_result = telemetry_workspace.run(
+      sources, targets, 4.0f, -1, DeltaSteppingCsrRunOptions{&telemetry},
+      stream, nullptr, nullptr);
+  validate_compact_target_paths(
+      "telemetry optimization fallback", unit_graph, sources, targets,
+      expected, telemetry_result);
+  require(telemetry.collected && telemetry.completed &&
+              telemetry.execution_path ==
+                  DeltaSteppingCsrExecutionPath::kCompactGeneric,
+          "optimization fallback did not retain generic telemetry");
+
+  DeltaSteppingCsrWorkspaceOptions legacy_options = all_enabled;
+  legacy_options.parent_mode = DeltaSteppingCsrParentMode::kForceLegacy;
+  DeltaSteppingCsrWorkspace legacy(unit_graph, stream, legacy_options);
+  const DeltaSteppingCsrResult legacy_result = legacy.run(
+      sources, targets, 4.0f, -1, stream, nullptr, nullptr);
+  validate_compact_target_paths(
+      "legacy-parent optimization fallback", unit_graph, sources, targets,
+      expected, legacy_result);
+}
+
 void test_shared_graph_workspaces(hipStream_t construction_stream) {
   const HostCsrF32 graph = make_weighted_corner_graph();
   auto shared_graph =
@@ -3866,6 +3992,7 @@ int main() {
     test_capped_tentative_target_filtering(stream.get());
     test_callback_exception_cleanup(stream.get());
     test_wave_boundary_contention(stream.get());
+    test_profiled_generic_kernel_optimization_matrix(stream.get());
     test_shared_graph_workspaces(stream.get());
     test_parallel_divergent_workspaces(stream.get());
     test_parallel_deep_wide_explicit_streams();

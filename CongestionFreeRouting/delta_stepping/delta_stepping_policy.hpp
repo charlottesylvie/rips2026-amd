@@ -1,8 +1,10 @@
 #pragma once
 
 #include <algorithm>
+#include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
 #include <limits>
 #include <stdexcept>
 #include <type_traits>
@@ -70,6 +72,230 @@ inline std::uint32_t delta_stepping_effective_controller_batch_size(
   return policy.mode == DeltaSteppingCsrControllerMode::kHostChecked
              ? std::uint32_t{1}
              : policy.batch_size;
+}
+
+// A verified proof is tied to the exact host value payload that was (or will
+// be) uploaded.  The fingerprint is not used to infer that weights are unit;
+// verification always performs the exact element scan first.  Rechecking the
+// payload before accepting a retained proof makes stale metadata fail closed.
+struct DeltaSteppingCsrUnitWeightProof {
+  bool verified = false;
+  std::size_t value_count = 0;
+  std::uint64_t fingerprint = 0;
+};
+
+inline std::uint64_t delta_stepping_edge_value_fingerprint(
+    const std::vector<float>& values) noexcept {
+  std::uint64_t hash = UINT64_C(1469598103934665603);
+  for (const float value : values) {
+    std::uint32_t bits = 0;
+    static_assert(sizeof(bits) == sizeof(value),
+                  "float fingerprint requires 32-bit float storage");
+    std::memcpy(&bits, &value, sizeof(bits));
+    for (int byte = 0; byte < 4; ++byte) {
+      hash ^= static_cast<std::uint8_t>(bits & UINT32_C(0xff));
+      hash *= UINT64_C(1099511628211);
+      bits >>= 8;
+    }
+  }
+  return hash;
+}
+
+inline DeltaSteppingCsrUnitWeightProof
+delta_stepping_make_unit_weight_proof(
+    const std::vector<float>& values) noexcept {
+  DeltaSteppingCsrUnitWeightProof proof;
+  proof.value_count = values.size();
+  proof.fingerprint = delta_stepping_edge_value_fingerprint(values);
+  proof.verified = std::all_of(values.begin(), values.end(), [](float value) {
+    return value == 1.0f;
+  });
+  return proof;
+}
+
+inline bool delta_stepping_unit_weight_proof_matches(
+    const DeltaSteppingCsrUnitWeightProof& proof,
+    const std::vector<float>& values) noexcept {
+  if (!proof.verified || proof.value_count != values.size()) {
+    return false;
+  }
+  const DeltaSteppingCsrUnitWeightProof current =
+      delta_stepping_make_unit_weight_proof(values);
+  return current.verified && current.fingerprint == proof.fingerprint;
+}
+
+constexpr bool delta_stepping_host_value_frontier_count_eligible(
+    DeltaSteppingCsrControllerMode controller_mode,
+    bool explicit_stream,
+    bool host_count_is_authoritative,
+    std::uint32_t rounds_to_enqueue) noexcept {
+  return controller_mode == DeltaSteppingCsrControllerMode::kHostChecked &&
+         explicit_stream && host_count_is_authoritative &&
+         rounds_to_enqueue == 1;
+}
+
+// The production wave-aggregated kernel is intentionally restricted to the
+// exact measured generic specialization. Any representation or instrumentation
+// change falls back to the established scalar kernel.
+constexpr bool delta_stepping_wave32_relaxation_eligible(
+    bool requested,
+    int wavefront_size,
+    bool compact_row_offsets,
+    DeltaSteppingCsrCurrentMembershipMode membership_mode,
+    bool track_parents,
+    bool compact_edge_parents,
+    bool has_vertex_costs,
+    bool collect_heavy,
+    bool all_edges_light,
+    bool collect_telemetry,
+    DeltaSteppingCsrControllerMode controller_mode,
+    bool verified_unit_weight_payload) noexcept {
+  return requested && wavefront_size == 32 && compact_row_offsets &&
+         membership_mode == DeltaSteppingCsrCurrentMembershipMode::kBoolean &&
+         track_parents && compact_edge_parents && !has_vertex_costs &&
+         !collect_heavy && all_edges_light && !collect_telemetry &&
+         controller_mode == DeltaSteppingCsrControllerMode::kHostChecked &&
+         verified_unit_weight_payload;
+}
+
+constexpr std::size_t kDeltaSteppingCsrNoQueuePosition =
+    std::numeric_limits<std::size_t>::max();
+
+inline std::size_t delta_stepping_checked_queue_reservation(
+    std::size_t base,
+    std::size_t winners,
+    std::size_t capacity) {
+  if (base > capacity || winners > capacity - base) {
+    throw std::overflow_error(
+        "Delta-Stepping wave queue reservation exceeds capacity");
+  }
+  return base + winners;
+}
+
+constexpr std::uint64_t delta_stepping_wave_width_mask(
+    unsigned int wave_width) noexcept {
+  return wave_width == 64
+             ? std::numeric_limits<std::uint64_t>::max()
+             : wave_width == 32 ? UINT64_C(0xffffffff) : UINT64_C(0);
+}
+
+inline std::size_t delta_stepping_ballot_prefix_position(
+    std::uint64_t ballot,
+    unsigned int lane,
+    unsigned int wave_width,
+    std::size_t reservation_base) {
+  const std::uint64_t width_mask =
+      delta_stepping_wave_width_mask(wave_width);
+  if (width_mask == 0 || lane >= wave_width || (ballot & ~width_mask) != 0) {
+    throw std::invalid_argument(
+        "Delta-Stepping ballot does not match its wave width");
+  }
+  const std::uint64_t lane_bit = UINT64_C(1) << lane;
+  if ((ballot & lane_bit) == 0) {
+    return kDeltaSteppingCsrNoQueuePosition;
+  }
+  const std::uint64_t lower_lanes =
+      lane == 0 ? UINT64_C(0) : lane_bit - UINT64_C(1);
+  const std::size_t prefix = static_cast<std::size_t>(
+      __builtin_popcountll(ballot & lower_lanes));
+  if (prefix > std::numeric_limits<std::size_t>::max() - reservation_base) {
+    throw std::overflow_error(
+        "Delta-Stepping ballot prefix position overflows");
+  }
+  return reservation_base + prefix;
+}
+
+struct DeltaSteppingCsrWaveQueueClaim {
+  bool active = false;
+  bool touched = false;
+  bool current = false;
+  bool pending = false;
+};
+
+struct DeltaSteppingCsrCompactParentCandidateModel {
+  float distance = std::numeric_limits<float>::infinity();
+  std::uint32_t edge = std::numeric_limits<std::uint32_t>::max();
+};
+
+inline DeltaSteppingCsrCompactParentCandidateModel
+delta_stepping_select_compact_parent_candidate(
+    DeltaSteppingCsrCompactParentCandidateModel current,
+    DeltaSteppingCsrCompactParentCandidateModel candidate) {
+  if (!std::isfinite(candidate.distance) || candidate.distance < 0.0f) {
+    throw std::invalid_argument(
+        "Delta-Stepping compact parent candidate must be finite and "
+        "nonnegative");
+  }
+  if (candidate.distance < current.distance ||
+      (candidate.distance == current.distance &&
+       candidate.edge < current.edge)) {
+    return candidate;
+  }
+  return current;
+}
+
+struct DeltaSteppingCsrWaveQueuePositions {
+  std::size_t touched = kDeltaSteppingCsrNoQueuePosition;
+  std::size_t current = kDeltaSteppingCsrNoQueuePosition;
+  std::size_t pending = kDeltaSteppingCsrNoQueuePosition;
+};
+
+struct DeltaSteppingCsrWaveQueueReservationModel {
+  std::vector<DeltaSteppingCsrWaveQueuePositions> positions;
+  std::size_t touched_tail = 0;
+  std::size_t current_tail = 0;
+  std::size_t pending_tail = 0;
+};
+
+inline DeltaSteppingCsrWaveQueueReservationModel
+delta_stepping_model_wave_queue_reservations(
+    const std::vector<DeltaSteppingCsrWaveQueueClaim>& claims,
+    unsigned int wave_width,
+    std::size_t touched_tail,
+    std::size_t current_tail,
+    std::size_t pending_tail,
+    std::size_t capacity) {
+  if ((wave_width != 32 && wave_width != 64) ||
+      claims.size() > wave_width) {
+    throw std::invalid_argument(
+        "Delta-Stepping wave reservation model has an invalid width");
+  }
+  std::uint64_t touched_ballot = 0;
+  std::uint64_t current_ballot = 0;
+  std::uint64_t pending_ballot = 0;
+  for (std::size_t lane = 0; lane < claims.size(); ++lane) {
+    const std::uint64_t bit = UINT64_C(1) << lane;
+    if (claims[lane].active && claims[lane].touched) touched_ballot |= bit;
+    if (claims[lane].active && claims[lane].current) current_ballot |= bit;
+    if (claims[lane].active && claims[lane].pending) pending_ballot |= bit;
+  }
+
+  const std::size_t touched_winners =
+      static_cast<std::size_t>(__builtin_popcountll(touched_ballot));
+  const std::size_t current_winners =
+      static_cast<std::size_t>(__builtin_popcountll(current_ballot));
+  const std::size_t pending_winners =
+      static_cast<std::size_t>(__builtin_popcountll(pending_ballot));
+  DeltaSteppingCsrWaveQueueReservationModel model;
+  model.positions.resize(claims.size());
+  model.touched_tail = delta_stepping_checked_queue_reservation(
+      touched_tail, touched_winners, capacity);
+  model.current_tail = delta_stepping_checked_queue_reservation(
+      current_tail, current_winners, capacity);
+  model.pending_tail = delta_stepping_checked_queue_reservation(
+      pending_tail, pending_winners, capacity);
+  for (std::size_t lane = 0; lane < claims.size(); ++lane) {
+    model.positions[lane].touched = delta_stepping_ballot_prefix_position(
+        touched_ballot, static_cast<unsigned int>(lane), wave_width,
+        touched_tail);
+    model.positions[lane].current = delta_stepping_ballot_prefix_position(
+        current_ballot, static_cast<unsigned int>(lane), wave_width,
+        current_tail);
+    model.positions[lane].pending = delta_stepping_ballot_prefix_position(
+        pending_ballot, static_cast<unsigned int>(lane), wave_width,
+        pending_tail);
+  }
+  return model;
 }
 
 // These types deliberately use fixed-width representations: a device may

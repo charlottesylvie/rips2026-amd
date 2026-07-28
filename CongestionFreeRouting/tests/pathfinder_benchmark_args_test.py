@@ -68,6 +68,12 @@ def main() -> None:
         "force-generic benchmarking must remain disabled by default",
     )
     require(
+        not defaults.delta_unit_weight_load_elision
+        and not defaults.delta_host_value_frontier_count
+        and not defaults.delta_wave_queue_reservations,
+        "generic kernel optimization controls must remain disabled by default",
+    )
+    require(
         not defaults.delta_telemetry,
         "delta telemetry must remain disabled by default",
     )
@@ -140,6 +146,9 @@ def main() -> None:
             "--delta",
             "0.75",
             "--delta-force-generic",
+            "--delta-unit-weight-load-elision",
+            "--delta-host-value-frontier-count",
+            "--delta-wave-queue-reservations",
             "--delta-telemetry",
             "--delta-telemetry",
             "--delta-force-legacy-parent",
@@ -158,6 +167,9 @@ def main() -> None:
         == [
             "--use-delta-step",
             "--delta-force-generic",
+            "--delta-unit-weight-load-elision",
+            "--delta-host-value-frontier-count",
+            "--delta-wave-queue-reservations",
             "--delta-telemetry",
             "--delta-force-legacy-parent",
             "--delta",
@@ -218,6 +230,9 @@ def main() -> None:
         ["--delta", "1"],
         ["--delta", "auto", "--delta-multiplier", "2"],
         ["--delta-force-generic"],
+        ["--delta-unit-weight-load-elision"],
+        ["--delta-host-value-frontier-count"],
+        ["--delta-wave-queue-reservations"],
         ["--delta-telemetry"],
         ["--delta-force-legacy-parent"],
         ["--delta-controller", "host-checked"],
