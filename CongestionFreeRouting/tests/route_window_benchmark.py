@@ -160,6 +160,10 @@ def aggregate_telemetry(records: list[dict[str, Any]]) -> dict[str, Any]:
     return {
         "record_count": len(records),
         "queries_by_kind": dict(sorted(by_kind.items())),
+        "bounded_attempts": by_kind["window"],
+        "verification_sssp_queries": by_kind["verification"],
+        "fallback_count": by_kind["fallback"],
+        "rejected_edges": totals["window_rejected_edges"],
         "execution_paths": dict(sorted(execution_paths.items())),
         "totals": dict(sorted(totals.items())),
     }

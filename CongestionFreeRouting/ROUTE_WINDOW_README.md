@@ -2,9 +2,16 @@
 
 Route windows are an opt-in Delta-Stepping optimization.  They never change
 PathFinder's shortest-path result: a bounded path is only an incumbent, and
-each reached target is checked by an unbounded query with an exclusive distance
-limit equal to that incumbent's cost.  A strictly cheaper global path replaces
-it; no result below the limit proves the bounded path is globally optimal.
+every reached target set is checked by one unbounded multi-target query.  Its
+exclusive distance limit is the largest bounded incumbent cost.  A target is
+replaced only by a strictly cheaper global path; equal-cost and more-expensive
+verification paths retain the bounded incumbent.
+
+The single verification explores every path below that largest incumbent.  As
+each target's incumbent is no larger than the limit, any path cheaper than that
+target is included.  Thus batching is equivalent to checking every sink below
+its own incumbent cost, while avoiding one SSSP launch and CPU/GPU result
+synchronization per sink.
 
 ```text
 pathfinder graph.csrbin graph.ifmeta.bin --sssp-engine delta-step \
@@ -56,8 +63,10 @@ bounded attempt, unbounded baseline, verification, and fallback.  Records
 include the attempt number, box, retry/verification reason, reached and
 unreached target counts, rejected edges, unknown-coordinate count, and whether
 global-cost verification was required, plus the selected execution path.  A
-successful bounded attempt is always followed by one verification record per
-target.
+successful bounded multi-target attempt is always followed by exactly one
+verification record.  On a verification record, `target_count` is the full
+target set and `reached_target_count` counts only targets with strictly cheaper
+replacement paths; `unreached_target_count` counts retained incumbents.
 
 ## Reproducible speed benchmark
 
@@ -83,7 +92,12 @@ greater than one means the complete safe windowed flow was faster.  The result
 includes global-cost verification and any fallback work, so it is not a
 misleading bounded-query-only number.  Use `--window-net-list` to benchmark a
 selected JSONL net subset, or the `--window-*-margin` options to evaluate a
-specific margin schedule.
+specific margin schedule.  The telemetry-enabled runs are diagnostic: use a
+matching run without `--route-window-stats-out` for production timing, keeping
+the Delta configuration and execution path (exact-unit or generic) identical.
+Each telemetry summary also exposes bounded attempts, verification SSSP queries,
+fallback count, rejected edges, and execution-path counts alongside the median
+end-to-end time.
 
 The benchmark harness itself can be smoke-tested without HIP or routing data:
 

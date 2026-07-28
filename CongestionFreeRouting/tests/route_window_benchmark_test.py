@@ -72,6 +72,12 @@ def main() -> int:
                 "benchmark did not retain window telemetry")
         require(telemetry[0]["queries_by_kind"]["verification"] == 1,
                 "benchmark did not retain verification telemetry")
+        require(telemetry[0]["bounded_attempts"] == 1 and
+                telemetry[0]["verification_sssp_queries"] == 1 and
+                telemetry[0]["fallback_count"] == 0 and
+                telemetry[0]["rejected_edges"] == 4 and
+                telemetry[0]["execution_paths"] == {"unit": 2},
+                "benchmark did not expose route-window performance counters")
     print("Route-window benchmark test passed")
     return 0
 

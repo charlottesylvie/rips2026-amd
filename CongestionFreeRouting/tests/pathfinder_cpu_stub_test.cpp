@@ -345,6 +345,21 @@ routing::RoutingMetadata make_window_metadata(
   return metadata;
 }
 
+routing::RoutingMetadata make_window_metadata_with_sinks(
+    const HostCsrF32& graph,
+    const std::vector<DeltaSteppingCsrNodeBounds>& bounds,
+    int source,
+    const std::vector<int>& sinks) {
+  routing::RoutingMetadata metadata =
+      make_window_metadata(graph, bounds, source, sinks.front());
+  routing::RouteRequest& request = metadata.route_requests.front();
+  request.sinks.clear();
+  for (const int sink : sinks) {
+    request.sinks.push_back({sink, 0, 0});
+  }
+  return metadata;
+}
+
 }  // namespace
 
 struct BellmanFord10CsrGraph::Impl {
@@ -1185,6 +1200,113 @@ int main() {
               cheaper_outside_result.nets[0].sinks[0].nodes ==
                   std::vector<int>({0, 2, 3}),
           "a reachable but nonoptimal window path must be replaced globally");
+
+  // A successful multi-sink bounded attempt performs one batched global
+  // verification.  The first target has a finite equal-cost path outside the
+  // box and the second is at the exclusive limit; both bounded incumbents
+  // must be retained.
+  HostCsrF32 multi_sink_retained_graph;
+  multi_sink_retained_graph.rows = 7;
+  multi_sink_retained_graph.cols = 7;
+  multi_sink_retained_graph.nnz = 7;
+  multi_sink_retained_graph.rowptr = {0, 3, 4, 5, 6, 6, 7, 7};
+  multi_sink_retained_graph.colind = {1, 2, 3, 4, 4, 5, 6};
+  multi_sink_retained_graph.values =
+      {1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f};
+  const std::vector<DeltaSteppingCsrNodeBounds> multi_sink_retained_bounds = {
+      {0, 0, 0, 0, 1}, {100, 100, 0, 0, 1}, {1, 1, 0, 0, 1},
+      {2, 2, 0, 0, 1}, {4, 4, 0, 0, 1}, {3, 3, 0, 0, 1},
+      {6, 6, 0, 0, 1}};
+  routing::PathfinderOptions multi_sink_retained_options =
+      adaptive_window_options();
+  multi_sink_retained_options.route_window_stats_out_path =
+      "/tmp/pathfinder_multi_sink_retained_stats.jsonl";
+  g_multisource_delta_calls = 0;
+  const routing::PathfinderResult multi_sink_retained_result =
+      routing::run_pathfinder(
+          multi_sink_retained_graph,
+          make_window_metadata_with_sinks(multi_sink_retained_graph,
+                                          multi_sink_retained_bounds, 0,
+                                          std::vector<int>{4, 6}),
+          multi_sink_retained_options, nullptr);
+  std::ifstream multi_sink_retained_stats_file(
+      multi_sink_retained_options.route_window_stats_out_path);
+  const std::string multi_sink_retained_stats(
+      (std::istreambuf_iterator<char>(multi_sink_retained_stats_file)),
+      std::istreambuf_iterator<char>());
+  const std::string verification_kind = "\"kind\":\"verification\"";
+  const std::size_t retained_verification =
+      multi_sink_retained_stats.find(verification_kind);
+  require(multi_sink_retained_result.routed &&
+              multi_sink_retained_result.nets[0].sinks[0].distance == 2.0f &&
+              multi_sink_retained_result.nets[0].sinks[0].nodes ==
+                  std::vector<int>({0, 2, 4}) &&
+              multi_sink_retained_result.nets[0].sinks[1].distance == 3.0f &&
+              multi_sink_retained_result.nets[0].sinks[1].nodes ==
+                  std::vector<int>({0, 3, 5, 6}) &&
+              g_multisource_delta_calls == 2 &&
+              retained_verification != std::string::npos &&
+              multi_sink_retained_stats.find(
+                  verification_kind,
+                  retained_verification + verification_kind.size()) ==
+                  std::string::npos &&
+              multi_sink_retained_stats.find(
+                  "\"kind\":\"verification\",\"fallback_triggered\":false,"
+                  "\"attempt\":1,\"reason\":\"verification_no_cheaper_path\",") !=
+                  std::string::npos &&
+              multi_sink_retained_stats.find("\"target_count\":2") !=
+                  std::string::npos,
+          "multi-sink bounded candidates should be retained after one batched verification");
+
+  // One target has a cheaper route outside the zero-margin endpoint box while
+  // the other is already globally shortest.  Batched verification replaces
+  // only the strictly cheaper target.
+  HostCsrF32 multi_sink_mixed_graph;
+  multi_sink_mixed_graph.rows = 6;
+  multi_sink_mixed_graph.cols = 6;
+  multi_sink_mixed_graph.nnz = 6;
+  multi_sink_mixed_graph.rowptr = {0, 3, 4, 5, 5, 6, 6};
+  multi_sink_mixed_graph.colind = {1, 2, 4, 3, 5, 3};
+  multi_sink_mixed_graph.values = {5.0f, 1.0f, 1.0f, 5.0f, 1.0f, 1.0f};
+  const std::vector<DeltaSteppingCsrNodeBounds> multi_sink_mixed_bounds = {
+      {0, 0, 0, 0, 1}, {1, 1, 0, 0, 1}, {2, 2, 0, 0, 1},
+      {3, 3, 0, 0, 1}, {100, 100, 0, 0, 1}, {5, 5, 0, 0, 1}};
+  routing::PathfinderOptions multi_sink_mixed_options =
+      adaptive_window_options();
+  multi_sink_mixed_options.route_window_stats_out_path =
+      "/tmp/pathfinder_multi_sink_mixed_stats.jsonl";
+  g_multisource_delta_calls = 0;
+  const routing::PathfinderResult multi_sink_mixed_result =
+      routing::run_pathfinder(
+          multi_sink_mixed_graph,
+          make_window_metadata_with_sinks(multi_sink_mixed_graph,
+                                          multi_sink_mixed_bounds, 0,
+                                          std::vector<int>{3, 5}),
+          multi_sink_mixed_options, nullptr);
+  std::ifstream multi_sink_mixed_stats_file(
+      multi_sink_mixed_options.route_window_stats_out_path);
+  const std::string multi_sink_mixed_stats(
+      (std::istreambuf_iterator<char>(multi_sink_mixed_stats_file)),
+      std::istreambuf_iterator<char>());
+  const std::size_t mixed_verification =
+      multi_sink_mixed_stats.find(verification_kind);
+  require(multi_sink_mixed_result.routed &&
+              multi_sink_mixed_result.nets[0].sinks[0].distance == 2.0f &&
+              multi_sink_mixed_result.nets[0].sinks[0].nodes ==
+                  std::vector<int>({0, 4, 3}) &&
+              multi_sink_mixed_result.nets[0].sinks[1].distance == 2.0f &&
+              multi_sink_mixed_result.nets[0].sinks[1].nodes ==
+                  std::vector<int>({0, 2, 5}) &&
+              g_multisource_delta_calls == 2 &&
+              mixed_verification != std::string::npos &&
+              multi_sink_mixed_stats.find(
+                  verification_kind,
+                  mixed_verification + verification_kind.size()) ==
+                  std::string::npos &&
+              multi_sink_mixed_stats.find(
+                  "\"reason\":\"verification_some_targets_cheaper\"") !=
+                  std::string::npos,
+          "batched verification should replace only strictly cheaper multi-sink paths");
 
   // The first zero-margin box misses the bridge; one geometric expansion is
   // required before the target can be found.

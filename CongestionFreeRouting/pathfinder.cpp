@@ -1067,7 +1067,9 @@ RoutedNet route_net(const HostCsrF32& graph,
     delta_telemetry->reserve(2);
   }
   if (route_window_stats != nullptr) {
-    route_window_stats->reserve(2 + request.sinks.size());
+    // A successful bounded attempt contributes one window record and one
+    // batched verification record, regardless of the number of targets.
+    route_window_stats->reserve(3);
   }
 
   std::vector<int> source_candidates;
@@ -1275,35 +1277,53 @@ RoutedNet route_net(const HostCsrF32& graph,
       append_query_record(RouteWindowQueryKind::kWindow, route_window,
                           attempt_telemetry, initial_targets.size(), 0, attempt,
                           "all_targets_reached_verify", true, false);
-      // Reachability inside a window is not a shortest-path proof.  Query each
-      // target globally below its bounded cost; a finite result is strictly
-      // better and replaces the incumbent, otherwise the window path is safe.
+      // Reachability inside a window is not a shortest-path proof.  The
+      // bounded paths are incumbents.  One unbounded query below the largest
+      // incumbent cost covers every path that could improve any target: each
+      // target's incumbent cost is at most verification_limit.  A result only
+      // replaces its incumbent when it is strictly cheaper, so equal-cost
+      // paths keep the bounded route and its deterministic path selection.
+      float verification_limit = std::numeric_limits<float>::lowest();
+      for (const std::size_t sink_index : initial_target_sink_indices) {
+        verification_limit = std::max(
+            verification_limit, net.sinks[sink_index].distance);
+      }
+      DeltaSteppingCsrTelemetry verification_telemetry;
+      auto verification_sssp = run_sssp_with_optional_delta_telemetry(
+          workspace, source_candidates, initial_targets, options.delta,
+          options.max_sssp_iterations, stream, {},
+          route_window_stats != nullptr,
+          collect_query_telemetry ? &verification_telemetry : nullptr,
+          verification_limit);
+      std::size_t strictly_cheaper_target_count = 0;
       for (std::size_t target_pos = 0;
            target_pos < initial_target_sink_indices.size(); ++target_pos) {
         const std::size_t sink_index = initial_target_sink_indices[target_pos];
         const float incumbent_cost = net.sinks[sink_index].distance;
-        DeltaSteppingCsrTelemetry verification_telemetry;
-        auto verification_sssp = run_sssp_with_optional_delta_telemetry(
-            workspace, source_candidates,
-            std::vector<int>{request.sinks[sink_index].node}, options.delta,
-            options.max_sssp_iterations, stream, {},
-            route_window_stats != nullptr,
-            collect_query_telemetry ? &verification_telemetry : nullptr,
-            incumbent_cost);
         RoutedSink better_candidate;
-        const bool found_cheaper = extract_routed_sink_candidate(
-            graph, verification_sssp, 0, 1, request.sinks[sink_index].node,
-            tree_seen, tree_stamp, &better_candidate);
-        if (found_cheaper) {
+        const bool found_verification_path = extract_routed_sink_candidate(
+            graph, verification_sssp, target_pos, initial_targets.size(),
+            request.sinks[sink_index].node, tree_seen, tree_stamp,
+            &better_candidate);
+        if (found_verification_path &&
+            better_candidate.distance < incumbent_cost) {
           net.sinks[sink_index] = std::move(better_candidate);
+          ++strictly_cheaper_target_count;
         }
-        append_query_record(RouteWindowQueryKind::kVerification, {},
-                            verification_telemetry, 1, found_cheaper ? 0 : 1,
-                            attempt,
-                            found_cheaper ? "verification_cheaper_path"
-                                         : "verification_no_cheaper_path",
-                            true, false);
       }
+      const char* verification_reason =
+          strictly_cheaper_target_count == 0
+              ? "verification_no_cheaper_path"
+              : strictly_cheaper_target_count == initial_targets.size()
+                    ? "verification_all_targets_cheaper"
+                    : "verification_some_targets_cheaper";
+      // For verification records, reached_target_count denotes targets with a
+      // strictly cheaper path.  This preserves the old per-target record
+      // meaning while one record now represents the entire target set.
+      append_query_record(RouteWindowQueryKind::kVerification, {},
+                          verification_telemetry, initial_targets.size(),
+                          initial_targets.size() - strictly_cheaper_target_count,
+                          attempt, verification_reason, true, false);
       break;
     }
   }
