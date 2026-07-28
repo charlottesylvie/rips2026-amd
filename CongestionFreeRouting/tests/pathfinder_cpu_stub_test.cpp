@@ -347,39 +347,39 @@ routing::RoutingMetadata make_window_metadata(
 
 }  // namespace
 
-struct BellmanFordCsrGraph::Impl {
+struct BellmanFord10CsrGraph::Impl {
   explicit Impl(const HostCsrF32& adjacency) : graph(adjacency) {}
 
   HostCsrF32 graph;
 };
 
-BellmanFordCsrGraph::BellmanFordCsrGraph(const HostCsrF32& adjacency,
-                                         hipStream_t stream)
+BellmanFord10CsrGraph::BellmanFord10CsrGraph(const HostCsrF32& adjacency,
+                                             hipStream_t stream)
     : impl_(std::make_shared<Impl>(adjacency)) {
   (void)stream;
   ++g_bellman_ford_graph_uploads;
 }
 
-BellmanFordCsrGraph::~BellmanFordCsrGraph() = default;
-BellmanFordCsrGraph::BellmanFordCsrGraph(BellmanFordCsrGraph&&) noexcept = default;
-BellmanFordCsrGraph& BellmanFordCsrGraph::operator=(
-    BellmanFordCsrGraph&&) noexcept = default;
+BellmanFord10CsrGraph::~BellmanFord10CsrGraph() = default;
+BellmanFord10CsrGraph::BellmanFord10CsrGraph(BellmanFord10CsrGraph&&) noexcept = default;
+BellmanFord10CsrGraph& BellmanFord10CsrGraph::operator=(
+    BellmanFord10CsrGraph&&) noexcept = default;
 
-struct BellmanFordCsrWorkspace::Impl {
-  std::shared_ptr<const BellmanFordCsrGraph::Impl> graph;
+struct BellmanFord10CsrWorkspace::Impl {
+  std::shared_ptr<const BellmanFord10CsrGraph::Impl> graph;
 };
 
-BellmanFordCsrWorkspace::BellmanFordCsrWorkspace(const HostCsrF32& adjacency,
-                                                 hipStream_t stream)
+BellmanFord10CsrWorkspace::BellmanFord10CsrWorkspace(const HostCsrF32& adjacency,
+                                                     hipStream_t stream)
     : impl_(std::make_unique<Impl>()) {
   (void)stream;
   ++g_bellman_ford_workspace_constructions;
   ++g_bellman_ford_graph_uploads;
-  impl_->graph = std::make_shared<BellmanFordCsrGraph::Impl>(adjacency);
+  impl_->graph = std::make_shared<BellmanFord10CsrGraph::Impl>(adjacency);
 }
 
-BellmanFordCsrWorkspace::BellmanFordCsrWorkspace(
-    std::shared_ptr<const BellmanFordCsrGraph> adjacency,
+BellmanFord10CsrWorkspace::BellmanFord10CsrWorkspace(
+    std::shared_ptr<const BellmanFord10CsrGraph> adjacency,
     hipStream_t stream)
     : impl_(std::make_unique<Impl>()) {
   (void)stream;
@@ -390,13 +390,13 @@ BellmanFordCsrWorkspace::BellmanFordCsrWorkspace(
   impl_->graph = adjacency->impl_;
 }
 
-BellmanFordCsrWorkspace::~BellmanFordCsrWorkspace() = default;
-BellmanFordCsrWorkspace::BellmanFordCsrWorkspace(
-    BellmanFordCsrWorkspace&&) noexcept = default;
-BellmanFordCsrWorkspace& BellmanFordCsrWorkspace::operator=(
-    BellmanFordCsrWorkspace&&) noexcept = default;
+BellmanFord10CsrWorkspace::~BellmanFord10CsrWorkspace() = default;
+BellmanFord10CsrWorkspace::BellmanFord10CsrWorkspace(
+    BellmanFord10CsrWorkspace&&) noexcept = default;
+BellmanFord10CsrWorkspace& BellmanFord10CsrWorkspace::operator=(
+    BellmanFord10CsrWorkspace&&) noexcept = default;
 
-BellmanFordCsrResult BellmanFordCsrWorkspace::run(
+BellmanFordCsrResult BellmanFord10CsrWorkspace::run(
     const std::vector<int>& sources,
     const std::vector<int>& targets,
     float delta,
@@ -423,7 +423,7 @@ BellmanFordCsrResult BellmanFordCsrWorkspace::run(
   return result;
 }
 
-BellmanFordCsrResult BellmanFordCsrWorkspace::run(
+BellmanFordCsrResult BellmanFord10CsrWorkspace::run(
     const std::vector<int>& sources,
     int target,
     float delta,
@@ -444,7 +444,7 @@ BellmanFordCsrResult BellmanFordCsrWorkspace::run(
   return result;
 }
 
-BellmanFordCsrResult BellmanFordCsrWorkspace::run(
+BellmanFordCsrResult BellmanFord10CsrWorkspace::run(
     int source,
     int target,
     float delta,

@@ -58,3 +58,35 @@ unreached target counts, rejected edges, unknown-coordinate count, and whether
 global-cost verification was required, plus the selected execution path.  A
 successful bounded attempt is always followed by one verification record per
 target.
+
+## Reproducible speed benchmark
+
+Use the supplied A/B driver with a HIP-built `pathfinder` executable and one
+existing CSR/metadata pair.  It alternates unbounded and windowed runs, warms
+up the GPU, writes a log and telemetry JSONL for every run, and reports median
+end-to-end wall-clock speedup.  Arguments after `--` are shared by both modes;
+keep the worker count and delta configuration fixed there.
+
+```bash
+python3 CongestionFreeRouting/tests/route_window_benchmark.py \
+  --pathfinder ./pathfinder \
+  --graph design.csrbin \
+  --metadata design.csrbin.ifmeta.bin \
+  --output-dir /tmp/route-window-benchmark \
+  --repetitions 7 --warmups 2 \
+  -- --delta auto --parallel-net-workers 4
+```
+
+`summary.json` contains every measured wall-clock sample, median speedup
+(`unbounded/windowed`), and the telemetry for each measured run.  A speedup
+greater than one means the complete safe windowed flow was faster.  The result
+includes global-cost verification and any fallback work, so it is not a
+misleading bounded-query-only number.  Use `--window-net-list` to benchmark a
+selected JSONL net subset, or the `--window-*-margin` options to evaluate a
+specific margin schedule.
+
+The benchmark harness itself can be smoke-tested without HIP or routing data:
+
+```bash
+python3 CongestionFreeRouting/tests/route_window_benchmark_test.py
+```

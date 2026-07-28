@@ -185,6 +185,13 @@ void validate_options(const PathfinderOptions& options) {
             "--delta-multiplier requires --delta auto");
       }
     }
+    if (options.route_window_min_margin < 0 ||
+        options.route_window_max_margin < options.route_window_min_margin ||
+        !std::isfinite(options.route_window_margin_scale) ||
+        options.route_window_margin_scale < 0.0f) {
+      throw std::invalid_argument(
+          "route-window margins require 0 <= min <= max and a finite nonnegative scale");
+    }
   }
   if (options.capacity <= 0) {
     throw std::invalid_argument("capacity must be positive");
@@ -674,14 +681,6 @@ std::vector<DeltaSteppingCsrNodeBounds> make_node_bounds(
     if (values.size() != node_count) {
       throw std::invalid_argument(std::string("route-window node ") + name +
                                   " count does not match CSR rows");
-    }
-    if (options.route_window_enabled &&
-        (options.route_window_min_margin < 0 ||
-         options.route_window_max_margin < options.route_window_min_margin ||
-         !std::isfinite(options.route_window_margin_scale) ||
-         options.route_window_margin_scale < 0.0f)) {
-      throw std::invalid_argument(
-          "route-window margins require 0 <= min <= max and a finite nonnegative scale");
     }
   };
   require_count(metadata.node_min_x, "min_x");
