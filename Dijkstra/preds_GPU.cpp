@@ -8,8 +8,11 @@
 
 #include <hip/hip_runtime.h>
 
+#include "preds_gpu_engine.hpp"
+
 #include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
@@ -27,138 +30,6 @@
 #include <vector>
 
 namespace rips_predicates_gpu {
-namespace {
-
-using Clock = std::chrono::steady_clock;
-using Offset = std::int64_t;
-using Index = std::int32_t;
-using CompactOffset = std::uint32_t;
-
-constexpr char kCsrMagic[8] = {'R', 'I', 'P', 'S', 'C', 'S', 'R', '1'};
-constexpr std::uint64_t kLegacyCsrVersion = 1;
-constexpr std::uint64_t kCurrentCsrVersion = 2;
-constexpr std::uint64_t kOutgoingEdgeOrientation = 2;
-constexpr std::size_t kMaximumPrintedPaths = 1000;
-constexpr unsigned int kInfinityBits = 0x7f800000u;
-constexpr unsigned int kNoPackedPredecessor = 0xffffffffu;
-constexpr int kUnexplored = 0;
-constexpr int kFringe = 1;
-constexpr int kSettled = 2;
-constexpr int kMaximumGridBlocks = 65535;
-
-static_assert(sizeof(Offset) == 8, "RIPS CSR offsets must be 64-bit");
-static_assert(sizeof(Index) == 4, "RIPS CSR indices must be 32-bit");
-static_assert(sizeof(float) == 4, "RIPS CSR weights must be 32-bit floats");
-static_assert(sizeof(CompactOffset) == 4,
-              "compact device offsets must be 32-bit");
-
-enum class PredicateMode : int {
-  kInSimple = 0,
-  kOutSimple = 1,
-  kInSimpleOrOutSimple = 2,
-  kInStatic = 3,
-  kOutStatic = 4,
-  kInStaticOrOutStatic = 5,
-};
-
-struct CsrGraph {
-  Offset rows = 0;
-  Offset cols = 0;
-  Offset nnz = 0;
-  std::vector<Offset> rowptr;
-  std::vector<Index> colind;
-  std::vector<float> values;
-};
-
-struct Options {
-  std::filesystem::path csr_path;
-  Index source = -1;
-  bool predicate_set = false;
-  PredicateMode predicate = PredicateMode::kInSimple;
-  bool stats_number_set = false;
-  std::uint64_t stats_number = 0;
-  bool print_paths = false;
-  std::filesystem::path paths_output_path;
-};
-
-struct Statistics {
-  std::uint64_t phases = 0;
-  std::uint64_t vertices_settled = 0;
-  std::uint64_t vertices_settled_current_phase = 0;
-  // A phase batch cannot exceed the signed 32-bit vertex domain. Keeping
-  // these immutable counts in 32 bits halves the worst-case host allocation.
-  std::vector<std::uint32_t> vertices_settled_per_phase;
-  std::uint64_t edges_examined = 0;
-  std::uint64_t relaxations_attempted = 0;
-  std::uint64_t successful_distance_updates = 0;
-  double predicate_evaluation_ms = 0.0;
-  double relaxation_ms = 0.0;
-  Clock::duration elapsed_time = Clock::duration::zero();
-  std::uint64_t tiny_relaxation_phases = 0;
-  std::uint64_t large_relaxation_phases = 0;
-};
-
-struct TransferStatistics {
-  double h2d_ms = 0.0;
-  double d2h_ms = 0.0;
-  std::uint64_t h2d_bytes = 0;
-  std::uint64_t d2h_bytes = 0;
-  std::uint64_t h2d_operations = 0;
-  std::uint64_t d2h_operations = 0;
-
-  double total_ms() const {
-    return h2d_ms + d2h_ms;
-  }
-};
-
-struct LaunchCounters {
-  std::uint64_t sssp = 0;
-  std::uint64_t output_reconstruction = 0;
-};
-
-struct DeviceMetadata {
-  int device = 0;
-  hipDeviceProp_t properties{};
-  int integrated = 0;
-  int block_size = 0;
-  std::size_t free_memory_bytes = 0;
-  std::size_t total_memory_bytes = 0;
-  std::size_t allocated_device_bytes = 0;
-};
-
-struct HostAuxiliary {
-  std::vector<float> min_in_static;
-  std::vector<float> min_out_static;
-  std::vector<Offset> incoming_rowptr;
-  std::vector<Index> incoming_sources;
-  std::vector<float> incoming_weights;
-  std::vector<Offset> outgoing_sorted_edge_ids;
-
-  void release_upload_data() {
-    std::vector<float>().swap(min_in_static);
-    std::vector<float>().swap(min_out_static);
-    std::vector<Offset>().swap(incoming_rowptr);
-    std::vector<Index>().swap(incoming_sources);
-    std::vector<float>().swap(incoming_weights);
-    std::vector<Offset>().swap(outgoing_sorted_edge_ids);
-  }
-};
-
-struct HostResult {
-  std::vector<float> distances;
-  std::vector<Offset> predecessor_edges;
-};
-
-struct ReconstructedPath {
-  std::vector<Index> nodes;
-  std::vector<Offset> csr_edges;
-};
-
-template <typename Rep, typename Period>
-double milliseconds(std::chrono::duration<Rep, Period> duration) {
-  return std::chrono::duration<double, std::milli>(duration).count();
-}
-
 const char* predicate_mode_name(PredicateMode mode) {
   switch (mode) {
     case PredicateMode::kInSimple:
@@ -201,6 +72,95 @@ PredicateMode parse_predicate_mode(const std::string& text) {
       "'; expected one of IN_SIMPLE, OUT_SIMPLE, "
       "IN_SIMPLE_OR_OUT_SIMPLE, IN_STATIC, OUT_STATIC, "
       "IN_STATIC_OR_OUT_STATIC");
+}
+
+const char* termination_reason_name(TerminationReason reason) {
+  switch (reason) {
+    case TerminationReason::kFullConvergence:
+      return "full_convergence";
+    case TerminationReason::kAllTargetsSettled:
+      return "all_targets_settled";
+  }
+  throw std::logic_error("unknown preds-gpu termination reason");
+}
+
+namespace {
+
+using Clock = std::chrono::steady_clock;
+using CompactOffset = std::uint32_t;
+
+constexpr char kCsrMagic[8] = {'R', 'I', 'P', 'S', 'C', 'S', 'R', '1'};
+constexpr std::uint64_t kLegacyCsrVersion = 1;
+constexpr std::uint64_t kCurrentCsrVersion = 2;
+constexpr std::uint64_t kOutgoingEdgeOrientation = 2;
+constexpr std::size_t kMaximumPrintedPaths = 1000;
+constexpr unsigned int kInfinityBits = 0x7f800000u;
+constexpr unsigned int kNoPackedPredecessor = 0xffffffffu;
+constexpr int kUnexplored = 0;
+constexpr int kFringe = 1;
+constexpr int kSettled = 2;
+constexpr int kMaximumGridBlocks = 65535;
+
+static_assert(sizeof(Offset) == 8, "RIPS CSR offsets must be 64-bit");
+static_assert(sizeof(Index) == 4, "RIPS CSR indices must be 32-bit");
+static_assert(sizeof(float) == 4, "RIPS CSR weights must be 32-bit floats");
+static_assert(sizeof(CompactOffset) == 4,
+              "compact device offsets must be 32-bit");
+
+struct Options {
+  std::filesystem::path csr_path;
+  Index source = -1;
+  bool predicate_set = false;
+  PredicateMode predicate = PredicateMode::kInSimple;
+  bool stats_number_set = false;
+  std::uint64_t stats_number = 0;
+  bool print_paths = false;
+  std::filesystem::path paths_output_path;
+};
+
+using Statistics = AlgorithmStatistics;
+
+struct DeviceMetadata {
+  int device = 0;
+  hipDeviceProp_t properties{};
+  int integrated = 0;
+  int block_size = 0;
+  std::size_t free_memory_bytes = 0;
+  std::size_t total_memory_bytes = 0;
+  std::size_t allocated_device_bytes = 0;
+};
+
+struct HostAuxiliary {
+  std::vector<float> min_in_static;
+  std::vector<float> min_out_static;
+  std::vector<Offset> incoming_rowptr;
+  std::vector<Index> incoming_sources;
+  std::vector<float> incoming_weights;
+  std::vector<Offset> outgoing_sorted_edge_ids;
+
+  void release_upload_data() {
+    std::vector<float>().swap(min_in_static);
+    std::vector<float>().swap(min_out_static);
+    std::vector<Offset>().swap(incoming_rowptr);
+    std::vector<Index>().swap(incoming_sources);
+    std::vector<float>().swap(incoming_weights);
+    std::vector<Offset>().swap(outgoing_sorted_edge_ids);
+  }
+};
+
+struct HostResult {
+  std::vector<float> distances;
+  std::vector<Offset> predecessor_edges;
+};
+
+struct ReconstructedPath {
+  std::vector<Index> nodes;
+  std::vector<Offset> csr_edges;
+};
+
+template <typename Rep, typename Period>
+double milliseconds(std::chrono::duration<Rep, Period> duration) {
+  return std::chrono::duration<double, std::milli>(duration).count();
 }
 
 bool uses_simple_in_predicate(PredicateMode mode) {
@@ -393,8 +353,19 @@ void validate_csr_structure(const CsrGraph& graph) {
   if (graph.rows <= 0 || graph.rows != graph.cols) {
     throw std::runtime_error("CSR graph must be nonempty and square");
   }
+  if (graph.rows >
+      static_cast<Offset>(std::numeric_limits<Index>::max())) {
+    throw std::runtime_error(
+        "CSR graph has too many vertices for 32-bit node indices");
+  }
   if (graph.nnz < 0) {
     throw std::runtime_error("CSR nnz must be nonnegative");
+  }
+  if (static_cast<std::uint64_t>(graph.nnz) >
+      static_cast<std::uint64_t>(
+          std::numeric_limits<std::size_t>::max())) {
+    throw std::runtime_error(
+        "CSR graph has too many edges for this host");
   }
   if (graph.rowptr.size() != static_cast<std::size_t>(graph.rows + 1) ||
       graph.colind.size() != static_cast<std::size_t>(graph.nnz) ||
@@ -411,11 +382,16 @@ void validate_csr_structure(const CsrGraph& graph) {
       throw std::runtime_error("CSR rowptr is not monotone");
     }
   }
-  for (Index destination : graph.colind) {
+  for (std::size_t edge = 0; edge < graph.colind.size(); ++edge) {
+    const Index destination = graph.colind[edge];
     if (destination < 0 ||
         static_cast<Offset>(destination) >= graph.cols) {
       throw std::runtime_error(
           "CSR colind contains an out-of-range vertex");
+    }
+    if (!std::isfinite(graph.values[edge]) || graph.values[edge] < 0.0f) {
+      throw std::runtime_error(
+          "CSR values must be finite nonnegative weights");
     }
   }
 }
@@ -639,6 +615,17 @@ std::size_t checked_add_bytes(std::size_t left,
   return left + right;
 }
 
+void checked_accumulate(std::uint64_t& destination,
+                        std::uint64_t value,
+                        const char* what) {
+  if (destination >
+      std::numeric_limits<std::uint64_t>::max() - value) {
+    throw std::overflow_error(
+        std::string(what) + " counter overflows uint64");
+  }
+  destination += value;
+}
+
 template <typename T>
 void add_allocation_bytes(std::size_t count,
                           std::size_t& total,
@@ -808,8 +795,8 @@ struct PhaseStatus {
   unsigned int out_threshold_bits = kInfinityBits;
   int selected_count = 0;
   int next_count = 0;
+  int settled_target_count = 0;
   int error_status = 0;
-  int reserved = 0;
   unsigned long long selected_edge_count = 0;
   unsigned long long successful_updates = 0;
   unsigned long long expanded_edge_count = 0;
@@ -1055,11 +1042,64 @@ __global__ void reset_phase_status_kernel(PhaseStatus* status) {
     status->out_threshold_bits = kInfinityBits;
     status->selected_count = 0;
     status->next_count = 0;
+    status->settled_target_count = 0;
     status->error_status = kDeviceSuccess;
-    status->reserved = 0;
     status->selected_edge_count = 0;
     status->successful_updates = 0;
     status->expanded_edge_count = 0;
+  }
+}
+
+__global__ void count_settled_targets_kernel(
+    const int* vertex_states,
+    Offset rows,
+    const Index* target_nodes,
+    int target_count,
+    PhaseStatus* status) {
+  const Offset global_thread =
+      static_cast<Offset>(blockIdx.x) * blockDim.x + threadIdx.x;
+  const Offset stride =
+      static_cast<Offset>(gridDim.x) * blockDim.x;
+  int local_count = 0;
+  for (Offset position = global_thread;
+       position < static_cast<Offset>(target_count);
+       position += stride) {
+    const Index target = target_nodes[position];
+    if (target < 0 || static_cast<Offset>(target) >= rows) {
+      publish_device_error(status, kDeviceBadDestination);
+      continue;
+    }
+    local_count +=
+        vertex_states[static_cast<Offset>(target)] == kSettled ? 1 : 0;
+  }
+  if (local_count != 0) {
+    atomicAdd(&status->settled_target_count, local_count);
+  }
+}
+
+template <bool Packed>
+__global__ void gather_target_distances_kernel(
+    const unsigned long long* packed_state,
+    const float* wide_distances,
+    Offset rows,
+    const Index* target_nodes,
+    int target_count,
+    float* target_distances,
+    PhaseStatus* status) {
+  const Offset global_thread =
+      static_cast<Offset>(blockIdx.x) * blockDim.x + threadIdx.x;
+  const Offset stride =
+      static_cast<Offset>(gridDim.x) * blockDim.x;
+  for (Offset position = global_thread;
+       position < static_cast<Offset>(target_count);
+       position += stride) {
+    const Index target = target_nodes[position];
+    if (target < 0 || static_cast<Offset>(target) >= rows) {
+      publish_device_error(status, kDeviceBadDestination);
+      continue;
+    }
+    target_distances[position] = load_device_distance<Packed>(
+        packed_state, wide_distances, target);
   }
 }
 
@@ -1527,8 +1567,16 @@ struct GpuResources {
   DeviceBuffer<Index> selected;
   DeviceBuffer<ExpandedEdge<DeviceOffset>> expanded_edges;
   DeviceBuffer<PhaseStatus> status;
+  DeviceBuffer<Index> target_nodes;
+  DeviceBuffer<float> target_distances;
 
   PinnedBuffer<PhaseStatus> host_status;
+  PinnedBuffer<float> host_target_distances;
+  PinnedBuffer<unsigned long long> host_packed_state;
+  PinnedBuffer<float> host_wide_distances;
+  PinnedBuffer<Offset> host_wide_predecessor_edges;
+  HipEvent reset_start;
+  HipEvent reset_end;
   HipEvent predicate_start;
   HipEvent predicate_end;
   HipEvent settlement_start;
@@ -1820,7 +1868,8 @@ void enqueue_d2h(T* destination,
 template <typename DeviceOffset, bool Packed>
 std::size_t required_device_bytes(const CsrGraph& graph,
                                   const HostAuxiliary& auxiliary,
-                                  PredicateMode mode) {
+                                  PredicateMode mode,
+                                  std::size_t target_capacity) {
   const std::size_t vertices = static_cast<std::size_t>(graph.rows);
   const std::size_t edges = static_cast<std::size_t>(graph.nnz);
   std::size_t bytes = 0;
@@ -1880,6 +1929,10 @@ std::size_t required_device_bytes(const CsrGraph& graph,
       edges, bytes, "expanded selected edges");
   add_allocation_bytes<PhaseStatus>(
       1, bytes, "phase status");
+  add_allocation_bytes<Index>(
+      target_capacity, bytes, "target nodes");
+  add_allocation_bytes<float>(
+      target_capacity, bytes, "target distances");
   return bytes;
 }
 
@@ -1907,6 +1960,8 @@ void allocate_and_upload(
     const CsrGraph& graph,
     HostAuxiliary& auxiliary,
     PredicateMode mode,
+    std::size_t target_capacity,
+    bool reserve_path_scratch,
     GpuResources<DeviceOffset, Packed>& resources,
     DeviceMetadata& metadata,
     TransferStatistics& transfers) {
@@ -1914,7 +1969,7 @@ void allocate_and_upload(
   const std::size_t edges = static_cast<std::size_t>(graph.nnz);
   const std::size_t required =
       required_device_bytes<DeviceOffset, Packed>(
-          graph, auxiliary, mode);
+          graph, auxiliary, mode, target_capacity);
   const std::size_t desired_reserve =
       std::max<std::size_t>(
           static_cast<std::size_t>(256) * 1024 * 1024,
@@ -1984,7 +2039,24 @@ void allocate_and_upload(
   resources.expanded_edges.allocate(
       edges, "hipMalloc expanded selected edges");
   resources.status.allocate(1, "hipMalloc phase status");
+  resources.target_nodes.allocate(
+      target_capacity, "hipMalloc target nodes");
+  resources.target_distances.allocate(
+      target_capacity, "hipMalloc target distances");
   resources.host_status.allocate(1, "hipHostMalloc phase status");
+  resources.host_target_distances.allocate(
+      target_capacity, "hipHostMalloc target distances");
+  if (reserve_path_scratch) {
+    if constexpr (Packed) {
+      resources.host_packed_state.allocate(
+          vertices, "hipHostMalloc reusable packed path state");
+    } else {
+      resources.host_wide_distances.allocate(
+          vertices, "hipHostMalloc reusable path distances");
+      resources.host_wide_predecessor_edges.allocate(
+          vertices, "hipHostMalloc reusable path predecessors");
+    }
+  }
 
   std::vector<DeviceOffset> rowptr =
       convert_offsets<DeviceOffset>(graph.rowptr, "CSR rowptr");
@@ -2144,9 +2216,9 @@ void print_statistics(const Statistics& statistics,
                       PredicateMode mode,
                       const TransferStatistics& transfers,
                       const LaunchCounters& launches,
-                      Clock::duration preprocessing_time,
-                      Clock::duration total_runtime,
-                      Clock::duration end_to_end_time) {
+                      double preprocessing_ms,
+                      double total_runtime_ms,
+                      double end_to_end_ms) {
   std::cout << "\n=== preds_GPU statistics (" << label << ") ===\n"
             << "Predicate mode: " << predicate_mode_name(mode) << '\n'
             << "Number of completed phases: " << statistics.phases << '\n'
@@ -2155,12 +2227,18 @@ void print_statistics(const Statistics& statistics,
             << "Vertices settled per phase (phases 1.."
             << statistics.phases << "): [";
   for (std::size_t index = 0;
-       index < static_cast<std::size_t>(statistics.phases);
+       index < std::min(
+                   statistics.vertices_settled_per_phase.size(),
+                   static_cast<std::size_t>(statistics.phases));
        ++index) {
     if (index != 0) {
       std::cout << ", ";
     }
     std::cout << statistics.vertices_settled_per_phase[index];
+  }
+  if (statistics.vertices_settled_per_phase.size() <
+      static_cast<std::size_t>(statistics.phases)) {
+    std::cout << "not collected";
   }
   std::cout << "]\n"
             << "Total vertices settled: "
@@ -2174,7 +2252,11 @@ void print_statistics(const Statistics& statistics,
             << "Predicate-evaluation time (ms): "
             << statistics.predicate_evaluation_ms << '\n'
             << "Relaxation time (ms): "
-            << statistics.relaxation_ms << '\n';
+            << statistics.relaxation_ms << '\n'
+            << "Per-source reset time (ms): "
+            << statistics.reset_ms << '\n'
+            << "Per-source reset kernel-launch count: "
+            << statistics.reset_kernel_launches << '\n';
   if (statistics.predicate_evaluation_ms > 0.0) {
     std::cout << "Relaxation/predicate time ratio: "
               << (statistics.relaxation_ms /
@@ -2191,7 +2273,7 @@ void print_statistics(const Statistics& statistics,
             << "Large relaxation phases: "
             << statistics.large_relaxation_phases << '\n'
             << "Preprocessing time (ms): "
-            << milliseconds(preprocessing_time) << '\n'
+            << preprocessing_ms << '\n'
             << "Transfer time (ms): " << transfers.total_ms() << '\n'
             << "  H2D transfer time (ms): " << transfers.h2d_ms << '\n'
             << "  D2H transfer time (ms): " << transfers.d2h_ms << '\n'
@@ -2200,11 +2282,11 @@ void print_statistics(const Statistics& statistics,
             << "  H2D operations: " << transfers.h2d_operations << '\n'
             << "  D2H operations: " << transfers.d2h_operations << '\n'
             << "Elapsed time (ms): "
-            << milliseconds(statistics.elapsed_time) << '\n'
-            << "Total runtime (ms): " << milliseconds(total_runtime)
+            << statistics.elapsed_ms << '\n'
+            << "Total runtime (ms): " << total_runtime_ms
             << '\n'
             << "End-to-end time (ms): "
-            << milliseconds(end_to_end_time) << '\n';
+            << end_to_end_ms << '\n';
 }
 
 Offset predecessor_source_for_edge(const CsrGraph& graph, Offset edge) {
@@ -2268,6 +2350,82 @@ ReconstructedPath reconstruct_path(const CsrGraph& graph,
   return path;
 }
 
+void validate_captured_target_path_against_graph(
+    const CsrGraph& graph,
+    Index source,
+    const CapturedTargetPathView& path) {
+  if (source < 0 || static_cast<Offset>(source) >= graph.rows) {
+    throw std::out_of_range(
+        "captured path source is outside the CSR graph");
+  }
+  if (path.target < 0 ||
+      static_cast<Offset>(path.target) >= graph.rows) {
+    throw std::out_of_range(
+        "captured path target is outside the CSR graph");
+  }
+  if (!path.path_captured) {
+    throw std::runtime_error(
+        "captured target result is missing its path-captured marker");
+  }
+  if (!path.reached) {
+    if (path.distance != std::numeric_limits<float>::infinity()) {
+      throw std::runtime_error(
+          "unreachable captured target must have positive-infinite distance");
+    }
+    if (path.node_count != 0 || path.csr_edge_count != 0) {
+      throw std::runtime_error(
+          "unreachable captured target contains path data");
+    }
+    return;
+  }
+
+  if (!std::isfinite(path.distance) || path.distance < 0.0f) {
+    throw std::runtime_error(
+        "reached captured target has an invalid distance");
+  }
+  if (path.node_count == 0 ||
+      path.node_count > static_cast<std::size_t>(graph.rows)) {
+    throw std::runtime_error(
+        "captured target path has an invalid node count");
+  }
+  if (path.nodes == nullptr ||
+      (path.csr_edge_count != 0 && path.csr_edges == nullptr)) {
+    throw std::runtime_error(
+        "captured target path has missing host storage");
+  }
+  if (path.csr_edge_count != path.node_count - 1 ||
+      path.nodes[0] != source ||
+      path.nodes[path.node_count - 1] != path.target) {
+    throw std::runtime_error(
+        "captured target path endpoints or lengths are inconsistent");
+  }
+
+  float reconstructed_distance = 0.0f;
+  for (std::size_t hop = 0; hop < path.csr_edge_count; ++hop) {
+    const Index from = path.nodes[hop];
+    const Index to = path.nodes[hop + 1];
+    if (from < 0 || static_cast<Offset>(from) >= graph.rows ||
+        to < 0 || static_cast<Offset>(to) >= graph.rows) {
+      throw std::runtime_error(
+          "captured target path contains an out-of-range vertex");
+    }
+    const Offset edge = path.csr_edges[hop];
+    if (edge < 0 || edge >= graph.nnz ||
+        edge < graph.rowptr[static_cast<std::size_t>(from)] ||
+        edge >= graph.rowptr[static_cast<std::size_t>(from + 1)] ||
+        graph.colind[static_cast<std::size_t>(edge)] != to) {
+      throw std::runtime_error(
+          "captured target path contains an invalid CSR edge");
+    }
+    reconstructed_distance =
+        reconstructed_distance + graph.values[static_cast<std::size_t>(edge)];
+  }
+  if (reconstructed_distance != path.distance) {
+    throw std::runtime_error(
+        "captured target path weight does not match its distance");
+  }
+}
+
 void write_path_record(std::ostream& output,
                        Index source,
                        Index target,
@@ -2304,8 +2462,9 @@ void write_path_record(std::ostream& output,
 }
 
 std::size_t write_paths_jsonl(const std::filesystem::path& output_path,
-                              const CsrGraph& graph,
-                              const HostResult& result,
+                              Offset graph_rows,
+                              Offset graph_nnz,
+                              const std::vector<TargetResult>& targets,
                               Index source,
                               PredicateMode mode) {
   if (output_path.has_parent_path()) {
@@ -2316,16 +2475,13 @@ std::size_t write_paths_jsonl(const std::filesystem::path& output_path,
     throw std::runtime_error(
         "could not open paths output: " + output_path.string());
   }
-  const std::size_t possible_paths =
-      static_cast<std::size_t>(graph.rows - 1);
-  const std::size_t paths_to_write =
-      std::min(kMaximumPrintedPaths, possible_paths);
+  const std::size_t paths_to_write = targets.size();
   output << "{\"type\":\"metadata\""
          << ",\"format\":\"rips-sssp-paths-v1\""
          << ",\"producer\":\"preds_GPU\""
          << ",\"predicate_mode\":\"" << predicate_mode_name(mode) << "\""
-         << ",\"node_count\":" << graph.rows
-         << ",\"edge_count\":" << graph.nnz
+         << ",\"node_count\":" << graph_rows
+         << ",\"edge_count\":" << graph_nnz
          << ",\"route_request_count\":1"
          << ",\"selected_source_count\":1"
          << ",\"selected_query_count\":" << paths_to_write
@@ -2334,22 +2490,17 @@ std::size_t write_paths_jsonl(const std::filesystem::path& output_path,
          << "}\n";
 
   std::size_t paths_written = 0;
-  for (Offset raw_target = 0;
-       raw_target < graph.rows && paths_written < paths_to_write;
-       ++raw_target) {
-    const Index target = static_cast<Index>(raw_target);
-    if (target == source) {
-      continue;
-    }
-    const float distance =
-        result.distances[static_cast<std::size_t>(target)];
-    const bool reached =
-        distance != std::numeric_limits<float>::infinity();
-    const ReconstructedPath path =
-        reached ? reconstruct_path(graph, result, source, target)
-                : ReconstructedPath{};
+  for (const TargetResult& target_result : targets) {
+    ReconstructedPath path;
+    path.nodes = target_result.nodes;
+    path.csr_edges = target_result.csr_edges;
     write_path_record(
-        output, source, target, reached, distance, path);
+        output,
+        source,
+        target_result.target,
+        target_result.reached,
+        target_result.distance,
+        path);
     ++paths_written;
   }
   output.close();
@@ -2361,27 +2512,32 @@ std::size_t write_paths_jsonl(const std::filesystem::path& output_path,
 }
 
 template <typename DeviceOffset, bool Packed>
-HostResult copy_final_state(
+void copy_final_state(
     const CsrGraph& graph,
     GpuResources<DeviceOffset, Packed>& resources,
-    TransferStatistics& transfers) {
+    TransferStatistics& transfers,
+    HostResult& result) {
   // Correctness-first optional-output fallback: copy the complete final
   // distance/predecessor state once for CPU path reconstruction. This is
   // never used for phase control and is skipped entirely without --print.
   const std::size_t vertices = static_cast<std::size_t>(graph.rows);
-  HostResult result;
-  result.distances.resize(vertices);
-  result.predecessor_edges.assign(vertices, -1);
+  if (result.distances.size() != vertices ||
+      result.predecessor_edges.size() != vertices) {
+    throw std::logic_error(
+        "reusable host path state does not match graph size");
+  }
   hipStream_t stream = resources.stream.get();
 
   if constexpr (Packed) {
-    PinnedBuffer<unsigned long long> host_state;
-    host_state.allocate(vertices, "hipHostMalloc final packed state");
+    if (resources.host_packed_state.size() != vertices) {
+      throw std::logic_error(
+          "packed path capture requested without reserved scratch");
+    }
     check_hip(
         hipEventRecord(resources.transfer_start.get(), stream),
         "record final packed D2H start");
     enqueue_d2h(
-        host_state.get(),
+        resources.host_packed_state.get(),
         resources.packed_state.get(),
         vertices,
         stream,
@@ -2397,10 +2553,12 @@ HostResult copy_final_state(
         resources.transfer_end,
         "measure final packed D2H");
     for (std::size_t vertex = 0; vertex < vertices; ++vertex) {
-      const unsigned long long state = host_state.get()[vertex];
+      const unsigned long long state =
+          resources.host_packed_state.get()[vertex];
       const unsigned int distance_bits =
           static_cast<unsigned int>(state >> 32);
       result.distances[vertex] = host_bits_float(distance_bits);
+      result.predecessor_edges[vertex] = -1;
       if (distance_bits != kInfinityBits) {
         const unsigned int edge =
             static_cast<unsigned int>(state);
@@ -2411,23 +2569,23 @@ HostResult copy_final_state(
       }
     }
   } else {
-    PinnedBuffer<float> host_distances;
-    PinnedBuffer<Offset> host_predecessors;
-    host_distances.allocate(vertices, "hipHostMalloc final distances");
-    host_predecessors.allocate(
-        vertices, "hipHostMalloc final predecessors");
+    if (resources.host_wide_distances.size() != vertices ||
+        resources.host_wide_predecessor_edges.size() != vertices) {
+      throw std::logic_error(
+          "wide path capture requested without reserved scratch");
+    }
     check_hip(
         hipEventRecord(resources.transfer_start.get(), stream),
         "record final wide D2H start");
     enqueue_d2h(
-        host_distances.get(),
+        resources.host_wide_distances.get(),
         resources.wide_distances.get(),
         vertices,
         stream,
         transfers,
         "copy final wide distances D2H");
     enqueue_d2h(
-        host_predecessors.get(),
+        resources.host_wide_predecessor_edges.get(),
         resources.wide_predecessor_edges.get(),
         vertices,
         stream,
@@ -2443,53 +2601,78 @@ HostResult copy_final_state(
         resources.transfer_end,
         "measure final wide D2H");
     std::copy(
-        host_distances.get(),
-        host_distances.get() + vertices,
+        resources.host_wide_distances.get(),
+        resources.host_wide_distances.get() + vertices,
         result.distances.begin());
     std::copy(
-        host_predecessors.get(),
-        host_predecessors.get() + vertices,
+        resources.host_wide_predecessor_edges.get(),
+        resources.host_wide_predecessor_edges.get() + vertices,
         result.predecessor_edges.begin());
   }
-  return result;
 }
 
 struct GpuRunResult {
   Statistics statistics;
   TransferStatistics transfers;
   LaunchCounters launches;
-  std::optional<HostResult> host_result;
-  Clock::duration total_runtime = Clock::duration::zero();
-  bool requested_snapshot_printed = false;
+  std::vector<TargetResult> targets;
+  TerminationReason termination = TerminationReason::kFullConvergence;
+  bool fully_converged = false;
+  bool all_targets_confirmed = false;
+  double total_runtime_ms = 0.0;
+  bool requested_snapshot_reached = false;
+  Statistics requested_snapshot_statistics;
+  TransferStatistics requested_snapshot_transfers;
+  LaunchCounters requested_snapshot_launches;
+  double requested_snapshot_runtime_ms = 0.0;
 };
 
 template <typename DeviceOffset, bool Packed>
 GpuRunResult run_gpu_typed(
     const CsrGraph& graph,
-    HostAuxiliary auxiliary,
-    const Options& options,
-    DeviceMetadata metadata,
-    Clock::duration preprocessing_time,
-    Clock::time_point total_begin,
-    Clock::time_point end_to_end_begin) {
+    PredicateMode mode,
+    const RunRequest& request,
+    GpuResources<DeviceOffset, Packed>& resources,
+    const LaunchPolicy& policy,
+    HostResult* reusable_host_result) {
+  const auto run_begin = Clock::now();
   GpuRunResult run_result;
-  GpuResources<DeviceOffset, Packed> resources;
-  allocate_and_upload(
-      graph,
-      auxiliary,
-      options.predicate,
-      resources,
-      metadata,
-      run_result.transfers);
-  const LaunchPolicy policy =
-      make_launch_policy<DeviceOffset, Packed>(metadata);
-  print_run_metadata(
-      metadata, policy, sizeof(DeviceOffset) == 4, Packed);
-  std::cout
-      << "Successful-update telemetry counts successful strict GPU atomic "
-         "decreases and can differ from sequential CPU update counts.\n";
+  const std::size_t target_count = request.unique_targets.size();
+  if (target_count > resources.target_nodes.size() ||
+      target_count > resources.target_distances.size() ||
+      target_count > resources.host_target_distances.size()) {
+    throw std::invalid_argument(
+        "preds-gpu target count exceeds reserved workload capacity");
+  }
+  if (target_count >
+      static_cast<std::size_t>(std::numeric_limits<int>::max())) {
+    throw std::overflow_error(
+        "preds-gpu target count exceeds the signed 32-bit device domain");
+  }
 
   hipStream_t stream = resources.stream.get();
+  if (target_count != 0) {
+    check_hip(
+        hipEventRecord(resources.transfer_start.get(), stream),
+        "record target H2D start");
+    enqueue_h2d(
+        resources.target_nodes.get(),
+        request.unique_targets.data(),
+        target_count,
+        stream,
+        run_result.transfers,
+        "copy target nodes H2D");
+    check_hip(
+        hipEventRecord(resources.transfer_end.get(), stream),
+        "record target H2D end");
+    wait_for_control_event(
+        stream, resources.control_ready, "wait for target nodes H2D");
+    run_result.transfers.h2d_ms += elapsed_event_ms(
+        resources.transfer_start,
+        resources.transfer_end,
+        "measure target nodes H2D");
+  }
+
   DeviceGraphView<DeviceOffset> device_graph =
       resources.graph_view(graph);
   DeviceWorkspaceView<DeviceOffset, Packed> initial_workspace =
@@ -2498,6 +2681,9 @@ GpuRunResult run_gpu_typed(
       static_cast<std::uint64_t>(graph.rows),
       policy.block_size,
       policy.initialization_blocks);
+  check_hip(
+      hipEventRecord(resources.reset_start.get(), stream),
+      "record SSSP reset start");
   launch_sssp_kernel(
       run_result.launches,
       "launch SSSP initialization",
@@ -2511,13 +2697,23 @@ GpuRunResult run_gpu_typed(
             stream,
             device_graph,
             initial_workspace,
-            options.source);
+            request.source);
       });
+  check_hip(
+      hipEventRecord(resources.reset_end.get(), stream),
+      "record SSSP reset end");
   wait_for_control_event(
       stream, resources.control_ready, "wait for SSSP initialization");
+  run_result.statistics.reset_ms = elapsed_event_ms(
+      resources.reset_start,
+      resources.reset_end,
+      "measure SSSP reset kernel");
+  run_result.statistics.reset_kernel_launches = 1;
 
-  run_result.statistics.vertices_settled_per_phase.resize(
-      static_cast<std::size_t>(graph.rows));
+  if (request.capture_phase_histogram) {
+    run_result.statistics.vertices_settled_per_phase.reserve(
+        static_cast<std::size_t>(graph.rows));
+  }
   int current_count = 1;
   while (current_count > 0) {
     const auto phase_begin = Clock::now();
@@ -2560,7 +2756,7 @@ GpuRunResult run_gpu_typed(
               stream,
               device_graph,
               workspace,
-              static_cast<int>(options.predicate),
+              static_cast<int>(mode),
               current_count);
         });
 
@@ -2584,7 +2780,7 @@ GpuRunResult run_gpu_typed(
               stream,
               device_graph,
               workspace,
-              static_cast<int>(options.predicate),
+              static_cast<int>(mode),
               current_count);
         });
     check_hip(
@@ -2625,7 +2821,7 @@ GpuRunResult run_gpu_typed(
     if (predicate_status.selected_count <= 0) {
       throw std::runtime_error(
           std::string("predicate ") +
-          predicate_mode_name(options.predicate) +
+          predicate_mode_name(mode) +
           " selected no vertex while the fringe was nonempty at phase " +
           std::to_string(run_result.statistics.phases + 1));
     }
@@ -2747,6 +2943,30 @@ GpuRunResult run_gpu_typed(
           });
       ++run_result.statistics.large_relaxation_phases;
     }
+    const bool target_stop_enabled =
+        request.early_stop && target_count != 0;
+    if (target_stop_enabled) {
+      const int target_blocks = blocks_for_items(
+          static_cast<std::uint64_t>(target_count),
+          policy.block_size,
+          policy.mark_block_cap);
+      launch_sssp_kernel(
+          run_result.launches,
+          "launch settled-target count",
+          [&] {
+            hipLaunchKernelGGL(
+                count_settled_targets_kernel,
+                dim3(static_cast<unsigned int>(target_blocks)),
+                dim3(static_cast<unsigned int>(policy.block_size)),
+                0,
+                stream,
+                workspace.vertex_states,
+                graph.rows,
+                resources.target_nodes.get(),
+                static_cast<int>(target_count),
+                workspace.status);
+          });
+    }
     check_hip(
         hipEventRecord(resources.relaxation_end.get(), stream),
         "record relaxation end");
@@ -2802,6 +3022,14 @@ GpuRunResult run_gpu_typed(
       throw std::runtime_error(
           "selected-edge expansion count is inconsistent");
     }
+    if (completed_status.settled_target_count < 0 ||
+        static_cast<std::size_t>(
+            completed_status.settled_target_count) > target_count ||
+        (!target_stop_enabled &&
+         completed_status.settled_target_count != 0)) {
+      throw std::runtime_error(
+          "settled-target count is inconsistent");
+    }
 
     ++run_result.statistics.phases;
     run_result.statistics.vertices_settled_current_phase =
@@ -2809,11 +3037,11 @@ GpuRunResult run_gpu_typed(
             completed_status.selected_count);
     run_result.statistics.vertices_settled +=
         run_result.statistics.vertices_settled_current_phase;
-    run_result.statistics.vertices_settled_per_phase[
-        static_cast<std::size_t>(
-            run_result.statistics.phases - 1)] =
-        static_cast<std::uint32_t>(
-            run_result.statistics.vertices_settled_current_phase);
+    if (request.capture_phase_histogram) {
+      run_result.statistics.vertices_settled_per_phase.push_back(
+          static_cast<std::uint32_t>(
+              run_result.statistics.vertices_settled_current_phase));
+    }
     run_result.statistics.edges_examined +=
         completed_status.selected_edge_count;
     run_result.statistics.relaxations_attempted +=
@@ -2824,20 +3052,29 @@ GpuRunResult run_gpu_typed(
     resources.current_fringe.swap(resources.next_fringe);
     current_count = completed_status.next_count;
     const auto phase_end = Clock::now();
-    run_result.statistics.elapsed_time += phase_end - phase_begin;
+    run_result.statistics.elapsed_ms +=
+        milliseconds(phase_end - phase_begin);
 
-    if (options.stats_number_set &&
-        run_result.statistics.phases == options.stats_number) {
-      print_statistics(
-          run_result.statistics,
-          "phase " + std::to_string(options.stats_number) + " snapshot",
-          options.predicate,
-          run_result.transfers,
-          run_result.launches,
-          preprocessing_time,
-          phase_end - total_begin,
-          phase_end - end_to_end_begin);
-      run_result.requested_snapshot_printed = true;
+    if (request.statistics_snapshot_phase != 0 &&
+        run_result.statistics.phases ==
+            request.statistics_snapshot_phase) {
+      run_result.requested_snapshot_reached = true;
+      run_result.requested_snapshot_statistics =
+          run_result.statistics;
+      run_result.requested_snapshot_transfers =
+          run_result.transfers;
+      run_result.requested_snapshot_launches =
+          run_result.launches;
+      run_result.requested_snapshot_runtime_ms =
+          milliseconds(phase_end - run_begin);
+    }
+
+    if (target_stop_enabled && current_count > 0 &&
+        static_cast<std::size_t>(
+            completed_status.settled_target_count) == target_count) {
+      run_result.termination =
+          TerminationReason::kAllTargetsSettled;
+      break;
     }
   }
 
@@ -2846,73 +3083,584 @@ GpuRunResult run_gpu_typed(
     throw std::runtime_error(
         "GPU settled more vertices than the graph contains");
   }
-  if (options.print_paths) {
-    run_result.host_result =
-        copy_final_state(graph, resources, run_result.transfers);
+  run_result.fully_converged = current_count == 0;
+  if (run_result.fully_converged) {
+    run_result.termination =
+        TerminationReason::kFullConvergence;
   }
-  run_result.total_runtime = Clock::now() - total_begin;
+  run_result.all_targets_confirmed =
+      run_result.fully_converged ||
+      run_result.termination ==
+          TerminationReason::kAllTargetsSettled;
+
+  if (target_count != 0) {
+    DeviceWorkspaceView<DeviceOffset, Packed> workspace =
+        resources.workspace_view();
+    const int gather_blocks = blocks_for_items(
+        static_cast<std::uint64_t>(target_count),
+        policy.block_size,
+        policy.mark_block_cap);
+    hipLaunchKernelGGL(
+        HIP_KERNEL_NAME(gather_target_distances_kernel<Packed>),
+        dim3(static_cast<unsigned int>(gather_blocks)),
+        dim3(static_cast<unsigned int>(policy.block_size)),
+        0,
+        stream,
+        workspace.packed_state,
+        workspace.wide_distances,
+        graph.rows,
+        resources.target_nodes.get(),
+        static_cast<int>(target_count),
+        resources.target_distances.get(),
+        workspace.status);
+    check_hip(
+        hipGetLastError(), "launch compact target-distance gather");
+    ++run_result.launches.output_reconstruction;
+
+    check_hip(
+        hipEventRecord(resources.transfer_start.get(), stream),
+        "record compact target D2H start");
+    enqueue_d2h(
+        resources.host_target_distances.get(),
+        resources.target_distances.get(),
+        target_count,
+        stream,
+        run_result.transfers,
+        "copy compact target distances D2H");
+    check_hip(
+        hipEventRecord(resources.transfer_end.get(), stream),
+        "record compact target D2H end");
+    wait_for_control_event(
+        stream,
+        resources.control_ready,
+        "wait for compact target distances");
+    run_result.transfers.d2h_ms += elapsed_event_ms(
+        resources.transfer_start,
+        resources.transfer_end,
+        "measure compact target distances D2H");
+
+    run_result.targets.reserve(target_count);
+    for (std::size_t target_index = 0;
+         target_index < target_count;
+         ++target_index) {
+      TargetResult target_result;
+      target_result.target =
+          request.unique_targets[target_index];
+      target_result.distance =
+          resources.host_target_distances.get()[target_index];
+      target_result.reached =
+          std::isfinite(target_result.distance);
+      run_result.targets.push_back(std::move(target_result));
+    }
+  }
+
+  if (request.capture_paths && target_count != 0) {
+    if (reusable_host_result == nullptr) {
+      throw std::logic_error(
+          "path capture requested without reserved host scratch");
+    }
+    copy_final_state(
+        graph,
+        resources,
+        run_result.transfers,
+        *reusable_host_result);
+    for (TargetResult& target_result : run_result.targets) {
+      target_result.path_captured = true;
+      if (!target_result.reached) {
+        continue;
+      }
+      ReconstructedPath path = reconstruct_path(
+          graph,
+          *reusable_host_result,
+          request.source,
+          target_result.target);
+      target_result.nodes = std::move(path.nodes);
+      target_result.csr_edges = std::move(path.csr_edges);
+    }
+  }
+
+  run_result.total_runtime_ms =
+      milliseconds(Clock::now() - run_begin);
   return run_result;
+}
+
+void add_transfer_statistics(TransferStatistics& destination,
+                             const TransferStatistics& source) {
+  destination.h2d_ms += source.h2d_ms;
+  destination.d2h_ms += source.d2h_ms;
+  checked_accumulate(
+      destination.h2d_bytes,
+      source.h2d_bytes,
+      "cumulative H2D bytes");
+  checked_accumulate(
+      destination.d2h_bytes,
+      source.d2h_bytes,
+      "cumulative D2H bytes");
+  checked_accumulate(
+      destination.h2d_operations,
+      source.h2d_operations,
+      "cumulative H2D operations");
+  checked_accumulate(
+      destination.d2h_operations,
+      source.d2h_operations,
+      "cumulative D2H operations");
+}
+
+void add_launch_counters(LaunchCounters& destination,
+                         const LaunchCounters& source) {
+  checked_accumulate(
+      destination.sssp,
+      source.sssp,
+      "cumulative SSSP kernel launches");
+  checked_accumulate(
+      destination.output_reconstruction,
+      source.output_reconstruction,
+      "cumulative output-reconstruction kernel launches");
+}
+
+void add_algorithm_statistics(Statistics& destination,
+                              const Statistics& source) {
+  checked_accumulate(
+      destination.phases,
+      source.phases,
+      "cumulative SSSP phases");
+  checked_accumulate(
+      destination.vertices_settled,
+      source.vertices_settled,
+      "cumulative settled vertices");
+  destination.vertices_settled_current_phase =
+      source.vertices_settled_current_phase;
+  checked_accumulate(
+      destination.edges_examined,
+      source.edges_examined,
+      "cumulative examined edges");
+  checked_accumulate(
+      destination.relaxations_attempted,
+      source.relaxations_attempted,
+      "cumulative relaxation attempts");
+  checked_accumulate(
+      destination.successful_distance_updates,
+      source.successful_distance_updates,
+      "cumulative successful distance updates");
+  destination.predicate_evaluation_ms +=
+      source.predicate_evaluation_ms;
+  destination.relaxation_ms += source.relaxation_ms;
+  destination.reset_ms += source.reset_ms;
+  destination.elapsed_ms += source.elapsed_ms;
+  checked_accumulate(
+      destination.reset_kernel_launches,
+      source.reset_kernel_launches,
+      "cumulative reset kernel launches");
+  checked_accumulate(
+      destination.tiny_relaxation_phases,
+      source.tiny_relaxation_phases,
+      "cumulative tiny-relaxation phases");
+  checked_accumulate(
+      destination.large_relaxation_phases,
+      source.large_relaxation_phases,
+      "cumulative large-relaxation phases");
+}
+
+RunResult public_run_result(GpuRunResult&& internal) {
+  RunResult result;
+  result.termination = internal.termination;
+  result.fully_converged = internal.fully_converged;
+  result.all_targets_confirmed =
+      internal.all_targets_confirmed;
+  result.phases_or_iterations = internal.statistics.phases;
+  result.targets = std::move(internal.targets);
+  result.telemetry.algorithm = std::move(internal.statistics);
+  result.telemetry.transfers = internal.transfers;
+  result.telemetry.launches = internal.launches;
+  result.telemetry.runtime_ms = internal.total_runtime_ms;
+  result.requested_snapshot_reached =
+      internal.requested_snapshot_reached;
+  if (internal.requested_snapshot_reached) {
+    result.requested_snapshot.algorithm =
+        std::move(internal.requested_snapshot_statistics);
+    result.requested_snapshot.transfers =
+        internal.requested_snapshot_transfers;
+    result.requested_snapshot.launches =
+        internal.requested_snapshot_launches;
+    result.requested_snapshot.runtime_ms =
+        internal.requested_snapshot_runtime_ms;
+  }
+  return result;
+}
+
+class PredsGpuTypedEngine {
+ public:
+  virtual ~PredsGpuTypedEngine() = default;
+  virtual RunResult run(const RunRequest& request) = 0;
+  virtual PredicateMode predicate_mode() const noexcept = 0;
+  virtual Offset rows() const noexcept = 0;
+  virtual Offset nnz() const noexcept = 0;
+  virtual std::size_t target_capacity() const noexcept = 0;
+  virtual bool path_scratch_reserved() const noexcept = 0;
+  virtual void validate_captured_target_path(
+      Index source,
+      const CapturedTargetPathView& path) const = 0;
+  virtual CumulativeStatistics cumulative_statistics() const = 0;
+};
+
+template <typename DeviceOffset, bool Packed>
+class PredsGpuTypedEngineImpl final : public PredsGpuTypedEngine {
+ public:
+  PredsGpuTypedEngineImpl(CsrGraph graph,
+                          PredicateMode mode,
+                          std::size_t target_capacity,
+                          bool reserve_path_scratch,
+                          bool print_setup_metadata)
+      : graph_(std::move(graph)),
+        mode_(mode),
+        target_capacity_(target_capacity),
+        reserve_path_scratch_(reserve_path_scratch) {
+    const auto setup_begin = Clock::now();
+    if (target_capacity_ >
+        static_cast<std::size_t>(graph_.rows)) {
+      throw std::invalid_argument(
+          "preds-gpu target capacity exceeds graph row count");
+    }
+    if (target_capacity_ >
+        static_cast<std::size_t>(
+            std::numeric_limits<int>::max())) {
+      throw std::overflow_error(
+          "preds-gpu target capacity exceeds the signed 32-bit device domain");
+    }
+
+    HostAuxiliary auxiliary =
+        build_host_auxiliary(graph_, mode_);
+    preprocessing_ms_ =
+        milliseconds(Clock::now() - setup_begin);
+    metadata_ = query_device_metadata();
+    allocate_and_upload(
+        graph_,
+        auxiliary,
+        mode_,
+        target_capacity_,
+        reserve_path_scratch_,
+        resources_,
+        metadata_,
+        setup_transfers_);
+    policy_ =
+        make_launch_policy<DeviceOffset, Packed>(metadata_);
+
+    if (reserve_path_scratch_) {
+      const std::size_t vertices =
+          static_cast<std::size_t>(graph_.rows);
+      reusable_host_result_.distances.resize(vertices);
+      reusable_host_result_.predecessor_edges.resize(vertices);
+    }
+    normalized_request_.unique_targets.reserve(
+        target_capacity_);
+    if (target_capacity_ != 0) {
+      host_target_epochs_.assign(
+          static_cast<std::size_t>(graph_.rows), 0);
+    }
+    cumulative_.graph_setup_transfers = setup_transfers_;
+    cumulative_.preprocessing_ms = preprocessing_ms_;
+    cumulative_.allocated_device_bytes =
+        metadata_.allocated_device_bytes;
+
+    if (print_setup_metadata) {
+      print_run_metadata(
+          metadata_,
+          policy_,
+          sizeof(DeviceOffset) == 4,
+          Packed);
+      std::cout
+          << "Successful-update telemetry counts successful strict GPU "
+             "atomic decreases and can differ from sequential CPU update "
+             "counts.\n";
+    }
+  }
+
+  RunResult run(const RunRequest& raw_request) override {
+    int active_device = -1;
+    check_hip(
+        hipGetDevice(&active_device),
+        "hipGetDevice before reusable preds-gpu run");
+    if (active_device != metadata_.device) {
+      throw std::runtime_error(
+          "preds-gpu context is device-affine; reactivate HIP device " +
+          std::to_string(metadata_.device) + " before run()");
+    }
+    if (raw_request.source < 0 ||
+        static_cast<Offset>(raw_request.source) >= graph_.rows) {
+      throw std::out_of_range(
+          "source node is outside the CSR graph");
+    }
+    if (raw_request.capture_paths &&
+        !reserve_path_scratch_) {
+      throw std::invalid_argument(
+          "preds-gpu path capture was not reserved at context construction");
+    }
+    if (target_capacity_ == 0 &&
+        !raw_request.unique_targets.empty()) {
+      throw std::invalid_argument(
+          "preds-gpu unique target count exceeds reserved workload "
+          "capacity");
+    }
+
+    normalized_request_.source = raw_request.source;
+    normalized_request_.early_stop = raw_request.early_stop;
+    normalized_request_.capture_paths =
+        raw_request.capture_paths;
+    normalized_request_.capture_phase_histogram =
+        raw_request.capture_phase_histogram;
+    normalized_request_.statistics_snapshot_phase =
+        raw_request.statistics_snapshot_phase;
+    normalized_request_.unique_targets.clear();
+    ++target_epoch_;
+    if (target_epoch_ == 0) {
+      std::fill(
+          host_target_epochs_.begin(),
+          host_target_epochs_.end(),
+          0);
+      target_epoch_ = 1;
+    }
+    for (Index target : raw_request.unique_targets) {
+      if (target < 0 ||
+          static_cast<Offset>(target) >= graph_.rows) {
+        throw std::out_of_range(
+            "target node is outside the CSR graph");
+      }
+      std::uint32_t& seen_epoch =
+          host_target_epochs_[static_cast<std::size_t>(target)];
+      if (seen_epoch != target_epoch_) {
+        if (normalized_request_.unique_targets.size() ==
+            target_capacity_) {
+          throw std::invalid_argument(
+              "preds-gpu unique target count exceeds reserved workload "
+              "capacity");
+        }
+        seen_epoch = target_epoch_;
+        normalized_request_.unique_targets.push_back(target);
+      }
+    }
+
+    GpuRunResult internal = run_gpu_typed(
+        graph_,
+        mode_,
+        normalized_request_,
+        resources_,
+        policy_,
+        reserve_path_scratch_
+            ? &reusable_host_result_
+            : nullptr);
+
+    checked_accumulate(
+        cumulative_.runs, 1, "cumulative preds-gpu runs");
+    if (internal.fully_converged) {
+      checked_accumulate(
+          cumulative_.fully_converged_runs,
+          1,
+          "cumulative fully converged preds-gpu runs");
+    } else if (internal.termination ==
+               TerminationReason::kAllTargetsSettled) {
+      checked_accumulate(
+          cumulative_.target_stopped_runs,
+          1,
+          "cumulative target-stopped preds-gpu runs");
+    }
+    add_algorithm_statistics(
+        cumulative_.algorithm, internal.statistics);
+    add_transfer_statistics(
+        cumulative_.run_transfers, internal.transfers);
+    add_launch_counters(
+        cumulative_.launches, internal.launches);
+    cumulative_.runtime_ms += internal.total_runtime_ms;
+    return public_run_result(std::move(internal));
+  }
+
+  PredicateMode predicate_mode() const noexcept override {
+    return mode_;
+  }
+
+  Offset rows() const noexcept override {
+    return graph_.rows;
+  }
+
+  Offset nnz() const noexcept override {
+    return graph_.nnz;
+  }
+
+  std::size_t target_capacity() const noexcept override {
+    return target_capacity_;
+  }
+
+  bool path_scratch_reserved() const noexcept override {
+    return reserve_path_scratch_;
+  }
+
+  void validate_captured_target_path(
+      Index source,
+      const CapturedTargetPathView& path) const override {
+    validate_captured_target_path_against_graph(
+        graph_, source, path);
+  }
+
+  CumulativeStatistics cumulative_statistics() const override {
+    return cumulative_;
+  }
+
+ private:
+  CsrGraph graph_;
+  PredicateMode mode_;
+  std::size_t target_capacity_ = 0;
+  bool reserve_path_scratch_ = false;
+  DeviceMetadata metadata_;
+  LaunchPolicy policy_;
+  GpuResources<DeviceOffset, Packed> resources_;
+  HostResult reusable_host_result_;
+  RunRequest normalized_request_;
+  std::vector<std::uint32_t> host_target_epochs_;
+  std::uint32_t target_epoch_ = 0;
+  TransferStatistics setup_transfers_;
+  double preprocessing_ms_ = 0.0;
+  CumulativeStatistics cumulative_;
+};
+
+CsrGraph copy_csr_graph_view(CsrGraphView view) {
+  if (view.rows <= 0 || view.rows != view.cols) {
+    throw std::invalid_argument(
+        "preds-gpu CSR view must be nonempty and square");
+  }
+  if (view.rows >
+      static_cast<Offset>(std::numeric_limits<Index>::max()) ||
+      view.nnz < 0) {
+    throw std::invalid_argument(
+        "preds-gpu CSR view dimensions are outside the supported domain");
+  }
+  if (view.rowptr == nullptr ||
+      (view.nnz != 0 &&
+       (view.colind == nullptr || view.values == nullptr))) {
+    throw std::invalid_argument(
+        "preds-gpu CSR view contains a null array");
+  }
+  if (static_cast<std::uint64_t>(view.nnz) >
+      static_cast<std::uint64_t>(
+          std::numeric_limits<std::size_t>::max())) {
+    throw std::overflow_error(
+        "preds-gpu CSR view edge count is too large for this host");
+  }
+
+  CsrGraph graph;
+  graph.rows = view.rows;
+  graph.cols = view.cols;
+  graph.nnz = view.nnz;
+  graph.rowptr.assign(
+      view.rowptr,
+      view.rowptr + static_cast<std::size_t>(view.rows) + 1);
+  if (view.nnz != 0) {
+    const std::size_t edges =
+        static_cast<std::size_t>(view.nnz);
+    graph.colind.assign(view.colind, view.colind + edges);
+    graph.values.assign(view.values, view.values + edges);
+  }
+  return graph;
 }
 
 int run(const Options& options, Clock::time_point end_to_end_begin) {
   const auto total_begin = Clock::now();
-  const auto preprocessing_begin = Clock::now();
-  const CsrGraph graph = load_csr(options.csr_path);
+  const double pre_run_end_to_end_ms =
+      milliseconds(total_begin - end_to_end_begin);
+  const auto graph_load_begin = Clock::now();
+  CsrGraph graph = load_csr(options.csr_path);
+  const double graph_load_ms =
+      milliseconds(Clock::now() - graph_load_begin);
   if (static_cast<Offset>(options.source) >= graph.rows) {
     throw std::out_of_range("source node is outside the CSR graph");
   }
-  HostAuxiliary auxiliary =
-      build_host_auxiliary(graph, options.predicate);
-  const auto preprocessing_end = Clock::now();
-  const Clock::duration preprocessing_time =
-      preprocessing_end - preprocessing_begin;
+  const Offset graph_rows = graph.rows;
+  const Offset graph_nnz = graph.nnz;
 
-  DeviceMetadata metadata = query_device_metadata();
-  const bool compact =
-      static_cast<unsigned long long>(graph.nnz) <=
-      static_cast<unsigned long long>(
-          std::numeric_limits<CompactOffset>::max());
-  GpuRunResult result =
-      compact
-          ? run_gpu_typed<CompactOffset, true>(
-                graph,
-                std::move(auxiliary),
-                options,
-                metadata,
-                preprocessing_time,
-                total_begin,
-                end_to_end_begin)
-          : run_gpu_typed<Offset, false>(
-                graph,
-                std::move(auxiliary),
-                options,
-                metadata,
-                preprocessing_time,
-                total_begin,
-                end_to_end_begin);
+  std::vector<Index> output_targets;
+  if (options.print_paths) {
+    const std::size_t possible_paths =
+        static_cast<std::size_t>(graph.rows - 1);
+    output_targets.reserve(
+        std::min(kMaximumPrintedPaths, possible_paths));
+    for (Offset raw_target = 0;
+         raw_target < graph.rows &&
+         output_targets.size() < kMaximumPrintedPaths;
+         ++raw_target) {
+      const Index target = static_cast<Index>(raw_target);
+      if (target != options.source) {
+        output_targets.push_back(target);
+      }
+    }
+  }
+
+  PredsGpuContext context(
+      std::move(graph),
+      options.predicate,
+      output_targets.size(),
+      options.print_paths,
+      true);
+  RunRequest request;
+  request.source = options.source;
+  request.unique_targets = output_targets;
+  request.early_stop = false;
+  request.capture_paths = options.print_paths;
+  request.capture_phase_histogram = true;
+  request.statistics_snapshot_phase =
+      options.stats_number_set ? options.stats_number : 0;
+  const double setup_runtime_ms =
+      milliseconds(Clock::now() - total_begin);
+  RunResult result = context.run(request);
+  const double total_runtime_ms =
+      milliseconds(Clock::now() - total_begin);
+  const CumulativeStatistics cumulative =
+      context.cumulative_statistics();
+  const double preprocessing_ms =
+      graph_load_ms + cumulative.preprocessing_ms;
+
+  TransferStatistics total_transfers =
+      cumulative.graph_setup_transfers;
+  add_transfer_statistics(
+      total_transfers, result.telemetry.transfers);
 
   std::size_t paths_written = 0;
+  if (options.stats_number_set &&
+      result.requested_snapshot_reached) {
+    TransferStatistics snapshot_transfers =
+        cumulative.graph_setup_transfers;
+    add_transfer_statistics(
+        snapshot_transfers,
+        result.requested_snapshot.transfers);
+    print_statistics(
+        result.requested_snapshot.algorithm,
+        "phase " + std::to_string(options.stats_number) +
+            " snapshot",
+        options.predicate,
+        snapshot_transfers,
+        result.requested_snapshot.launches,
+        preprocessing_ms,
+        setup_runtime_ms +
+            result.requested_snapshot.runtime_ms,
+        pre_run_end_to_end_ms + setup_runtime_ms +
+            result.requested_snapshot.runtime_ms);
+  }
   if (options.print_paths) {
-    if (!result.host_result.has_value()) {
-      throw std::logic_error(
-          "path output requested without a copied GPU result");
-    }
     paths_written = write_paths_jsonl(
         options.paths_output_path,
-        graph,
-        *result.host_result,
+        graph_rows,
+        graph_nnz,
+        result.targets,
         options.source,
         options.predicate);
   }
-  const Clock::duration end_to_end_time =
-      Clock::now() - end_to_end_begin;
+  const double end_to_end_ms =
+      milliseconds(Clock::now() - end_to_end_begin);
 
   if (options.stats_number_set &&
-      !result.requested_snapshot_printed) {
+      !result.requested_snapshot_reached) {
     std::cout << "\nRequested statistics phase "
               << options.stats_number
               << " was not reached; the run completed after "
-              << result.statistics.phases << " phase(s).\n";
+              << result.telemetry.algorithm.phases
+              << " phase(s).\n";
   }
   if (options.print_paths) {
     std::cout << "\nWrote " << paths_written
@@ -2920,20 +3668,136 @@ int run(const Options& options, Clock::time_point end_to_end_begin) {
               << options.paths_output_path.string() << '\n';
   }
   print_statistics(
-      result.statistics,
+      result.telemetry.algorithm,
       "final",
       options.predicate,
-      result.transfers,
-      result.launches,
-      preprocessing_time,
-      result.total_runtime,
-      end_to_end_time);
+      total_transfers,
+      result.telemetry.launches,
+      preprocessing_ms,
+      total_runtime_ms,
+      end_to_end_ms);
   return 0;
 }
 
 }  // namespace
+
+struct PredsGpuContext::Impl {
+  Impl(CsrGraph graph,
+       PredicateMode mode,
+       std::size_t max_unique_targets,
+       bool reserve_path_scratch,
+       bool print_setup_metadata) {
+    (void)predicate_mode_name(mode);
+    validate_csr_structure(graph);
+    const bool compact =
+        static_cast<unsigned long long>(graph.nnz) <=
+        static_cast<unsigned long long>(
+            std::numeric_limits<CompactOffset>::max());
+    if (compact) {
+      engine =
+          std::make_unique<
+              PredsGpuTypedEngineImpl<CompactOffset, true>>(
+              std::move(graph),
+              mode,
+              max_unique_targets,
+              reserve_path_scratch,
+              print_setup_metadata);
+    } else {
+      engine =
+          std::make_unique<
+              PredsGpuTypedEngineImpl<Offset, false>>(
+              std::move(graph),
+              mode,
+              max_unique_targets,
+              reserve_path_scratch,
+              print_setup_metadata);
+    }
+  }
+
+  std::unique_ptr<PredsGpuTypedEngine> engine;
+};
+
+PredsGpuContext::PredsGpuContext(
+    CsrGraph graph,
+    PredicateMode mode,
+    std::size_t max_unique_targets,
+    bool reserve_path_scratch,
+    bool print_setup_metadata)
+    : impl_(std::make_unique<Impl>(
+          std::move(graph),
+          mode,
+          max_unique_targets,
+          reserve_path_scratch,
+          print_setup_metadata)) {}
+
+PredsGpuContext::PredsGpuContext(
+    CsrGraphView graph,
+    PredicateMode mode,
+    std::size_t max_unique_targets,
+    bool reserve_path_scratch,
+    bool print_setup_metadata)
+    : PredsGpuContext(
+          copy_csr_graph_view(graph),
+          mode,
+          max_unique_targets,
+          reserve_path_scratch,
+          print_setup_metadata) {}
+
+PredsGpuContext::~PredsGpuContext() = default;
+PredsGpuContext::PredsGpuContext(PredsGpuContext&&) noexcept = default;
+PredsGpuContext& PredsGpuContext::operator=(
+    PredsGpuContext&&) noexcept = default;
+
+PredicateMode PredsGpuContext::predicate_mode() const noexcept {
+  return impl_ ? impl_->engine->predicate_mode()
+               : PredicateMode::kInSimple;
+}
+
+Offset PredsGpuContext::rows() const noexcept {
+  return impl_ ? impl_->engine->rows() : 0;
+}
+
+Offset PredsGpuContext::nnz() const noexcept {
+  return impl_ ? impl_->engine->nnz() : 0;
+}
+
+std::size_t PredsGpuContext::target_capacity() const noexcept {
+  return impl_ ? impl_->engine->target_capacity() : 0;
+}
+
+bool PredsGpuContext::path_scratch_reserved() const noexcept {
+  return impl_ && impl_->engine->path_scratch_reserved();
+}
+
+RunResult PredsGpuContext::run(const RunRequest& request) {
+  if (!impl_) {
+    throw std::logic_error(
+        "cannot run a moved-from preds-gpu context");
+  }
+  return impl_->engine->run(request);
+}
+
+void PredsGpuContext::validate_captured_target_path(
+    Index source,
+    const CapturedTargetPathView& path) const {
+  if (!impl_) {
+    throw std::logic_error(
+        "cannot validate a path with a moved-from preds-gpu context");
+  }
+  impl_->engine->validate_captured_target_path(source, path);
+}
+
+CumulativeStatistics PredsGpuContext::cumulative_statistics() const {
+  return impl_ ? impl_->engine->cumulative_statistics()
+               : CumulativeStatistics{};
+}
+
 }  // namespace rips_predicates_gpu
 
+// Keep the reusable translation unit entry-point-free by default.  The
+// standalone executable opts in explicitly; PREDS_GPU_NO_MAIN remains an
+// overriding compatibility guard for embedding build recipes.
+#if defined(PREDS_GPU_STANDALONE_MAIN) && !defined(PREDS_GPU_NO_MAIN)
 int main(int argc, char** argv) {
   if (argc == 2 &&
       (std::string(argv[1]) == "-h" ||
@@ -2952,3 +3816,4 @@ int main(int argc, char** argv) {
     return 1;
   }
 }
+#endif
