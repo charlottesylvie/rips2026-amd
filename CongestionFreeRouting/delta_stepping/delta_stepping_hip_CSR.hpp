@@ -155,12 +155,6 @@ struct DeltaSteppingCsrWorkspaceOptions {
   // seeds the next generic generation advance. It has no effect in Boolean
   // membership mode.
   std::uint32_t controller_generation_seed_for_testing = 0;
-  // Experimental host-checked generic-kernel controls. All remain default-off
-  // and fail closed to the established implementation when their eligibility
-  // guards are not satisfied.
-  bool verified_unit_weight_load_elision = false;
-  bool host_value_frontier_count = false;
-  bool wave_aggregated_queue_reservations = false;
 };
 
 struct DeltaSteppingCsrGraphOptions {
@@ -444,9 +438,6 @@ class DeltaSteppingCsrWorkspace {
       DeltaSteppingCsrControllerMode::kHostChecked;
   std::uint32_t controller_batch_size_ =
       kDeltaSteppingCsrRecommendedControllerBatchSize;
-  bool verified_unit_weight_load_elision_ = false;
-  bool host_value_frontier_count_ = false;
-  bool wave_aggregated_queue_reservations_ = false;
   std::uint32_t controller_generation_seed_for_testing_ = 0;
   DeltaSteppingCsrTelemetry* active_telemetry_ = nullptr;
   float active_distance_limit_ = std::numeric_limits<float>::infinity();

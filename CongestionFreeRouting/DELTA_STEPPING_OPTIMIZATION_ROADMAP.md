@@ -1,10 +1,9 @@
 # Classic Delta-Stepping Optimization Roadmap
 
-Updated 2026-07-28 for the host-checked relaxation pass. Compact row offsets,
-generation-tagged current membership, capacity pre-reservation, the optional
-reduced-round-trip controller, and three new relaxation A/B paths are
-implemented and host-tested, but the changed HIP translation units have not
-been compiled or run locally.
+Updated 2026-07-27 for the bounded controller pass. Compact row offsets,
+generation-tagged current membership, capacity pre-reservation, and the
+optional reduced-round-trip controller are implemented and host-tested, but
+not compiled or run with HIP.
 
 ## Scope
 
@@ -37,10 +36,8 @@ path, and cannot rank genuinely mixed-weight behavior.
   keeps those dependent phases in one grid-synchronized cooperative kernel for
   a bounded batch and publishes one compact descriptor; callbacks and
   unsupported kernels use the full host fallback.
-- The legacy/default relaxation uses scalar global atomics for every competing
-  distance update, queue claim, and queue reservation. A default-off wave32
-  specialization now keeps distance/parent/membership atomics unchanged but
-  combines each wave's successful touched/current/pending tail reservation.
+- Scalar global atomics publish every competing distance update, queue claim,
+  and queue reservation.
 - Compact vector-target runs use a 64-bit `{distance_bits,
   original_edge_id}` parent key. The old predecessor-row recovery is only a
   forced legacy or allocation fallback.
@@ -92,19 +89,7 @@ host: one descriptor check -> stop, relaunch, extract, or full-reset error
 The retained four-worker gfx1151 host baseline averaged about 133 dispatches
 and 65 `hipStreamSynchronize` calls per query, with 34.09 seconds of zero
 active-kernel time. The reduced-controller cells are deliberately marked “not
-run” in that historical table. A later measured reduced-controller run was a
-severe regression while host-checked and telemetry-enabled host-checked runs
-were fast. The reduced controller therefore remains opt-in for A/B diagnosis
-and is not a performance solution or optimization target.
-
-The relaxation profile that now determines priority instantiated
-`relax_light_edges_kernel<unsigned int, false, true, true, false, false, true,
-false>`. Across 2,951 dispatches it accumulated 524.97 ms (177.9 us mean,
-34.0 us median), with 97.28% wave dependency wait, 0.12 IPC, 20.32% reported
-occupancy, 11.69% GL1 and 58.65% L2 hit rates, and approximately 23.3% of L2
-requests atomic. “Wait for Counter” intensity was 112.13% and is not an
-additive time fraction. This evidence prioritizes dependent-memory and queue
-tail contention, not VALU, instruction-cache, or bulk-bandwidth tuning.
+run”; the local host has no HIP toolchain or AMD GPU.
 
 | Metric per query | Host-checked retained trace | Reduced controller |
 | --- | ---: | ---: |
@@ -129,20 +114,17 @@ workload, with broader weighted-graph upside called out separately.
 
 | Rank | Optimization | Status | Expected speed improvement | Difficulty | Why it ranks here |
 | ---: | --- | --- | --- | --- | --- |
-| 1 | Wave-aggregate touched/current/pending reservations in the exact profiled kernel | Implemented, opt-in, HIP-unvalidated | Unknown until profiler-free AMD A/B | High | One elected wave32 lane reserves each output queue for all winners. The edge-step loop is convergent; distance, deterministic parent, and first-membership atomics remain per edge. Wave64 and every unprofiled specialization fall back. |
-| 2 | Elide verified-unit edge-value loads | Implemented, opt-in, HIP-unvalidated | Unknown until profiler-free AMD A/B | Low | An immutable proof tied to the uploaded value payload selects exact `1.0f`; delta/all-light state never implies unit weights, and force-generic remains classic Delta. |
-| 3 | Pass authoritative host frontier counts by value | Implemented, opt-in, HIP-unvalidated | Unknown until profiler-free AMD A/B | Low | Eligible explicit-stream host-checked rounds already have a synchronized, range-checked count. Device-produced/default-stream rounds retain the pointer load and barrier, and the gfx1151 clear-to-relax boundary is unchanged. |
-| — | Reduced-round-trip controller | Preserved opt-in; measured severe regression | Do not pursue as a performance solution | Very high | The measured regression is controller-specific, not telemetry, conversion, graph loading, or four-stream contention. Keep it only for existing A/B coverage. |
-| 4 | Generation-tagged `in_current` | Implemented, opt-in, HIP-unvalidated | 10--30% end-to-end, 15--40% traversal when many vertices are touched | High | The new representation removes only the current-membership clear path. Sparse reset of distance, parent, pending, and heavy state remains necessary. Boolean/clear remains default until AMD validation. |
-| 5 | Eligible 32-bit device row offsets with forced-wide A/B | Implemented, automatic, HIP-unvalidated | 5--15% traversal plus 4 B/V shared-graph savings | Medium | Complete-range eligibility is exact at `UINT32_MAX`; every row-reading kernel is typed, while the public CSR/path edge identity remains 64-bit. |
-| 6 | Add a degree-aware outgoing-edge expander | Not implemented | 0--15% on the mostly short-row routing graph; 10--40% on skewed weighted graphs | High | Thread-per-row is appropriate for short rows but serializes long rows. Use lane groups, wave-per-row, and CTA/edge-balanced paths only above measured reached-degree thresholds. |
-| 7 | Reduce candidates by destination before global atomics | Not implemented | 0--10% on low-collision routing frontiers; 10--30% when destinations collide heavily | High | The current kernel performs one distance atomic and queue decision per eligible edge. Wave/block aggregation is worthwhile only after convergent edge assignment and collision telemetry exist. |
-| 8 | Batch independent searches in one launch | Not implemented | 5--30% throughput when individual frontiers underfill the GPU | Very high | It can amortize launches and fill small frontiers, but the retained worker sweep was nearly flat from 2 to 8 workers and the old trace already showed high overlap. Implement only after per-query state is smaller and current single-query control is measured. |
-| 9 | Prepartition immutable adjacency into light and heavy edge ranges | Not implemented | 0% for all-light routing runs; 10--35% for truly mixed fixed weights | High | It avoids rescanning mixed rows, but a new delta or destination-cost update can invalidate the partition. Keep the existing direct path for all-light and mutable-cost workloads. |
-| 10 | Replace flat pending scans with circular/windowed buckets plus a nonempty bitmap | Not implemented | About 0--5% on the retained all-light profile; 5--30% on broad weighted bucket spans | High | Pending management was only about 1% in the historical unit-weight trace, so this must be justified by new weighted telemetry before implementation. |
-| 11 | Tune weighted automatic delta and refresh it after mutable value/cost updates | Partially implemented | 0--25% on weighted workloads | Low--Medium | Exact-unit effective weights now select the natural width `1 * multiplier`; weighted graphs retain the graph-aware seed. The remaining work is a target-GPU weighted multiplier sweep and an optional workspace-owned statistic refresh after updates. |
-| 12 | Pre-reserve and geometrically retain query/path buffers | Implemented, enabled, HIP-unvalidated | 2--8% where allocation/free is visible | Low | Metadata-derived source/target reservations are active, all growth retains geometric high water, and compact paths remain demand-sized. |
-| 13 | Tune block sizes, launch bounds, architecture flags, and compiler options | Not implemented | 0--10% | Low | Useful after structural kernels stabilize; it cannot remove the present controller or state traffic. |
+| 1 | Keep classic-Delta bucket and light-closure control on the GPU | Implemented, opt-in, HIP-unvalidated | 20--50% end-to-end on control-bound searches; potentially larger for many shallow buckets | Very high | The reduced controller fuses dependent light/bucket phases behind cooperative grid barriers and publishes one descriptor per bounded batch. The host-checked path remains default, and target-gfx1151 correctness/performance gates are outstanding. |
+| 2 | Generation-tagged `in_current` | Implemented, opt-in, HIP-unvalidated | 10--30% end-to-end, 15--40% traversal when many vertices are touched | High | The new representation removes only the current-membership clear path. Sparse reset of distance, parent, pending, and heavy state remains necessary. Boolean/clear remains default until AMD validation. |
+| 3 | Eligible 32-bit device row offsets with forced-wide A/B | Implemented, automatic, HIP-unvalidated | 5--15% traversal plus 4 B/V shared-graph savings | Medium | Complete-range eligibility is exact at `UINT32_MAX`; every row-reading kernel is typed, while the public CSR/path edge identity remains 64-bit. |
+| 4 | Add a degree-aware outgoing-edge expander | Not implemented | 0--15% on the mostly short-row routing graph; 10--40% on skewed weighted graphs | High | Thread-per-row is appropriate for short rows but serializes long rows. Use lane groups, wave-per-row, and CTA/edge-balanced paths only above measured reached-degree thresholds. |
+| 5 | Reduce candidates by destination before global atomics | Not implemented | 0--10% on low-collision routing frontiers; 10--30% when destinations collide heavily | High | The current kernel performs one distance atomic and queue decision per eligible edge. Wave/block aggregation is worthwhile only after convergent edge assignment and collision telemetry exist. |
+| 6 | Batch independent searches in one launch | Not implemented | 5--30% throughput when individual frontiers underfill the GPU | Very high | It can amortize launches and fill small frontiers, but the retained worker sweep was nearly flat from 2 to 8 workers and the old trace already showed high overlap. Implement only after per-query state is smaller and current single-query control is measured. |
+| 7 | Prepartition immutable adjacency into light and heavy edge ranges | Not implemented | 0% for all-light routing runs; 10--35% for truly mixed fixed weights | High | It avoids rescanning mixed rows, but a new delta or destination-cost update can invalidate the partition. Keep the existing direct path for all-light and mutable-cost workloads. |
+| 8 | Replace flat pending scans with circular/windowed buckets plus a nonempty bitmap | Not implemented | About 0--5% on the retained all-light profile; 5--30% on broad weighted bucket spans | High | Pending management was only about 1% in the historical unit-weight trace, so this must be justified by new weighted telemetry before implementation. |
+| 9 | Tune weighted automatic delta and refresh it after mutable value/cost updates | Partially implemented | 0--25% on weighted workloads | Low--Medium | Exact-unit effective weights now select the natural width `1 * multiplier`; weighted graphs retain the graph-aware seed. The remaining work is a target-GPU weighted multiplier sweep and an optional workspace-owned statistic refresh after updates. |
+| 10 | Pre-reserve and geometrically retain query/path buffers | Implemented, enabled, HIP-unvalidated | 2--8% where allocation/free is visible | Low | Metadata-derived source/target reservations are active, all growth retains geometric high water, and compact paths remain demand-sized. |
+| 11 | Tune block sizes, launch bounds, architecture flags, and compiler options | Not implemented | 0--10% | Low | Useful after structural kernels stabilize; it cannot remove the present controller or state traffic. |
 
 ## Recommended implementation sequence
 
@@ -223,20 +205,7 @@ end-to-end win with identical route results.
 
 ### Phase 4: shared edge expansion and contention control
 
-The first bounded contention-control slice is implemented for the exact
-profiled specialization. A wave owns up to 32 frontier rows, reduces the
-maximum row length, executes one uniform masked edge-step loop, and performs
-three independent ballot/prefix/reservation sequences. It is enabled only
-with exact-unit load elision, wave32, compact rows, Boolean membership, compact
-edge parents, no costs/heavy work/telemetry, and the host-checked controller.
-All other combinations use the unchanged scalar row loop. Host tests cover
-wave32 and wave64 prefix arithmetic (wave64 is model-only), empty/sparse/full
-ballots, highest lanes, capacity boundaries, parent ties, and randomized
-classic-Delta scheduling equivalence. HIP correctness and performance remain
-outstanding.
-
-After that bounded path is validated, build a convergent degree-aware edge
-assignment for broader weighted workloads:
+Build a convergent degree-aware edge assignment:
 
 - thread-per-row for short rows;
 - lane groups or packed waves for medium rows;

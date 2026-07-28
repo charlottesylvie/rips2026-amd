@@ -214,21 +214,6 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         help="force legacy generic-delta predecessor recovery",
     )
     parser.add_argument(
-        "--delta-unit-weight-load-elision",
-        action="store_true",
-        help="enable proof-gated generic exact-unit edge-load elision",
-    )
-    parser.add_argument(
-        "--delta-host-value-frontier-count",
-        action="store_true",
-        help="enable eligible explicit-stream host frontier-count values",
-    )
-    parser.add_argument(
-        "--delta-wave-queue-reservations",
-        action="store_true",
-        help="enable eligible wave32 generic queue reservation aggregation",
-    )
-    parser.add_argument(
         "--delta-controller",
         choices=("host-checked", "reduced-round-trip"),
         help="generic delta-stepping controller mode",
@@ -303,9 +288,6 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         or args.delta_multiplier is not None
         or args.delta_force_generic
         or args.delta_force_legacy_parent
-        or args.delta_unit_weight_load_elision
-        or args.delta_host_value_frontier_count
-        or args.delta_wave_queue_reservations
         or args.delta_telemetry
         or args.delta_controller is not None
         or args.delta_controller_batch_size is not None
@@ -349,12 +331,6 @@ def pathfinder_args(args: argparse.Namespace) -> list[str]:
         forwarded.append("--use-delta-step")
     if args.delta_force_generic:
         forwarded.append("--delta-force-generic")
-    if args.delta_unit_weight_load_elision:
-        forwarded.append("--delta-unit-weight-load-elision")
-    if args.delta_host_value_frontier_count:
-        forwarded.append("--delta-host-value-frontier-count")
-    if args.delta_wave_queue_reservations:
-        forwarded.append("--delta-wave-queue-reservations")
     if args.delta_telemetry:
         forwarded.append("--delta-telemetry")
     if args.delta_force_legacy_parent:

@@ -197,12 +197,6 @@ void print_usage(const char* program) {
       << "  --delta-force-generic          Force generic Delta-Stepping even for exact-unit weights.\n"
       << "  --delta-telemetry              Forward opt-in Delta-Stepping runtime telemetry.\n"
       << "  --delta-force-legacy-parent    Forwarded for generic Delta parent-path A/B comparison.\n"
-      << "  --delta-unit-weight-load-elision\n"
-      << "                                 Forward verified-unit generic load-elision opt-in.\n"
-      << "  --delta-host-value-frontier-count\n"
-      << "                                 Forward host-known frontier-count opt-in.\n"
-      << "  --delta-wave-queue-reservations\n"
-      << "                                 Forward wave32 queue-reservation aggregation opt-in.\n"
       << "  --delta <float|auto>           Forwarded to pathfinder.\n"
       << "  --delta-multiplier <float>     Forwarded for an automatic-delta sweep.\n"
       << "  --delta-controller <host-checked|reduced-round-trip>\n"
@@ -277,10 +271,7 @@ Options parse_args(int argc, char** argv) {
       options.allow_unrouted = false;
     } else if (option == "--use-delta-step" ||
                option == "--delta-force-generic" ||
-               option == "--delta-force-legacy-parent" ||
-               option == "--delta-unit-weight-load-elision" ||
-               option == "--delta-host-value-frontier-count" ||
-               option == "--delta-wave-queue-reservations") {
+               option == "--delta-force-legacy-parent") {
       options.pathfinder_args.push_back(option);
     } else if (option == "--delta-telemetry") {
       if (!delta_telemetry) {

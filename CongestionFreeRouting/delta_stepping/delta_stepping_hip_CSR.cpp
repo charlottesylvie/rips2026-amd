@@ -31,7 +31,6 @@ static_assert(sizeof(CompactRowOffset) == 4,
 
 constexpr int kBlockSize = 256;
 constexpr int kMaxGridX = 65535;
-constexpr int kMaxPendingReductionBlocks = 256;
 constexpr int kNoBucket = 0x3fffffff;
 constexpr Offset kMaxUnitSpecializationRows =
     static_cast<Offset>(1) << std::numeric_limits<float>::digits;
@@ -312,8 +311,6 @@ struct DeltaSteppingScratch {
   DeviceBuffer<int> heavy_count;
   DeviceBuffer<int> touched_count;
   DeviceBuffer<int> settled_target_count;
-  // Element zero is the cooperative controller's atomic minimum. The
-  // host-checked controller uses the full allocation for per-block minima.
   DeviceBuffer<int> min_pending_bucket;
   // Unit-weight specialization status: append tail, targets reached, frontier
   // begin/end, next depth, whether the last expansion was active, last
@@ -338,7 +335,6 @@ struct DeltaSteppingScratch {
   DeviceBuffer<Offset> compact_path_edges;
   PinnedHostBuffer<int> host_scalar;
   PinnedHostBuffer<int> host_unit_status;
-  std::unique_ptr<PinnedHostBuffer<int>> host_pending_bucket_block_mins;
   std::unique_ptr<
       PinnedHostBuffer<DeltaSteppingCsrControllerDescriptor>>
       host_controller_descriptor;
@@ -391,14 +387,7 @@ struct DeltaSteppingScratch {
     ensure_scalar(heavy_count);
     ensure_scalar(touched_count);
     ensure_scalar(settled_target_count);
-    if (min_pending_bucket.size() < kMaxPendingReductionBlocks) {
-      min_pending_bucket.reset(kMaxPendingReductionBlocks);
-    }
-    if (!host_pending_bucket_block_mins) {
-      host_pending_bucket_block_mins =
-          std::make_unique<PinnedHostBuffer<int>>(
-              kMaxPendingReductionBlocks);
-    }
+    ensure_scalar(min_pending_bucket);
   }
 
   void ensure_parent_key_storage() {
@@ -645,6 +634,12 @@ inline float max_edge_value(const std::vector<float>& values) {
     max_value = std::max(max_value, value);
   }
   return max_value;
+}
+
+inline bool has_exact_unit_edge_values(const std::vector<float>& values) {
+  return std::all_of(values.begin(), values.end(), [](float value) {
+    return value == 1.0f;
+  });
 }
 
 inline void validate_host_csr(const HostCsrF32& g, int source, int target, float delta) {
@@ -1662,12 +1657,9 @@ template <typename RowOffset,
           bool HasVertexCosts,
           bool CollectHeavy,
           bool AllEdgesLight,
-          bool CollectTelemetry,
-          bool VerifiedUnitWeight,
-          bool HostKnownFrontierCount>
+          bool CollectTelemetry>
 __global__ void relax_light_edges_kernel(const int* frontier,
                                          const int* frontier_count_ptr,
-                                         int frontier_count_value,
                                          int current_bucket,
                                          float delta,
                                          float exclusive_distance_limit,
@@ -1693,15 +1685,11 @@ __global__ void relax_light_edges_kernel(const int* frontier,
   // FPGA routing graphs have short outgoing rows.  Assign one active vertex to
   // each thread so a 256-thread block can process up to 256 rows concurrently,
   // matching the unit-BFS traversal instead of idling most of a block per row.
-  int frontier_count = frontier_count_value;
-  if constexpr (!HostKnownFrontierCount) {
-    __shared__ int device_frontier_count;
-    if (threadIdx.x == 0) {
-      device_frontier_count = atomic_load_counter(frontier_count_ptr);
-    }
-    __syncthreads();
-    frontier_count = device_frontier_count;
+  __shared__ int frontier_count;
+  if (threadIdx.x == 0) {
+    frontier_count = atomic_load_counter(frontier_count_ptr);
   }
+  __syncthreads();
   unsigned long long telemetry[kTelemetryCounterCount] = {};
   unsigned long long current_peak =
       threadIdx.x == 0 ? static_cast<unsigned long long>(frontier_count) : 0;
@@ -1746,10 +1734,7 @@ __global__ void relax_light_edges_kernel(const int* frontier,
         if constexpr (CollectTelemetry) {
           ++telemetry[kTelemetryLightEdgeVisits];
         }
-        float w = 1.0f;
-        if constexpr (!VerifiedUnitWeight) {
-          w = out_values[e];
-        }
+        const float w = out_values[e];
         const int v = static_cast<int>(out_colind[e]);
         const float effective_w =
             HasVertexCosts ? w * vertex_costs[v] : w;
@@ -1851,141 +1836,6 @@ __global__ void relax_light_edges_kernel(const int* frontier,
     add_block_telemetry(telemetry, telemetry_counters);
     update_block_queue_peaks(current_peak, pending_peak, heavy_peak,
                              telemetry_counters);
-  }
-}
-
-__device__ inline int wave32_append_position(bool append,
-                                             int* count,
-                                             int capacity) {
-  const unsigned int lane = threadIdx.x & 31U;
-  const unsigned int ballot =
-      static_cast<unsigned int>(__ballot(append));
-  if (ballot == 0) {
-    // Keep the shuffle source valid even when no lane reserves queue space.
-    return -1;
-  }
-  const int leader = __ffs(ballot) - 1;
-  int base = 0;
-  if (lane == static_cast<unsigned int>(leader)) {
-    base = atomicAdd(count, __popc(ballot));
-  }
-  base = __shfl(base, leader, 32);
-  const long long reservation_end =
-      static_cast<long long>(base) + __popc(ballot);
-  const bool valid_reservation =
-      base >= 0 && reservation_end <= static_cast<long long>(capacity);
-  if (!append || !valid_reservation) return -1;
-  const unsigned int lower_lanes =
-      lane == 0 ? 0U : (UINT32_C(1) << lane) - UINT32_C(1);
-  return base + __popc(ballot & lower_lanes);
-}
-
-// This kernel is deliberately separate from the scalar row loop. Every lane
-// executes the same edge-step loop and all three ballots at every step, so no
-// wave collective is placed in a divergent per-thread CSR loop.
-template <bool HostKnownFrontierCount>
-__global__ void relax_light_edges_wave32_compact_unit_kernel(
-    const int* frontier,
-    const int* frontier_count_ptr,
-    int frontier_count_value,
-    int current_bucket,
-    float delta,
-    float exclusive_distance_limit,
-    const CompactRowOffset* out_rowptr,
-    const Index* out_colind,
-    float* dist,
-    unsigned long long* parent_key,
-    std::uint32_t* in_current,
-    int* in_pending,
-    int* touched_queue,
-    int* touched_count,
-    int* next_frontier,
-    int* next_count,
-    int* pending_queue,
-    int* pending_count,
-    int queue_capacity) {
-  int frontier_count = frontier_count_value;
-  if constexpr (!HostKnownFrontierCount) {
-    __shared__ int device_frontier_count;
-    if (threadIdx.x == 0) {
-      device_frontier_count = atomic_load_counter(frontier_count_ptr);
-    }
-    __syncthreads();
-    frontier_count = device_frontier_count;
-  }
-  const unsigned int lane = threadIdx.x & 31U;
-  const int waves_per_block = blockDim.x / 32;
-  const int wave_in_block = threadIdx.x / 32;
-  const int first_wave = blockIdx.x * waves_per_block + wave_in_block;
-  const int wave_stride = gridDim.x * waves_per_block;
-
-  for (long long wave_base = static_cast<long long>(first_wave) * 32;
-       wave_base < frontier_count;
-       wave_base += static_cast<long long>(wave_stride) * 32) {
-    const long long fi = wave_base + lane;
-    const bool row_present = fi < frontier_count;
-    const int u = row_present ? frontier[static_cast<int>(fi)] : 0;
-    const float du = row_present ? dist[u] : INFINITY;
-    const bool row_active =
-        row_present && finite_float(du) &&
-        bucket_index(du, delta) == current_bucket;
-    const CompactRowOffset row_begin =
-        row_active ? out_rowptr[u] : CompactRowOffset{0};
-    const CompactRowOffset row_length =
-        row_active ? out_rowptr[u + 1] - row_begin : CompactRowOffset{0};
-    CompactRowOffset max_row_length = row_length;
-    for (int offset = 16; offset > 0; offset >>= 1) {
-      const CompactRowOffset other =
-          __shfl_down(max_row_length, offset, 32);
-      if (other > max_row_length) max_row_length = other;
-    }
-    max_row_length = __shfl(max_row_length, 0, 32);
-
-    for (CompactRowOffset row_offset = 0; row_offset < max_row_length;
-         ++row_offset) {
-      const bool edge_active = row_offset < row_length;
-      int v = 0;
-      CompactRowOffset edge = 0;
-      bool append_touched = false;
-      bool append_current = false;
-      bool append_pending = false;
-      if (edge_active) {
-        edge = row_begin + row_offset;
-        v = static_cast<int>(out_colind[edge]);
-        const float candidate = du + 1.0f;
-        const bool below_distance_limit =
-            candidate < exclusive_distance_limit;
-        const float nd = below_distance_limit ? candidate : INFINITY;
-        const float old = below_distance_limit
-                              ? atomic_min_float_nonnegative(&dist[v], nd)
-                              : INFINITY;
-        const bool decreased = below_distance_limit && nd < old;
-        append_touched = decreased && infinite_float(old);
-        if (decreased) {
-          publish_parent_candidate<true, true>(
-              &parent_key[v], u, edge, nd);
-          const int candidate_bucket = bucket_index(nd, delta);
-          if (candidate_bucket == current_bucket) {
-            append_current = atomicCAS(&in_current[v], 0U, 1U) == 0U;
-          } else if (candidate_bucket > current_bucket &&
-                     candidate_bucket < kNoBucket) {
-            append_pending = atomicCAS(&in_pending[v], 0, 1) == 0;
-          }
-        }
-      }
-
-      const int touched_pos =
-          wave32_append_position(append_touched, touched_count,
-                                 queue_capacity);
-      const int current_pos =
-          wave32_append_position(append_current, next_count, queue_capacity);
-      const int pending_pos =
-          wave32_append_position(append_pending, pending_count,
-                                 queue_capacity);
-      if (touched_pos >= 0) touched_queue[touched_pos] = v;
-      if (current_pos >= 0) next_frontier[current_pos] = v;
-      if (pending_pos >= 0) pending_queue[pending_pos] = v;
-    }
   }
 }
 
@@ -2112,52 +1962,7 @@ template <typename RowOffset,
           bool HasVertexCosts,
           bool CollectHeavy,
           bool AllEdgesLight,
-          bool CollectTelemetry,
-          bool VerifiedUnitWeight,
-          bool HostKnownFrontierCount>
-void launch_relax_light_edges_variant(
-    const DeviceCsrView<RowOffset>& graph,
-    DeltaSteppingScratch& scratch,
-    const float* vertex_costs,
-    const int* current_queue,
-    const int* current_count,
-    int launch_blocks,
-    int current_bucket,
-    float delta,
-    float exclusive_distance_limit,
-    int* next_queue,
-    int* next_count,
-    std::uint32_t next_current_generation,
-    int* pending_queue,
-    hipStream_t stream,
-    int host_frontier_count) {
-  relax_light_edges_kernel<RowOffset, UseCurrentGenerations, TrackParents,
-                           UseEdgeParent, HasVertexCosts, CollectHeavy,
-                           AllEdgesLight, CollectTelemetry,
-                           VerifiedUnitWeight, HostKnownFrontierCount>
-      <<<launch_blocks, kBlockSize, 0, stream>>>(
-          current_queue, HostKnownFrontierCount ? nullptr : current_count,
-          host_frontier_count, current_bucket, delta, exclusive_distance_limit,
-          graph.rowptr, graph.colind, graph.values, vertex_costs,
-          scratch.dist.get(), scratch.parent_key.get(),
-          scratch.in_current.get(), next_current_generation,
-          scratch.in_pending.get(), scratch.in_heavy.get(),
-          scratch.touched_queue.get(), scratch.touched_count.get(), next_queue,
-          next_count, pending_queue, scratch.pending_count.get(),
-          scratch.heavy_queue.get(), scratch.heavy_count.get(),
-          CollectTelemetry ? scratch.telemetry_counters.get() : nullptr);
-  DS_DELTA_HIP_CHECK(hipGetLastError());
-}
-
-template <typename RowOffset,
-          bool UseCurrentGenerations,
-          bool TrackParents,
-          bool UseEdgeParent,
-          bool HasVertexCosts,
-          bool CollectHeavy,
-          bool AllEdgesLight,
-          bool CollectTelemetry,
-          bool VerifiedUnitWeight = false>
+          bool CollectTelemetry>
 void launch_relax_light_edges(
     const DeviceCsrView<RowOffset>& graph,
     DeltaSteppingScratch& scratch,
@@ -2172,57 +1977,22 @@ void launch_relax_light_edges(
     int* next_count,
     std::uint32_t next_current_generation,
     int* pending_queue,
-    hipStream_t stream,
-    bool host_known_frontier_count = false,
-    int host_frontier_count = 0) {
-  if (host_known_frontier_count) {
-    launch_relax_light_edges_variant<
-        RowOffset, UseCurrentGenerations, TrackParents, UseEdgeParent,
-        HasVertexCosts, CollectHeavy, AllEdgesLight, CollectTelemetry,
-        VerifiedUnitWeight, true>(
-        graph, scratch, vertex_costs, current_queue, current_count,
-        launch_blocks, current_bucket, delta, exclusive_distance_limit,
-        next_queue, next_count, next_current_generation, pending_queue, stream,
-        host_frontier_count);
-  } else {
-    launch_relax_light_edges_variant<
-        RowOffset, UseCurrentGenerations, TrackParents, UseEdgeParent,
-        HasVertexCosts, CollectHeavy, AllEdgesLight, CollectTelemetry,
-        VerifiedUnitWeight, false>(
-        graph, scratch, vertex_costs, current_queue, current_count,
-        launch_blocks, current_bucket, delta, exclusive_distance_limit,
-        next_queue, next_count, next_current_generation, pending_queue, stream,
-        host_frontier_count);
-  }
-}
-
-template <bool HostKnownFrontierCount>
-void launch_relax_light_edges_wave32_compact_unit(
-    DeltaSteppingScratch& scratch,
-    const DeviceCsrView<CompactRowOffset>& graph,
-    const int* current_queue,
-    const int* current_count,
-    int host_frontier_count,
-    int launch_blocks,
-    int current_bucket,
-    float delta,
-    float exclusive_distance_limit,
-    int* next_queue,
-    int* next_count,
-    int* pending_queue,
     hipStream_t stream) {
-  static_assert(kBlockSize % 32 == 0,
-                "wave32 queue aggregation requires full 32-lane waves");
-  relax_light_edges_wave32_compact_unit_kernel<HostKnownFrontierCount>
+  relax_light_edges_kernel<RowOffset, UseCurrentGenerations, TrackParents,
+                           UseEdgeParent, HasVertexCosts, CollectHeavy,
+                           AllEdgesLight, CollectTelemetry>
       <<<launch_blocks, kBlockSize, 0, stream>>>(
-          current_queue, HostKnownFrontierCount ? nullptr : current_count,
-          host_frontier_count, current_bucket, delta,
-          exclusive_distance_limit, graph.rowptr, graph.colind,
+          current_queue, current_count, current_bucket, delta,
+          exclusive_distance_limit,
+          graph.rowptr, graph.colind, graph.values, vertex_costs,
           scratch.dist.get(), scratch.parent_key.get(),
-          scratch.in_current.get(), scratch.in_pending.get(),
-          scratch.touched_queue.get(), scratch.touched_count.get(), next_queue,
-          next_count, pending_queue, scratch.pending_count.get(),
-          static_cast<int>(graph.rows));
+          scratch.in_current.get(), next_current_generation,
+          scratch.in_pending.get(),
+          scratch.in_heavy.get(), scratch.touched_queue.get(),
+          scratch.touched_count.get(), next_queue, next_count,
+          pending_queue, scratch.pending_count.get(), scratch.heavy_queue.get(),
+          scratch.heavy_count.get(),
+          CollectTelemetry ? scratch.telemetry_counters.get() : nullptr);
   DS_DELTA_HIP_CHECK(hipGetLastError());
 }
 
@@ -2367,7 +2137,7 @@ __global__ void reduce_min_pending_bucket_kernel(const int* pending_queue,
                                                  float delta,
                                                  const float* dist,
                                                  const int* in_pending,
-                                                 int* block_mins,
+                                                 int* global_min,
                                                  unsigned long long* telemetry_counters) {
   __shared__ int s_min[kBlockSize];
   __shared__ int shared_pending_count;
@@ -2406,14 +2176,8 @@ __global__ void reduce_min_pending_bucket_kernel(const int* pending_queue,
     }
     __syncthreads();
   }
-  if (tid == 0) {
-    // Publish one self-contained result per block. The host-checked
-    // controller previously initialized one global atomic minimum with an
-    // H2D copy before this launch. Under concurrent nonblocking streams on
-    // gfx1151 that copy-engine-to-atomic handoff can expose the old scalar,
-    // making a mathematically impossible stale bucket survive the reduction.
-    // Block-local outputs need no cross-dispatch initializer.
-    block_mins[blockIdx.x] = s_min[0];
+  if (tid == 0 && s_min[0] < kNoBucket) {
+    atomicMin(global_min, s_min[0]);
   }
   if constexpr (CollectTelemetry) {
     unsigned long long telemetry[kTelemetryCounterCount] = {};
@@ -4549,31 +4313,23 @@ int find_min_pending_bucket(const int* d_pending_queue,
                             float delta,
                             const float* d_dist,
                             const int* d_in_pending,
-                            int* d_block_mins,
-                            int* h_block_mins,
+                            int* d_min_bucket,
+                            int* h_min_bucket,
                             hipStream_t stream,
                             unsigned long long* telemetry_counters) {
-  if (launch_blocks <= 0 ||
-      launch_blocks > kMaxPendingReductionBlocks) {
-    throw std::logic_error(
-        "delta pending-bucket reduction block count is outside bounds");
-  }
-  // Preserve the established explicit-stream producer boundary, but do not
-  // use a copy-engine scalar write as the reduction's initial state.
+  const int initial_min = kNoBucket;
+  DS_DELTA_HIP_CHECK(hipMemcpyAsync(d_min_bucket,
+                                    &initial_min,
+                                    sizeof(int),
+                                    hipMemcpyHostToDevice,
+                                    stream));
   synchronize_explicit_stream(stream);
   reduce_min_pending_bucket_kernel<CollectTelemetry>
       <<<launch_blocks, kBlockSize, 0, stream>>>(
       d_pending_queue, d_pending_count, current_bucket, delta, d_dist,
-      d_in_pending, d_block_mins, telemetry_counters);
+      d_in_pending, d_min_bucket, telemetry_counters);
   DS_DELTA_HIP_CHECK(hipGetLastError());
-  DS_DELTA_HIP_CHECK(hipMemcpyAsync(
-      h_block_mins, d_block_mins,
-      sssp_capacity::checked_bytes<int>(
-          static_cast<std::size_t>(launch_blocks)),
-      hipMemcpyDeviceToHost, stream));
-  DS_DELTA_HIP_CHECK(hipStreamSynchronize(stream));
-  return *std::min_element(h_block_mins,
-                           h_block_mins + launch_blocks);
+  return copy_scalar_to_host(d_min_bucket, stream, h_min_bucket);
 }
 
 int mark_and_count_settled_targets(DeltaSteppingScratch& scratch,
@@ -4614,11 +4370,7 @@ DeltaSteppingCsrResult run_delta_stepping_impl(
     DeltaSteppingCsrControllerMode controller_mode,
     std::uint32_t controller_batch_size,
     std::uint32_t controller_generation_seed_for_testing,
-    DeltaSteppingCsrTelemetry* telemetry,
-    bool verified_unit_weight_payload,
-    bool verified_unit_weight_load_elision_requested,
-    bool host_value_frontier_count_requested,
-    bool wave_aggregated_queue_reservations_requested) {
+    DeltaSteppingCsrTelemetry* telemetry) {
   if (max_iters < 0) max_iters = std::numeric_limits<int>::max();
 
   const DeltaSteppingCsrControllerPolicy controller_policy{
@@ -4642,28 +4394,6 @@ DeltaSteppingCsrResult run_delta_stepping_impl(
   const bool use_reduced_controller =
       reduced_controller_requested && progress_callback == nullptr &&
       cooperative_blocks > 0;
-  const bool exact_profiled_generic_specialization =
-      std::is_same<RowOffset, CompactRowOffset>::value &&
-      !UseCurrentGenerations && TrackParents && UseEdgeParent &&
-      vertex_costs == nullptr && skip_heavy_edges && !CollectTelemetry &&
-      controller_mode == DeltaSteppingCsrControllerMode::kHostChecked;
-  const bool use_verified_unit_weight_load_elision =
-      verified_unit_weight_load_elision_requested &&
-      verified_unit_weight_payload && exact_profiled_generic_specialization;
-  const bool use_wave_aggregated_queue_reservations =
-      delta_stepping_wave32_relaxation_eligible(
-          wave_aggregated_queue_reservations_requested &&
-              verified_unit_weight_load_elision_requested,
-          wave_aggregated_queue_reservations_requested
-              ? current_hip_wavefront_size()
-              : 0,
-          std::is_same<RowOffset, CompactRowOffset>::value,
-          UseCurrentGenerations
-              ? DeltaSteppingCsrCurrentMembershipMode::kGeneration
-              : DeltaSteppingCsrCurrentMembershipMode::kBoolean,
-          TrackParents, UseEdgeParent, vertex_costs != nullptr,
-          !skip_heavy_edges, skip_heavy_edges, CollectTelemetry,
-          controller_mode, verified_unit_weight_payload);
   if constexpr (CollectTelemetry) {
     telemetry->effective_controller_mode =
         use_reduced_controller
@@ -4831,8 +4561,7 @@ DeltaSteppingCsrResult run_delta_stepping_impl(
   std::uint64_t controller_round_trips = 0;
   // Device-counted heavy/pending kernels need a host-independent launch size.
   // Cap it to avoid pathological grids; tune 32--256 on the target GPU.
-  const int device_count_blocks =
-      std::min(grid_for_items(n), kMaxPendingReductionBlocks);
+  const int device_count_blocks = std::min(grid_for_items(n), 256);
   DeltaSteppingCsrResult result;
   result.target = target;
   if (use_target_set && initial_settled_target_count == target_count) {
@@ -5113,11 +4842,6 @@ DeltaSteppingCsrResult run_delta_stepping_impl(
               ? std::min(graph_blocks,
                          std::max(grid_for_frontier(current_count), 32))
               : grid_for_frontier(current_count);
-      const bool use_host_value_frontier_count =
-          host_value_frontier_count_requested &&
-          delta_stepping_host_value_frontier_count_eligible(
-              controller_mode, stream != nullptr, true,
-              static_cast<std::uint32_t>(rounds_to_enqueue));
 
       for (int round = 0; round < rounds_to_enqueue; ++round) {
         reset_int_zero_async(next_count_device, stream);
@@ -5143,58 +4867,15 @@ DeltaSteppingCsrResult run_delta_stepping_impl(
               d_adjacency, scratch, vertex_costs, current_queue,
               current_count_device, launch_blocks, current_bucket, delta,
               exclusive_distance_limit, next_queue, next_count_device,
-              next_current_generation, pending_queue, stream,
-              use_host_value_frontier_count, current_count);
+              next_current_generation, pending_queue, stream);
         } else if (terminal_bucket || skip_heavy_edges) {
-          if constexpr (std::is_same<RowOffset, CompactRowOffset>::value &&
-                        !UseCurrentGenerations && TrackParents &&
-                        UseEdgeParent && !CollectTelemetry) {
-            if (use_wave_aggregated_queue_reservations) {
-              if (use_host_value_frontier_count) {
-                launch_relax_light_edges_wave32_compact_unit<true>(
-                    scratch, d_adjacency, current_queue,
-                    current_count_device, current_count, launch_blocks,
-                    current_bucket, delta, exclusive_distance_limit,
-                    next_queue, next_count_device, pending_queue, stream);
-              } else {
-                launch_relax_light_edges_wave32_compact_unit<false>(
-                    scratch, d_adjacency, current_queue,
-                    current_count_device, current_count, launch_blocks,
-                    current_bucket, delta, exclusive_distance_limit,
-                    next_queue, next_count_device, pending_queue, stream);
-              }
-            } else {
-              if (use_verified_unit_weight_load_elision) {
-                launch_relax_light_edges<
-                    RowOffset, UseCurrentGenerations, TrackParents,
-                    UseEdgeParent, false, false, true, CollectTelemetry,
-                    true>(
-                    d_adjacency, scratch, nullptr, current_queue,
-                    current_count_device, launch_blocks, current_bucket,
-                    delta, exclusive_distance_limit, next_queue,
-                    next_count_device, next_current_generation, pending_queue,
-                    stream, use_host_value_frontier_count, current_count);
-              } else {
-                launch_relax_light_edges<
-                    RowOffset, UseCurrentGenerations, TrackParents,
-                    UseEdgeParent, false, false, true, CollectTelemetry>(
-                    d_adjacency, scratch, nullptr, current_queue,
-                    current_count_device, launch_blocks, current_bucket,
-                    delta, exclusive_distance_limit, next_queue,
-                    next_count_device, next_current_generation, pending_queue,
-                    stream, use_host_value_frontier_count, current_count);
-              }
-            }
-          } else {
-            launch_relax_light_edges<RowOffset, UseCurrentGenerations,
-                                     TrackParents, UseEdgeParent, false, false,
-                                     true, CollectTelemetry>(
-                d_adjacency, scratch, nullptr, current_queue,
-                current_count_device, launch_blocks, current_bucket, delta,
-                exclusive_distance_limit, next_queue, next_count_device,
-                next_current_generation, pending_queue, stream,
-                use_host_value_frontier_count, current_count);
-          }
+          launch_relax_light_edges<RowOffset, UseCurrentGenerations,
+                                   TrackParents, UseEdgeParent, false, false,
+                                   true, CollectTelemetry>(
+              d_adjacency, scratch, nullptr, current_queue,
+              current_count_device, launch_blocks, current_bucket, delta,
+              exclusive_distance_limit, next_queue, next_count_device,
+              next_current_generation, pending_queue, stream);
         } else if (vertex_costs != nullptr) {
           launch_relax_light_edges<RowOffset, UseCurrentGenerations,
                                    TrackParents, UseEdgeParent, true, true,
@@ -5202,8 +4883,7 @@ DeltaSteppingCsrResult run_delta_stepping_impl(
               d_adjacency, scratch, vertex_costs, current_queue,
               current_count_device, launch_blocks, current_bucket, delta,
               exclusive_distance_limit, next_queue, next_count_device,
-              next_current_generation, pending_queue, stream,
-              use_host_value_frontier_count, current_count);
+              next_current_generation, pending_queue, stream);
         } else {
           launch_relax_light_edges<RowOffset, UseCurrentGenerations,
                                    TrackParents, UseEdgeParent, false, true,
@@ -5211,8 +4891,7 @@ DeltaSteppingCsrResult run_delta_stepping_impl(
               d_adjacency, scratch, nullptr, current_queue,
               current_count_device, launch_blocks, current_bucket, delta,
               exclusive_distance_limit, next_queue, next_count_device,
-              next_current_generation, pending_queue, stream,
-              use_host_value_frontier_count, current_count);
+              next_current_generation, pending_queue, stream);
         }
         std::swap(current_queue, next_queue);
         std::swap(current_count_device, next_count_device);
@@ -5295,19 +4974,14 @@ DeltaSteppingCsrResult run_delta_stepping_impl(
     const int next_bucket = find_min_pending_bucket<CollectTelemetry>(
         pending_queue, scratch.pending_count.get(), device_count_blocks,
         current_bucket, delta, scratch.dist.get(), scratch.in_pending.get(),
-        scratch.min_pending_bucket.get(),
-        scratch.host_pending_bucket_block_mins->get(), stream,
+        scratch.min_pending_bucket.get(), scratch.host_scalar.get(), stream,
         CollectTelemetry ? scratch.telemetry_counters.get() : nullptr);
     ++controller_round_trips;
     const bool changed = (next_bucket != kNoBucket);
     if (changed &&
         (next_bucket <= current_bucket || next_bucket >= kNoBucket)) {
-      std::ostringstream message;
-      message
-          << "delta pending-bucket reduction returned an invalid successor"
-          << " (current_bucket=" << current_bucket
-          << ", next_bucket=" << next_bucket << ')';
-      throw std::runtime_error(message.str());
+      throw std::runtime_error(
+          "delta pending-bucket reduction returned an invalid successor");
     }
     if (progress_callback) {
       DeltaSteppingCsrProgress progress;
@@ -5531,11 +5205,7 @@ DeltaSteppingCsrResult dispatch_delta_stepping_impl(
     DeltaSteppingCsrControllerMode controller_mode,
     std::uint32_t controller_batch_size,
     std::uint32_t controller_generation_seed_for_testing,
-    DeltaSteppingCsrTelemetry* telemetry,
-    bool verified_unit_weight_payload = false,
-    bool verified_unit_weight_load_elision_requested = false,
-    bool host_value_frontier_count_requested = false,
-    bool wave_aggregated_queue_reservations_requested = false) {
+    DeltaSteppingCsrTelemetry* telemetry) {
   if (current_membership_mode ==
       DeltaSteppingCsrCurrentMembershipMode::kGeneration) {
     if (telemetry != nullptr) {
@@ -5546,10 +5216,7 @@ DeltaSteppingCsrResult dispatch_delta_stepping_impl(
           exclusive_distance_limit, stream,
           progress_callback, progress_user_data, controller_mode,
           controller_batch_size, controller_generation_seed_for_testing,
-          telemetry, verified_unit_weight_payload,
-          verified_unit_weight_load_elision_requested,
-          host_value_frontier_count_requested,
-          wave_aggregated_queue_reservations_requested);
+          telemetry);
     }
     return run_delta_stepping_impl<RowOffset, true, TrackParents,
                                    UseEdgeParent, false>(
@@ -5558,10 +5225,7 @@ DeltaSteppingCsrResult dispatch_delta_stepping_impl(
         exclusive_distance_limit, stream,
         progress_callback, progress_user_data, controller_mode,
         controller_batch_size, controller_generation_seed_for_testing,
-        nullptr, verified_unit_weight_payload,
-        verified_unit_weight_load_elision_requested,
-        host_value_frontier_count_requested,
-        wave_aggregated_queue_reservations_requested);
+        nullptr);
   }
   if (current_membership_mode !=
       DeltaSteppingCsrCurrentMembershipMode::kBoolean) {
@@ -5576,10 +5240,7 @@ DeltaSteppingCsrResult dispatch_delta_stepping_impl(
         exclusive_distance_limit, stream,
         progress_callback, progress_user_data, controller_mode,
         controller_batch_size, controller_generation_seed_for_testing,
-        telemetry, verified_unit_weight_payload,
-        verified_unit_weight_load_elision_requested,
-        host_value_frontier_count_requested,
-        wave_aggregated_queue_reservations_requested);
+        telemetry);
   }
   return run_delta_stepping_impl<RowOffset, false, TrackParents,
                                  UseEdgeParent, false>(
@@ -5588,10 +5249,7 @@ DeltaSteppingCsrResult dispatch_delta_stepping_impl(
       exclusive_distance_limit, stream,
       progress_callback, progress_user_data, controller_mode,
       controller_batch_size, controller_generation_seed_for_testing,
-      nullptr, verified_unit_weight_payload,
-      verified_unit_weight_load_elision_requested,
-      host_value_frontier_count_requested,
-      wave_aggregated_queue_reservations_requested);
+      nullptr);
 }
 
 void begin_telemetry_record(DeltaSteppingCsrTelemetry* telemetry,
@@ -5646,7 +5304,7 @@ struct DeltaSteppingCsrGraph::Impl {
   int device = 0;
   ds_delta_detail::DeviceCsrOwner adjacency;
   float max_edge_value = 0.0f;
-  DeltaSteppingCsrUnitWeightProof unit_weight_proof;
+  bool has_exact_unit_edge_values = false;
   bool path_capable = true;
 
   Impl(const HostCsrF32& host,
@@ -5659,8 +5317,8 @@ struct DeltaSteppingCsrGraph::Impl {
             storage_mode == DeltaSteppingCsrStorageMode::kPathCapable,
             offset_mode)),
         max_edge_value(ds_delta_detail::max_edge_value(host.values)),
-        unit_weight_proof(
-            delta_stepping_make_unit_weight_proof(host.values)),
+        has_exact_unit_edge_values(
+            ds_delta_detail::has_exact_unit_edge_values(host.values)),
         path_capable(
             storage_mode == DeltaSteppingCsrStorageMode::kPathCapable) {}
 };
@@ -5735,7 +5393,7 @@ struct DeltaSteppingCsrWorkspace::Impl {
   ds_delta_detail::DeltaSteppingScratch scratch;
   ds_delta_detail::DeviceBuffer<float> vertex_costs;
   float max_edge_value = 0.0f;
-  DeltaSteppingCsrUnitWeightProof unit_weight_proof;
+  bool has_exact_unit_edge_values = false;
   bool has_vertex_costs = false;
   bool path_capable = true;
   hipStream_t stream = nullptr;
@@ -5752,8 +5410,8 @@ struct DeltaSteppingCsrWorkspace::Impl {
                 offset_mode))),
         scratch(host.rows),
         max_edge_value(ds_delta_detail::max_edge_value(host.values)),
-        unit_weight_proof(
-            delta_stepping_make_unit_weight_proof(host.values)),
+        has_exact_unit_edge_values(
+            ds_delta_detail::has_exact_unit_edge_values(host.values)),
         path_capable(
             storage_mode == DeltaSteppingCsrStorageMode::kPathCapable),
         stream(stream),
@@ -5774,7 +5432,7 @@ struct DeltaSteppingCsrWorkspace::Impl {
       : shared_graph(require_shared_graph(graph)),
         scratch(shared_graph->adjacency.rows),
         max_edge_value(shared_graph->max_edge_value),
-        unit_weight_proof(shared_graph->unit_weight_proof),
+        has_exact_unit_edge_values(shared_graph->has_exact_unit_edge_values),
         path_capable(shared_graph->path_capable),
         stream(stream),
         device(shared_graph->device) {
@@ -5870,11 +5528,6 @@ DeltaSteppingCsrWorkspace::DeltaSteppingCsrWorkspace(
   controller_batch_size_ = options.controller_batch_size;
   controller_generation_seed_for_testing_ =
       options.controller_generation_seed_for_testing;
-  verified_unit_weight_load_elision_ =
-      options.verified_unit_weight_load_elision;
-  host_value_frontier_count_ = options.host_value_frontier_count;
-  wave_aggregated_queue_reservations_ =
-      options.wave_aggregated_queue_reservations;
   impl_->scratch.reserve_query_capacity(options.capacity_hints,
                                         impl_->path_capable);
 }
@@ -5898,11 +5551,6 @@ DeltaSteppingCsrWorkspace::DeltaSteppingCsrWorkspace(
   controller_batch_size_ = options.controller_batch_size;
   controller_generation_seed_for_testing_ =
       options.controller_generation_seed_for_testing;
-  verified_unit_weight_load_elision_ =
-      options.verified_unit_weight_load_elision;
-  host_value_frontier_count_ = options.host_value_frontier_count;
-  wave_aggregated_queue_reservations_ =
-      options.wave_aggregated_queue_reservations;
   impl_->scratch.reserve_query_capacity(options.capacity_hints,
                                         impl_->path_capable);
 }
@@ -5931,19 +5579,13 @@ void DeltaSteppingCsrWorkspace::update_values(const std::vector<float>& values,
           "updated CSR values must be finite and nonnegative");
     }
   }
-  const DeltaSteppingCsrUnitWeightProof next_unit_weight_proof =
-      delta_stepping_make_unit_weight_proof(values);
-  const float next_max_edge_value = max_edge_value(values);
+  impl_->has_exact_unit_edge_values =
+      ds_delta_detail::has_exact_unit_edge_values(values);
   if (adjacency.nnz == 0) {
     impl_->max_edge_value = 0.0f;
-    impl_->unit_weight_proof = next_unit_weight_proof;
     return;
   }
-  // Fail closed while the device payload is in transition. If HIP reports an
-  // upload/synchronization error, no later call may use the old proof or the
-  // old all-light summary to specialize potentially changed device values.
-  impl_->unit_weight_proof = {};
-  impl_->max_edge_value = std::numeric_limits<float>::infinity();
+  impl_->max_edge_value = max_edge_value(values);
   DS_DELTA_HIP_CHECK(hipMemcpyAsync(adjacency.values.get(),
                                     values.data(),
                                     sssp_capacity::checked_bytes<float>(
@@ -5953,10 +5595,6 @@ void DeltaSteppingCsrWorkspace::update_values(const std::vector<float>& values,
   // The caller retains ownership of values and may have passed a temporary.
   // Complete the upload before that storage can be destroyed or reused.
   DS_DELTA_HIP_CHECK(hipStreamSynchronize(stream));
-  // Publish proof/summary metadata only after the corresponding payload is
-  // resident.
-  impl_->max_edge_value = next_max_edge_value;
-  impl_->unit_weight_proof = next_unit_weight_proof;
 }
 
 void DeltaSteppingCsrWorkspace::update_vertex_costs(
@@ -6142,7 +5780,7 @@ DeltaSteppingCsrResult DeltaSteppingCsrWorkspace::run(
     validate_device_csr_shape(graph, sources, -1, delta);
     if (execution_mode_ == DeltaSteppingCsrExecutionMode::kAutomatic &&
         parent_mode_ == DeltaSteppingCsrParentMode::kAutomatic &&
-        impl_->unit_weight_proof.verified &&
+        impl_->has_exact_unit_edge_values &&
         !impl_->has_vertex_costs &&
         graph.rows <= kMaxUnitSpecializationRows &&
         max_iters < 0 && progress_callback == nullptr) {
@@ -6187,9 +5825,7 @@ DeltaSteppingCsrResult DeltaSteppingCsrWorkspace::run(
           active_distance_limit_, stream, progress_callback,
           progress_user_data, current_membership_mode_, controller_mode_,
           controller_batch_size_, controller_generation_seed_for_testing_,
-          active_telemetry_, impl_->unit_weight_proof.verified,
-          verified_unit_weight_load_elision_, host_value_frontier_count_,
-          wave_aggregated_queue_reservations_);
+          active_telemetry_);
     }
     const bool compact_parent_fallback =
         parent_mode_ == DeltaSteppingCsrParentMode::kAutomatic &&
