@@ -24,7 +24,6 @@
 #include <zlib.h>
 
 #include <algorithm>
-#include <array>
 #include <cerrno>
 #include <cctype>
 #include <cmath>
@@ -50,7 +49,9 @@ namespace {
 
 constexpr char METADATA_MAGIC[8] = {'R', 'I', 'P', 'S', 'I', 'F', 'M', '1'};
 constexpr std::uint64_t LEGACY_METADATA_VERSION = 4;
-constexpr std::uint64_t CURRENT_METADATA_VERSION = 5;
+constexpr std::uint64_t CURRENT_METADATA_VERSION = 6;
+constexpr std::uint64_t ARTIFACT_PAIR_METADATA_VERSION = 5;
+constexpr std::uint64_t COMPACT_METADATA_VERSION = 6;
 constexpr std::uint64_t EXPECTED_OUTGOING_EDGE_ORIENTATION = 2;
 constexpr std::uint64_t kInvalidRouteNode =
     std::numeric_limits<std::uint64_t>::max();
@@ -371,14 +372,41 @@ int read_route_node(std::ifstream& in, const char* name) {
   return static_cast<int>(raw);
 }
 
+std::uint64_t checked_byte_count(std::uint64_t count,
+                                 std::uint64_t bytes_per_item,
+                                 const char* name) {
+  if (bytes_per_item != 0 &&
+      count > std::numeric_limits<std::uint64_t>::max() / bytes_per_item) {
+    throw std::runtime_error(std::string(name) + " byte count overflow");
+  }
+  return count * bytes_per_item;
+}
+
+// Seek over unused bulk metadata without reading it through a temporary
+// buffer. Checking the remaining file length first is required because a
+// standard seek is otherwise allowed to move beyond end-of-file silently.
 void skip_bytes(std::ifstream& in, std::uint64_t count, const char* name) {
-  constexpr std::uint64_t kChunk = 1 << 20;
-  std::array<char, kChunk> buffer{};
-  while (count != 0) {
-    const std::uint64_t take = std::min<std::uint64_t>(count, buffer.size());
-    in.read(buffer.data(), static_cast<std::streamsize>(take));
-    if (!in) throw std::runtime_error(std::string("failed while skipping ") + name);
-    count -= take;
+  if (count == 0) {
+    return;
+  }
+  if (count > static_cast<std::uint64_t>(
+                  std::numeric_limits<std::streamoff>::max())) {
+    throw std::runtime_error(std::string(name) +
+                             " byte count is too large to seek");
+  }
+  const std::streampos current = in.tellg();
+  if (current == std::streampos(-1)) {
+    throw std::runtime_error(std::string("failed while locating ") + name);
+  }
+  in.seekg(0, std::ios::end);
+  const std::streampos end = in.tellg();
+  if (!in || end == std::streampos(-1) || end < current ||
+      static_cast<std::uint64_t>(end - current) < count) {
+    throw std::runtime_error(std::string("failed while skipping ") + name);
+  }
+  in.seekg(current + static_cast<std::streamoff>(count));
+  if (!in) {
+    throw std::runtime_error(std::string("failed while skipping ") + name);
   }
 }
 
@@ -416,8 +444,8 @@ RoutingMetadataSummary load_metadata_summary(const std::filesystem::path& path) 
 
   const std::uint64_t version = read_u64(in, "metadata version");
   const std::uint64_t orientation = read_u64(in, "metadata orientation");
-  if (version != LEGACY_METADATA_VERSION &&
-      version != CURRENT_METADATA_VERSION) {
+  if (version < LEGACY_METADATA_VERSION ||
+      version > CURRENT_METADATA_VERSION) {
     throw std::runtime_error("unsupported metadata version");
   }
   if (orientation != EXPECTED_OUTGOING_EDGE_ORIENTATION) {
@@ -426,7 +454,7 @@ RoutingMetadataSummary load_metadata_summary(const std::filesystem::path& path) 
 
   std::optional<routing::interchange::InterchangeArtifactPairId>
       artifact_pair_id;
-  if (version == CURRENT_METADATA_VERSION) {
+  if (version >= ARTIFACT_PAIR_METADATA_VERSION) {
     routing::interchange::InterchangeArtifactPairId id;
     id.high = read_u64(in, "metadata artifact pair id high");
     id.low = read_u64(in, "metadata artifact pair id low");
@@ -465,16 +493,48 @@ RoutingMetadataSummary load_metadata_summary(const std::filesystem::path& path) 
     metadata.strings.push_back(read_metadata_string(in));
   }
 
-  skip_bytes(in, node_count * sizeof(std::uint64_t), "node ids");
-  skip_bytes(in, node_count * sizeof(std::int32_t), "node min x coordinates");
-  skip_bytes(in, node_count * sizeof(std::int32_t), "node max x coordinates");
-  skip_bytes(in, node_count * sizeof(std::int32_t), "node min y coordinates");
-  skip_bytes(in, node_count * sizeof(std::int32_t), "node max y coordinates");
-  skip_bytes(in, node_count * sizeof(std::uint64_t), "node tile type strings");
-  skip_bytes(in, node_count * sizeof(std::uint64_t), "node wire type strings");
-  skip_bytes(in, edge_attr_count * 2 * sizeof(std::uint64_t), "edge attrs");
-  skip_bytes(in, pip_data_count * 3 * sizeof(std::uint64_t), "pip data");
-  skip_bytes(in, site_pin_attr_count * 3 * sizeof(std::uint64_t), "site pin attrs");
+  if (version < COMPACT_METADATA_VERSION) {
+    skip_bytes(in,
+               checked_byte_count(node_count, sizeof(std::uint64_t),
+                                  "node ids"),
+               "node ids");
+    skip_bytes(in,
+               checked_byte_count(node_count, sizeof(std::int32_t),
+                                  "node min x coordinates"),
+               "node min x coordinates");
+    skip_bytes(in,
+               checked_byte_count(node_count, sizeof(std::int32_t),
+                                  "node max x coordinates"),
+               "node max x coordinates");
+    skip_bytes(in,
+               checked_byte_count(node_count, sizeof(std::int32_t),
+                                  "node min y coordinates"),
+               "node min y coordinates");
+    skip_bytes(in,
+               checked_byte_count(node_count, sizeof(std::int32_t),
+                                  "node max y coordinates"),
+               "node max y coordinates");
+    skip_bytes(in,
+               checked_byte_count(node_count, sizeof(std::uint64_t),
+                                  "node tile type strings"),
+               "node tile type strings");
+    skip_bytes(in,
+               checked_byte_count(node_count, sizeof(std::uint64_t),
+                                  "node wire type strings"),
+               "node wire type strings");
+  }
+  skip_bytes(in,
+             checked_byte_count(edge_attr_count,
+                                2 * sizeof(std::uint64_t), "edge attrs"),
+             "edge attrs");
+  skip_bytes(in,
+             checked_byte_count(pip_data_count,
+                                3 * sizeof(std::uint64_t), "pip data"),
+             "pip data");
+  skip_bytes(in,
+             checked_byte_count(site_pin_attr_count,
+                                3 * sizeof(std::uint64_t), "site pin attrs"),
+             "site pin attrs");
 
   metadata.route_requests.reserve(static_cast<std::size_t>(route_request_count));
   for (std::uint64_t i = 0; i < route_request_count; ++i) {
@@ -504,12 +564,27 @@ RoutingMetadataSummary load_metadata_summary(const std::filesystem::path& path) 
     metadata.route_requests.push_back(std::move(request));
   }
 
-  skip_bytes(in, logical_cell_count * 3 * sizeof(std::uint64_t), "logical cells");
-  skip_bytes(in, logical_net_count * 4 * sizeof(std::uint64_t), "logical nets");
-  skip_bytes(in, logical_port_instance_count * 7 * sizeof(std::uint64_t),
+  skip_bytes(in,
+             checked_byte_count(logical_cell_count,
+                                3 * sizeof(std::uint64_t), "logical cells"),
+             "logical cells");
+  skip_bytes(in,
+             checked_byte_count(logical_net_count,
+                                4 * sizeof(std::uint64_t), "logical nets"),
+             "logical nets");
+  skip_bytes(in,
+             checked_byte_count(logical_port_instance_count,
+                                7 * sizeof(std::uint64_t),
+                                "logical port instances"),
              "logical port instances");
-  skip_bytes(in, blocked_node_count * sizeof(std::uint64_t), "blocked nodes");
-  skip_bytes(in, sink_stop_node_count * sizeof(std::uint64_t), "sink stop nodes");
+  skip_bytes(in,
+             checked_byte_count(blocked_node_count, sizeof(std::uint64_t),
+                                "blocked nodes"),
+             "blocked nodes");
+  skip_bytes(in,
+             checked_byte_count(sink_stop_node_count, sizeof(std::uint64_t),
+                                "sink stop nodes"),
+             "sink stop nodes");
   skip_bytes(in, physical_netlist_byte_count, "physical netlist bytes");
   skip_bytes(in, logical_netlist_byte_count, "logical netlist bytes");
 

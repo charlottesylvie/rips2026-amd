@@ -35,6 +35,7 @@
 #include <array>
 #include <atomic>
 #include <cerrno>
+#include <chrono>
 #include <cmath>
 #include <cstddef>
 #include <cstdlib>
@@ -46,6 +47,7 @@
 #include <sstream>
 #include <stdexcept>
 #include <thread>
+#include <type_traits>
 #include <unordered_set>
 #include <utility>
 
@@ -57,8 +59,34 @@ constexpr char METADATA_MAGIC[8] = {'R', 'I', 'P', 'S', 'I', 'F', 'M', '1'};
 constexpr std::uint64_t LEGACY_CSR_VERSION = 1;
 constexpr std::uint64_t CURRENT_CSR_VERSION = 2;
 constexpr std::uint64_t LEGACY_METADATA_VERSION = 4;
-constexpr std::uint64_t CURRENT_METADATA_VERSION = 5;
+constexpr std::uint64_t FIRST_PAIRED_METADATA_VERSION = 5;
+constexpr std::uint64_t CURRENT_METADATA_VERSION = 6;
 constexpr std::uint64_t EXPECTED_OUTGOING_EDGE_ORIENTATION = 2;
+
+struct PipDataDisk {
+  std::uint64_t wire0_string = 0;
+  std::uint64_t wire1_string = 0;
+  std::uint64_t forward = 0;
+};
+
+struct SitePinNodeDisk {
+  std::uint64_t node = 0;
+  std::uint64_t site_string = 0;
+  std::uint64_t pin_string = 0;
+};
+
+static_assert(sizeof(EdgeAttr) == 2 * sizeof(std::uint64_t),
+              "EdgeAttr metadata layout changed");
+static_assert(std::is_trivially_copyable<EdgeAttr>::value,
+              "EdgeAttr must remain bulk-readable");
+static_assert(sizeof(PipDataDisk) == 3 * sizeof(std::uint64_t),
+              "PipData disk layout changed");
+static_assert(std::is_trivially_copyable<PipDataDisk>::value,
+              "PipData disk records must remain bulk-readable");
+static_assert(sizeof(SitePinNodeDisk) == 3 * sizeof(std::uint64_t),
+              "site-pin disk layout changed");
+static_assert(std::is_trivially_copyable<SitePinNodeDisk>::value,
+              "site-pin disk records must remain bulk-readable");
 
 std::uint64_t read_u64(std::ifstream& in, const char* name) {
   std::uint64_t value = 0;
@@ -69,8 +97,7 @@ std::uint64_t read_u64(std::ifstream& in, const char* name) {
   return value;
 }
 
-int read_route_node(std::ifstream& in, const char* name) {
-  const std::uint64_t raw = read_u64(in, name);
+int route_node_from_disk(std::uint64_t raw, const char* name) {
   if (raw == kNoIndex) {
     return -1;
   }
@@ -78,6 +105,10 @@ int read_route_node(std::ifstream& in, const char* name) {
     throw std::runtime_error(std::string(name) + " exceeds int range");
   }
   return static_cast<int>(raw);
+}
+
+int read_route_node(std::ifstream& in, const char* name) {
+  return route_node_from_disk(read_u64(in, name), name);
 }
 
 template <typename T>
@@ -118,6 +149,42 @@ void read_array(std::ifstream& in,
   }
 }
 
+void skip_bytes(std::ifstream& in, std::size_t bytes, const char* name) {
+  if (bytes == 0) {
+    return;
+  }
+  if (bytes > static_cast<std::size_t>(
+                  std::numeric_limits<std::streamoff>::max())) {
+    throw std::overflow_error(std::string(name) +
+                              " byte count exceeds stream offset range");
+  }
+  in.seekg(static_cast<std::streamoff>(bytes), std::ios::cur);
+  if (!in) {
+    throw std::runtime_error(std::string("failed while skipping ") + name);
+  }
+}
+
+template <typename T>
+void skip_array(std::ifstream& in, std::uint64_t count, const char* name) {
+  const std::size_t host_count = checked_vector_count<T>(count, name);
+  skip_bytes(in, sssp_capacity::checked_bytes<T>(host_count), name);
+}
+
+void require_position_within_file(std::ifstream& in, const char* name) {
+  const std::ifstream::pos_type position = in.tellg();
+  if (position == std::ifstream::pos_type(-1)) {
+    throw std::runtime_error(std::string("failed while checking ") + name);
+  }
+  in.seekg(0, std::ios::end);
+  if (!in) {
+    throw std::runtime_error(std::string("failed while checking ") + name);
+  }
+  const std::ifstream::pos_type end = in.tellg();
+  if (end == std::ifstream::pos_type(-1) || position > end) {
+    throw std::runtime_error(std::string(name) + " is truncated");
+  }
+}
+
 std::string read_string(std::ifstream& in) {
   const std::uint64_t size = read_u64(in, "metadata string length");
   const std::size_t host_size =
@@ -144,9 +211,25 @@ void validate_csr(const HostCsrF32& graph) {
   if (graph.nnz < 0) {
     throw std::runtime_error("CSR nnz must be nonnegative");
   }
-  if (graph.rowptr.size() != static_cast<std::size_t>(graph.rows + 1) ||
-      graph.colind.size() != static_cast<std::size_t>(graph.nnz) ||
-      graph.values.size() != static_cast<std::size_t>(graph.nnz)) {
+  const std::uint64_t unsigned_rows =
+      static_cast<std::uint64_t>(graph.rows);
+  const std::uint64_t unsigned_nnz =
+      static_cast<std::uint64_t>(graph.nnz);
+  if (unsigned_rows >=
+          static_cast<std::uint64_t>(
+              std::numeric_limits<std::size_t>::max()) ||
+      unsigned_rows >
+          static_cast<std::uint64_t>(std::numeric_limits<int>::max()) ||
+      unsigned_nnz >
+          static_cast<std::uint64_t>(
+              std::numeric_limits<std::size_t>::max())) {
+    throw std::runtime_error("CSR graph is too large for PathFinder");
+  }
+  const std::size_t row_count = static_cast<std::size_t>(unsigned_rows);
+  const std::size_t edge_count = static_cast<std::size_t>(unsigned_nnz);
+  if (graph.rowptr.size() != row_count + 1 ||
+      graph.colind.size() != edge_count ||
+      graph.values.size() != edge_count) {
     throw std::runtime_error("CSR array sizes do not match header counts");
   }
   if (graph.rowptr.front() != 0 || graph.rowptr.back() != graph.nnz) {
@@ -167,6 +250,44 @@ void validate_csr(const HostCsrF32& graph) {
     if (!std::isfinite(graph.values[edge]) || graph.values[edge] < 0.0f) {
       throw std::runtime_error("CSR values must be finite nonnegative costs");
     }
+  }
+}
+
+// Public backend graph constructors perform the authoritative O(V + E)
+// content validation before any device work.  PathFinder only needs these
+// constant-time checks up front to make its metadata and allocation bounds
+// safe; repeating the complete scan here made a freshly loaded large graph
+// traverse every edge yet again.
+void validate_csr_shape(const HostCsrF32& graph) {
+  if (graph.rows <= 0 || graph.rows != graph.cols) {
+    throw std::runtime_error("CSR graph must be nonempty and square");
+  }
+  if (graph.nnz < 0) {
+    throw std::runtime_error("CSR nnz must be nonnegative");
+  }
+  const std::uint64_t unsigned_rows =
+      static_cast<std::uint64_t>(graph.rows);
+  const std::uint64_t unsigned_nnz =
+      static_cast<std::uint64_t>(graph.nnz);
+  if (unsigned_rows >=
+          static_cast<std::uint64_t>(
+              std::numeric_limits<std::size_t>::max()) ||
+      unsigned_rows >
+          static_cast<std::uint64_t>(std::numeric_limits<int>::max()) ||
+      unsigned_nnz >
+          static_cast<std::uint64_t>(
+              std::numeric_limits<std::size_t>::max())) {
+    throw std::runtime_error("CSR graph is too large for PathFinder");
+  }
+  const std::size_t row_count = static_cast<std::size_t>(unsigned_rows);
+  const std::size_t edge_count = static_cast<std::size_t>(unsigned_nnz);
+  if (graph.rowptr.size() != row_count + 1 ||
+      graph.colind.size() != edge_count ||
+      graph.values.size() != edge_count) {
+    throw std::runtime_error("CSR array sizes do not match header counts");
+  }
+  if (graph.rowptr.front() != 0 || graph.rowptr.back() != graph.nnz) {
+    throw std::runtime_error("CSR rowptr must start at 0 and end at nnz");
   }
 }
 
@@ -2061,7 +2182,17 @@ HostCsrF32 load_csrbin(
   return graph;
 }
 
-RoutingMetadata load_interchange_metadata(const std::filesystem::path& path) {
+RoutingMetadata load_interchange_metadata(
+    const std::filesystem::path& path,
+    InterchangeMetadataLoadMode mode) {
+  switch (mode) {
+    case InterchangeMetadataLoadMode::kFull:
+    case InterchangeMetadataLoadMode::kRoutingOnly:
+    case InterchangeMetadataLoadMode::kRoutingWithRouteOutput:
+      break;
+    default:
+      throw std::invalid_argument("unknown interchange metadata load mode");
+  }
   std::ifstream in(path, std::ios::binary);
   if (!in) {
     throw std::runtime_error("could not open metadata file: " + path.string());
@@ -2075,8 +2206,8 @@ RoutingMetadata load_interchange_metadata(const std::filesystem::path& path) {
 
   const std::uint64_t version = read_u64(in, "metadata format version");
   const std::uint64_t orientation = read_u64(in, "metadata orientation");
-  if (version != LEGACY_METADATA_VERSION &&
-      version != CURRENT_METADATA_VERSION) {
+  if (version < LEGACY_METADATA_VERSION ||
+      version > CURRENT_METADATA_VERSION) {
     throw std::runtime_error("unsupported metadata format version");
   }
   if (orientation != EXPECTED_OUTGOING_EDGE_ORIENTATION) {
@@ -2084,7 +2215,7 @@ RoutingMetadata load_interchange_metadata(const std::filesystem::path& path) {
   }
 
   std::optional<interchange::InterchangeArtifactPairId> parsed_pair_id;
-  if (version == CURRENT_METADATA_VERSION) {
+  if (version >= FIRST_PAIRED_METADATA_VERSION) {
     interchange::InterchangeArtifactPairId id;
     id.high = read_u64(in, "metadata artifact pair id high");
     id.low = read_u64(in, "metadata artifact pair id low");
@@ -2113,6 +2244,8 @@ RoutingMetadata load_interchange_metadata(const std::filesystem::path& path) {
 
   RoutingMetadata metadata;
   metadata.artifact_pair_id = parsed_pair_id;
+  metadata.declared_node_count = node_count;
+  metadata.declared_edge_attr_count = edge_attr_count;
   metadata.device_path_string = read_u64(in, "metadata device path string");
   metadata.physical_path_string = read_u64(in, "metadata physical path string");
   metadata.logical_path_string = read_u64(in, "metadata logical path string");
@@ -2124,55 +2257,80 @@ RoutingMetadata load_interchange_metadata(const std::filesystem::path& path) {
     metadata.strings.push_back(read_string(in));
   }
 
-  read_array(in, metadata.node_device_ids, node_count, "metadata device node ids");
-  read_array(in,
-             metadata.node_min_x,
-             node_count,
-             "metadata node min x coordinates");
-  read_array(in,
-             metadata.node_max_x,
-             node_count,
-             "metadata node max x coordinates");
-  read_array(in,
-             metadata.node_min_y,
-             node_count,
-             "metadata node min y coordinates");
-  read_array(in,
-             metadata.node_max_y,
-             node_count,
-             "metadata node max y coordinates");
-  read_array(in,
-             metadata.node_tile_type_strings,
-             node_count,
-             "metadata node tile type strings");
-  read_array(in,
-             metadata.node_wire_type_strings,
-             node_count,
-             "metadata node wire type strings");
-
-  metadata.edge_attrs.resize(
-      checked_vector_count<EdgeAttr>(edge_attr_count,
-                                     "metadata edge attributes"));
-  for (EdgeAttr& attr : metadata.edge_attrs) {
-    attr.tile_string = read_u64(in, "metadata edge tile string");
-    attr.pip_data_index = read_u64(in, "metadata edge pip data index");
+  const bool has_node_arrays = version < CURRENT_METADATA_VERSION;
+  const bool load_node_arrays =
+      mode == InterchangeMetadataLoadMode::kFull && has_node_arrays;
+  if (has_node_arrays) {
+    if (load_node_arrays) {
+      read_array(in, metadata.node_device_ids, node_count,
+                 "metadata device node ids");
+      read_array(in, metadata.node_min_x, node_count,
+                 "metadata node min x coordinates");
+      read_array(in, metadata.node_max_x, node_count,
+                 "metadata node max x coordinates");
+      read_array(in, metadata.node_min_y, node_count,
+                 "metadata node min y coordinates");
+      read_array(in, metadata.node_max_y, node_count,
+                 "metadata node max y coordinates");
+      read_array(in, metadata.node_tile_type_strings, node_count,
+                 "metadata node tile type strings");
+      read_array(in, metadata.node_wire_type_strings, node_count,
+                 "metadata node wire type strings");
+    } else {
+      skip_array<std::uint64_t>(in, node_count, "metadata device node ids");
+      skip_array<std::int32_t>(in, node_count,
+                               "metadata node min x coordinates");
+      skip_array<std::int32_t>(in, node_count,
+                               "metadata node max x coordinates");
+      skip_array<std::int32_t>(in, node_count,
+                               "metadata node min y coordinates");
+      skip_array<std::int32_t>(in, node_count,
+                               "metadata node max y coordinates");
+      skip_array<std::uint64_t>(in, node_count,
+                                "metadata node tile type strings");
+      skip_array<std::uint64_t>(in, node_count,
+                                "metadata node wire type strings");
+    }
   }
 
-  metadata.pip_data.resize(
-      checked_vector_count<PipData>(pip_data_count, "metadata pip data"));
-  for (PipData& pip : metadata.pip_data) {
-    pip.wire0_string = read_u64(in, "metadata pip wire0 string");
-    pip.wire1_string = read_u64(in, "metadata pip wire1 string");
-    pip.forward = read_u64(in, "metadata pip forward flag") != 0;
+  const bool load_route_output_tables =
+      mode != InterchangeMetadataLoadMode::kRoutingOnly;
+  if (load_route_output_tables) {
+    read_array(in, metadata.edge_attrs, edge_attr_count,
+               "metadata edge attributes");
+  } else {
+    skip_array<EdgeAttr>(in, edge_attr_count, "metadata edge attributes");
   }
 
-  metadata.site_pin_attrs.resize(
-      checked_vector_count<SitePinNode>(site_pin_attr_count,
-                                        "metadata site pin attributes"));
-  for (SitePinNode& attr : metadata.site_pin_attrs) {
-    attr.node = read_route_node(in, "metadata site pin node");
-    attr.site_string = read_u64(in, "metadata site pin site");
-    attr.pin_string = read_u64(in, "metadata site pin pin");
+  if (load_route_output_tables) {
+    std::vector<PipDataDisk> disk_pip_data;
+    read_array(in, disk_pip_data, pip_data_count, "metadata pip data");
+    metadata.pip_data.resize(disk_pip_data.size());
+    for (std::size_t i = 0; i < disk_pip_data.size(); ++i) {
+      metadata.pip_data[i] = {
+          disk_pip_data[i].wire0_string,
+          disk_pip_data[i].wire1_string,
+          disk_pip_data[i].forward != 0};
+    }
+  } else {
+    skip_array<PipDataDisk>(in, pip_data_count, "metadata pip data");
+  }
+
+  if (mode == InterchangeMetadataLoadMode::kFull) {
+    std::vector<SitePinNodeDisk> disk_site_pin_attrs;
+    read_array(in, disk_site_pin_attrs, site_pin_attr_count,
+               "metadata site pin attributes");
+    metadata.site_pin_attrs.resize(disk_site_pin_attrs.size());
+    for (std::size_t i = 0; i < disk_site_pin_attrs.size(); ++i) {
+      metadata.site_pin_attrs[i] = {
+          route_node_from_disk(disk_site_pin_attrs[i].node,
+                               "metadata site pin node"),
+          disk_site_pin_attrs[i].site_string,
+          disk_site_pin_attrs[i].pin_string};
+    }
+  } else {
+    skip_array<SitePinNodeDisk>(in, site_pin_attr_count,
+                                "metadata site pin attributes");
   }
 
   metadata.route_requests.resize(
@@ -2205,33 +2363,30 @@ RoutingMetadata load_interchange_metadata(const std::filesystem::path& path) {
     }
   }
 
-  for (std::uint64_t i = 0; i < logical_cell_count; ++i) {
-    (void)read_u64(in, "metadata logical cell declaration");
-    (void)read_u64(in, "metadata logical cell net begin");
-    (void)read_u64(in, "metadata logical cell net count");
-  }
-  for (std::uint64_t i = 0; i < logical_net_count; ++i) {
-    (void)read_u64(in, "metadata logical net name");
-    (void)read_u64(in, "metadata logical net cell");
-    (void)read_u64(in, "metadata logical net port begin");
-    (void)read_u64(in, "metadata logical net port count");
-  }
-  for (std::uint64_t i = 0; i < logical_port_instance_count; ++i) {
-    (void)read_u64(in, "metadata logical port name");
-    (void)read_u64(in, "metadata logical instance name");
-    (void)read_u64(in, "metadata logical port index");
-    (void)read_u64(in, "metadata logical instance index");
-    (void)read_u64(in, "metadata logical bus index");
-    (void)read_u64(in, "metadata logical has bus");
-    (void)read_u64(in, "metadata logical external port");
+  skip_array<std::array<std::uint64_t, 3>>(
+      in, logical_cell_count, "metadata logical cells");
+  skip_array<std::array<std::uint64_t, 4>>(
+      in, logical_net_count, "metadata logical nets");
+  skip_array<std::array<std::uint64_t, 7>>(
+      in, logical_port_instance_count, "metadata logical port instances");
+
+  if (mode == InterchangeMetadataLoadMode::kFull) {
+    read_array(in, metadata.blocked_nodes, blocked_node_count,
+               "metadata blocked nodes");
+    read_array(in, metadata.sink_stop_nodes, sink_stop_node_count,
+               "metadata sink stop nodes");
+  } else {
+    skip_array<std::uint64_t>(in, blocked_node_count,
+                              "metadata blocked nodes");
+    skip_array<std::uint64_t>(in, sink_stop_node_count,
+                              "metadata sink stop nodes");
   }
 
-  read_array(in, metadata.blocked_nodes, blocked_node_count, "metadata blocked nodes");
-  read_array(in, metadata.sink_stop_nodes, sink_stop_node_count, "metadata sink stop nodes");
-
-  std::vector<std::uint8_t> skipped_bytes;
-  read_array(in, skipped_bytes, physical_netlist_byte_count, "metadata physical bytes");
-  read_array(in, skipped_bytes, logical_netlist_byte_count, "metadata logical bytes");
+  skip_array<std::uint8_t>(in, physical_netlist_byte_count,
+                           "metadata physical bytes");
+  skip_array<std::uint8_t>(in, logical_netlist_byte_count,
+                           "metadata logical bytes");
+  require_position_within_file(in, "interchange metadata");
 
   return metadata;
 }
@@ -2331,26 +2486,44 @@ PathfinderResult run_pathfinder(const HostCsrF32& base_graph,
         automatic_delta_wavefront_size,
         options.delta_multiplier);
   } else {
-    validate_csr(base_graph);
+    validate_csr_shape(base_graph);
   }
-  if (metadata.node_device_ids.size() != static_cast<std::size_t>(base_graph.rows)) {
+  const std::size_t metadata_node_count =
+      metadata.declared_node_count != 0
+          ? checked_vector_count<std::uint8_t>(metadata.declared_node_count,
+                                               "metadata node count")
+          : metadata.node_device_ids.size();
+  if (metadata_node_count != static_cast<std::size_t>(base_graph.rows)) {
     throw std::runtime_error("metadata node count does not match CSR row count");
   }
-  if (metadata.node_min_x.size() != metadata.node_device_ids.size() ||
-      metadata.node_max_x.size() != metadata.node_device_ids.size() ||
-      metadata.node_min_y.size() != metadata.node_device_ids.size() ||
-      metadata.node_max_y.size() != metadata.node_device_ids.size() ||
-      metadata.node_tile_type_strings.size() != metadata.node_device_ids.size() ||
-      metadata.node_wire_type_strings.size() != metadata.node_device_ids.size()) {
+  const bool has_any_node_metadata =
+      !metadata.node_device_ids.empty() || !metadata.node_min_x.empty() ||
+      !metadata.node_max_x.empty() || !metadata.node_min_y.empty() ||
+      !metadata.node_max_y.empty() ||
+      !metadata.node_tile_type_strings.empty() ||
+      !metadata.node_wire_type_strings.empty();
+  if (has_any_node_metadata &&
+      (metadata.node_device_ids.size() != metadata_node_count ||
+       metadata.node_min_x.size() != metadata_node_count ||
+       metadata.node_max_x.size() != metadata_node_count ||
+       metadata.node_min_y.size() != metadata_node_count ||
+       metadata.node_max_y.size() != metadata_node_count ||
+       metadata.node_tile_type_strings.size() != metadata_node_count ||
+       metadata.node_wire_type_strings.size() != metadata_node_count)) {
     throw std::runtime_error(
         "metadata node coordinate range/tile/wire type arrays do not match node count");
   }
-  if (metadata.edge_attrs.size() != static_cast<std::size_t>(base_graph.nnz)) {
+  const std::size_t metadata_edge_attr_count =
+      metadata.declared_edge_attr_count != 0
+          ? checked_vector_count<std::uint8_t>(
+                metadata.declared_edge_attr_count,
+                "metadata edge attribute count")
+          : metadata.edge_attrs.size();
+  if (metadata_edge_attr_count != static_cast<std::size_t>(base_graph.nnz)) {
     throw std::runtime_error("metadata edge attributes do not match CSR nnz");
   }
 
   PathfinderResult result;
-  result.occupancy.assign(static_cast<std::size_t>(base_graph.rows), 0);
 
   const std::size_t route_request_count =
       options.net_limit == 0
@@ -2442,8 +2615,18 @@ PathfinderResult run_pathfinder(const HostCsrF32& base_graph,
                 << ", multiplier=" << delta_options.delta_multiplier << ")\n";
         std::cout << message.str();
       }
+      std::cout << "[pathfinder] validating and uploading Delta graph..."
+                << std::flush;
+      const auto graph_upload_started = std::chrono::steady_clock::now();
       auto shared_graph =
           std::make_shared<DeltaSteppingCsrGraph>(base_graph, stream);
+      std::cout << " done ("
+                << std::chrono::duration<double>(
+                       std::chrono::steady_clock::now() -
+                       graph_upload_started)
+                       .count()
+                << " s)\n"
+                << std::flush;
       if (delta_options.parallel_net_workers == 0) {
         const bool uses_unit_specialization =
             !delta_options.delta_force_generic &&
@@ -2557,6 +2740,10 @@ PathfinderResult run_pathfinder(const HostCsrF32& base_graph,
     }
   }
 
+  // Worker workspaces and their graph-sized CPU/GPU scratch have been
+  // released. Allocate the write-only occupancy summary now instead of
+  // carrying another 4 * rows bytes through the peak-memory routing phase.
+  result.occupancy.assign(static_cast<std::size_t>(base_graph.rows), 0);
   for (const RoutedNet& net : result.nets) {
     commit_net_occupancy(net, result.occupancy);
   }
@@ -2656,11 +2843,16 @@ std::string string_at(const RoutingMetadata& metadata, std::uint64_t index) {
   return metadata.strings[static_cast<std::size_t>(index)];
 }
 
-void write_routes_jsonl(const std::filesystem::path& path,
-                        const HostCsrF32& graph,
-                        const RoutingMetadata& metadata,
-                        const PathfinderResult& result) {
-  validate_csr(graph);
+void write_routes_jsonl_impl(const std::filesystem::path& path,
+                             const HostCsrF32& graph,
+                             const RoutingMetadata& metadata,
+                             const PathfinderResult& result,
+                             bool validate_graph) {
+  if (validate_graph) {
+    validate_csr(graph);
+  } else {
+    validate_csr_shape(graph);
+  }
   if (metadata.edge_attrs.size() != static_cast<std::size_t>(graph.nnz)) {
     throw std::runtime_error("metadata edge attributes do not match CSR nnz");
   }
@@ -2776,6 +2968,24 @@ void write_routes_jsonl(const std::filesystem::path& path,
     }
     out << "]}\n";
   }
+}
+
+void write_routes_jsonl(const std::filesystem::path& path,
+                        const HostCsrF32& graph,
+                        const RoutingMetadata& metadata,
+                        const PathfinderResult& result) {
+  write_routes_jsonl_impl(path, graph, metadata, result, true);
+}
+
+// The CLI loaded and fully validated this immutable CSR artifact before
+// routing, and every selected backend validated it again before device use.
+// Keep the public writer defensive while avoiding one final O(V + E) scan in
+// the end-to-end artifact path.
+void write_routes_jsonl_loaded_artifact(const std::filesystem::path& path,
+                                        const HostCsrF32& graph,
+                                        const RoutingMetadata& metadata,
+                                        const PathfinderResult& result) {
+  write_routes_jsonl_impl(path, graph, metadata, result, false);
 }
 
 }  // namespace routing
@@ -2985,10 +3195,18 @@ int main(int argc, char** argv) {
 
     std::optional<routing::interchange::InterchangeArtifactPairId>
         csr_artifact_pair_id;
+    std::cout << "[pathfinder] loading CSR..." << std::flush;
+    const auto csr_load_started = std::chrono::steady_clock::now();
     HostCsrF32 graph = [&]() {
       PATHFINDER_PROFILE_RANGE("pathfinder.load_csr");
       return routing::load_csrbin(csr_path, &csr_artifact_pair_id);
     }();
+    std::cout << " done ("
+              << std::chrono::duration<double>(
+                     std::chrono::steady_clock::now() - csr_load_started)
+                     .count()
+              << " s)\n"
+              << std::flush;
     if (delta_benchmark_weights_seen) {
       routing::apply_delta_benchmark_weights(
           graph,
@@ -3002,15 +3220,54 @@ int main(int argc, char** argv) {
                 << " seed=" << delta_benchmark_weight_seed << "\n";
     }
 
+    std::cout << "[pathfinder] loading routing metadata..." << std::flush;
+    const auto metadata_load_started = std::chrono::steady_clock::now();
     routing::RoutingMetadata metadata = [&]() {
       PATHFINDER_PROFILE_RANGE("pathfinder.load_metadata");
-      return routing::load_interchange_metadata(metadata_path);
+      return routing::load_interchange_metadata(
+          metadata_path,
+          routing::InterchangeMetadataLoadMode::kRoutingOnly);
     }();
+    std::cout << " done ("
+              << std::chrono::duration<double>(
+                     std::chrono::steady_clock::now() - metadata_load_started)
+                     .count()
+              << " s)\n"
+              << std::flush;
     routing::interchange::verify_interchange_publication(
         csr_path, metadata_path, publication_snapshot);
     routing::interchange::require_matching_interchange_pair_ids(
         csr_artifact_pair_id, metadata.artifact_pair_id,
         publication_snapshot.generation);
+
+    // V5+ artifacts carry a pair ID and publication generation, so their
+    // graph-sized route-output tables can be loaded safely after routing.
+    // Legacy v4 artifacts have neither identity token. Retain their output
+    // tables before routing rather than risk combining routes from one
+    // sidecar with edge/PIP records from a replacement sidecar later.
+    const bool defer_route_output_metadata =
+        !routes_out_path.empty() && metadata.artifact_pair_id.has_value();
+    if (!routes_out_path.empty() && !defer_route_output_metadata) {
+      std::cout << "[pathfinder] loading legacy route-output metadata..."
+                << std::flush;
+      const auto legacy_route_metadata_started =
+          std::chrono::steady_clock::now();
+      metadata = routing::load_interchange_metadata(
+          metadata_path,
+          routing::InterchangeMetadataLoadMode::kRoutingWithRouteOutput);
+      routing::interchange::verify_interchange_publication(
+          csr_path, metadata_path, publication_snapshot);
+      routing::interchange::require_matching_interchange_pair_ids(
+          csr_artifact_pair_id, metadata.artifact_pair_id,
+          publication_snapshot.generation);
+      std::cout << " done ("
+                << std::chrono::duration<double>(
+                       std::chrono::steady_clock::now() -
+                       legacy_route_metadata_started)
+                       .count()
+                << " s)\n"
+                << std::flush;
+    }
 
     routing::PathfinderResult result =
         routing::run_pathfinder(
@@ -3032,9 +3289,38 @@ int main(int argc, char** argv) {
         std::cerr << "error: refusing to write routes because not all sinks were reached\n";
         return 2;
       }
+      if (defer_route_output_metadata) {
+        const routing::interchange::InterchangePublicationSnapshot
+            route_output_snapshot =
+                routing::interchange::snapshot_interchange_publication(
+                    csr_path, metadata_path);
+        if (!(route_output_snapshot == publication_snapshot)) {
+          throw std::runtime_error(
+              "interchange CSR/metadata generation changed while routing");
+        }
+        std::cout << "[pathfinder] loading route-output metadata..."
+                  << std::flush;
+        const auto route_metadata_started = std::chrono::steady_clock::now();
+        metadata = routing::load_interchange_metadata(
+            metadata_path,
+            routing::InterchangeMetadataLoadMode::kRoutingWithRouteOutput);
+        routing::interchange::verify_interchange_publication(
+            csr_path, metadata_path, route_output_snapshot);
+        routing::interchange::require_matching_interchange_pair_ids(
+            csr_artifact_pair_id, metadata.artifact_pair_id,
+            route_output_snapshot.generation);
+        std::cout << " done ("
+                  << std::chrono::duration<double>(
+                         std::chrono::steady_clock::now() -
+                         route_metadata_started)
+                         .count()
+                  << " s)\n"
+                  << std::flush;
+      }
       {
         PATHFINDER_PROFILE_RANGE("pathfinder.write_routes");
-        routing::write_routes_jsonl(routes_out_path, graph, metadata, result);
+        routing::write_routes_jsonl_loaded_artifact(
+            routes_out_path, graph, metadata, result);
       }
     }
 

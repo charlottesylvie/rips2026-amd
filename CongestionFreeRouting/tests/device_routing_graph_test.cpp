@@ -49,7 +49,8 @@ ri::CsrGraph reference_filter_with_separate_destination_masks(
     const std::vector<std::uint8_t>& sink_stops,
     const std::vector<std::uint8_t>& exclusive_sources) {
   ri::CsrGraph filtered;
-  const std::size_t node_count = graph.node_device_ids.size();
+  const std::size_t node_count =
+      ri::device_routing_graph_node_count(graph);
   filtered.rows = static_cast<std::int64_t>(node_count);
   filtered.cols = filtered.rows;
   filtered.declared_edges = graph.declared_edges;
@@ -151,7 +152,8 @@ ri::DeviceRoutingGraph make_graph() {
 }
 
 void compare_graphs(const ri::DeviceRoutingGraph& expected,
-                    const ri::DeviceRoutingGraph& actual) {
+                    const ri::DeviceRoutingGraph& actual,
+                    bool expect_physical_node_arrays = true) {
   require(actual.device_fingerprint == expected.device_fingerprint,
           "fingerprint changed across roundtrip");
   require(actual.device_path_string == expected.device_path_string,
@@ -167,17 +169,30 @@ void compare_graphs(const ri::DeviceRoutingGraph& expected,
           "bounds changed across roundtrip");
   require(actual.string_table.strings == expected.string_table.strings,
           "string table changed across roundtrip");
-  require(actual.node_device_ids == expected.node_device_ids,
-          "node IDs changed across roundtrip");
-  require(actual.node_min_x == expected.node_min_x &&
-              actual.node_max_x == expected.node_max_x &&
-              actual.node_min_y == expected.node_min_y &&
-              actual.node_max_y == expected.node_max_y,
-          "node coordinates changed across roundtrip");
-  require(actual.node_tile_type_strings == expected.node_tile_type_strings &&
-              actual.node_wire_type_strings ==
-                  expected.node_wire_type_strings,
-          "node type strings changed across roundtrip");
+  require(ri::device_routing_graph_node_count(actual) ==
+              expected.node_device_ids.size(),
+          "retained node count changed across roundtrip");
+  if (expect_physical_node_arrays) {
+    require(actual.node_device_ids == expected.node_device_ids,
+            "node IDs changed across roundtrip");
+    require(actual.node_min_x == expected.node_min_x &&
+                actual.node_max_x == expected.node_max_x &&
+                actual.node_min_y == expected.node_min_y &&
+                actual.node_max_y == expected.node_max_y,
+            "node coordinates changed across roundtrip");
+    require(actual.node_tile_type_strings ==
+                    expected.node_tile_type_strings &&
+                actual.node_wire_type_strings ==
+                    expected.node_wire_type_strings,
+            "node type strings changed across roundtrip");
+  } else {
+    require(actual.node_device_ids.empty() && actual.node_min_x.empty() &&
+                actual.node_max_x.empty() && actual.node_min_y.empty() &&
+                actual.node_max_y.empty() &&
+                actual.node_tile_type_strings.empty() &&
+                actual.node_wire_type_strings.empty(),
+            "filtering projection retained physical node arrays");
+  }
   require(actual.declared_edges == expected.declared_edges &&
               actual.loaded_edges == expected.loaded_edges,
           "diagnostic edge counts changed across roundtrip");
@@ -260,7 +275,10 @@ int main() {
     const std::filesystem::path streamed_path = base.string() + ".streamed";
     const std::filesystem::path legacy_path = base.string() + ".legacy";
     const std::filesystem::path trailing_path = base.string() + ".trailing";
-    cleanup = {split_path, streamed_path, legacy_path, trailing_path};
+    const std::filesystem::path projected_truncated_path =
+        base.string() + ".projected-truncated";
+    cleanup = {split_path, streamed_path, legacy_path, trailing_path,
+               projected_truncated_path};
 
     const std::filesystem::path staged_one =
         ri::create_unique_staging_path(base.string() + ".output");
@@ -398,7 +416,36 @@ int main() {
     compare_graphs(expected, split);
     const ri::DeviceRoutingGraph deferred =
         ri::read_device_routing_graph_for_filtering(split_path);
-    compare_graphs(expected, deferred);
+    compare_graphs(expected, deferred, false);
+
+    // Truncate one byte before the end of the skipped 40-byte/node block.
+    // The projection must check the available file extent instead of letting
+    // a relative seek silently move beyond EOF.
+    std::filesystem::copy_file(
+        split_path, projected_truncated_path,
+        std::filesystem::copy_options::overwrite_existing);
+    constexpr std::uintmax_t kDeviceGraphFixedHeaderBytes =
+        8 + 17 * sizeof(std::uint64_t);
+    std::uintmax_t node_arrays_begin = kDeviceGraphFixedHeaderBytes;
+    for (const std::string& text : expected.string_table.strings) {
+      node_arrays_begin += sizeof(std::uint64_t) + text.size();
+    }
+    const std::uintmax_t node_array_bytes =
+        expected.node_device_ids.size() * 40;
+    require(node_array_bytes != 0,
+            "projection truncation fixture has no node metadata");
+    std::filesystem::resize_file(
+        projected_truncated_path,
+        node_arrays_begin + node_array_bytes - 1);
+    bool rejected_projected_truncation = false;
+    try {
+      (void)ri::read_device_routing_graph_for_filtering(
+          projected_truncated_path);
+    } catch (const std::runtime_error&) {
+      rejected_projected_truncation = true;
+    }
+    require(rejected_projected_truncation,
+            "filtering projection accepted a truncated node block");
 
     std::filesystem::copy_file(
         split_path, legacy_path,
@@ -440,6 +487,14 @@ int main() {
     }
     require(rejected_trailing_data,
             "device graph accepted trailing bytes");
+    rejected_trailing_data = false;
+    try {
+      (void)ri::read_device_routing_graph_for_filtering(trailing_path);
+    } catch (const std::runtime_error&) {
+      rejected_trailing_data = true;
+    }
+    require(rejected_trailing_data,
+            "device graph filtering projection accepted trailing bytes");
 
     const auto site = ri::find_site_pin_node(
         split.site_pin_nodes, split.string_table, "SITE0",

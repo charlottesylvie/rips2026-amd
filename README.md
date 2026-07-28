@@ -276,6 +276,28 @@ g++ -std=c++17 -O3 -I"$SCHEMA_DIR" \
 g++ -std=c++17 -O2 CongestionFreeRouting/pathfinder_router.cpp -o PathFinderFile
 ```
 
+When those generated schemas are available, the root Makefile can keep the
+default in-tree converter and reconstructor synchronized with both their C++
+sources and generated Cap'n Proto files:
+
+```bash
+make PATHFINDER_SCHEMA_DIR="$SCHEMA_DIR" \
+  ./interchange_to_csr ./routes_to_phys
+```
+
+Pass the same variable to a contest-style run so source changes are rebuilt
+before routing:
+
+```bash
+make ROUTER=PathFinderFile BENCHMARKS="boom_med_pb" VERBOSE=1 \
+  PATHFINDER_SCHEMA_DIR="$SCHEMA_DIR"
+```
+
+When `PATHFINDER_SCHEMA_DIR` is empty, Make does not add build rules for these
+schema-dependent helpers. Manually built binaries and helpers supplied through
+non-default `INTERCHANGE_TO_CSR` or `ROUTES_TO_PHYS` paths remain
+caller-managed.
+
 To include optional ROCTx ranges in profiler traces, add
 `-DPATHFINDER_ENABLE_ROCTX -lrocprofiler-sdk-roctx` to the `hipcc` command.
 
@@ -350,14 +372,20 @@ analyzes each routable source forest once, reserves the large name/endpoint
 maps, and precombines blocked/exclusive destination state before the edge
 filter. The one-time device preprocessor builds compact lookup records directly
 and compacts row offsets in place. These changes preserve serialized order and
-filter semantics; no production converter timing is claimed on the host-only
-development machine.
+filter semantics. Per-design conversion retains the device-graph node count but
+seeks over its seven physical node columns, avoiding another 40 bytes per node
+of input and host allocation; full device-graph readers still validate those
+columns. No production converter timing is claimed on the host-only development
+machine.
 
 The two outputs are staged before publication. Separate adjacent `.publishing`
 guards are acquired for the CSR and metadata paths, so converters that share
-either output cannot race. CSR version 2 and metadata version 5 embed the same
+either output cannot race. CSR version 2 and metadata version 6 embed the same
 nonzero 128-bit pair ID; the `.generation` sidecar publishes its canonical hex
-form, and PathFinder propagates it into every route JSON record. Current
+form, and PathFinder propagates it into every route JSON record. Metadata v6
+keeps the declared node count but omits seven unused per-node columns that
+previously added 40 bytes per node to every design sidecar; readers remain
+compatible with metadata v4 and v5. Current
 readers sample the guards/generation around their reads and require every
 available ID to match. This rejects overlapping publication, stable old/new
 pairs, and stale route files. An interrupted process can leave a guard behind
@@ -561,7 +589,7 @@ Useful wrapper options:
 | `xcvu3p.device` | RapidWright | FPGA Interchange device resources for the target part. |
 | `.devicegraph` | `device_to_routing_graph` | Persistent device-wide CSR, node/PIP metadata, and lookup tables for one device/bounds policy. |
 | `.csrbin` | `interchange_to_csr` | Internal outgoing CSR routing graph; new version-2 files embed an artifact-pair ID. |
-| `.csrbin.ifmeta.bin` | `interchange_to_csr` | Version-5 metadata sidecar with the matching pair ID, string table, node coordinate ranges, tile/wire type IDs, PIP data, site pins, logical summaries, and route requests. |
+| `.csrbin.ifmeta.bin` | `interchange_to_csr` | Version-6 metadata sidecar with the matching pair ID, declared node/edge counts, string table, PIP data, site pins, logical summaries, and route requests. Redundant device-wide node columns remain available in `.devicegraph` and are no longer copied into each design sidecar. |
 | `.csrbin.ifmeta.bin.generation` | `interchange_to_csr` | Canonical pair ID sampled around reads; must match both binary headers. |
 | `.routes.jsonl` | `pathfinder` | One pair-ID-bound JSON object per net containing sources, sinks, and selected PIP edges. |
 | `<benchmark>_PathFinderFile.phys` | `routes_to_phys` | Routed physical netlist. |
@@ -570,7 +598,8 @@ Useful wrapper options:
 
 CSR orientation is outgoing-edge: row `u`, column `v` represents directed edge
 `u -> v`. Edge weights are stored as a separate `float` array aligned with
-`colind`; node coordinate ranges and tile/wire type metadata stay in the sidecar.
+`colind`; node coordinate ranges and tile/wire type metadata stay in the
+reusable `.devicegraph` instead of being duplicated in every v6 sidecar.
 
 Device-graph format version 3 excludes pseudo-PIPs whose site occupancy cannot
 be represented, retains typed primary/alternate site-pin aliases, records the
@@ -821,7 +850,7 @@ output, and computes the benchmark score.
   fingerprint, bounds policy, and device name; conversion rejects a
   PhysicalNetlist for a different part. CSR/metadata publication is guarded
   against concurrent converters and process interruption. New CSR v2,
-  metadata v5, generation, and route records carry one pair ID and supported
+  metadata v6, generation, and route records carry one pair ID and supported
   readers require equality. Coherent CSR v1/metadata v4 pairs without a
   generation remain readable as explicitly legacy/unverified input; mixed
   legacy/current files fail. Pair IDs are provenance tokens rather than content

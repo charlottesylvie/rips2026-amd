@@ -169,6 +169,9 @@ PATHFINDER_HIPCC ?= hipcc
 PATHFINDER_HOST_CXX ?= g++
 PATHFINDER_HIP_FLAGS ?= -std=c++17 -O3 -x hip
 PATHFINDER_HOST_FLAGS ?= -std=c++17 -O2
+PATHFINDER_INTERCHANGE_FLAGS ?= -std=c++17 -O3
+PATHFINDER_INTERCHANGE_LIBS ?= -lcapnp -lkj -lz
+PATHFINDER_SCHEMA_DIR ?=
 PATHFINDER_SSSP_ENGINE ?= unit-bfs
 PATHFINDER_ARGS ?=
 PATHFINDER_DEVICE_GRAPH ?= xcvu3p.full-poc-base-wire.devicegraph
@@ -188,9 +191,11 @@ PATHFINDER_GPU_HEADERS := \
 	$(wildcard CongestionFreeRouting/unit_bfs/*.hpp) \
 	HIP_kernel/bellman_ford/src/bf_hip_CSR.hpp
 
-# Rebuild the wrapper and GPU router changed in this repository before timing
-# them. Schema-dependent converter/reconstructor builds and helper binaries
-# supplied through non-default paths remain caller-managed.
+# Rebuild binaries changed in this repository before timing them. Generated
+# FPGA Interchange schemas are not present in every checkout, so the default
+# converter/reconstructor targets become Make-managed only when their schema
+# directory is supplied explicitly. Helpers at non-default paths remain
+# caller-managed.
 ./PathFinderFile: CongestionFreeRouting/pathfinder_router.cpp
 	$(PATHFINDER_HOST_CXX) $(PATHFINDER_HOST_FLAGS) $< -o $@
 
@@ -201,6 +206,50 @@ PATHFINDER_GPU_HEADERS := \
 		-I CongestionFreeRouting/delta_stepping \
 		-I CongestionFreeRouting/unit_bfs \
 		$(PATHFINDER_GPU_SOURCES) -pthread -o $@
+
+ifneq ($(strip $(PATHFINDER_SCHEMA_DIR)),)
+PATHFINDER_INTERCHANGE_HEADERS := \
+	CongestionFreeRouting/interchange/device_routing_graph.hpp \
+	CongestionFreeRouting/interchange/gzip_io.hpp \
+	CongestionFreeRouting/interchange/import_policy.hpp
+PATHFINDER_PHYSICAL_SCHEMA_FILES := \
+	$(PATHFINDER_SCHEMA_DIR)/PhysicalNetlist.capnp.h \
+	$(PATHFINDER_SCHEMA_DIR)/PhysicalNetlist.capnp.c++
+PATHFINDER_LOGICAL_SCHEMA_FILES := \
+	$(PATHFINDER_SCHEMA_DIR)/LogicalNetlist.capnp.h \
+	$(PATHFINDER_SCHEMA_DIR)/LogicalNetlist.capnp.c++
+PATHFINDER_REFERENCES_SCHEMA_FILES := \
+	$(PATHFINDER_SCHEMA_DIR)/References.capnp.h \
+	$(PATHFINDER_SCHEMA_DIR)/References.capnp.c++
+
+./interchange_to_csr: \
+		CongestionFreeRouting/interchange_to_csr.cpp \
+		CongestionFreeRouting/interchange/device_routing_graph.cpp \
+		$(PATHFINDER_INTERCHANGE_HEADERS) \
+		$(PATHFINDER_PHYSICAL_SCHEMA_FILES) \
+		$(PATHFINDER_LOGICAL_SCHEMA_FILES) \
+		$(PATHFINDER_REFERENCES_SCHEMA_FILES)
+	$(PATHFINDER_HOST_CXX) $(PATHFINDER_INTERCHANGE_FLAGS) \
+		-I"$(PATHFINDER_SCHEMA_DIR)" \
+		CongestionFreeRouting/interchange_to_csr.cpp \
+		CongestionFreeRouting/interchange/device_routing_graph.cpp \
+		$(PATHFINDER_SCHEMA_DIR)/PhysicalNetlist.capnp.c++ \
+		$(PATHFINDER_SCHEMA_DIR)/LogicalNetlist.capnp.c++ \
+		$(PATHFINDER_SCHEMA_DIR)/References.capnp.c++ \
+		$(PATHFINDER_INTERCHANGE_LIBS) -o $@
+
+./routes_to_phys: \
+		CongestionFreeRouting/routes_to_phys.cpp \
+		CongestionFreeRouting/interchange/gzip_io.hpp \
+		CongestionFreeRouting/interchange/import_policy.hpp \
+		$(PATHFINDER_PHYSICAL_SCHEMA_FILES) \
+		$(PATHFINDER_SCHEMA_DIR)/References.capnp.h
+	$(PATHFINDER_HOST_CXX) $(PATHFINDER_INTERCHANGE_FLAGS) \
+		-I"$(PATHFINDER_SCHEMA_DIR)" \
+		CongestionFreeRouting/routes_to_phys.cpp \
+		$(PATHFINDER_SCHEMA_DIR)/PhysicalNetlist.capnp.c++ \
+		$(PATHFINDER_INTERCHANGE_LIBS) -o $@
+endif
 
 # DeviceResources preprocessing is deliberately outside Make and benchmark
 # timing. Require the configured artifact, but never generate it implicitly.

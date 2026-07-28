@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cstddef>
 #include <cstdint>
 #include <filesystem>
 #include <limits>
@@ -131,6 +132,12 @@ struct DeviceRoutingGraph {
   std::uint64_t declared_edges = 0;
   std::uint64_t loaded_edges = 0;
 
+  // The filtering projection retains the on-disk node count without loading
+  // the seven physical node arrays. Full graphs leave this equal to the array
+  // size; programmatically constructed graphs may leave it at zero and derive
+  // their count from node_device_ids.
+  std::size_t retained_node_count = 0;
+
   std::vector<std::uint64_t> node_device_ids;
   std::vector<std::int32_t> node_min_x;
   std::vector<std::int32_t> node_max_x;
@@ -149,6 +156,12 @@ struct DeviceRoutingGraph {
   std::vector<PairNodeLookup> tile_wire_nodes;
   std::vector<SitePinNodeLookup> site_pin_nodes;
 };
+
+// Return the authoritative node count for either a full graph or the compact
+// filtering projection, rejecting a retained count that contradicts loaded
+// node IDs.
+std::size_t device_routing_graph_node_count(
+    const DeviceRoutingGraph& graph);
 
 // Design-filtered outgoing CSR. Values are always exact unit weights.
 struct CsrGraph {
@@ -195,10 +208,11 @@ void validate_device_routing_graph(const DeviceRoutingGraph& graph);
 DeviceRoutingGraph read_device_routing_graph(
     const std::filesystem::path& path);
 
-// Converter fast path: validates the header, static metadata, lookups, and CSR
-// shape while deferring individual edge checks to
-// filter_device_routing_graph(). This avoids scanning every large edge record
-// twice in the per-design pipeline.
+// Converter fast path: seeks over the seven unused physical node arrays,
+// retains their node count, and validates the header, strings, lookups, and
+// CSR shape. Individual edge checks are deferred to
+// filter_device_routing_graph(), avoiding both 40 bytes/node of input and a
+// second scan of every large edge record in the per-design pipeline.
 DeviceRoutingGraph read_device_routing_graph_for_filtering(
     const std::filesystem::path& path);
 

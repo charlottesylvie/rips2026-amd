@@ -1,7 +1,6 @@
 #include "device_routing_graph.hpp"
 
 #include <algorithm>
-#include <array>
 #include <cerrno>
 #include <cstddef>
 #include <cstring>
@@ -64,6 +63,45 @@ std::size_t checked_array_bytes(std::size_t count, const char* name) {
                              " byte count exceeds streamsize");
   }
   return bytes;
+}
+
+std::size_t checked_byte_count(std::size_t count,
+                               std::size_t bytes_per_item,
+                               const char* name) {
+  if (bytes_per_item != 0 &&
+      count > std::numeric_limits<std::size_t>::max() / bytes_per_item) {
+    throw std::runtime_error(std::string(name) +
+                             " byte count overflows size_t");
+  }
+  const std::size_t bytes = count * bytes_per_item;
+  if (bytes > static_cast<std::size_t>(
+                  std::numeric_limits<std::streamoff>::max())) {
+    throw std::runtime_error(std::string(name) +
+                             " byte count exceeds stream offset range");
+  }
+  return bytes;
+}
+
+// A relative seek may legally move beyond EOF. Check the remaining file size
+// first so the filtering projection cannot accept a truncated skipped block.
+void skip_bytes(std::ifstream& in, std::size_t count, const char* name) {
+  if (count == 0) {
+    return;
+  }
+  const std::streampos current = in.tellg();
+  if (current == std::streampos(-1)) {
+    throw std::runtime_error(std::string("failed while locating ") + name);
+  }
+  in.seekg(0, std::ios::end);
+  const std::streampos end = in.tellg();
+  if (!in || end == std::streampos(-1) || end < current ||
+      static_cast<std::uint64_t>(end - current) < count) {
+    throw std::runtime_error(std::string("failed while skipping ") + name);
+  }
+  in.seekg(current + static_cast<std::streamoff>(count));
+  if (!in) {
+    throw std::runtime_error(std::string("failed while skipping ") + name);
+  }
 }
 
 void write_u64(std::ofstream& out, std::uint64_t value, const char* name) {
@@ -163,8 +201,9 @@ std::string read_string(std::ifstream& in) {
 }
 
 void validate_node_arrays(const DeviceRoutingGraph& graph) {
-  const std::size_t node_count = graph.node_device_ids.size();
+  const std::size_t node_count = device_routing_graph_node_count(graph);
   if (node_count == 0 ||
+      graph.node_device_ids.size() != node_count ||
       graph.node_min_x.size() != node_count ||
       graph.node_max_x.size() != node_count ||
       graph.node_min_y.size() != node_count ||
@@ -257,13 +296,13 @@ void validate_site_pin_lookup_records(
   }
 }
 
-void validate_static_metadata(const DeviceRoutingGraph& graph) {
-  validate_node_arrays(graph);
-  const std::size_t node_count = graph.node_device_ids.size();
+void validate_static_metadata_common(const DeviceRoutingGraph& graph,
+                                     std::size_t node_count) {
   const std::size_t string_count = graph.string_table.strings.size();
-  if (node_count > static_cast<std::size_t>(
+  if (node_count == 0 ||
+      node_count > static_cast<std::size_t>(
                        std::numeric_limits<NodeId>::max())) {
-    throw std::runtime_error("device graph has too many nodes for int32 IDs");
+    throw std::runtime_error("device graph has an invalid node count");
   }
   if (graph.device_fingerprint == 0) {
     throw std::runtime_error("device graph has an empty device fingerprint");
@@ -286,6 +325,23 @@ void validate_static_metadata(const DeviceRoutingGraph& graph) {
     throw std::runtime_error(
         "device graph has more loaded than declared edges");
   }
+  for (const PipData& pip : graph.pip_data) {
+    if (pip.wire0_string >= string_count ||
+        pip.wire1_string >= string_count) {
+      throw std::runtime_error("device graph contains invalid PIP strings");
+    }
+  }
+  validate_lookup_records(graph.tile_wire_nodes, string_count, node_count,
+                          "tile-wire");
+  validate_site_pin_lookup_records(graph.site_pin_nodes, string_count,
+                                   node_count);
+}
+
+void validate_static_metadata(const DeviceRoutingGraph& graph) {
+  validate_node_arrays(graph);
+  const std::size_t node_count = device_routing_graph_node_count(graph);
+  const std::size_t string_count = graph.string_table.strings.size();
+  validate_static_metadata_common(graph, node_count);
   for (std::size_t node = 0; node < node_count; ++node) {
     if (graph.node_min_x[node] > graph.node_max_x[node] ||
         graph.node_min_y[node] > graph.node_max_y[node]) {
@@ -300,20 +356,27 @@ void validate_static_metadata(const DeviceRoutingGraph& graph) {
           "device graph contains an invalid node type string");
     }
   }
-  for (const PipData& pip : graph.pip_data) {
-    if (pip.wire0_string >= string_count ||
-        pip.wire1_string >= string_count) {
-      throw std::runtime_error("device graph contains invalid PIP strings");
-    }
+}
+
+void validate_filtering_projection(const DeviceRoutingGraph& graph) {
+  const std::size_t node_count = device_routing_graph_node_count(graph);
+  if (!graph.node_device_ids.empty() || !graph.node_min_x.empty() ||
+      !graph.node_max_x.empty() || !graph.node_min_y.empty() ||
+      !graph.node_max_y.empty() ||
+      !graph.node_tile_type_strings.empty() ||
+      !graph.node_wire_type_strings.empty()) {
+    throw std::runtime_error(
+        "device graph filtering projection retained physical node arrays");
   }
-  validate_lookup_records(graph.tile_wire_nodes, string_count, node_count,
-                          "tile-wire");
-  validate_site_pin_lookup_records(graph.site_pin_nodes, string_count,
-                                   node_count);
+  validate_static_metadata_common(graph, node_count);
 }
 
 std::size_t validate_row_pointers(const DeviceRoutingGraph& graph) {
-  const std::size_t expected_count = graph.node_device_ids.size() + 1;
+  const std::size_t node_count = device_routing_graph_node_count(graph);
+  if (node_count == std::numeric_limits<std::size_t>::max()) {
+    throw std::runtime_error("device graph row-pointer count overflows size_t");
+  }
+  const std::size_t expected_count = node_count + 1;
   if (graph.rowptr.size() != expected_count || graph.rowptr.front() != 0) {
     throw std::runtime_error("device graph has invalid CSR row pointers");
   }
@@ -328,14 +391,24 @@ std::size_t validate_row_pointers(const DeviceRoutingGraph& graph) {
                       "base CSR edge count");
 }
 
-std::size_t validate_csr_shape(const DeviceRoutingGraph& graph) {
-  validate_static_metadata(graph);
+std::size_t validate_csr_arrays(const DeviceRoutingGraph& graph) {
   const std::size_t edge_count = validate_row_pointers(graph);
   if (graph.loaded_edges != edge_count || graph.colind.size() != edge_count ||
       graph.edge_attrs.size() != edge_count) {
     throw std::runtime_error("device graph edge counts are inconsistent");
   }
   return edge_count;
+}
+
+std::size_t validate_csr_shape(const DeviceRoutingGraph& graph) {
+  validate_static_metadata(graph);
+  return validate_csr_arrays(graph);
+}
+
+std::size_t validate_filtering_csr_shape(
+    const DeviceRoutingGraph& graph) {
+  validate_filtering_projection(graph);
+  return validate_csr_arrays(graph);
 }
 
 void write_header_and_static_prefix(std::ofstream& out,
@@ -356,7 +429,9 @@ void write_header_and_static_prefix(std::ofstream& out,
   write_i64(out, graph.bounds.max_y, "maximum Y bound");
   write_u64(out, static_cast<std::uint64_t>(graph.string_table.strings.size()),
             "string count");
-  write_u64(out, static_cast<std::uint64_t>(graph.node_device_ids.size()),
+  write_u64(out,
+            static_cast<std::uint64_t>(
+                device_routing_graph_node_count(graph)),
             "node count");
   write_u64(out, edge_count, "edge count");
   write_u64(out, static_cast<std::uint64_t>(graph.pip_data.size()),
@@ -418,6 +493,24 @@ void finish_output(std::ofstream& out,
 }
 
 }  // namespace
+
+std::size_t device_routing_graph_node_count(
+    const DeviceRoutingGraph& graph) {
+  const std::size_t node_count = graph.retained_node_count == 0
+                                     ? graph.node_device_ids.size()
+                                     : graph.retained_node_count;
+  if (graph.retained_node_count != 0 &&
+      !graph.node_device_ids.empty() &&
+      graph.node_device_ids.size() != node_count) {
+    throw std::runtime_error(
+        "retained device-graph node count contradicts node IDs");
+  }
+  if (node_count >
+      static_cast<std::size_t>(std::numeric_limits<NodeId>::max())) {
+    throw std::runtime_error("device graph has too many nodes for int32 IDs");
+  }
+  return node_count;
+}
 
 const char* node_bounds_mode_name(NodeBoundsMode mode) {
   switch (mode) {
@@ -690,7 +783,7 @@ std::optional<NodeId> find_site_pin_node(
 }
 
 void validate_device_routing_graph(const DeviceRoutingGraph& graph) {
-  const std::size_t node_count = graph.node_device_ids.size();
+  const std::size_t node_count = device_routing_graph_node_count(graph);
   const std::size_t edge_count = validate_csr_shape(graph);
   for (std::size_t row = 0; row < node_count; ++row) {
     const std::int64_t begin = graph.rowptr[row];
@@ -719,9 +812,14 @@ void validate_device_routing_graph(const DeviceRoutingGraph& graph) {
 
 namespace {
 
+enum class DeviceRoutingGraphReadProfile {
+  kFull,
+  kFilteringProjection,
+};
+
 DeviceRoutingGraph read_device_routing_graph_impl(
     const std::filesystem::path& path,
-    bool validate_edge_records) {
+    DeviceRoutingGraphReadProfile profile) {
   std::ifstream in(path, std::ios::binary);
   if (!in) {
     throw std::runtime_error("could not open device-routing graph: " +
@@ -779,6 +877,9 @@ DeviceRoutingGraph read_device_routing_graph_impl(
       graph.loaded_edges != edge_count) {
     throw std::runtime_error("device-routing graph header counts are invalid");
   }
+  const std::size_t retained_node_count =
+      checked_size(node_count, "node count");
+  graph.retained_node_count = retained_node_count;
 
   graph.string_table.strings.reserve(checked_size(string_count, "strings"));
   for (std::uint64_t index = 0; index < string_count; ++index) {
@@ -786,15 +887,31 @@ DeviceRoutingGraph read_device_routing_graph_impl(
   }
   graph.string_table.rebuild_index();
 
-  read_array(in, graph.node_device_ids, node_count, "device node IDs");
-  read_array(in, graph.node_min_x, node_count, "node minimum X coordinates");
-  read_array(in, graph.node_max_x, node_count, "node maximum X coordinates");
-  read_array(in, graph.node_min_y, node_count, "node minimum Y coordinates");
-  read_array(in, graph.node_max_y, node_count, "node maximum Y coordinates");
-  read_array(in, graph.node_tile_type_strings, node_count,
-             "node tile type strings");
-  read_array(in, graph.node_wire_type_strings, node_count,
-             "node wire type strings");
+  if (profile == DeviceRoutingGraphReadProfile::kFull) {
+    read_array(in, graph.node_device_ids, node_count, "device node IDs");
+    read_array(in, graph.node_min_x, node_count,
+               "node minimum X coordinates");
+    read_array(in, graph.node_max_x, node_count,
+               "node maximum X coordinates");
+    read_array(in, graph.node_min_y, node_count,
+               "node minimum Y coordinates");
+    read_array(in, graph.node_max_y, node_count,
+               "node maximum Y coordinates");
+    read_array(in, graph.node_tile_type_strings, node_count,
+               "node tile type strings");
+    read_array(in, graph.node_wire_type_strings, node_count,
+               "node wire type strings");
+  } else {
+    constexpr std::size_t kPhysicalNodeBytes =
+        3 * sizeof(std::uint64_t) + 4 * sizeof(std::int32_t);
+    static_assert(kPhysicalNodeBytes == 40,
+                  "device graph physical-node footprint changed");
+    skip_bytes(in,
+               checked_byte_count(retained_node_count,
+                                  kPhysicalNodeBytes,
+                                  "physical node arrays"),
+               "physical node arrays");
+  }
   read_array(in, graph.rowptr, node_count + 1, "base CSR row pointers");
   read_array(in, graph.colind, edge_count, "base CSR destinations");
   read_array(in, graph.edge_attrs, edge_count, "base CSR edge attributes");
@@ -823,10 +940,10 @@ DeviceRoutingGraph read_device_routing_graph_impl(
         "failed while checking the end of device-routing graph");
   }
 
-  if (validate_edge_records) {
+  if (profile == DeviceRoutingGraphReadProfile::kFull) {
     validate_device_routing_graph(graph);
   } else {
-    (void)validate_csr_shape(graph);
+    (void)validate_filtering_csr_shape(graph);
   }
   return graph;
 }
@@ -835,12 +952,14 @@ DeviceRoutingGraph read_device_routing_graph_impl(
 
 DeviceRoutingGraph read_device_routing_graph(
     const std::filesystem::path& path) {
-  return read_device_routing_graph_impl(path, true);
+  return read_device_routing_graph_impl(
+      path, DeviceRoutingGraphReadProfile::kFull);
 }
 
 DeviceRoutingGraph read_device_routing_graph_for_filtering(
     const std::filesystem::path& path) {
-  return read_device_routing_graph_impl(path, false);
+  return read_device_routing_graph_impl(
+      path, DeviceRoutingGraphReadProfile::kFilteringProjection);
 }
 
 void write_device_routing_graph(const DeviceRoutingGraph& graph,
@@ -989,7 +1108,7 @@ CsrGraph filter_device_routing_graph(
     const std::vector<std::uint8_t>& blocked_node,
     const std::vector<std::uint8_t>& sink_node_stops,
     const std::vector<std::uint8_t>& unavailable_destination_nodes) {
-  const std::size_t node_count = graph.node_device_ids.size();
+  const std::size_t node_count = device_routing_graph_node_count(graph);
   if (blocked_node.size() != node_count ||
       sink_node_stops.size() != node_count ||
       unavailable_destination_nodes.size() != node_count) {

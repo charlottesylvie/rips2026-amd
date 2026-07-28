@@ -6,6 +6,7 @@ import argparse
 import contextlib
 import io
 import sys
+import tempfile
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -36,7 +37,31 @@ def require_parse_rejected(argv: list[str], message: str) -> None:
     raise RuntimeError(message)
 
 
+def require_current_metadata_pair_versions() -> None:
+    high = 0x123456789ABCDEF0
+    low = 0x0FEDCBA987654321
+    expected = f"{high:016x}{low:016x}"
+    with tempfile.TemporaryDirectory() as directory:
+        for version in (5, 6):
+            metadata = Path(directory) / f"metadata-v{version}.ifmeta.bin"
+            metadata.write_bytes(
+                b"RIPSIFM1"
+                + version.to_bytes(8, byteorder=sys.byteorder)
+                + (2).to_bytes(8, byteorder=sys.byteorder)
+                + high.to_bytes(8, byteorder=sys.byteorder)
+                + low.to_bytes(8, byteorder=sys.byteorder)
+            )
+            Path(str(metadata) + ".generation").write_text(
+                expected + "\n", encoding="ascii"
+            )
+            require(
+                benchmark.read_metadata_artifact_pair_id(metadata) == expected,
+                f"metadata v{version} pair ID was not accepted",
+            )
+
+
 def main() -> None:
+    require_current_metadata_pair_versions()
     defaults = benchmark.parse_args(["input.phys", "output.phys"])
     require(
         not defaults.delta_force_generic,

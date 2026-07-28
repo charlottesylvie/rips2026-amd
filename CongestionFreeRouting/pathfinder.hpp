@@ -63,6 +63,27 @@ struct RoutingMetadata {
   std::uint64_t physical_path_string = kNoIndex;
   std::uint64_t logical_path_string = kNoIndex;
   std::uint64_t logical_design_name_string = kNoIndex;
+  // The routing-only v6 sidecar deliberately omits graph-sized per-node
+  // metadata arrays.  Keep the declared header count separately so callers
+  // can still verify that the sidecar and CSR describe the same graph.  Zero
+  // preserves the historical direct-test convention of deriving the count
+  // from node_device_ids.
+  std::uint64_t declared_node_count = 0;
+  // Like declared_node_count, this lets the routing-only loader validate the
+  // CSR/metadata pairing without retaining the graph-sized edge/PIP tables.
+  std::uint64_t declared_edge_attr_count = 0;
+};
+
+enum class InterchangeMetadataLoadMode {
+  // Materialize every section represented by RoutingMetadata.  V6 still has
+  // no per-node arrays because those sections are absent from the format.
+  kFull,
+  // Load only strings and route requests needed by PathFinder. Large unused
+  // sections are range-checked and skipped without throwaway allocations.
+  kRoutingOnly,
+  // Load the routing fields plus the edge/PIP tables needed by the routes
+  // JSONL writer, while still skipping graph-sized per-node metadata.
+  kRoutingWithRouteOutput,
 };
 
 struct PathEdge {
@@ -174,7 +195,9 @@ HostCsrF32 load_csrbin(
     const std::filesystem::path& path,
     std::optional<interchange::InterchangeArtifactPairId>* artifact_pair_id =
         nullptr);
-RoutingMetadata load_interchange_metadata(const std::filesystem::path& path);
+RoutingMetadata load_interchange_metadata(
+    const std::filesystem::path& path,
+    InterchangeMetadataLoadMode mode = InterchangeMetadataLoadMode::kFull);
 
 // Derive conservative initial workspace reservations from exactly the routed
 // request prefix. Raw endpoint counts are retained (including duplicates), and

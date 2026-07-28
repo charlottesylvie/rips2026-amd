@@ -903,9 +903,10 @@ constexpr std::uint64_t MIN_CSR_VERSION = 1;
 constexpr std::uint64_t CURRENT_CSR_VERSION = 2;
 constexpr std::uint64_t ARTIFACT_PAIR_CSR_VERSION = 2;
 constexpr std::uint64_t MIN_METADATA_VERSION = 3;
-constexpr std::uint64_t CURRENT_METADATA_VERSION = 5;
+constexpr std::uint64_t CURRENT_METADATA_VERSION = 6;
 constexpr std::uint64_t NODE_PHYSICAL_METADATA_VERSION = 4;
 constexpr std::uint64_t ARTIFACT_PAIR_METADATA_VERSION = 5;
+constexpr std::uint64_t COMPACT_METADATA_VERSION = 6;
 constexpr std::uint64_t EXPECTED_OUTGOING_EDGE_ORIENTATION = 2;
 constexpr unsigned int kPackedNoPredEdge = 0xffffffffu;
 constexpr std::uint64_t kNoIndex = std::numeric_limits<std::uint64_t>::max();
@@ -1047,7 +1048,17 @@ void skip_bytes(std::ifstream& in, std::uint64_t count, const char* name) {
   if (count > static_cast<std::uint64_t>(std::numeric_limits<std::streamoff>::max())) {
     throw std::runtime_error(std::string(name) + " byte count is too large to seek");
   }
-  in.seekg(static_cast<std::streamoff>(count), std::ios::cur);
+  const std::streampos current = in.tellg();
+  if (current == std::streampos(-1)) {
+    throw std::runtime_error(std::string("failed while locating ") + name);
+  }
+  in.seekg(0, std::ios::end);
+  const std::streampos end = in.tellg();
+  if (!in || end == std::streampos(-1) || end < current ||
+      static_cast<std::uint64_t>(end - current) < count) {
+    throw std::runtime_error(std::string("failed while skipping ") + name);
+  }
+  in.seekg(current + static_cast<std::streamoff>(count));
   if (!in) {
     throw std::runtime_error(std::string("failed while skipping ") + name);
   }
@@ -1391,7 +1402,7 @@ RoutingMetadata load_routing_metadata(const std::filesystem::path& path,
   const std::uint64_t orientation = read_u64(in, "metadata orientation");
   if (version < MIN_METADATA_VERSION || version > CURRENT_METADATA_VERSION) {
     throw std::runtime_error(
-        "unsupported RIPSIFM1 metadata version (expected version 3, 4, or 5)");
+        "unsupported RIPSIFM1 metadata version (expected version 3, 4, 5, or 6)");
   }
   if (orientation != EXPECTED_OUTGOING_EDGE_ORIENTATION) {
     throw std::runtime_error(
@@ -1446,40 +1457,37 @@ RoutingMetadata load_routing_metadata(const std::filesystem::path& path,
     metadata.strings.push_back(read_string(in));
   }
 
-  skip_bytes(in,
-             checked_byte_count(node_count, sizeof(std::uint64_t), "metadata device node ids"),
-             "metadata device node ids");
-  if (version >= NODE_PHYSICAL_METADATA_VERSION) {
+  if (version < COMPACT_METADATA_VERSION) {
     skip_bytes(in,
-               checked_byte_count(node_count,
-                                  sizeof(std::int32_t),
-                                  "metadata node min x coordinates"),
-               "metadata node min x coordinates");
-    skip_bytes(in,
-               checked_byte_count(node_count,
-                                  sizeof(std::int32_t),
-                                  "metadata node max x coordinates"),
-               "metadata node max x coordinates");
-    skip_bytes(in,
-               checked_byte_count(node_count,
-                                  sizeof(std::int32_t),
-                                  "metadata node min y coordinates"),
-               "metadata node min y coordinates");
-    skip_bytes(in,
-               checked_byte_count(node_count,
-                                  sizeof(std::int32_t),
-                                  "metadata node max y coordinates"),
-               "metadata node max y coordinates");
-    skip_bytes(in,
-               checked_byte_count(node_count,
-                                  sizeof(std::uint64_t),
-                                  "metadata node tile type strings"),
-               "metadata node tile type strings");
-    skip_bytes(in,
-               checked_byte_count(node_count,
-                                  sizeof(std::uint64_t),
-                                  "metadata node wire type strings"),
-               "metadata node wire type strings");
+               checked_byte_count(node_count, sizeof(std::uint64_t),
+                                  "metadata device node ids"),
+               "metadata device node ids");
+    if (version >= NODE_PHYSICAL_METADATA_VERSION) {
+      skip_bytes(in,
+                 checked_byte_count(node_count, sizeof(std::int32_t),
+                                    "metadata node min x coordinates"),
+                 "metadata node min x coordinates");
+      skip_bytes(in,
+                 checked_byte_count(node_count, sizeof(std::int32_t),
+                                    "metadata node max x coordinates"),
+                 "metadata node max x coordinates");
+      skip_bytes(in,
+                 checked_byte_count(node_count, sizeof(std::int32_t),
+                                    "metadata node min y coordinates"),
+                 "metadata node min y coordinates");
+      skip_bytes(in,
+                 checked_byte_count(node_count, sizeof(std::int32_t),
+                                    "metadata node max y coordinates"),
+                 "metadata node max y coordinates");
+      skip_bytes(in,
+                 checked_byte_count(node_count, sizeof(std::uint64_t),
+                                    "metadata node tile type strings"),
+                 "metadata node tile type strings");
+      skip_bytes(in,
+                 checked_byte_count(node_count, sizeof(std::uint64_t),
+                                    "metadata node wire type strings"),
+                 "metadata node wire type strings");
+    }
   }
   skip_bytes(in,
              checked_byte_count(edge_attr_count, 2 * sizeof(std::uint64_t), "metadata edge attrs"),

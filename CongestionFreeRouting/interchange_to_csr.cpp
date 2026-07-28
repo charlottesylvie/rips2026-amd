@@ -91,7 +91,10 @@ static_assert(sizeof(PipDataDisk) == 3 * sizeof(std::uint64_t),
 constexpr char CSR_MAGIC[8] = {'R', 'I', 'P', 'S', 'C', 'S', 'R', '1'};
 constexpr char METADATA_MAGIC[8] = {'R', 'I', 'P', 'S', 'I', 'F', 'M', '1'};
 constexpr std::uint64_t CSR_FORMAT_VERSION = 2;
-constexpr std::uint64_t METADATA_FORMAT_VERSION = 5;
+// Version 6 keeps the node count but omits the seven 40-byte-per-node physical
+// metadata arrays. No production consumer used their contents, and retaining
+// them made every full-device conversion write more than a GiB of dead data.
+constexpr std::uint64_t METADATA_FORMAT_VERSION = 6;
 constexpr std::uint64_t OUTGOING_EDGE_ORIENTATION = 2;
 using routing::interchange::CsrGraph;
 using routing::interchange::DeviceRoutingGraph;
@@ -100,6 +103,7 @@ using routing::interchange::InterchangeArtifactPairId;
 using routing::interchange::NodeId;
 using routing::interchange::PipData;
 using routing::interchange::StringTable;
+using routing::interchange::device_routing_graph_node_count;
 using routing::interchange::filter_device_routing_graph;
 using routing::interchange::find_pair_node;
 using routing::interchange::find_site_pin_candidates;
@@ -189,14 +193,15 @@ struct LogicalCellSummary {
 struct RoutingGraph : DeviceRoutingGraph {
   explicit RoutingGraph(DeviceRoutingGraph&& device_graph)
       : DeviceRoutingGraph(std::move(device_graph)) {
-    blocked_node.assign(node_device_ids.size(), 0);
+    const std::size_t node_count = device_routing_graph_node_count(*this);
+    blocked_node.assign(node_count, 0);
     // With a shared immutable CSR, terminal rows are the conservative guard
     // against one net traversing another net's exclusive sink site pin.  This
     // matches the contest POC.  RWRoute can make a narrower same-net pinbounce
     // exception because its traversal carries connection ownership and intent;
     // this graph currently cannot.
-    sink_node_stops.assign(node_device_ids.size(), 0);
-    unavailable_destination_nodes.assign(node_device_ids.size(), 0);
+    sink_node_stops.assign(node_count, 0);
+    unavailable_destination_nodes.assign(node_count, 0);
   }
 
   std::vector<std::uint8_t> blocked_node;
@@ -506,7 +511,8 @@ void add_site_pin_attr(RoutingGraph& graph,
                        std::uint64_t site_string,
                        std::uint64_t pin_string) {
   if (node < 0 ||
-      static_cast<std::size_t>(node) >= graph.node_device_ids.size()) {
+      static_cast<std::size_t>(node) >=
+          device_routing_graph_node_count(graph)) {
     throw std::runtime_error("site pin node is outside graph");
   }
   SitePinNode attr;
@@ -1306,13 +1312,8 @@ void write_metadata(const RoutingGraph& graph,
   //   u64 device_path_string, physical_path_string, logical_path_string
   //   u64 logical_design_name_string
   //   repeated strings: u64 byte_length, bytes
-  //   u64[node_count] original DeviceResources node ids
-  //   i32[node_count] min X tile coordinate, or -1
-  //   i32[node_count] max X tile coordinate, or -1
-  //   i32[node_count] min Y tile coordinate, or -1
-  //   i32[node_count] max Y tile coordinate, or -1
-  //   u64[node_count] representative tile-type string index, or kNoIndex
-  //   u64[node_count] representative wire-type string index, or kNoIndex
+  //   Version 4/5 only: seven node metadata arrays totaling 40 bytes/node.
+  //   Version 6 omits them; node_count remains in the header for CSR binding.
   //   edge_attr_count records: u64 tile_string, u64 pip_data_index
   //   pip_data_count records: u64 wire0_string, u64 wire1_string, u64 forward
   //   site_pin_attr_count records: u64 node, u64 site_string, u64 pin_string
@@ -1328,13 +1329,19 @@ void write_metadata(const RoutingGraph& graph,
   if (metadata_path.has_parent_path()) {
     std::filesystem::create_directories(metadata_path.parent_path());
   }
-  if (graph.node_min_x.size() != graph.node_device_ids.size() ||
-      graph.node_max_x.size() != graph.node_device_ids.size() ||
-      graph.node_min_y.size() != graph.node_device_ids.size() ||
-      graph.node_max_y.size() != graph.node_device_ids.size() ||
-      graph.node_tile_type_strings.size() != graph.node_device_ids.size() ||
-      graph.node_wire_type_strings.size() != graph.node_device_ids.size()) {
-    throw std::runtime_error("node metadata arrays do not match node count");
+  const std::uint64_t node_count_u64 =
+      as_u64(csr.rows, "metadata node count");
+  if (csr.cols != csr.rows) {
+    throw std::runtime_error("metadata CSR must be square");
+  }
+  if (node_count_u64 >
+      static_cast<std::uint64_t>(std::numeric_limits<std::size_t>::max())) {
+    throw std::runtime_error("metadata node count does not fit size_t");
+  }
+  const std::size_t node_count = static_cast<std::size_t>(node_count_u64);
+  if (graph.blocked_node.size() != node_count ||
+      graph.sink_node_stops.size() != node_count) {
+    throw std::runtime_error("node masks do not match metadata node count");
   }
 
   std::ofstream out(metadata_path, std::ios::binary);
@@ -1348,7 +1355,7 @@ void write_metadata(const RoutingGraph& graph,
   // Store node-level masks separately from CSR. blocked_nodes were removed
   // from the CSR graph; sink_stop_nodes identify site-pin targets whose
   // outgoing edges were suppressed.
-  for (std::size_t node = 0; node < graph.node_device_ids.size(); ++node) {
+  for (std::size_t node = 0; node < node_count; ++node) {
     if (graph.blocked_node[node]) {
       blocked_nodes.push_back(static_cast<std::uint64_t>(node));
     }
@@ -1368,8 +1375,7 @@ void write_metadata(const RoutingGraph& graph,
   write_u64(out, artifact_pair_id.low, "metadata artifact pair id low");
   write_u64(out, static_cast<std::uint64_t>(graph.string_table.strings.size()),
             "string count");
-  write_u64(out, static_cast<std::uint64_t>(graph.node_device_ids.size()),
-            "node count");
+  write_u64(out, node_count_u64, "node count");
   write_u64(out, static_cast<std::uint64_t>(csr.edge_attrs.size()),
             "edge attribute count");
   write_u64(out, static_cast<std::uint64_t>(graph.pip_data.size()),
@@ -1405,16 +1411,6 @@ void write_metadata(const RoutingGraph& graph,
   for (const std::string& text : graph.string_table.strings) {
     write_string(out, text);
   }
-
-  // For each compact CSR node, preserve the original DeviceResources node
-  // index plus lightweight physical metadata useful to GPU cost models.
-  write_array(out, graph.node_device_ids, "device node ids");
-  write_array(out, graph.node_min_x, "node min x coordinates");
-  write_array(out, graph.node_max_x, "node max x coordinates");
-  write_array(out, graph.node_min_y, "node min y coordinates");
-  write_array(out, graph.node_max_y, "node max y coordinates");
-  write_array(out, graph.node_tile_type_strings, "node tile type strings");
-  write_array(out, graph.node_wire_type_strings, "node wire type strings");
 
   // Edge attributes are aligned exactly with CSR colind/values order. For edge
   // k, csr.colind[k], csr.values[k], and edge_attrs[k] describe one PIP edge.
@@ -1600,7 +1596,8 @@ int main(int argc, char** argv) {
     graph.logical_path_string =
         graph.string_table.intern(options.logical_path.string());
 
-    std::cout << "imported_nodes: " << graph.node_device_ids.size() << "\n";
+    std::cout << "imported_nodes: "
+              << device_routing_graph_node_count(graph) << "\n";
     std::cout << "unique_edges: " << graph.loaded_edges << "\n";
 
     // LogicalNetlist parsing records logical cells/nets/port instances and
@@ -1654,6 +1651,17 @@ int main(int argc, char** argv) {
     // CSR is the GPU-facing graph. Metadata is the CPU-facing FPGA context
     // needed to map CSR edges back to tile/wire PIPs and site-pin targets.
     CsrGraph csr = make_outgoing_csr(graph);
+
+    // Version 6 does not serialize the seven physical node-metadata arrays.
+    // The filtering reader normally projected them out before this point;
+    // release them defensively if a full graph is ever supplied here.
+    release_storage(graph.node_device_ids);
+    release_storage(graph.node_min_x);
+    release_storage(graph.node_max_x);
+    release_storage(graph.node_min_y);
+    release_storage(graph.node_max_y);
+    release_storage(graph.node_tile_type_strings);
+    release_storage(graph.node_wire_type_strings);
 
     // Filtering has copied every retained destination and edge attribute.
     // Drop the immutable base CSR before serializing either design output.

@@ -298,6 +298,187 @@ void write_fixture_u64(std::ofstream& out, std::uint64_t value) {
   }
 }
 
+void write_fixture_i32(std::ofstream& out, std::int32_t value) {
+  out.write(reinterpret_cast<const char*>(&value), sizeof(value));
+  if (!out) {
+    throw std::runtime_error("failed to write binary loader fixture");
+  }
+}
+
+void write_fixture_string(std::ofstream& out, const std::string& value) {
+  write_fixture_u64(out, static_cast<std::uint64_t>(value.size()));
+  out.write(value.data(), static_cast<std::streamsize>(value.size()));
+  if (!out) {
+    throw std::runtime_error("failed to write metadata string fixture");
+  }
+}
+
+enum class MetadataFixtureTruncation {
+  kNone,
+  kLegacyNodeArrays,
+  kEdgeAttrs,
+  kPipData,
+};
+
+void write_metadata_loader_fixture(
+    const std::filesystem::path& path,
+    std::uint64_t version,
+    const routing::interchange::InterchangeArtifactPairId& id,
+    MetadataFixtureTruncation truncation = MetadataFixtureTruncation::kNone) {
+  if (version < 4 || version > 6) {
+    throw std::invalid_argument("metadata loader fixture requires v4, v5, or v6");
+  }
+
+  std::ofstream out(path, std::ios::binary | std::ios::trunc);
+  const char magic[8] = {'R', 'I', 'P', 'S', 'I', 'F', 'M', '1'};
+  out.write(magic, sizeof(magic));
+  write_fixture_u64(out, version);
+  write_fixture_u64(out, 2);  // outgoing orientation
+  if (version >= 5) {
+    write_fixture_u64(out, id.high);
+    write_fixture_u64(out, id.low);
+  }
+
+  constexpr std::uint64_t kStringCount = 9;
+  constexpr std::uint64_t kNodeCount = 3;
+  constexpr std::uint64_t kEdgeAttrCount = 4;
+  constexpr std::uint64_t kPipDataCount = 2;
+  constexpr std::uint64_t kSitePinAttrCount = 1;
+  constexpr std::uint64_t kRouteRequestCount = 1;
+  constexpr std::uint64_t kBlockedNodeCount = 1;
+  constexpr std::uint64_t kSinkStopNodeCount = 1;
+  constexpr std::uint64_t kLogicalCellCount = 1;
+  constexpr std::uint64_t kLogicalNetCount = 1;
+  constexpr std::uint64_t kLogicalPortInstanceCount = 1;
+  constexpr std::uint64_t kPhysicalBytes = 3;
+  constexpr std::uint64_t kLogicalBytes = 2;
+  for (const std::uint64_t count :
+       {kStringCount,
+        kNodeCount,
+        kEdgeAttrCount,
+        kPipDataCount,
+        kSitePinAttrCount,
+        kRouteRequestCount,
+        kBlockedNodeCount,
+        kSinkStopNodeCount,
+        kLogicalCellCount,
+        kLogicalNetCount,
+        kLogicalPortInstanceCount,
+        kPhysicalBytes,
+        kLogicalBytes}) {
+    write_fixture_u64(out, count);
+  }
+
+  write_fixture_u64(out, 0);  // device path string
+  write_fixture_u64(out, 1);  // physical path string
+  write_fixture_u64(out, 2);  // logical path string
+  write_fixture_u64(out, 3);  // logical design name string
+  const std::vector<std::string> strings = {
+      "device", "physical", "logical", "design", "tile-a",
+      "wire-a", "wire-b", "net-a", "site-a"};
+  for (const std::string& value : strings) {
+    write_fixture_string(out, value);
+  }
+
+  // V4/V5 carry seven dense node columns. V6 deliberately omits them while
+  // retaining the declared node count in the common header.
+  if (version < 6) {
+    for (const std::uint64_t value : {101ULL, 202ULL, 303ULL}) {
+      write_fixture_u64(out, value);
+    }
+    if (truncation == MetadataFixtureTruncation::kLegacyNodeArrays) {
+      write_fixture_i32(out, -7);
+      return;
+    }
+    for (const std::int32_t value : {-7, 11, 23}) write_fixture_i32(out, value);
+    for (const std::int32_t value : {-5, 13, 29}) write_fixture_i32(out, value);
+    for (const std::int32_t value : {2, 3, 5}) write_fixture_i32(out, value);
+    for (const std::int32_t value : {7, 11, 13}) write_fixture_i32(out, value);
+    for (const std::uint64_t value : {4ULL, 4ULL, 4ULL}) {
+      write_fixture_u64(out, value);
+    }
+    for (const std::uint64_t value : {5ULL, 6ULL, 5ULL}) {
+      write_fixture_u64(out, value);
+    }
+  }
+
+  // EdgeAttr is two adjacent u64s on disk. Distinctive valid values catch
+  // field swapping and record-order mistakes in the bulk reader.
+  const std::uint64_t edge_attrs[][2] = {
+      {4, 0},
+      {5, 1},
+      {6, 0},
+      {7, 1},
+  };
+  for (std::size_t index = 0; index < 4; ++index) {
+    write_fixture_u64(out, edge_attrs[index][0]);
+    if (truncation == MetadataFixtureTruncation::kEdgeAttrs && index == 1) {
+      return;
+    }
+    write_fixture_u64(out, edge_attrs[index][1]);
+  }
+
+  const std::uint64_t pip_data[][3] = {
+      {5, 6, 1},
+      {6, 5, 0},
+  };
+  for (std::size_t index = 0; index < 2; ++index) {
+    write_fixture_u64(out, pip_data[index][0]);
+    write_fixture_u64(out, pip_data[index][1]);
+    if (truncation == MetadataFixtureTruncation::kPipData && index == 0) {
+      return;
+    }
+    write_fixture_u64(out, pip_data[index][2]);
+  }
+
+  write_fixture_u64(out, 1);  // site-pin node
+  write_fixture_u64(out, 8);  // site
+  write_fixture_u64(out, 5);  // pin
+
+  write_fixture_u64(out, 7);  // route-request net string
+  write_fixture_u64(out, 0);  // logical net index
+  write_fixture_u64(out, 2);  // source count
+  write_fixture_u64(out, 0);
+  write_fixture_u64(out, 8);
+  write_fixture_u64(out, 5);
+  write_fixture_u64(out, 2);
+  write_fixture_u64(out, 8);
+  write_fixture_u64(out, 6);
+  write_fixture_u64(out, 2);  // sink count
+  write_fixture_u64(out, 1);
+  write_fixture_u64(out, 8);
+  write_fixture_u64(out, 6);
+  write_fixture_u64(out, routing::kNoIndex);  // unresolved sink
+  write_fixture_u64(out, 8);
+  write_fixture_u64(out, 5);
+
+  // The remaining v5/v6 sections are not needed by routing, but keeping them
+  // nonempty verifies that the loader lands on every following table exactly.
+  write_fixture_u64(out, 3);  // logical cell declaration
+  write_fixture_u64(out, 0);  // logical net begin
+  write_fixture_u64(out, 1);  // logical net count
+  write_fixture_u64(out, 7);  // logical net name
+  write_fixture_u64(out, 0);  // logical cell index
+  write_fixture_u64(out, 0);  // logical port begin
+  write_fixture_u64(out, 1);  // logical port count
+  write_fixture_u64(out, 5);  // logical port name
+  write_fixture_u64(out, 8);  // logical instance name
+  write_fixture_u64(out, 17); // logical port index
+  write_fixture_u64(out, 19); // logical instance index
+  write_fixture_u64(out, 23); // bus index
+  write_fixture_u64(out, 1);  // has bus
+  write_fixture_u64(out, 0);  // external port
+  write_fixture_u64(out, 2);  // blocked node
+  write_fixture_u64(out, 1);  // sink-stop node
+  const char physical_bytes[3] = {'P', 'H', 'Y'};
+  const char logical_bytes[2] = {'L', 'O'};
+  out.write(physical_bytes, sizeof(physical_bytes));
+  out.write(logical_bytes, sizeof(logical_bytes));
+  if (!out) {
+    throw std::runtime_error("failed to finish metadata loader fixture");
+  }
+}
+
 void write_minimal_csr_fixture(
     const std::filesystem::path& path,
     std::uint64_t version,
@@ -334,7 +515,7 @@ void write_minimal_metadata_fixture(
   out.write(magic, sizeof(magic));
   write_fixture_u64(out, version);
   write_fixture_u64(out, 2);
-  if (version == 5) {
+  if (version >= 5) {
     const auto value = id.value_or(
         routing::interchange::InterchangeArtifactPairId{});
     write_fixture_u64(out, value.high);
@@ -432,6 +613,213 @@ void test_interchange_artifact_pair_loaders() {
   require_failure(
       [&] { (void)routing::load_csrbin(csr); },
       "truncated CSR artifact pair id was accepted");
+}
+
+void require_metadata_loader_fixture(
+    const routing::RoutingMetadata& metadata,
+    const std::optional<routing::interchange::InterchangeArtifactPairId>& pair,
+    bool expects_legacy_node_arrays,
+    bool expects_route_output_tables,
+    bool expects_auxiliary_tables) {
+  require(metadata.artifact_pair_id == pair,
+          "metadata loader lost the artifact pair id");
+  require(metadata.declared_node_count == 3 &&
+              metadata.declared_edge_attr_count == 4,
+          "metadata loader lost routing-only declared graph counts");
+  require(metadata.strings ==
+              std::vector<std::string>({"device", "physical", "logical",
+                                        "design", "tile-a", "wire-a",
+                                        "wire-b", "net-a", "site-a"}),
+          "metadata loader changed the string table");
+  require(metadata.device_path_string == 0 &&
+              metadata.physical_path_string == 1 &&
+              metadata.logical_path_string == 2 &&
+              metadata.logical_design_name_string == 3,
+          "metadata loader changed provenance string indexes");
+
+  if (expects_legacy_node_arrays) {
+    require(metadata.node_device_ids ==
+                std::vector<std::uint64_t>({101, 202, 303}) &&
+                metadata.node_min_x ==
+                    std::vector<std::int32_t>({-7, 11, 23}) &&
+                metadata.node_max_x ==
+                    std::vector<std::int32_t>({-5, 13, 29}) &&
+                metadata.node_min_y ==
+                    std::vector<std::int32_t>({2, 3, 5}) &&
+                metadata.node_max_y ==
+                    std::vector<std::int32_t>({7, 11, 13}) &&
+                metadata.node_tile_type_strings ==
+                    std::vector<std::uint64_t>({4, 4, 4}) &&
+                metadata.node_wire_type_strings ==
+                    std::vector<std::uint64_t>({5, 6, 5}),
+            "v5 metadata loader changed a legacy node column");
+  } else {
+    require(metadata.node_device_ids.empty() && metadata.node_min_x.empty() &&
+                metadata.node_max_x.empty() && metadata.node_min_y.empty() &&
+                metadata.node_max_y.empty() &&
+                metadata.node_tile_type_strings.empty() &&
+                metadata.node_wire_type_strings.empty(),
+            "v6 metadata loader fabricated omitted node columns");
+  }
+
+  if (expects_route_output_tables) {
+    require(metadata.edge_attrs.size() == 4,
+            "metadata loader changed the edge-attribute count");
+    require(metadata.edge_attrs[0].tile_string == 4 &&
+                metadata.edge_attrs[0].pip_data_index == 0 &&
+                metadata.edge_attrs[1].tile_string == 5 &&
+                metadata.edge_attrs[1].pip_data_index == 1 &&
+                metadata.edge_attrs[2].tile_string == 6 &&
+                metadata.edge_attrs[2].pip_data_index == 0 &&
+                metadata.edge_attrs[3].tile_string == 7 &&
+                metadata.edge_attrs[3].pip_data_index == 1,
+            "bulk EdgeAttr loading changed record order or field width");
+
+    require(metadata.pip_data.size() == 2 &&
+                metadata.pip_data[0].wire0_string == 5 &&
+                metadata.pip_data[0].wire1_string == 6 &&
+                metadata.pip_data[0].forward &&
+                metadata.pip_data[1].wire0_string == 6 &&
+                metadata.pip_data[1].wire1_string == 5 &&
+                !metadata.pip_data[1].forward,
+            "bulk PIP-data loading changed record order or direction");
+  } else {
+    require(metadata.edge_attrs.empty() && metadata.pip_data.empty(),
+            "routing-only metadata loader retained edge/PIP tables");
+  }
+  if (expects_auxiliary_tables) {
+    require(metadata.site_pin_attrs.size() == 1 &&
+                metadata.site_pin_attrs[0].node == 1 &&
+                metadata.site_pin_attrs[0].site_string == 8 &&
+                metadata.site_pin_attrs[0].pin_string == 5,
+            "metadata loader changed the site-pin table");
+  } else {
+    require(metadata.site_pin_attrs.empty(),
+            "routing projection retained the unused site-pin table");
+  }
+
+  require(metadata.route_requests.size() == 1,
+          "metadata loader changed the route-request count");
+  const routing::RouteRequest& request = metadata.route_requests.front();
+  require(request.net_string == 7 && request.logical_net_index == 0 &&
+              request.sources.size() == 2 && request.sinks.size() == 2,
+          "metadata loader changed the route-request header");
+  require(request.sources[0].node == 0 &&
+              request.sources[0].site_string == 8 &&
+              request.sources[0].pin_string == 5 &&
+              request.sources[1].node == 2 &&
+              request.sources[1].site_string == 8 &&
+              request.sources[1].pin_string == 6,
+          "metadata loader changed source endpoint records");
+  require(request.sinks[0].node == 1 &&
+              request.sinks[0].site_string == 8 &&
+              request.sinks[0].pin_string == 6 &&
+              request.sinks[1].node == -1 &&
+              request.sinks[1].site_string == 8 &&
+              request.sinks[1].pin_string == 5,
+          "metadata loader changed sink endpoint records");
+  if (expects_auxiliary_tables) {
+    require(metadata.blocked_nodes == std::vector<std::uint64_t>({2}) &&
+                metadata.sink_stop_nodes == std::vector<std::uint64_t>({1}),
+            "metadata loader changed node-mask records");
+  } else {
+    require(metadata.blocked_nodes.empty() &&
+                metadata.sink_stop_nodes.empty(),
+            "routing projection retained unused node-mask records");
+  }
+}
+
+void test_compact_metadata_loader() {
+  const auto nonce = std::chrono::steady_clock::now()
+                         .time_since_epoch()
+                         .count();
+  const std::filesystem::path directory =
+      std::filesystem::temp_directory_path() /
+      ("pathfinder_compact_metadata_" + std::to_string(nonce));
+  std::filesystem::create_directory(directory);
+  struct Cleanup {
+    std::filesystem::path path;
+    ~Cleanup() {
+      std::error_code ignored;
+      std::filesystem::remove_all(path, ignored);
+    }
+  } cleanup{directory};
+
+  const routing::interchange::InterchangeArtifactPairId pair{
+      0x3141592653589793ULL, 0x2384626433832795ULL};
+  const std::filesystem::path v4_path = directory / "metadata-v4.ifmeta.bin";
+  const std::filesystem::path v5_path = directory / "metadata-v5.ifmeta.bin";
+  const std::filesystem::path v6_path = directory / "metadata-v6.ifmeta.bin";
+  write_metadata_loader_fixture(v4_path, 4, pair);
+  write_metadata_loader_fixture(v5_path, 5, pair);
+  write_metadata_loader_fixture(v6_path, 6, pair);
+
+  const routing::RoutingMetadata v5_full =
+      routing::load_interchange_metadata(
+          v5_path, routing::InterchangeMetadataLoadMode::kFull);
+  const routing::RoutingMetadata v6_full =
+      routing::load_interchange_metadata(
+          v6_path, routing::InterchangeMetadataLoadMode::kFull);
+  require_metadata_loader_fixture(v5_full, pair, true, true, true);
+  require_metadata_loader_fixture(v6_full, pair, false, true, true);
+
+  const routing::RoutingMetadata v5_routing =
+      routing::load_interchange_metadata(
+          v5_path, routing::InterchangeMetadataLoadMode::kRoutingOnly);
+  const routing::RoutingMetadata v6_routing =
+      routing::load_interchange_metadata(
+          v6_path, routing::InterchangeMetadataLoadMode::kRoutingOnly);
+  require_metadata_loader_fixture(v5_routing, pair, false, false, false);
+  require_metadata_loader_fixture(v6_routing, pair, false, false, false);
+
+  const routing::RoutingMetadata v4_route_output =
+      routing::load_interchange_metadata(
+          v4_path,
+          routing::InterchangeMetadataLoadMode::kRoutingWithRouteOutput);
+  require_metadata_loader_fixture(
+      v4_route_output, std::nullopt, false, true, false);
+
+  const routing::RoutingMetadata v6_route_output =
+      routing::load_interchange_metadata(
+          v6_path,
+          routing::InterchangeMetadataLoadMode::kRoutingWithRouteOutput);
+  require_metadata_loader_fixture(
+      v6_route_output, pair, false, true, false);
+
+  const auto require_truncated_failure =
+      [&](std::uint64_t version,
+          MetadataFixtureTruncation truncation,
+          const char* message) {
+        const std::filesystem::path path =
+            directory /
+            ("truncated-" + std::to_string(version) + "-" +
+             std::to_string(static_cast<int>(truncation)) + ".ifmeta.bin");
+        write_metadata_loader_fixture(path, version, pair, truncation);
+        bool failed = false;
+        try {
+          const routing::InterchangeMetadataLoadMode mode =
+              truncation == MetadataFixtureTruncation::kLegacyNodeArrays
+                  ? routing::InterchangeMetadataLoadMode::kRoutingOnly
+                  : routing::InterchangeMetadataLoadMode::
+                        kRoutingWithRouteOutput;
+          (void)routing::load_interchange_metadata(path, mode);
+        } catch (const std::exception&) {
+          failed = true;
+        }
+        require(failed, message);
+      };
+  require_truncated_failure(
+      5,
+      MetadataFixtureTruncation::kLegacyNodeArrays,
+      "v5 metadata truncated inside legacy node arrays was accepted");
+  require_truncated_failure(
+      6,
+      MetadataFixtureTruncation::kEdgeAttrs,
+      "v6 metadata truncated inside bulk EdgeAttr data was accepted");
+  require_truncated_failure(
+      6,
+      MetadataFixtureTruncation::kPipData,
+      "v6 metadata truncated inside bulk PIP data was accepted");
 }
 
 void populate_stub_delta_telemetry(
@@ -1514,6 +1902,7 @@ UnitBfsCsrResult UnitBfsCsrWorkspace::run(
 
 int main() {
   test_interchange_artifact_pair_loaders();
+  test_compact_metadata_loader();
 
   {
     const routing::RoutingMetadata empty_metadata;

@@ -423,7 +423,7 @@ def read_metadata_artifact_pair_id(metadata_path: Path) -> str | None:
             raise ValueError(f"{metadata_path} does not use outgoing CSR orientation")
         if version == 4:
             pair_id = None
-        elif version == 5:
+        elif version in (5, 6):
             raw_id = metadata_file.read(16)
             if len(raw_id) != 16:
                 raise ValueError(f"{metadata_path} has a truncated artifact pair id")
