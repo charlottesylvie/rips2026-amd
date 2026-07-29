@@ -1681,10 +1681,15 @@ struct DeltaTelemetryTotals {
   std::array<std::uint64_t, 4> path_counts{};
   std::array<std::uint64_t, 2> effective_controller_counts{};
   std::uint64_t controller_fallback_queries = 0;
+  std::array<std::uint64_t, 5> controller_fallback_reason_counts{};
   DeltaSteppingCsrTelemetry sums;
+  std::uint32_t minimum_effective_controller_batch_size =
+      std::numeric_limits<std::uint32_t>::max();
+  std::uint32_t maximum_effective_controller_batch_size = 0;
   std::uint64_t current_queue_high_water = 0;
   std::uint64_t pending_queue_high_water = 0;
   std::uint64_t heavy_queue_high_water = 0;
+  std::uint64_t max_device_iterations_in_batch = 0;
 };
 
 DeltaTelemetryTotals aggregate_delta_telemetry(
@@ -1722,7 +1727,18 @@ DeltaTelemetryTotals aggregate_delta_telemetry(
     }
     if (record.controller_fallback) {
       ++totals.controller_fallback_queries;
+      const auto reason_index = static_cast<std::size_t>(
+          record.controller_fallback_reason);
+      if (reason_index < totals.controller_fallback_reason_counts.size()) {
+        ++totals.controller_fallback_reason_counts[reason_index];
+      }
     }
+    totals.minimum_effective_controller_batch_size =
+        std::min(totals.minimum_effective_controller_batch_size,
+                 record.effective_controller_batch_size);
+    totals.maximum_effective_controller_batch_size =
+        std::max(totals.maximum_effective_controller_batch_size,
+                 record.effective_controller_batch_size);
     totals.sums.outer_buckets_processed +=
         record.outer_buckets_processed;
     totals.sums.light_relaxation_rounds +=
@@ -1759,6 +1775,18 @@ DeltaTelemetryTotals aggregate_delta_telemetry(
     totals.sums.explicit_stream_waits += record.explicit_stream_waits;
     totals.sums.batched_status_readbacks +=
         record.batched_status_readbacks;
+    totals.sums.device_controller_batches +=
+        record.device_controller_batches;
+    totals.sums.controller_status_readbacks +=
+        record.controller_status_readbacks;
+    totals.sums.device_controller_iterations +=
+        record.device_controller_iterations;
+    totals.sums.controller_queue_overflow_events +=
+        record.controller_queue_overflow_events;
+    totals.sums.controller_invalid_state_events +=
+        record.controller_invalid_state_events;
+    totals.sums.controller_stale_publication_events +=
+        record.controller_stale_publication_events;
     totals.sums.compact_parent_fallback_events +=
         record.compact_parent_fallback_events;
     totals.current_queue_high_water =
@@ -1770,6 +1798,9 @@ DeltaTelemetryTotals aggregate_delta_telemetry(
     totals.heavy_queue_high_water =
         std::max(totals.heavy_queue_high_water,
                  record.heavy_queue_high_water);
+    totals.max_device_iterations_in_batch =
+        std::max(totals.max_device_iterations_in_batch,
+                 record.max_device_iterations_in_batch);
   }
   return totals;
 }
@@ -1785,7 +1816,7 @@ std::string delta_telemetry_aggregate_json(
   std::ostringstream out;
   out.precision(std::numeric_limits<float>::max_digits10);
   out << "{\"type\":\"delta_stepping_telemetry\""
-      << ",\"schema_version\":3"
+      << ",\"schema_version\":4"
       << ",\"scope\":\"pathfinder_run\""
       << ",\"queries\":" << totals.queries
       << ",\"completed_queries\":" << totals.completed_queries
@@ -1806,13 +1837,38 @@ std::string delta_telemetry_aggregate_json(
       << "\""
       << ",\"controller_batch_size\":"
       << options.delta_controller_batch_size
+      << ",\"requested_controller_mode\":\""
+      << (options.delta_controller_mode ==
+                  DeltaSteppingCsrControllerMode::kReducedRoundTrip
+              ? "reduced_round_trip"
+              : "host_checked")
+      << "\""
+      << ",\"requested_controller_batch_size\":"
+      << options.delta_controller_batch_size
       << ",\"effective_controller_modes\":{"
       << "\"host_checked\":" << totals.effective_controller_counts[0]
       << ",\"reduced_round_trip\":"
       << totals.effective_controller_counts[1]
       << "}"
+      << ",\"effective_controller_batch_size\":{"
+      << "\"min\":"
+      << (totals.queries == 0
+              ? 0
+              : totals.minimum_effective_controller_batch_size)
+      << ",\"max\":" << totals.maximum_effective_controller_batch_size
+      << "}"
       << ",\"controller_fallback_queries\":"
       << totals.controller_fallback_queries
+      << ",\"controller_fallback_reasons\":{"
+      << "\"none\":" << totals.controller_fallback_reason_counts[0]
+      << ",\"exact_unit_specialization\":"
+      << totals.controller_fallback_reason_counts[1]
+      << ",\"progress_callback_requires_host\":"
+      << totals.controller_fallback_reason_counts[2]
+      << ",\"cooperative_launch_unavailable\":"
+      << totals.controller_fallback_reason_counts[3]
+      << ",\"generation_budget_unavailable\":"
+      << totals.controller_fallback_reason_counts[4] << "}"
       << ",\"execution_paths\":{"
       << "\"exact_unit\":" << totals.path_counts[0]
       << ",\"compact_generic\":" << totals.path_counts[1]
@@ -1854,6 +1910,18 @@ std::string delta_telemetry_aggregate_json(
       << sums.explicit_stream_waits
       << ",\"batched_status_readbacks\":"
       << sums.batched_status_readbacks
+      << ",\"device_controller_batches\":"
+      << sums.device_controller_batches
+      << ",\"controller_status_readbacks\":"
+      << sums.controller_status_readbacks
+      << ",\"device_controller_iterations\":"
+      << sums.device_controller_iterations
+      << ",\"controller_queue_overflow_events\":"
+      << sums.controller_queue_overflow_events
+      << ",\"controller_invalid_state_events\":"
+      << sums.controller_invalid_state_events
+      << ",\"controller_stale_publication_events\":"
+      << sums.controller_stale_publication_events
       << ",\"compact_parent_fallback_events\":"
       << sums.compact_parent_fallback_events
       << "},\"maxima\":{"
@@ -1862,7 +1930,9 @@ std::string delta_telemetry_aggregate_json(
       << ",\"pending_queue_high_water\":"
       << totals.pending_queue_high_water
       << ",\"heavy_queue_high_water\":"
-      << totals.heavy_queue_high_water << "}}";
+      << totals.heavy_queue_high_water
+      << ",\"device_iterations_in_batch\":"
+      << totals.max_device_iterations_in_batch << "}}";
   return out.str();
 }
 

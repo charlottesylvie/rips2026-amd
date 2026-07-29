@@ -5,6 +5,7 @@
 #include <iostream>
 #include <limits>
 #include <stdexcept>
+#include <string>
 #include <vector>
 
 namespace {
@@ -46,6 +47,8 @@ void require_valid_controller_descriptor(
 void test_controller_policy_and_descriptor() {
   static_assert(sizeof(DeltaSteppingCsrControllerMode) ==
                 sizeof(std::uint32_t));
+  static_assert(sizeof(DeltaSteppingCsrControllerFallbackReason) ==
+                sizeof(std::uint32_t));
   static_assert(sizeof(DeltaSteppingCsrControllerStatus) ==
                 sizeof(std::uint32_t));
   static_assert(sizeof(DeltaSteppingCsrControllerPhase) ==
@@ -64,6 +67,14 @@ void test_controller_policy_and_descriptor() {
       DeltaSteppingCsrControllerMode::kReducedRoundTrip, 7};
   require(delta_stepping_effective_controller_batch_size(reduced) == 7,
           "reduced controller did not retain its bounded batch size");
+  require(std::string(delta_stepping_controller_fallback_reason_name(
+              DeltaSteppingCsrControllerFallbackReason::
+                  kCooperativeLaunchUnavailable)) ==
+              "cooperative_launch_unavailable" &&
+              std::string(delta_stepping_controller_fallback_reason_name(
+                  static_cast<DeltaSteppingCsrControllerFallbackReason>(99))) ==
+                  "unknown",
+          "controller fallback reasons lost their stable telemetry names");
   require_throws<std::invalid_argument>(
       [] {
         delta_stepping_validate_controller_policy(

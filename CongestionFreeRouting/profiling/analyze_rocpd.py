@@ -34,7 +34,103 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="write summary.json only; do not require matplotlib",
     )
+    parser.add_argument(
+        "--completed-routes",
+        type=int,
+        help=(
+            "manual completed-route count used for exploratory rates; "
+            "acceptance runs must use --routes-summary"
+        ),
+    )
+    parser.add_argument(
+        "--routes-summary",
+        type=Path,
+        help=(
+            "strict summarize_routes_jsonl.py JSON used to verify the "
+            "completed-route denominator"
+        ),
+    )
+    parser.add_argument(
+        "--require-delta-scopes",
+        action="store_true",
+        help="fail unless generic and compact-extraction ROCTx ranges exist",
+    )
     return parser.parse_args()
+
+
+def completed_routes_from_summary(path: Path) -> int:
+    """Return a fail-closed completed-route count from a route summary."""
+
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as error:
+        raise RuntimeError(f"{path}: invalid route-summary JSON: {error}") from error
+    if not isinstance(value, dict):
+        raise RuntimeError(f"{path}: route summary must be a JSON object")
+
+    fields: dict[str, int] = {}
+    for name in (
+        "route_requests",
+        "routed",
+        "unrouted",
+        "sinks",
+        "reached_sinks",
+    ):
+        observed = value.get(name)
+        if type(observed) is not int or observed < 0:
+            raise RuntimeError(
+                f"{path}: {name} must be a nonnegative integer, "
+                f"observed {observed!r}"
+            )
+        fields[name] = observed
+    if fields["route_requests"] <= 0:
+        raise RuntimeError(f"{path}: route summary contains no requests")
+    if (
+        fields["routed"] != fields["route_requests"]
+        or fields["unrouted"] != 0
+        or fields["reached_sinks"] != fields["sinks"]
+    ):
+        raise RuntimeError(
+            f"{path}: route summary is incomplete: "
+            f"routed={fields['routed']}/{fields['route_requests']}, "
+            f"unrouted={fields['unrouted']}, "
+            f"reached_sinks={fields['reached_sinks']}/{fields['sinks']}"
+        )
+    return fields["route_requests"]
+
+
+def validate_delta_marker_cardinality(
+    markers: dict[str, dict[str, int | float]], completed_routes: int
+) -> None:
+    """Reject incomplete ROCTx capture without assuming one SSSP per net."""
+
+    route_net_calls = int(markers.get("pathfinder.route_net", {}).get("calls", 0))
+    generic_calls = int(markers.get("delta_step.generic", {}).get("calls", 0))
+    compact_calls = int(
+        markers.get("delta_step.compact_edge_path_extraction", {}).get("calls", 0)
+    )
+    failures = []
+    if route_net_calls != completed_routes:
+        failures.append(
+            f"pathfinder.route_net={route_net_calls}, "
+            f"completed_routes={completed_routes}"
+        )
+    if generic_calls <= 0:
+        failures.append("delta_step.generic contains no completed query ranges")
+    if generic_calls != compact_calls:
+        failures.append(
+            f"delta_step.generic={generic_calls}, "
+            f"delta_step.compact_edge_path_extraction={compact_calls}"
+        )
+    if generic_calls > route_net_calls:
+        failures.append(
+            f"Delta query ranges={generic_calls} exceed route-net ranges={route_net_calls}"
+        )
+    if failures:
+        raise RuntimeError(
+            "RocPD Delta marker cardinality is incomplete: "
+            + "; ".join(failures)
+        )
 
 
 def seconds(nanoseconds: int | float | None) -> float:
@@ -155,7 +251,11 @@ def add_aggregate(target: dict[str, float | int], calls: int, byte_count: int, d
     ) + duration
 
 
-def analyze(database: Path) -> dict[str, Any]:
+def analyze(
+    database: Path,
+    completed_routes: int | None = None,
+    require_delta_scopes: bool = False,
+) -> dict[str, Any]:
     connection = sqlite3.connect(f"file:{database.resolve()}?mode=ro", uri=True)
     connection.row_factory = sqlite3.Row
 
@@ -170,11 +270,17 @@ def analyze(database: Path) -> dict[str, Any]:
     if missing:
         raise RuntimeError(f"database is missing required RocPD views: {', '.join(missing)}")
 
-    process = connection.execute(
-        "SELECT pid, start, end, command FROM processes ORDER BY start LIMIT 1"
-    ).fetchone()
-    if process is None:
+    processes = connection.execute(
+        "SELECT pid, start, end, command FROM processes ORDER BY start"
+    ).fetchall()
+    if not processes:
         raise RuntimeError("database contains no process record")
+    if len(processes) != 1:
+        raise RuntimeError(
+            "RocPD analysis requires a single-process trace; observed "
+            f"{len(processes)} process records"
+        )
+    process = processes[0]
 
     marker_rows = connection.execute(
         """
@@ -322,6 +428,107 @@ def analyze(database: Path) -> dict[str, Any]:
                 "active_span_percent": 100.0 * int(row["duration"]) / active_span,
             }
         )
+
+    # A HIP call belongs to the host thread that issued it. Attribute each
+    # stream wait to the innermost relevant ROCTx scope on that same thread.
+    # compact_edge_path_extraction is nested in delta_step.generic, so exclude
+    # it from the generic count to keep the scopes disjoint.
+    marker_names = {
+        str(row[0])
+        for row in connection.execute(
+            """
+            SELECT DISTINCT json_extract(extdata, '$.message')
+            FROM regions
+            WHERE category = 'MARKER_CORE_RANGE_API'
+            """
+        )
+    }
+    required_delta_markers = {
+        "pathfinder.route_net",
+        "delta_step.generic",
+        "delta_step.compact_edge_path_extraction",
+    }
+    if require_delta_scopes and not required_delta_markers.issubset(marker_names):
+        missing_markers = sorted(required_delta_markers - marker_names)
+        raise RuntimeError(
+            "RocPD trace is missing required Delta ROCTx ranges: "
+            + ", ".join(missing_markers)
+        )
+    if require_delta_scopes:
+        if completed_routes is None:
+            raise RuntimeError(
+                "Delta scope acceptance requires a verified completed-route count"
+            )
+        validate_delta_marker_cardinality(markers, completed_routes)
+
+    synchronize_ids = {
+        (str(row[0]), int(row[1]))
+        for row in connection.execute(
+            """
+            SELECT guid, id FROM regions
+            WHERE name = 'hipStreamSynchronize'
+              AND category = 'HIP_RUNTIME_API_EXT'
+            """
+        )
+    }
+
+    def waits_in_marker(marker: str) -> set[tuple[str, int]]:
+        return {
+            (str(row[0]), int(row[1]))
+            for row in connection.execute(
+                """
+                SELECT DISTINCT api.guid, api.id
+                FROM regions AS api
+                JOIN regions AS marker
+                  ON marker.guid = api.guid
+                 AND marker.pid = api.pid
+                 AND marker.tid = api.tid
+                 AND api.start >= marker.start
+                 AND api.end <= marker.end
+                WHERE api.name = 'hipStreamSynchronize'
+                  AND api.category = 'HIP_RUNTIME_API_EXT'
+                  AND marker.category = 'MARKER_CORE_RANGE_API'
+                  AND json_extract(marker.extdata, '$.message') = ?
+                """,
+                (marker,),
+            )
+        }
+
+    generic_inclusive_ids = waits_in_marker("delta_step.generic")
+    compact_ids = waits_in_marker(
+        "delta_step.compact_edge_path_extraction"
+    )
+    generic_ids = generic_inclusive_ids - compact_ids
+    other_ids = synchronize_ids - generic_ids - compact_ids
+    categorized_syncs = len(generic_ids) + len(compact_ids) + len(other_ids)
+    reported_syncs = int(
+        api_by_name.get("hipStreamSynchronize", {}).get("calls", 0)
+    )
+    if categorized_syncs != len(synchronize_ids) or reported_syncs != len(
+        synchronize_ids
+    ):
+        raise RuntimeError(
+            "hipStreamSynchronize scope accounting is inconsistent: "
+            f"regions={len(synchronize_ids)}, categorized={categorized_syncs}, "
+            f"API aggregate={reported_syncs}"
+        )
+    synchronize_scopes: dict[str, Any] = {
+        "total": len(synchronize_ids),
+        "generic_controller": len(generic_ids),
+        "compact_edge_path_extraction": len(compact_ids),
+        "other": len(other_ids),
+    }
+    if completed_routes is not None:
+        if completed_routes <= 0:
+            raise ValueError("--completed-routes must be positive")
+        synchronize_scopes["completed_routes"] = completed_routes
+        synchronize_scopes["per_route"] = {
+            "total": len(synchronize_ids) / completed_routes,
+            "generic_controller": len(generic_ids) / completed_routes,
+            "compact_edge_path_extraction": len(compact_ids)
+            / completed_routes,
+            "other": len(other_ids) / completed_routes,
+        }
 
     copy_api: dict[str, Any] = {
         "total": {"calls": 0, "bytes": 0, "aggregate_api_nanoseconds": 0},
@@ -527,6 +734,7 @@ def analyze(database: Path) -> dict[str, Any]:
         "hip_api": {
             "by_name": api_by_name,
             "worker_stream_synchronize": worker_sync,
+            "stream_synchronize_scopes": synchronize_scopes,
         },
         "copy_api": copy_api,
         "transfer_engine": transfer_engine,
@@ -746,6 +954,26 @@ def main() -> int:
     database = args.database.resolve()
     if not database.is_file():
         raise FileNotFoundError(database)
+    if args.routes_summary is not None:
+        routes_summary = args.routes_summary.resolve()
+        if not routes_summary.is_file():
+            raise FileNotFoundError(routes_summary)
+        completed_routes = completed_routes_from_summary(routes_summary)
+        if (
+            args.completed_routes is not None
+            and args.completed_routes != completed_routes
+        ):
+            raise RuntimeError(
+                "--completed-routes disagrees with --routes-summary: "
+                f"{args.completed_routes} != {completed_routes}"
+            )
+    else:
+        completed_routes = args.completed_routes
+    if args.require_delta_scopes and args.routes_summary is None:
+        raise RuntimeError(
+            "--require-delta-scopes requires --routes-summary so the "
+            "per-route denominator is auditable"
+        )
     output_dir = (
         args.output_dir.resolve()
         if args.output_dir is not None
@@ -753,7 +981,11 @@ def main() -> int:
     )
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    summary = analyze(database)
+    summary = analyze(
+        database,
+        completed_routes=completed_routes,
+        require_delta_scopes=args.require_delta_scopes,
+    )
     summary_path = output_dir / "summary.json"
     summary_path.write_text(json.dumps(summary, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     print(summary_path)

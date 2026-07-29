@@ -31,6 +31,37 @@ enum class DeltaSteppingCsrControllerMode : std::uint32_t {
   kReducedRoundTrip = 1,
 };
 
+// Why an explicitly requested reduced controller did not execute.  Keep this
+// separate from terminal device status: fallback is selected before generic
+// traversal starts, while invalid state and queue overflow fail the query.
+enum class DeltaSteppingCsrControllerFallbackReason : std::uint32_t {
+  kNone = 0,
+  kExactUnitSpecialization = 1,
+  kProgressCallbackRequiresHost = 2,
+  kCooperativeLaunchUnavailable = 3,
+  kGenerationBudgetUnavailable = 4,
+};
+
+constexpr const char* delta_stepping_controller_fallback_reason_name(
+    DeltaSteppingCsrControllerFallbackReason reason) noexcept {
+  switch (reason) {
+    case DeltaSteppingCsrControllerFallbackReason::kNone:
+      return "none";
+    case DeltaSteppingCsrControllerFallbackReason::kExactUnitSpecialization:
+      return "exact_unit_specialization";
+    case DeltaSteppingCsrControllerFallbackReason::
+        kProgressCallbackRequiresHost:
+      return "progress_callback_requires_host";
+    case DeltaSteppingCsrControllerFallbackReason::
+        kCooperativeLaunchUnavailable:
+      return "cooperative_launch_unavailable";
+    case DeltaSteppingCsrControllerFallbackReason::
+        kGenerationBudgetUnavailable:
+      return "generation_budget_unavailable";
+  }
+  return "unknown";
+}
+
 constexpr std::uint32_t
     kDeltaSteppingCsrRecommendedControllerBatchSize = 4;
 

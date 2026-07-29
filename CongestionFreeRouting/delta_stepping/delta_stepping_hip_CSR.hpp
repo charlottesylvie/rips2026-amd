@@ -74,6 +74,18 @@ struct DeltaSteppingCsrTelemetry {
   std::uint64_t scalar_d2h_readbacks = 0;
   std::uint64_t explicit_stream_waits = 0;
   std::uint64_t batched_status_readbacks = 0;
+  // Reduced-controller publications are separated from compact-extraction
+  // tuples so a validation run can prove that bounded device batches ran.
+  std::uint64_t device_controller_batches = 0;
+  std::uint64_t controller_status_readbacks = 0;
+  // One device-controller iteration is one bounded light-round action; an
+  // action may also close its bucket, settle targets, run heavy relaxation,
+  // reduce the pending minimum, and compact the successor bucket.
+  std::uint64_t device_controller_iterations = 0;
+  std::uint64_t max_device_iterations_in_batch = 0;
+  std::uint64_t controller_queue_overflow_events = 0;
+  std::uint64_t controller_invalid_state_events = 0;
+  std::uint64_t controller_stale_publication_events = 0;
   std::uint64_t compact_parent_fallback_events = 0;
   DeltaSteppingCsrControllerMode requested_controller_mode =
       DeltaSteppingCsrControllerMode::kHostChecked;
@@ -83,6 +95,8 @@ struct DeltaSteppingCsrTelemetry {
       kDeltaSteppingCsrRecommendedControllerBatchSize;
   std::uint32_t effective_controller_batch_size = 1;
   bool controller_fallback = false;
+  DeltaSteppingCsrControllerFallbackReason controller_fallback_reason =
+      DeltaSteppingCsrControllerFallbackReason::kNone;
 };
 
 struct DeltaSteppingCsrRunOptions {
@@ -224,7 +238,10 @@ class DeltaSteppingCsrWorkspace {
 
   // A workspace is stream- and device-affine: construction, updates, and
   // every run must use the same stream handle while its construction device is
-  // current. Separate workspaces may use separate streams.
+  // current. It owns mutable queues plus pinned publication storage and is not
+  // reentrant; one host worker must own it and calls on it must not overlap.
+  // Separate workspaces may run concurrently on separate worker streams while
+  // sharing the immutable DeltaSteppingCsrGraph allocation.
   explicit DeltaSteppingCsrWorkspace(const HostCsrF32& adjacency,
                                      hipStream_t stream = nullptr);
   DeltaSteppingCsrWorkspace(const HostCsrF32& adjacency,

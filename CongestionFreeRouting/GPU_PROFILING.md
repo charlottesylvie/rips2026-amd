@@ -232,16 +232,16 @@ grep '^{"type":"delta_stepping_telemetry"' \
 ```
 
 After all workers join, `pathfinder` writes exactly one compact JSON line to
-standard output with `type="delta_stepping_telemetry"`, `schema_version=3`,
+standard output with `type="delta_stepping_telemetry"`, `schema_version=4`,
 and `scope="pathfinder_run"`. `queries` counts actual SSSP invocations, not net
 slots; a net with no unresolved target leaves its slot uncollected.
 `completed_queries` counts records whose cleanup and final synchronization
 finished. `execution_paths` counts `exact_unit`, `compact_generic`,
 `legacy_generic`, and `generic_distances_only`. The record also includes the
 resolved numeric delta, runtime wavefront size, actual worker count,
-auto-delta/multiplier values, force-mode flags, configured `controller_mode`
-and `controller_batch_size`, per-query `effective_controller_modes` counts,
-and `controller_fallback_queries`. The configured names use
+auto-delta/multiplier values, force-mode flags, configured/requested controller
+mode and batch size, per-query `effective_controller_modes` counts, the
+effective batch-size range, and fallback counts/reasons. The configured names use
 `host_checked`/`reduced_round_trip` in JSON even though the CLI spells them
 `host-checked`/`reduced-round-trip`. Counter fields are summed across queries;
 the three queue high-water fields under `maxima` are maxima across queries,
@@ -272,9 +272,14 @@ The counters are exact under these definitions:
 | `controller_round_trips` | Explicitly counted host-visible status/count transfers used for control decisions. It is not a count of every HIP call or synchronization. |
 | `scalar_d2h_readbacks` | Generic-controller scalar D2H transfers completed for host decisions or sparse-reset counts. |
 | `explicit_stream_waits` | Completion waits issued by the generic controller and its cleanup, separate from scalar/status readback completion. Null-stream no-op helper calls, one-time workspace setup, and result/path/telemetry materialization waits are excluded. |
-| `batched_status_readbacks` | Generic compact-path status tuples that include sparse-reset state, plus reduced-controller descriptor transfers that publish several fields with one D2H copy and wait. Non-generic paths report zero. |
+| `batched_status_readbacks` | Generic compact-path status tuples that include sparse-reset state, plus reduced-controller descriptor transfers that publish several fields with one D2H copy and wait. In a successful all-compact reduced arm this is exactly `device_controller_batches + queries`; non-generic paths report zero. |
 | `controller_mode`, `controller_batch_size` | Run-level requested A/B configuration. These fields alone do not prove that the reduced controller executed. |
-| `effective_controller_modes`, `controller_fallback_queries` | Query counts by controller actually used and the number that fell back to host checking. Reject a performance sample when either total does not match the intended A/B arm. |
+| `requested_controller_mode`, `requested_controller_batch_size` | Explicit schema-v4 aliases for the requested A/B arm. Legacy `controller_mode` and `controller_batch_size` remain present. |
+| `effective_controller_modes`, `effective_controller_batch_size` | Query counts by controller actually used and the minimum/maximum effective batch. For a homogeneous validation arm, require the intended count to equal `queries` and both batch extrema to equal the requested value (or one for host checking). |
+| `controller_fallback_queries`, `controller_fallback_reasons` | Number of pre-traversal fallbacks and the reason histogram. Reject an ordinary reduced-controller performance sample unless all are zero. An invalid controller policy is rejected before traversal rather than counted as a fallback. |
+| `device_controller_batches`, `controller_status_readbacks` | Completed reduced-controller bounded batches and their 64-byte descriptor readbacks. They must be equal for successful reduced queries and zero for host-checked queries. |
+| `device_controller_iterations`, `device_iterations_in_batch` | Total bounded device actions and the maximum in any published batch. A reduced arm with published batches requires a maximum in `[1, requested batch size]` and total actions no greater than `batches * requested batch size`. |
+| `controller_queue_overflow_events`, `controller_invalid_state_events`, `controller_stale_publication_events` | Fatal device-state, capacity, query-ID, and ready-sequence diagnostics. Successful validation requires zero; failed queries also exit nonzero, so preserve and inspect stderr. |
 | `compact_parent_fallback_events` | One when an automatic compact-parent vector-target query had to use legacy parents because its edge-to-source map was unavailable; otherwise zero. |
 | `current_queue_high_water`, `pending_queue_high_water`, `heavy_queue_high_water` | Maximum observed queue entry counts within one invocation. The exact-unit current queue is append-only, so its peak is cumulative rather than one BFS layer's width. The run-level JSON reports the maximum per-query value; these are entries, not bytes. |
 
@@ -472,6 +477,14 @@ commands from the repository root on a gfx1151 AMD system and retain every
 log. Keep both the reduced controller and generation-tagged membership opt-in
 until their complete matrix and repeated explicit-stream stress pass.
 
+For the current synchronization milestone, prefer the non-destructive phased
+runner in `profiling/validate_delta_controller_rocm.sh` and the exact gates in
+`DELTA_CONTROLLER_SERVER_VALIDATION.md`. They create a unique run directory,
+preserve candidate and pre-existing binaries, validate schema-v4 telemetry,
+and prevent full correctness or profiling from starting before the preceding
+phase has a success marker. The snippets below remain useful as manual
+diagnostics, but some use fixed artifact names and are not resumable.
+
 Record the checkout and device first, then build the production router and the
 two focused HIP regressions:
 
@@ -508,7 +521,7 @@ four extraction/visitation combinations: host offsets with sparse reset (the
 default), device offsets with sparse reset, host offsets with generation
 visitation, and device offsets with generation visitation. The Delta binary
 must run the Cartesian controller matrix: host-checked and
-reduced-round-trip (batch sizes 1 and 4), automatic-compact and forced-wide
+reduced-round-trip (batch sizes 1, 2, 4, and 8), automatic-compact and forced-wide
 row offsets, Boolean and generation membership, automatic compact and forced
 legacy parents, and path-producing and distances-only runs. Fixtures cover
 zero-weight SCCs, parallel edges, duplicate/multiple sources and targets,
@@ -534,8 +547,9 @@ DELTA_MULTI_QUEUE_STRESS_RUNS=1200 \
 
 `DELTA_REQUIRE_REDUCED_CONTROLLER=1` makes every instrumented reduced-mode
 matrix/stress probe fail on a capability fallback; callback probes still
-require their intentional host fallback. The Delta stress must keep at least
-four nonblocking streams active, reuse each
+require their intentional host fallback. The Delta stress includes
+four-worker mixed-query reuse and a synchronized eight-worker
+reduced-batch-four probe. It must keep nonblocking streams active, reuse each
 workspace for thousands of queries, force generation rollover repeatedly, and
 exercise a callback exception/abort followed by a successful query on the
 same workspace. Confirm exact distance/path equivalence and outgoing-row edge

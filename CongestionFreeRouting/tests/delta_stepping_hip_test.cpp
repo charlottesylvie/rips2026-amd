@@ -15,6 +15,7 @@
 #include <cmath>
 #include <cstdint>
 #include <cstdlib>
+#include <exception>
 #include <functional>
 #include <future>
 #include <iostream>
@@ -151,14 +152,24 @@ constexpr ControllerTestCase kReducedBatchOneControllerTestCase{
     DeltaSteppingCsrControllerMode::kReducedRoundTrip,
     1,
     "reduced-batch-1"};
+constexpr ControllerTestCase kReducedBatchTwoControllerTestCase{
+    DeltaSteppingCsrControllerMode::kReducedRoundTrip,
+    2,
+    "reduced-batch-2"};
 constexpr ControllerTestCase kReducedBatchFourControllerTestCase{
     DeltaSteppingCsrControllerMode::kReducedRoundTrip,
     4,
     "reduced-batch-4"};
+constexpr ControllerTestCase kReducedBatchEightControllerTestCase{
+    DeltaSteppingCsrControllerMode::kReducedRoundTrip,
+    8,
+    "reduced-batch-8"};
 constexpr ControllerTestCase kControllerTestCases[] = {
     kHostCheckedControllerTestCase,
     kReducedBatchOneControllerTestCase,
+    kReducedBatchTwoControllerTestCase,
     kReducedBatchFourControllerTestCase,
+    kReducedBatchEightControllerTestCase,
 };
 
 void require_controller_telemetry(
@@ -175,7 +186,11 @@ void require_controller_telemetry(
     require(telemetry.effective_controller_mode ==
                     DeltaSteppingCsrControllerMode::kHostChecked &&
                 telemetry.effective_controller_batch_size == 1 &&
-                !telemetry.controller_fallback,
+                !telemetry.controller_fallback &&
+                telemetry.controller_fallback_reason ==
+                    DeltaSteppingCsrControllerFallbackReason::kNone &&
+                telemetry.device_controller_batches == 0 &&
+                telemetry.controller_status_readbacks == 0,
             label + ": host-checked controller telemetry is inconsistent");
     return;
   }
@@ -184,14 +199,19 @@ void require_controller_telemetry(
       telemetry.effective_controller_mode ==
           DeltaSteppingCsrControllerMode::kReducedRoundTrip &&
       telemetry.effective_controller_batch_size == requested.batch_size &&
-      !telemetry.controller_fallback;
+      !telemetry.controller_fallback &&
+      telemetry.controller_fallback_reason ==
+          DeltaSteppingCsrControllerFallbackReason::kNone;
   const bool capability_fallback =
       telemetry.effective_controller_mode ==
           DeltaSteppingCsrControllerMode::kHostChecked &&
       telemetry.effective_controller_batch_size == 1 &&
       telemetry.controller_fallback;
   if (require_host_fallback) {
-    require(capability_fallback,
+    require(capability_fallback &&
+                telemetry.controller_fallback_reason ==
+                    DeltaSteppingCsrControllerFallbackReason::
+                        kProgressCallbackRequiresHost,
             label + ": reduced request did not report required host fallback");
   } else if (require_reduced_controller_selection()) {
     require(reduced_selected,
@@ -203,6 +223,24 @@ void require_controller_telemetry(
             label +
                 ": reduced request reported neither selection nor capability "
                 "fallback");
+  }
+  if (reduced_selected) {
+    require(telemetry.device_controller_batches ==
+                    telemetry.controller_status_readbacks &&
+                telemetry.batched_status_readbacks >=
+                    telemetry.controller_status_readbacks &&
+                telemetry.device_controller_iterations >=
+                    telemetry.device_controller_batches &&
+                telemetry.max_device_iterations_in_batch <=
+                    requested.batch_size &&
+                telemetry.controller_queue_overflow_events == 0 &&
+                telemetry.controller_invalid_state_events == 0 &&
+                telemetry.controller_stale_publication_events == 0,
+            label + ": reduced controller diagnostics are inconsistent");
+  } else if (capability_fallback) {
+    require(telemetry.controller_fallback_reason !=
+                DeltaSteppingCsrControllerFallbackReason::kNone,
+            label + ": controller fallback omitted its reason");
   }
 }
 
@@ -3399,53 +3437,96 @@ void test_parallel_divergent_workspaces(hipStream_t construction_stream) {
   constexpr int kRunsPerWorker = 16;
   constexpr int kForceGenericMaxIterations =
       std::numeric_limits<int>::max();
+  DeltaSteppingCsrWorkspaceOptions options;
+  options.execution_mode = DeltaSteppingCsrExecutionMode::kForceGeneric;
+  options.controller_mode =
+      DeltaSteppingCsrControllerMode::kReducedRoundTrip;
+  options.controller_batch_size = 4;
+  std::promise<void> start_promise;
+  const std::shared_future<void> start = start_promise.get_future().share();
+  std::atomic<int> ready{0};
   std::vector<std::future<void>> workers;
   workers.reserve(kWorkers);
-  for (int worker = 0; worker < kWorkers; ++worker) {
-    workers.push_back(std::async(std::launch::async, [&, worker]() {
-      check_hip(hipSetDevice(device), "hipSetDevice");
-      HipStream stream;
-      DeltaSteppingCsrWorkspace workspace(shared_graph, stream.get());
-      for (int repetition = 0; repetition < kRunsPerWorker; ++repetition) {
-        const std::string label =
-            "parallel divergent worker " + std::to_string(worker) +
-            " reuse " + std::to_string(repetition);
-        const DeltaSteppingCsrResult early = workspace.run(
-            std::vector<int>{0},
-            std::vector<int>{65},
-            4.0f,
-            kForceGenericMaxIterations,
-            stream.get(),
-            nullptr,
-            nullptr);
-        validate_compact_target_paths(label + ": reachable",
-                                      graph,
-                                      {0},
-                                      {65},
-                                      expected,
-                                      early);
-        require(early.stopped_on_target && !early.converged,
-                label + ": reachable target did not stop early");
+  try {
+    for (int worker = 0; worker < kWorkers; ++worker) {
+      workers.push_back(std::async(std::launch::async, [&, worker]() {
+        bool readiness_reported = false;
+        try {
+          check_hip(hipSetDevice(device), "hipSetDevice");
+          HipStream stream;
+          DeltaSteppingCsrWorkspace workspace(
+              shared_graph, stream.get(), options);
+          ready.fetch_add(1, std::memory_order_release);
+          readiness_reported = true;
+          start.wait();
 
-        const DeltaSteppingCsrResult exhausted = workspace.run(
-            std::vector<int>{0},
-            std::vector<int>{130},
-            4.0f,
-            kForceGenericMaxIterations,
-            stream.get(),
-            nullptr,
-            nullptr);
-        validate_compact_target_paths(label + ": exhausted",
-                                      graph,
-                                      {0},
-                                      {130},
-                                      expected,
-                                      exhausted);
-        require(exhausted.converged && !exhausted.stopped_on_target,
-                label + ": unreachable target did not exhaust");
-      }
-    }));
+          for (int repetition = 0; repetition < kRunsPerWorker; ++repetition) {
+            const std::string label =
+                "parallel divergent reduced-batch-4 worker " +
+                std::to_string(worker) + " reuse " +
+                std::to_string(repetition);
+            DeltaSteppingCsrTelemetry telemetry;
+            const DeltaSteppingCsrResult early = workspace.run(
+                std::vector<int>{0},
+                std::vector<int>{65},
+                4.0f,
+                kForceGenericMaxIterations,
+                DeltaSteppingCsrRunOptions{&telemetry},
+                stream.get(),
+                nullptr,
+                nullptr);
+            validate_compact_target_paths(label + ": reachable",
+                                          graph,
+                                          {0},
+                                          {65},
+                                          expected,
+                                          early);
+            require(early.stopped_on_target && !early.converged,
+                    label + ": reachable target did not stop early");
+            require_controller_telemetry(
+                label + ": reachable", telemetry,
+                kReducedBatchFourControllerTestCase);
+
+            const DeltaSteppingCsrResult exhausted = workspace.run(
+                std::vector<int>{0},
+                std::vector<int>{130},
+                4.0f,
+                kForceGenericMaxIterations,
+                stream.get(),
+                nullptr,
+                nullptr);
+            validate_compact_target_paths(label + ": exhausted",
+                                          graph,
+                                          {0},
+                                          {130},
+                                          expected,
+                                          exhausted);
+            require(exhausted.converged && !exhausted.stopped_on_target,
+                    label + ": unreachable target did not exhaust");
+          }
+        } catch (...) {
+          if (!readiness_reported) {
+            ready.fetch_add(1, std::memory_order_release);
+          }
+          throw;
+        }
+      }));
+    }
+  } catch (...) {
+    // A thread-launch failure must release workers already waiting at the
+    // start gate before their futures are destroyed. Preserve the launch
+    // exception after every successfully launched worker has stopped.
+    const std::exception_ptr launch_exception = std::current_exception();
+    start_promise.set_value();
+    for (std::future<void>& worker : workers) {
+      worker.wait();
+    }
+    std::rethrow_exception(launch_exception);
   }
+  while (ready.load(std::memory_order_acquire) != kWorkers) {
+    std::this_thread::yield();
+  }
+  start_promise.set_value();
   for (std::future<void>& worker : workers) {
     worker.get();
   }

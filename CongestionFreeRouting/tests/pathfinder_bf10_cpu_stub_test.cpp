@@ -881,11 +881,22 @@ void populate_stub_delta_telemetry(
   if (execution_path == DeltaSteppingCsrExecutionPath::kCompactGeneric) {
     telemetry.batched_status_readbacks = 25 * token;
   }
+  if (execution_path != DeltaSteppingCsrExecutionPath::kExactUnit) {
+    telemetry.device_controller_batches = 26 * token;
+    telemetry.controller_status_readbacks = 27 * token;
+    telemetry.device_controller_iterations = 28 * token;
+    telemetry.max_device_iterations_in_batch = 29 * token;
+  }
   telemetry.compact_parent_fallback_events = 23 * token;
   telemetry.requested_controller_mode = requested_controller_mode;
   telemetry.requested_controller_batch_size =
       requested_controller_batch_size;
   telemetry.controller_fallback = controller_fallback;
+  telemetry.controller_fallback_reason =
+      controller_fallback
+          ? DeltaSteppingCsrControllerFallbackReason::
+                kCooperativeLaunchUnavailable
+          : DeltaSteppingCsrControllerFallbackReason::kNone;
   telemetry.effective_controller_mode =
       requested_controller_mode ==
                   DeltaSteppingCsrControllerMode::kReducedRoundTrip &&
@@ -2468,6 +2479,9 @@ int main() {
       DeltaSteppingCsrControllerMode::kReducedRoundTrip;
   aggregate_records[3].requested_controller_batch_size = 7;
   aggregate_records[3].controller_fallback = true;
+  aggregate_records[3].controller_fallback_reason =
+      DeltaSteppingCsrControllerFallbackReason::
+          kCooperativeLaunchUnavailable;
   DeltaSteppingCsrTelemetry ignored_record;
   ignored_record.outer_buckets_processed = 100000;
   ignored_record.current_queue_high_water = 100000;
@@ -2481,7 +2495,11 @@ int main() {
                   std::array<std::uint64_t, 4>{1, 1, 1, 1} &&
               telemetry_totals.effective_controller_counts ==
                   std::array<std::uint64_t, 2>{3, 1} &&
-              telemetry_totals.controller_fallback_queries == 1,
+              telemetry_totals.controller_fallback_queries == 1 &&
+              telemetry_totals.controller_fallback_reason_counts ==
+                  std::array<std::uint64_t, 5>{0, 0, 0, 1, 0} &&
+              telemetry_totals.minimum_effective_controller_batch_size == 1 &&
+              telemetry_totals.maximum_effective_controller_batch_size == 7,
           "telemetry aggregation must count collected, completed, and path records");
   const DeltaSteppingCsrTelemetry& telemetry_sums = telemetry_totals.sums;
   require(telemetry_sums.outer_buckets_processed == 10 &&
@@ -2506,11 +2524,15 @@ int main() {
               telemetry_sums.scalar_d2h_readbacks == 207 &&
               telemetry_sums.explicit_stream_waits == 216 &&
               telemetry_sums.batched_status_readbacks == 50 &&
+              telemetry_sums.device_controller_batches == 234 &&
+              telemetry_sums.controller_status_readbacks == 243 &&
+              telemetry_sums.device_controller_iterations == 252 &&
               telemetry_sums.compact_parent_fallback_events == 230,
           "telemetry aggregation must sum every counter and ignore empty slots");
   require(telemetry_totals.current_queue_high_water == 76 &&
               telemetry_totals.pending_queue_high_water == 80 &&
-              telemetry_totals.heavy_queue_high_water == 84,
+              telemetry_totals.heavy_queue_high_water == 84 &&
+              telemetry_totals.max_device_iterations_in_batch == 116,
           "telemetry aggregation must take maxima instead of summing peaks");
 
   routing::PathfinderOptions aggregate_json_options;
@@ -2525,7 +2547,7 @@ int main() {
   const std::string aggregate_json = routing::delta_telemetry_aggregate_json(
       aggregate_records, aggregate_json_options, 2.5f, 64, 3);
   require(aggregate_json.find('\n') == std::string::npos &&
-              aggregate_json.find("\"schema_version\":3") !=
+              aggregate_json.find("\"schema_version\":4") !=
                   std::string::npos &&
               aggregate_json.find("\"queries\":4") != std::string::npos &&
               aggregate_json.find("\"completed_queries\":3") !=
@@ -2539,6 +2561,16 @@ int main() {
               aggregate_json.find("\"controller_fallback_queries\":1") !=
                   std::string::npos &&
               aggregate_json.find(
+                  "\"effective_controller_batch_size\":{\"min\":1,"
+                  "\"max\":7}") != std::string::npos &&
+              aggregate_json.find(
+                  "\"controller_fallback_reasons\":{\"none\":0,"
+                  "\"exact_unit_specialization\":0,"
+                  "\"progress_callback_requires_host\":0,"
+                  "\"cooperative_launch_unavailable\":1,"
+                  "\"generation_budget_unavailable\":0}") !=
+                  std::string::npos &&
+              aggregate_json.find(
                   "\"execution_paths\":{\"exact_unit\":1,"
                   "\"compact_generic\":1,\"legacy_generic\":1,"
                   "\"generic_distances_only\":1}") != std::string::npos &&
@@ -2548,9 +2580,16 @@ int main() {
                   "\"batched_status_readbacks\":50") !=
                   std::string::npos &&
               aggregate_json.find(
+                  "\"device_controller_batches\":234,"
+                  "\"controller_status_readbacks\":243,"
+                  "\"device_controller_iterations\":252") !=
+                  std::string::npos &&
+              aggregate_json.find(
                   "\"maxima\":{\"current_queue_high_water\":76,"
                   "\"pending_queue_high_water\":80,"
-                  "\"heavy_queue_high_water\":84}") != std::string::npos,
+                  "\"heavy_queue_high_water\":84,"
+                  "\"device_iterations_in_batch\":116}") !=
+                  std::string::npos,
           "aggregate telemetry JSON must preserve stable counts and maxima");
   const std::filesystem::path aggregate_telemetry_path =
       "/tmp/pathfinder_delta_telemetry_aggregate.json";
@@ -2756,7 +2795,7 @@ int main() {
       single_delta_telemetry_json_line(parallel_telemetry_stdout);
   require(parallel_telemetry_json.find("\"queries\":2") !=
                   std::string::npos &&
-              parallel_telemetry_json.find("\"schema_version\":3") !=
+              parallel_telemetry_json.find("\"schema_version\":4") !=
                   std::string::npos &&
               parallel_telemetry_json.find("\"completed_queries\":2") !=
                   std::string::npos &&
@@ -2791,7 +2830,9 @@ int main() {
               parallel_telemetry_json.find(
                   "\"maxima\":{\"current_queue_high_water\":38,"
                   "\"pending_queue_high_water\":40,"
-                  "\"heavy_queue_high_water\":42}") != std::string::npos,
+                  "\"heavy_queue_high_water\":42,"
+                  "\"device_iterations_in_batch\":0}") !=
+                  std::string::npos,
           "parallel telemetry must aggregate isolated per-net slots once");
   const std::filesystem::path parallel_telemetry_path =
       "/tmp/pathfinder_delta_telemetry.json";
