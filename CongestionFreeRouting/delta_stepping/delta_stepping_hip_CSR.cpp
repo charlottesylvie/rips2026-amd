@@ -2407,10 +2407,10 @@ __device__ inline int controller_bounded_append(
 
 template <typename Grid>
 __device__ inline void controller_grid_release_sync(Grid& grid) {
-  // grid.sync() supplies the execution barrier.  The explicit fence documents
-  // and enforces publication of queue payloads/counts before a later phase on
-  // the same cooperative launch consumes them, including on gfx1151.
-  __threadfence();
+  // HIP grid-group synchronization waits for preceding shared/global memory
+  // accesses to complete and makes them visible to every thread in the group.
+  // A per-thread device-wide fence here is therefore redundant and turns each
+  // controller phase boundary into thousands of global fence operations.
   grid.sync();
 }
 
