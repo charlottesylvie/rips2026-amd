@@ -31,6 +31,7 @@ static_assert(sizeof(CompactRowOffset) == 4,
 
 constexpr int kBlockSize = 256;
 constexpr int kMaxGridX = 65535;
+constexpr int kMaxHostCheckedReductionBlocks = 256;
 constexpr int kNoBucket = 0x3fffffff;
 constexpr Offset kMaxUnitSpecializationRows =
     static_cast<Offset>(1) << std::numeric_limits<float>::digits;
@@ -335,6 +336,9 @@ struct DeltaSteppingScratch {
   DeviceBuffer<Offset> compact_path_edges;
   PinnedHostBuffer<int> host_scalar;
   PinnedHostBuffer<int> host_unit_status;
+  // Persistent pinned staging for the host-checked controller's per-block
+  // pending-bucket minima.  It outlives every asynchronous copy that uses it.
+  std::unique_ptr<PinnedHostBuffer<int>> host_pending_bucket_block_mins;
   std::unique_ptr<
       PinnedHostBuffer<DeltaSteppingCsrControllerDescriptor>>
       host_controller_descriptor;
@@ -388,6 +392,14 @@ struct DeltaSteppingScratch {
     ensure_scalar(touched_count);
     ensure_scalar(settled_target_count);
     ensure_scalar(min_pending_bucket);
+  }
+
+  void ensure_host_checked_reduction_storage() {
+    if (!host_pending_bucket_block_mins) {
+      host_pending_bucket_block_mins =
+          std::make_unique<PinnedHostBuffer<int>>(
+              kMaxHostCheckedReductionBlocks);
+    }
   }
 
   void ensure_parent_key_storage() {
@@ -1977,6 +1989,7 @@ void launch_relax_light_edges(
     int* next_count,
     std::uint32_t next_current_generation,
     int* pending_queue,
+    int* pending_count,
     hipStream_t stream) {
   relax_light_edges_kernel<RowOffset, UseCurrentGenerations, TrackParents,
                            UseEdgeParent, HasVertexCosts, CollectHeavy,
@@ -1990,7 +2003,7 @@ void launch_relax_light_edges(
           scratch.in_pending.get(),
           scratch.in_heavy.get(), scratch.touched_queue.get(),
           scratch.touched_count.get(), next_queue, next_count,
-          pending_queue, scratch.pending_count.get(), scratch.heavy_queue.get(),
+          pending_queue, pending_count, scratch.heavy_queue.get(),
           scratch.heavy_count.get(),
           CollectTelemetry ? scratch.telemetry_counters.get() : nullptr);
   DS_DELTA_HIP_CHECK(hipGetLastError());
@@ -2010,6 +2023,7 @@ void launch_relax_heavy_edges(
     float delta,
     float exclusive_distance_limit,
     int* pending_queue,
+    int* pending_count,
     hipStream_t stream) {
   relax_heavy_edges_kernel<RowOffset, TrackParents, UseEdgeParent,
                            HasVertexCosts, CollectTelemetry>
@@ -2019,7 +2033,7 @@ void launch_relax_heavy_edges(
           graph.rowptr, graph.colind, graph.values, vertex_costs,
           scratch.dist.get(), scratch.parent_key.get(), scratch.in_pending.get(),
           scratch.touched_queue.get(), scratch.touched_count.get(),
-          pending_queue, scratch.pending_count.get(), scratch.in_heavy.get(),
+          pending_queue, pending_count, scratch.in_heavy.get(),
           CollectTelemetry ? scratch.telemetry_counters.get() : nullptr);
   DS_DELTA_HIP_CHECK(hipGetLastError());
 }
@@ -2137,7 +2151,7 @@ __global__ void reduce_min_pending_bucket_kernel(const int* pending_queue,
                                                  float delta,
                                                  const float* dist,
                                                  const int* in_pending,
-                                                 int* global_min,
+                                                 int* block_mins,
                                                  unsigned long long* telemetry_counters) {
   __shared__ int s_min[kBlockSize];
   __shared__ int shared_pending_count;
@@ -2176,8 +2190,16 @@ __global__ void reduce_min_pending_bucket_kernel(const int* pending_queue,
     }
     __syncthreads();
   }
-  if (tid == 0 && s_min[0] < kNoBucket) {
-    atomicMin(global_min, s_min[0]);
+  if (tid == 0) {
+    // Each block publishes a self-contained result.  The previous global
+    // atomic minimum had to be initialized by an H2D scalar copy followed by
+    // a host stream synchronization before this kernel.  Per-block outputs
+    // remove that producer dependency entirely; the already-required D2H
+    // completion below certifies every block before the host reduces them.
+    // Preserve an explicit system-visible publication on gfx1151 without a
+    // host drain between this kernel and the copy engine.
+    atomicExch(block_mins + blockIdx.x, s_min[0]);
+    __threadfence_system();
   }
   if constexpr (CollectTelemetry) {
     unsigned long long telemetry[kTelemetryCounterCount] = {};
@@ -4313,23 +4335,38 @@ int find_min_pending_bucket(const int* d_pending_queue,
                             float delta,
                             const float* d_dist,
                             const int* d_in_pending,
-                            int* d_min_bucket,
-                            int* h_min_bucket,
+                            int* d_block_mins,
+                            int* h_block_mins,
+                            bool pending_updates_synchronized,
                             hipStream_t stream,
                             unsigned long long* telemetry_counters) {
-  const int initial_min = kNoBucket;
-  DS_DELTA_HIP_CHECK(hipMemcpyAsync(d_min_bucket,
-                                    &initial_min,
-                                    sizeof(int),
-                                    hipMemcpyHostToDevice,
-                                    stream));
-  synchronize_explicit_stream(stream);
+  if (launch_blocks <= 0 ||
+      launch_blocks > kMaxHostCheckedReductionBlocks) {
+    throw std::logic_error(
+        "delta pending-bucket reduction block count is outside bounds");
+  }
+  // A preceding host observation already completed the producer in the
+  // multi-target PathFinder path.  Retain the established explicit-stream
+  // guard only for low-level no-target runs whose heavy phase has no such
+  // completion boundary.
+  if (!pending_updates_synchronized) {
+    synchronize_explicit_stream(stream);
+  }
   reduce_min_pending_bucket_kernel<CollectTelemetry>
       <<<launch_blocks, kBlockSize, 0, stream>>>(
       d_pending_queue, d_pending_count, current_bucket, delta, d_dist,
-      d_in_pending, d_min_bucket, telemetry_counters);
+      d_in_pending, d_block_mins, telemetry_counters);
   DS_DELTA_HIP_CHECK(hipGetLastError());
-  return copy_scalar_to_host(d_min_bucket, stream, h_min_bucket);
+  DS_DELTA_HIP_CHECK(hipMemcpyAsync(
+      h_block_mins,
+      d_block_mins,
+      sssp_capacity::checked_bytes<int>(
+          static_cast<std::size_t>(launch_blocks)),
+      hipMemcpyDeviceToHost,
+      stream));
+  DS_DELTA_HIP_CHECK(hipStreamSynchronize(stream));
+  return *std::min_element(h_block_mins,
+                           h_block_mins + launch_blocks);
 }
 
 int mark_and_count_settled_targets(DeltaSteppingScratch& scratch,
@@ -4461,6 +4498,12 @@ DeltaSteppingCsrResult run_delta_stepping_impl(
     }
   }
   const float inf = std::numeric_limits<float>::infinity();
+  // Keep the per-block staging lazy: a supported reduced controller never
+  // performs this host reduction.  Allocate before any query work is enqueued
+  // so allocation failure cannot leave partially mutated asynchronous state.
+  if (!use_reduced_controller) {
+    scratch.ensure_host_checked_reduction_storage();
+  }
   if constexpr (CollectTelemetry) {
     prepare_device_telemetry(scratch, stream);
   }
@@ -4543,6 +4586,8 @@ DeltaSteppingCsrResult run_delta_stepping_impl(
   int* next_count_device = scratch.next_count.get();
   int* pending_queue = scratch.pending_a.get();
   int* pending_scratch = scratch.pending_b.get();
+  int* pending_count_device = scratch.pending_count.get();
+  int* pending_scratch_count_device = scratch.new_pending_count.get();
   int current_bucket = 0;
   const bool has_distance_limit =
       std::isfinite(exclusive_distance_limit);
@@ -4561,7 +4606,8 @@ DeltaSteppingCsrResult run_delta_stepping_impl(
   std::uint64_t controller_round_trips = 0;
   // Device-counted heavy/pending kernels need a host-independent launch size.
   // Cap it to avoid pathological grids; tune 32--256 on the target GPU.
-  const int device_count_blocks = std::min(grid_for_items(n), 256);
+  const int device_count_blocks =
+      std::min(grid_for_items(n), kMaxHostCheckedReductionBlocks);
   DeltaSteppingCsrResult result;
   result.target = target;
   if (use_target_set && initial_settled_target_count == target_count) {
@@ -4867,7 +4913,8 @@ DeltaSteppingCsrResult run_delta_stepping_impl(
               d_adjacency, scratch, vertex_costs, current_queue,
               current_count_device, launch_blocks, current_bucket, delta,
               exclusive_distance_limit, next_queue, next_count_device,
-              next_current_generation, pending_queue, stream);
+              next_current_generation, pending_queue, pending_count_device,
+              stream);
         } else if (terminal_bucket || skip_heavy_edges) {
           launch_relax_light_edges<RowOffset, UseCurrentGenerations,
                                    TrackParents, UseEdgeParent, false, false,
@@ -4875,7 +4922,8 @@ DeltaSteppingCsrResult run_delta_stepping_impl(
               d_adjacency, scratch, nullptr, current_queue,
               current_count_device, launch_blocks, current_bucket, delta,
               exclusive_distance_limit, next_queue, next_count_device,
-              next_current_generation, pending_queue, stream);
+              next_current_generation, pending_queue, pending_count_device,
+              stream);
         } else if (vertex_costs != nullptr) {
           launch_relax_light_edges<RowOffset, UseCurrentGenerations,
                                    TrackParents, UseEdgeParent, true, true,
@@ -4883,7 +4931,8 @@ DeltaSteppingCsrResult run_delta_stepping_impl(
               d_adjacency, scratch, vertex_costs, current_queue,
               current_count_device, launch_blocks, current_bucket, delta,
               exclusive_distance_limit, next_queue, next_count_device,
-              next_current_generation, pending_queue, stream);
+              next_current_generation, pending_queue, pending_count_device,
+              stream);
         } else {
           launch_relax_light_edges<RowOffset, UseCurrentGenerations,
                                    TrackParents, UseEdgeParent, false, true,
@@ -4891,7 +4940,8 @@ DeltaSteppingCsrResult run_delta_stepping_impl(
               d_adjacency, scratch, nullptr, current_queue,
               current_count_device, launch_blocks, current_bucket, delta,
               exclusive_distance_limit, next_queue, next_count_device,
-              next_current_generation, pending_queue, stream);
+              next_current_generation, pending_queue, pending_count_device,
+              stream);
         }
         std::swap(current_queue, next_queue);
         std::swap(current_count_device, next_count_device);
@@ -4907,6 +4957,10 @@ DeltaSteppingCsrResult run_delta_stepping_impl(
       }
     }
 
+    // The final frontier-count transfer completed every light-phase update.
+    // A heavy launch below makes the pending queue live again until a target
+    // observation (or an explicit low-level guard) completes it.
+    bool pending_updates_synchronized = true;
     if (!skip_heavy_edges && current_bucket != kNoBucket - 1) {
       ++heavy_edge_phases;
       if (vertex_costs != nullptr) {
@@ -4914,19 +4968,21 @@ DeltaSteppingCsrResult run_delta_stepping_impl(
                                  CollectTelemetry>(
             d_adjacency, scratch, vertex_costs, device_count_blocks,
             current_bucket, delta, exclusive_distance_limit, pending_queue,
-            stream);
+            pending_count_device, stream);
       } else {
         launch_relax_heavy_edges<RowOffset, TrackParents, UseEdgeParent,
                                  false, CollectTelemetry>(
             d_adjacency, scratch, nullptr, device_count_blocks,
             current_bucket, delta, exclusive_distance_limit, pending_queue,
-            stream);
+            pending_count_device, stream);
       }
+      pending_updates_synchronized = false;
       // Vector-target settlement is the only immediate device consumer here.
-      // Scalar target copies synchronize on their D2H transfer, while the
-      // minimum-bucket helper synchronizes its H2D initializer before reduce.
+      // Preserve the established gfx1151 producer boundary before it. Scalar
+      // target copies synchronize on their own D2H transfer.
       if (use_target_set) {
         synchronize_explicit_stream(stream);
+        pending_updates_synchronized = true;
       }
     }
 
@@ -4935,6 +4991,7 @@ DeltaSteppingCsrResult run_delta_stepping_impl(
       const int settled_count =
           mark_and_count_settled_targets(scratch, target_count, current_bucket,
                                          delta, stream);
+      pending_updates_synchronized = true;
       ++controller_round_trips;
       if (settled_count >= target_count) {
         result.target_reached = true;
@@ -4951,6 +5008,7 @@ DeltaSteppingCsrResult run_delta_stepping_impl(
       }
     } else if (target >= 0) {
       const float target_distance = copy_dist_value_to_host(scratch.dist.get(), target, stream);
+      pending_updates_synchronized = true;
       ++controller_round_trips;
       const bool target_settled =
           std::isfinite(target_distance) &&
@@ -4971,10 +5029,18 @@ DeltaSteppingCsrResult run_delta_stepping_impl(
       }
     }
 
+    // The inactive pending queue has n entries, while device_count_blocks is
+    // no greater than min(ceil(n / kBlockSize), 256).  Its first entries are
+    // therefore safe temporary storage for block minima.  The D2H completion
+    // in this helper finishes those writes before compaction overwrites the
+    // inactive queue with the next pending generation.
     const int next_bucket = find_min_pending_bucket<CollectTelemetry>(
-        pending_queue, scratch.pending_count.get(), device_count_blocks,
+        pending_queue, pending_count_device, device_count_blocks,
         current_bucket, delta, scratch.dist.get(), scratch.in_pending.get(),
-        scratch.min_pending_bucket.get(), scratch.host_scalar.get(), stream,
+        pending_scratch,
+        scratch.host_pending_bucket_block_mins->get(),
+        pending_updates_synchronized,
+        stream,
         CollectTelemetry ? scratch.telemetry_counters.get() : nullptr);
     ++controller_round_trips;
     const bool changed = (next_bucket != kNoBucket);
@@ -5011,7 +5077,7 @@ DeltaSteppingCsrResult run_delta_stepping_impl(
     current_count_device = scratch.current_count.get();
     next_count_device = scratch.next_count.get();
     reset_int_zero_async(scratch.current_count.get(), stream);
-    reset_int_zero_async(scratch.new_pending_count.get(), stream);
+    reset_int_zero_async(pending_scratch_count_device, stream);
     synchronize_explicit_stream(stream);
     const std::uint32_t compacted_current_generation =
         acquire_current_generation<UseCurrentGenerations>(scratch, stream);
@@ -5019,12 +5085,12 @@ DeltaSteppingCsrResult run_delta_stepping_impl(
     compact_pending_to_current_bucket_kernel<UseCurrentGenerations,
                                              CollectTelemetry>
         <<<device_count_blocks, kBlockSize, 0, stream>>>(
-        pending_queue, scratch.pending_count.get(), current_bucket, delta,
+        pending_queue, pending_count_device, current_bucket, delta,
         scratch.dist.get(),
         scratch.in_pending.get(), scratch.in_current.get(),
         compacted_current_generation, current_queue,
         scratch.current_count.get(), pending_scratch,
-        scratch.new_pending_count.get(),
+        pending_scratch_count_device,
         CollectTelemetry ? scratch.telemetry_counters.get() : nullptr);
     DS_DELTA_HIP_CHECK(hipGetLastError());
 
@@ -5035,14 +5101,12 @@ DeltaSteppingCsrResult run_delta_stepping_impl(
       throw std::runtime_error(
           "delta compacted frontier count is outside graph bounds");
     }
-    DS_DELTA_HIP_CHECK(hipMemcpyAsync(scratch.pending_count.get(),
-                                      scratch.new_pending_count.get(),
-                                      sizeof(int),
-                                      hipMemcpyDeviceToDevice,
-                                      stream));
-    // The next bucket appends to this count and consumes the compacted queue.
-    synchronize_explicit_stream(stream);
+    // The current-count D2H completion above also certifies the compaction's
+    // queue and pending-count outputs.  Advance queue and count parity
+    // together instead of copying the count back to one fixed address and
+    // introducing another explicit stream barrier.
     std::swap(pending_queue, pending_scratch);
+    std::swap(pending_count_device, pending_scratch_count_device);
     }
   }
 
