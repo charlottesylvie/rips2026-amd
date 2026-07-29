@@ -294,6 +294,7 @@ void validate_csr_shape(const HostCsrF32& graph) {
 void validate_options(const PathfinderOptions& options) {
   switch (options.delta_controller_mode) {
     case DeltaSteppingCsrControllerMode::kHostChecked:
+    case DeltaSteppingCsrControllerMode::kFusedHostChecked:
     case DeltaSteppingCsrControllerMode::kReducedRoundTrip:
       break;
     default:
@@ -304,7 +305,15 @@ void validate_options(const PathfinderOptions& options) {
         "Delta-Stepping controller batch size must be positive");
   }
   if (options.delta_controller_mode ==
-          DeltaSteppingCsrControllerMode::kHostChecked &&
+          DeltaSteppingCsrControllerMode::kReducedRoundTrip &&
+      static_cast<std::uint64_t>(options.delta_controller_batch_size) >
+          kDeltaSteppingCsrMaxControllerBatchSize) {
+    throw std::invalid_argument(
+        "Delta-Stepping controller batch size exceeds the bounded device "
+        "watchdog limit");
+  }
+  if (options.delta_controller_mode !=
+          DeltaSteppingCsrControllerMode::kReducedRoundTrip &&
       options.delta_controller_batch_size !=
           static_cast<int>(
               kDeltaSteppingCsrRecommendedControllerBatchSize)) {
@@ -1679,13 +1688,40 @@ struct DeltaTelemetryTotals {
   std::uint64_t queries = 0;
   std::uint64_t completed_queries = 0;
   std::array<std::uint64_t, 4> path_counts{};
-  std::array<std::uint64_t, 2> effective_controller_counts{};
+  std::array<std::uint64_t, 3> effective_controller_counts{};
+  std::array<std::uint64_t, 4> controller_backend_counts{};
+  std::array<std::uint64_t, 8> controller_fallback_reason_counts{};
   std::uint64_t controller_fallback_queries = 0;
   DeltaSteppingCsrTelemetry sums;
   std::uint64_t current_queue_high_water = 0;
   std::uint64_t pending_queue_high_water = 0;
   std::uint64_t heavy_queue_high_water = 0;
+  std::uint32_t cooperative_grid_blocks_min = 0;
+  std::uint32_t cooperative_grid_blocks_max = 0;
+  std::uint32_t cooperative_active_blocks_per_compute_unit_min = 0;
+  std::uint32_t cooperative_active_blocks_per_compute_unit_max = 0;
+  std::uint32_t cooperative_compute_units_min = 0;
+  std::uint32_t cooperative_compute_units_max = 0;
 };
+
+template <typename T>
+void update_nonzero_minimum(T candidate, T* minimum) {
+  if (candidate == 0) return;
+  if (*minimum == 0 || candidate < *minimum) *minimum = candidate;
+}
+
+const char* delta_controller_mode_json_name(
+    DeltaSteppingCsrControllerMode mode) noexcept {
+  switch (mode) {
+    case DeltaSteppingCsrControllerMode::kHostChecked:
+      return "host_checked";
+    case DeltaSteppingCsrControllerMode::kFusedHostChecked:
+      return "fused_host_checked";
+    case DeltaSteppingCsrControllerMode::kReducedRoundTrip:
+      return "reduced_round_trip";
+  }
+  return "unknown";
+}
 
 DeltaTelemetryTotals aggregate_delta_telemetry(
     const std::vector<DeltaSteppingCsrTelemetry>& records) {
@@ -1714,10 +1750,51 @@ DeltaTelemetryTotals aggregate_delta_telemetry(
       case DeltaSteppingCsrControllerMode::kHostChecked:
         ++totals.effective_controller_counts[0];
         break;
-      case DeltaSteppingCsrControllerMode::kReducedRoundTrip:
+      case DeltaSteppingCsrControllerMode::kFusedHostChecked:
         ++totals.effective_controller_counts[1];
         break;
-      default:
+      case DeltaSteppingCsrControllerMode::kReducedRoundTrip:
+        ++totals.effective_controller_counts[2];
+        break;
+    }
+    switch (record.controller_backend) {
+      case DeltaSteppingCsrControllerBackend::kNotRun:
+        ++totals.controller_backend_counts[0];
+        break;
+      case DeltaSteppingCsrControllerBackend::kScalarHost:
+        ++totals.controller_backend_counts[1];
+        break;
+      case DeltaSteppingCsrControllerBackend::kCooperativeGrid:
+        ++totals.controller_backend_counts[2];
+        break;
+      case DeltaSteppingCsrControllerBackend::kExactUnit:
+        ++totals.controller_backend_counts[3];
+        break;
+    }
+    switch (record.controller_fallback_reason) {
+      case DeltaSteppingCsrControllerFallbackReason::kNone:
+        ++totals.controller_fallback_reason_counts[0];
+        break;
+      case DeltaSteppingCsrControllerFallbackReason::kProgressCallback:
+        ++totals.controller_fallback_reason_counts[1];
+        break;
+      case DeltaSteppingCsrControllerFallbackReason::kExactUnitBypass:
+        ++totals.controller_fallback_reason_counts[2];
+        break;
+      case DeltaSteppingCsrControllerFallbackReason::kGenerationBudget:
+        ++totals.controller_fallback_reason_counts[3];
+        break;
+      case DeltaSteppingCsrControllerFallbackReason::kCooperativeUnsupported:
+        ++totals.controller_fallback_reason_counts[4];
+        break;
+      case DeltaSteppingCsrControllerFallbackReason::kCapabilityQueryFailed:
+        ++totals.controller_fallback_reason_counts[5];
+        break;
+      case DeltaSteppingCsrControllerFallbackReason::kOccupancyQueryFailed:
+        ++totals.controller_fallback_reason_counts[6];
+        break;
+      case DeltaSteppingCsrControllerFallbackReason::kNoResidentGrid:
+        ++totals.controller_fallback_reason_counts[7];
         break;
     }
     if (record.controller_fallback) {
@@ -1757,6 +1834,20 @@ DeltaTelemetryTotals aggregate_delta_telemetry(
         record.controller_round_trips;
     totals.sums.compact_parent_fallback_events +=
         record.compact_parent_fallback_events;
+    totals.sums.cooperative_launches += record.cooperative_launches;
+    totals.sums.controller_publications += record.controller_publications;
+    totals.sums.controller_nonterminal_publications +=
+        record.controller_nonterminal_publications;
+    totals.sums.controller_terminal_publications +=
+        record.controller_terminal_publications;
+    totals.sums.controller_action_slots_budgeted +=
+        record.controller_action_slots_budgeted;
+    totals.sums.controller_actions_completed +=
+        record.controller_actions_completed;
+    totals.sums.controller_unused_action_slots +=
+        record.controller_unused_action_slots;
+    totals.sums.cooperative_grid_barriers +=
+        record.cooperative_grid_barriers;
     totals.current_queue_high_water =
         std::max(totals.current_queue_high_water,
                  record.current_queue_high_water);
@@ -1766,6 +1857,22 @@ DeltaTelemetryTotals aggregate_delta_telemetry(
     totals.heavy_queue_high_water =
         std::max(totals.heavy_queue_high_water,
                  record.heavy_queue_high_water);
+    update_nonzero_minimum(record.cooperative_grid_blocks_min,
+                           &totals.cooperative_grid_blocks_min);
+    totals.cooperative_grid_blocks_max =
+        std::max(totals.cooperative_grid_blocks_max,
+                 record.cooperative_grid_blocks_max);
+    update_nonzero_minimum(
+        record.cooperative_active_blocks_per_compute_unit,
+        &totals.cooperative_active_blocks_per_compute_unit_min);
+    totals.cooperative_active_blocks_per_compute_unit_max =
+        std::max(totals.cooperative_active_blocks_per_compute_unit_max,
+                 record.cooperative_active_blocks_per_compute_unit);
+    update_nonzero_minimum(record.cooperative_compute_units,
+                           &totals.cooperative_compute_units_min);
+    totals.cooperative_compute_units_max =
+        std::max(totals.cooperative_compute_units_max,
+                 record.cooperative_compute_units);
   }
   return totals;
 }
@@ -1781,7 +1888,7 @@ std::string delta_telemetry_aggregate_json(
   std::ostringstream out;
   out.precision(std::numeric_limits<float>::max_digits10);
   out << "{\"type\":\"delta_stepping_telemetry\""
-      << ",\"schema_version\":2"
+      << ",\"schema_version\":3"
       << ",\"scope\":\"pathfinder_run\""
       << ",\"queries\":" << totals.queries
       << ",\"completed_queries\":" << totals.completed_queries
@@ -1795,20 +1902,69 @@ std::string delta_telemetry_aggregate_json(
       << ",\"force_legacy_parent\":"
       << (options.delta_force_legacy_parent ? "true" : "false")
       << ",\"controller_mode\":\""
-      << (options.delta_controller_mode ==
-                  DeltaSteppingCsrControllerMode::kReducedRoundTrip
-              ? "reduced_round_trip"
-              : "host_checked")
+      << delta_controller_mode_json_name(options.delta_controller_mode)
       << "\""
       << ",\"controller_batch_size\":"
       << options.delta_controller_batch_size
       << ",\"effective_controller_modes\":{"
       << "\"host_checked\":" << totals.effective_controller_counts[0]
-      << ",\"reduced_round_trip\":"
+      << ",\"fused_host_checked\":"
       << totals.effective_controller_counts[1]
+      << ",\"reduced_round_trip\":"
+      << totals.effective_controller_counts[2]
+      << "}"
+      << ",\"controller_backends\":{"
+      << "\"not_run\":" << totals.controller_backend_counts[0]
+      << ",\"scalar_host\":" << totals.controller_backend_counts[1]
+      << ",\"cooperative_grid\":" << totals.controller_backend_counts[2]
+      << ",\"exact_unit\":" << totals.controller_backend_counts[3]
+      << "}"
+      << ",\"controller_fallback_reasons\":{"
+      << "\"none\":" << totals.controller_fallback_reason_counts[0]
+      << ",\"progress_callback\":"
+      << totals.controller_fallback_reason_counts[1]
+      << ",\"exact_unit_bypass\":"
+      << totals.controller_fallback_reason_counts[2]
+      << ",\"generation_budget\":"
+      << totals.controller_fallback_reason_counts[3]
+      << ",\"cooperative_unsupported\":"
+      << totals.controller_fallback_reason_counts[4]
+      << ",\"capability_query_failed\":"
+      << totals.controller_fallback_reason_counts[5]
+      << ",\"occupancy_query_failed\":"
+      << totals.controller_fallback_reason_counts[6]
+      << ",\"no_resident_grid\":"
+      << totals.controller_fallback_reason_counts[7]
       << "}"
       << ",\"controller_fallback_queries\":"
       << totals.controller_fallback_queries
+      << ",\"controller_diagnostics\":{"
+      << "\"cooperative_grid_blocks_min\":"
+      << totals.cooperative_grid_blocks_min
+      << ",\"cooperative_grid_blocks_max\":"
+      << totals.cooperative_grid_blocks_max
+      << ",\"cooperative_active_blocks_per_compute_unit_min\":"
+      << totals.cooperative_active_blocks_per_compute_unit_min
+      << ",\"cooperative_active_blocks_per_compute_unit_max\":"
+      << totals.cooperative_active_blocks_per_compute_unit_max
+      << ",\"cooperative_compute_units_min\":"
+      << totals.cooperative_compute_units_min
+      << ",\"cooperative_compute_units_max\":"
+      << totals.cooperative_compute_units_max
+      << ",\"cooperative_launches\":" << sums.cooperative_launches
+      << ",\"controller_publications\":" << sums.controller_publications
+      << ",\"controller_nonterminal_publications\":"
+      << sums.controller_nonterminal_publications
+      << ",\"controller_terminal_publications\":"
+      << sums.controller_terminal_publications
+      << ",\"controller_action_slots_budgeted\":"
+      << sums.controller_action_slots_budgeted
+      << ",\"controller_actions_completed\":"
+      << sums.controller_actions_completed
+      << ",\"controller_unused_action_slots\":"
+      << sums.controller_unused_action_slots
+      << ",\"cooperative_grid_barriers\":"
+      << sums.cooperative_grid_barriers << "}"
       << ",\"execution_paths\":{"
       << "\"exact_unit\":" << totals.path_counts[0]
       << ",\"compact_generic\":" << totals.path_counts[1]
@@ -2028,6 +2184,9 @@ DeltaSteppingCsrControllerMode parse_delta_controller_arg(const char* text) {
   if (value == "host-checked") {
     return DeltaSteppingCsrControllerMode::kHostChecked;
   }
+  if (value == "fused-host-checked") {
+    return DeltaSteppingCsrControllerMode::kFusedHostChecked;
+  }
   if (value == "reduced-round-trip") {
     return DeltaSteppingCsrControllerMode::kReducedRoundTrip;
   }
@@ -2089,7 +2248,7 @@ void print_usage(const char* program) {
       << "  --max-sssp-iters <int>          Delta rounds, BFS depth, or Bellman-Ford rounds; -1 for default.\n"
       << "  --delta-force-generic           Bypass exact-unit specialization; retain weights and delta.\n"
       << "  --delta-force-legacy-parent     Force generic Delta predecessor recovery for A/B comparison.\n"
-      << "  --delta-controller <host-checked|reduced-round-trip>\n"
+      << "  --delta-controller <host-checked|fused-host-checked|reduced-round-trip>\n"
       << "                                  Generic Delta controller. Default: host-checked\n"
       << "  --delta-controller-batch-size <positive-int>\n"
       << "                                  Reduced-round-trip controller batch size. Default: 4\n"
@@ -2645,6 +2804,12 @@ PathfinderResult run_pathfinder(const HostCsrF32& base_graph,
                   << delta_options.parallel_net_workers
                   << " delta-step worker(s)\n";
       }
+      const std::size_t actual_delta_worker_count =
+          stream != nullptr
+              ? 1
+              : std::min<std::size_t>(
+                    delta_options.parallel_net_workers,
+                    std::max<std::size_t>(1, route_request_count));
       DeltaSteppingCsrWorkspaceOptions workspace_options;
       workspace_options.parent_mode =
           delta_options.delta_force_legacy_parent
@@ -2658,6 +2823,12 @@ PathfinderResult run_pathfinder(const HostCsrF32& base_graph,
           delta_options.delta_controller_mode;
       workspace_options.controller_batch_size =
           delta_options.delta_controller_batch_size;
+      workspace_options.controller_concurrency_hint =
+          static_cast<std::uint32_t>(std::max<std::size_t>(
+              1,
+              std::min<std::size_t>(
+                  actual_delta_worker_count,
+                  std::numeric_limits<std::uint32_t>::max())));
       workspace_options.capacity_hints = query_capacity_hints;
       if (workspace_options.execution_mode ==
           DeltaSteppingCsrExecutionMode::kForceGeneric) {
@@ -2698,18 +2869,12 @@ PathfinderResult run_pathfinder(const HostCsrF32& base_graph,
                                      net_records.begin(),
                                      net_records.end());
         }
-        const std::size_t actual_worker_count =
-            stream != nullptr
-                ? 1
-                : std::min<std::size_t>(
-                      delta_options.parallel_net_workers,
-                      std::max<std::size_t>(1, route_request_count));
         std::cout << delta_telemetry_aggregate_json(
                          flattened_telemetry,
                          delta_options,
                          delta_options.delta,
                          automatic_delta_wavefront_size,
-                         actual_worker_count)
+                         actual_delta_worker_count)
                   << '\n';
       }
       break;

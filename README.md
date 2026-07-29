@@ -107,10 +107,13 @@ make ROUTER=PathFinderFile BENCHMARKS="boom_med_pb" VERBOSE=1 \
   PATHFINDER_ARGS="--delta 1 --delta-force-generic"
 ```
 
-The generic controller has an explicit correctness-first A/B control. The
-existing host-checked controller remains the default. The reduced-round-trip
-controller is opt-in, uses a bounded device batch, and reports whether runtime
-cooperative-launch checks selected it or fell back to the host path:
+The generic controller has explicit correctness-first A/B controls. The
+existing `host-checked` scalar controller remains the trusted default and
+reference. Two experimental cooperative modes are opt-in:
+`fused-host-checked` executes one generic Delta action per publication, while
+`reduced-round-trip` uses a bounded configurable multi-action batch. Both
+report whether runtime cooperative-launch checks selected them or fell back to
+the scalar host path:
 
 ```bash
 # Existing/default controller.
@@ -119,7 +122,13 @@ make ROUTER=PathFinderFile BENCHMARKS="boom_med_pb" VERBOSE=1 \
   PATHFINDER_ARGS="--delta 1 --delta-force-generic \
     --parallel-net-workers 4 --delta-controller host-checked"
 
-# Opt-in controller candidate.
+# Experimental one-action cooperative controller.
+make ROUTER=PathFinderFile BENCHMARKS="boom_med_pb" VERBOSE=1 \
+  PATHFINDER_SSSP_ENGINE=delta-step \
+  PATHFINDER_ARGS="--delta 1 --delta-force-generic \
+    --parallel-net-workers 4 --delta-controller fused-host-checked"
+
+# Experimental bounded multi-action cooperative controller.
 make ROUTER=PathFinderFile BENCHMARKS="boom_med_pb" VERBOSE=1 \
   PATHFINDER_SSSP_ENGINE=delta-step \
   PATHFINDER_ARGS="--delta 1 --delta-force-generic \
@@ -416,7 +425,7 @@ Tuning options:
 | `--delta-multiplier <float>` | `1` | Positive multiplier for sweeping around `--delta auto`; rejected with an explicit numeric width. |
 | `--delta-force-generic` | unset | Bypass only the exact-unit Delta dispatch while preserving weights, delta, destination costs, and automatic compact-parent selection. |
 | `--delta-force-legacy-parent` | unset | Select legacy predecessor recovery for generic vector-target Delta runs; combine with force-generic for a parent-policy A/B test. |
-| `--delta-controller <host-checked\|reduced-round-trip>` | `host-checked` | Select the established generic host controller or the capability-gated bounded device controller. |
+| `--delta-controller <host-checked\|fused-host-checked\|reduced-round-trip>` | `host-checked` | Select the trusted scalar host reference, the experimental fixed-one-action cooperative controller, or the experimental bounded multi-action cooperative controller. |
 | `--delta-controller-batch-size <int>` | `4` in reduced mode | Positive device-control budget; valid only with an explicitly selected reduced-round-trip controller. |
 | `--delta-telemetry` | unset | Emit one aggregate Delta-Stepping telemetry JSON record after all net workers join. |
 | `--delta-benchmark-weights <unit\|all-light\|all-heavy\|mixed>` | unset | Deterministically replace in-memory CSR weights for a benchmark; requires an explicit numeric delta. |
@@ -435,9 +444,9 @@ Every Delta-specific control requires `--sssp-engine delta-step` or
 works with numeric or automatic delta. The multiplier requires automatic
 delta, benchmark weight families require an explicit numeric delta, and the
 seed is valid only with `mixed`. A controller batch size requires an explicit
-`--delta-controller reduced-round-trip`; host-checked mode preserves the
-existing null-stream and explicit-stream behavior exactly. Force-generic and
-force-legacy-parent may be
+`--delta-controller reduced-round-trip`; `host-checked` preserves the existing
+scalar null-stream and explicit-stream behavior, while `fused-host-checked`
+always uses its fixed one-action budget. Force-generic and force-legacy-parent may be
 combined: the first chooses generic execution and the second chooses its
 parent representation. Force-legacy-parent by itself also makes the fixed
 exact-unit parent path ineligible, so use force-generic with automatic parents
@@ -482,14 +491,15 @@ uninstrumented kernel instantiations and does not allocate, reset, or copy the
 device counter buffer. `--delta-telemetry` selects instrumented kernels and is
 intended for diagnosis, not clean wall-time measurement. After a successful
 worker join, PathFinder writes one JSON line to standard output with
-`type="delta_stepping_telemetry"` and `schema_version=2`; filter mixed logs on
+`type="delta_stepping_telemetry"` and `schema_version=3`; filter mixed logs on
 that type. `queries` counts actual collected net searches, counter fields are
 sums across searches, and queue fields under `maxima` are per-search maxima
 combined with `max`, not sums. Execution-path counts distinguish exact-unit,
 compact generic, legacy generic, and generic distances-only work. The record
-also includes the configured controller and batch, effective host/reduced query
-counts, and `controller_fallback_queries`; this prevents a capability fallback
-from being mistaken for a reduced-controller measurement.
+also includes the configured controller and batch, effective host/fused/reduced
+query counts, selected backend, fallback-reason counts, cooperative controller
+diagnostics, and `controller_fallback_queries`; this prevents a capability
+fallback from being mistaken for a cooperative-controller measurement.
 
 The counters measure bucket/light/heavy rounds, frontier and edge visits,
 distance atomic attempts/successes/CAS retries, logical queue insertions and

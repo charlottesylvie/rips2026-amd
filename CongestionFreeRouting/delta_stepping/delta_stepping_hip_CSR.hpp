@@ -33,6 +33,24 @@ enum class DeltaSteppingCsrExecutionPath {
   kGenericDistancesOnly,
 };
 
+enum class DeltaSteppingCsrControllerBackend : std::uint32_t {
+  kNotRun = 0,
+  kScalarHost = 1,
+  kCooperativeGrid = 2,
+  kExactUnit = 3,
+};
+
+enum class DeltaSteppingCsrControllerFallbackReason : std::uint32_t {
+  kNone = 0,
+  kProgressCallback = 1,
+  kExactUnitBypass = 2,
+  kGenerationBudget = 3,
+  kCooperativeUnsupported = 4,
+  kCapabilityQueryFailed = 5,
+  kOccupancyQueryFailed = 6,
+  kNoResidentGrid = 7,
+};
+
 // Per-invocation telemetry. Every counter is exact under the semantics below;
 // pending-entry counters count examinations and may therefore count one token
 // more than once across scheduler scans. Queue peaks count entries, not bytes.
@@ -78,6 +96,22 @@ struct DeltaSteppingCsrTelemetry {
       kDeltaSteppingCsrRecommendedControllerBatchSize;
   std::uint32_t effective_controller_batch_size = 1;
   bool controller_fallback = false;
+  DeltaSteppingCsrControllerBackend controller_backend =
+      DeltaSteppingCsrControllerBackend::kNotRun;
+  DeltaSteppingCsrControllerFallbackReason controller_fallback_reason =
+      DeltaSteppingCsrControllerFallbackReason::kNone;
+  std::uint32_t cooperative_grid_blocks_min = 0;
+  std::uint32_t cooperative_grid_blocks_max = 0;
+  std::uint32_t cooperative_active_blocks_per_compute_unit = 0;
+  std::uint32_t cooperative_compute_units = 0;
+  std::uint64_t cooperative_launches = 0;
+  std::uint64_t controller_publications = 0;
+  std::uint64_t controller_nonterminal_publications = 0;
+  std::uint64_t controller_terminal_publications = 0;
+  std::uint64_t controller_action_slots_budgeted = 0;
+  std::uint64_t controller_actions_completed = 0;
+  std::uint64_t controller_unused_action_slots = 0;
+  std::uint64_t cooperative_grid_barriers = 0;
 };
 
 struct DeltaSteppingCsrRunOptions {
@@ -91,6 +125,10 @@ struct DeltaSteppingCsrRunOptions {
 
 const char* delta_stepping_execution_path_name(
     DeltaSteppingCsrExecutionPath path) noexcept;
+const char* delta_stepping_controller_backend_name(
+    DeltaSteppingCsrControllerBackend backend) noexcept;
+const char* delta_stepping_controller_fallback_reason_name(
+    DeltaSteppingCsrControllerFallbackReason reason) noexcept;
 
 enum class DeltaSteppingCsrParentMode {
   // Applies to vector-target workspace runs. Single-target/full-predecessor,
@@ -143,9 +181,9 @@ struct DeltaSteppingCsrWorkspaceOptions {
   // Zero fields preserve lazy growth for low-level callers. Keep this field in
   // its historical aggregate position for source compatibility.
   SsspQueryCapacityHints capacity_hints{};
-  // The existing host-checked controller remains the default.  The reduced
-  // round-trip path is capability-gated and falls back to it when cooperative
-  // grid launch is unavailable for the selected kernel specialization.
+  // Host-checked remains the scalar reference. Fused-host-checked and
+  // reduced-round-trip are explicit cooperative A/B modes and fall back to
+  // scalar host checking when their selected kernel cannot launch safely.
   DeltaSteppingCsrControllerMode controller_mode =
       DeltaSteppingCsrControllerMode::kHostChecked;
   std::uint32_t controller_batch_size =
@@ -155,6 +193,10 @@ struct DeltaSteppingCsrWorkspaceOptions {
   // seeds the next generic generation advance. It has no effect in Boolean
   // membership mode.
   std::uint32_t controller_generation_seed_for_testing = 0;
+  // Divide a cooperative controller's CU-sized grid among this many expected
+  // concurrent workspace streams. PathFinder supplies its actual worker
+  // count; low-level callers retain one full-grid controller by default.
+  std::uint32_t controller_concurrency_hint = 1;
 };
 
 struct DeltaSteppingCsrGraphOptions {

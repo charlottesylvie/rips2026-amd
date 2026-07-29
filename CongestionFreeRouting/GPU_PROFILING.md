@@ -16,6 +16,15 @@ figures as the host-checked baseline, not as measurements of the opt-in
 controller in this checkout. Reproduce correctness and profiler-free timing
 before using archived percentages to rank current code.
 
+The user later observed that the old `reduced-round-trip` controller was
+dramatically slower than `host-checked`. That report is an important rejection
+signal, but it did not include a retained timing series and is not promoted to
+a measurement here. This pass keeps `host-checked` as the unchanged scalar
+correctness reference, adds the explicit experimental `fused-host-checked`
+cooperative batch-one arm, and keeps `reduced-round-trip` as the explicit
+multi-action arm. No cooperative result in this checkout has been compiled or
+run on AMD hardware, and no speedup is claimed.
+
 The full profiling workflow has a manual one-time device stage followed by
 three Make-driven per-test processes:
 
@@ -64,7 +73,7 @@ Add the following to the normal `pathfinder` build:
 For example:
 
 ```bash
-hipcc -std=c++17 -O3 -x hip -DBF10_NO_MAIN \
+hipcc -std=c++17 -O3 -x hip --offload-arch=gfx1151 -DBF10_NO_MAIN \
   -DPATHFINDER_ENABLE_ROCTX \
   -I HIP_kernel/bellman_ford/src \
   -I CongestionFreeRouting/bellman_ford \
@@ -81,7 +90,7 @@ ROCm distributions package the header and library as
 `rocprofiler-sdk-roctx`. Rebuild without the macro/library for final timing if
 even the small marker overhead matters.
 
-## First pass: controller A/B GPU timelines with rocprofv3
+## First pass: three-arm controller GPU timelines with rocprofv3
 
 ```bash
 make ROUTER=PathFinderFile BENCHMARKS="logicnets_jscl" VERBOSE=1 \
@@ -90,6 +99,13 @@ make ROUTER=PathFinderFile BENCHMARKS="logicnets_jscl" VERBOSE=1 \
     --delta-controller host-checked --parallel-net-workers 4" \
   PATHFINDER_PROFILE=rocprofv3 \
   PATHFINDER_PROFILE_RUN=delta-host-checked-w4
+
+make ROUTER=PathFinderFile BENCHMARKS="logicnets_jscl" VERBOSE=1 \
+  PATHFINDER_SSSP_ENGINE=delta-step \
+  PATHFINDER_ARGS="--delta 1 --delta-force-generic \
+    --delta-controller fused-host-checked --parallel-net-workers 4" \
+  PATHFINDER_PROFILE=rocprofv3 \
+  PATHFINDER_PROFILE_RUN=delta-fused-host-checked-w4
 
 make ROUTER=PathFinderFile BENCHMARKS="logicnets_jscl" VERBOSE=1 \
   PATHFINDER_SSSP_ENGINE=delta-step \
@@ -104,15 +120,41 @@ Four workers are the current measured classic Delta-Stepping timing control.
 Keep the count explicit when comparing traces or profiler-free timings; it is
 workload-specific and is not a universal default.
 
-The host-checked controller is the default and the correctness reference. The
-reduced-round-trip controller is opt-in. It capability-checks its device
-controller and falls back before traversal when the selected configuration is
-unsupported; callbacks also require host bucket boundaries. Always pair a
-profile with telemetry from a separate run and confirm that
-`effective_controller_modes.reduced_round_trip` equals the query count and
-`controller_fallback_queries` is zero before calling it a reduced-controller
-measurement. Batch size one is the state-machine equivalence control; batch
-size four is the initial performance candidate, not a portable worker count.
+The host-checked controller is the default, trusted scalar correctness
+reference; it never silently selects the cooperative backend.
+`fused-host-checked` is an explicit experimental cooperative controller with a
+fixed one-action budget. `reduced-round-trip` is the explicit multi-action
+controller, with batch size four as the initial candidate and a hard maximum
+of 64. Both cooperative modes capability-check before traversal and fall back
+to the scalar controller when unsupported; callbacks also require host bucket
+boundaries. Always pair a profile with telemetry from a separate run and
+require the requested effective mode, `cooperative_grid` backend, and zero
+unexpected fallbacks before naming a sample fused or reduced.
+
+For a successful all-light vector-target query on an explicit stream, let `L`
+be light actions, `B` processed buckets, and `K` the reduced action budget. The
+static synchronization inventory is `2L + 4B + 5` for host-checked, `L + 8`
+for fused-host-checked, and `ceil(L / K) + 8` for reduced-round-trip. At
+`L = B = 8`, those are 53, 16, and 10 synchronizations (`K = 4`); at
+`L = B = 10`, they are 65, 18, and 11. The cooperative fixed term includes
+one fewer boundary than the prior pass because initial controller-state H2D is
+queued before source initialization and completed by the already-required
+post-source publication synchronization. These formulas count blocking API
+boundaries, not saved wall time.
+
+The old cooperative mechanics could make fewer host waits slower: a Boolean
+all-light bucket-closing action that compacted and continued crossed 12 phase
+barriers, while the Boolean target-settled terminal branch crossed six; other
+branches have different counts, and every launch adds entry/final publication
+barriers. Every thread also issued redundant fences and contended atomic
+scalar reads around phase changes, queue reservation used a CAS loop, pending
+minimum used one global atomic per thread, and each query could span a
+one-block-per-CU grid. The repair uses grid-barrier ordering with
+one final system fence, stable post-barrier loads, one `atomicAdd` reservation,
+a block minimum followed by one global atomic per block, and a
+concurrency-partitioned grid that does not shrink from the batch's starting
+frontier. Treat telemetry's publications, completed actions, grid size, and
+grid barriers as acceptance data; fewer publications alone is insufficient.
 
 Important: the current FPGA Interchange converter writes every CSR edge weight
 as `1.0f`. A graph at or below the exact-unit specialization's `2^24`-row
@@ -222,17 +264,26 @@ make ROUTER=PathFinderFile BENCHMARKS="logicnets_jscl" VERBOSE=1 \
   PATHFINDER_SSSP_ENGINE=delta-step \
   PATHFINDER_ARGS="--delta 2 --delta-force-generic \
     --delta-benchmark-weights mixed --delta-benchmark-weight-seed 17 \
+    --delta-controller fused-host-checked --parallel-net-workers 4 \
+    --delta-telemetry" \
+  PATHFINDER_PROFILE=none 2>&1 | tee delta-mixed-fused-telemetry.log
+
+make ROUTER=PathFinderFile BENCHMARKS="logicnets_jscl" VERBOSE=1 \
+  PATHFINDER_SSSP_ENGINE=delta-step \
+  PATHFINDER_ARGS="--delta 2 --delta-force-generic \
+    --delta-benchmark-weights mixed --delta-benchmark-weight-seed 17 \
     --delta-controller reduced-round-trip \
     --delta-controller-batch-size 4 --parallel-net-workers 4 \
     --delta-telemetry" \
   PATHFINDER_PROFILE=none 2>&1 | tee delta-mixed-reduced-telemetry.log
 
 grep '^{"type":"delta_stepping_telemetry"' \
-  delta-mixed-host-telemetry.log delta-mixed-reduced-telemetry.log
+  delta-mixed-host-telemetry.log delta-mixed-fused-telemetry.log \
+  delta-mixed-reduced-telemetry.log
 ```
 
 After all workers join, `pathfinder` writes exactly one compact JSON line to
-standard output with `type="delta_stepping_telemetry"`, `schema_version=2`,
+standard output with `type="delta_stepping_telemetry"`, `schema_version=3`,
 and `scope="pathfinder_run"`. `queries` counts actual SSSP invocations, not net
 slots; a net with no unresolved target leaves its slot uncollected.
 `completed_queries` counts records whose cleanup and final synchronization
@@ -241,11 +292,12 @@ finished. `execution_paths` counts `exact_unit`, `compact_generic`,
 resolved numeric delta, runtime wavefront size, actual worker count,
 auto-delta/multiplier values, force-mode flags, configured `controller_mode`
 and `controller_batch_size`, per-query `effective_controller_modes` counts,
-and `controller_fallback_queries`. The configured names use
-`host_checked`/`reduced_round_trip` in JSON even though the CLI spells them
-`host-checked`/`reduced-round-trip`. Counter fields are summed across queries;
-the three queue high-water fields under `maxima` are maxima across queries,
-not sums.
+`controller_fallback_queries`, backend/fallback-reason histograms, and a
+`controller_diagnostics` object. The configured names use `host_checked`,
+`fused_host_checked`, and `reduced_round_trip` in JSON even though the CLI
+uses hyphens. Counter fields are summed across queries; controller grid minima
+and maxima summarize selected cooperative queries, and the three queue
+high-water fields under `maxima` are maxima across queries, not sums.
 
 The counters are exact under these definitions:
 
@@ -270,8 +322,15 @@ The counters are exact under these definitions:
 | `stale_pending_entry_examinations` | Those examinations whose token is inactive or no longer names a valid future bucket for that scan. It has the same repeated-examination behavior. |
 | `reached_vertices` | Unique vertices whose distance became finite during the invocation, including deduplicated sources. |
 | `controller_round_trips` | Explicitly counted host-visible status/count transfers used for control decisions. It is not a count of every HIP call or synchronization. |
-| `controller_mode`, `controller_batch_size` | Run-level requested A/B configuration. These fields alone do not prove that the reduced controller executed. |
-| `effective_controller_modes`, `controller_fallback_queries` | Query counts by controller actually used and the number that fell back to host checking. Reject a performance sample when either total does not match the intended A/B arm. |
+| `controller_mode`, `controller_batch_size` | Run-level requested A/B configuration. These fields alone do not prove that a cooperative controller executed. |
+| `effective_controller_modes` | Query counts by effective mode: `host_checked`, `fused_host_checked`, and `reduced_round_trip`. Host must remain host; a fused or reduced sample must put every generic query in its requested bucket. |
+| `controller_backends` | Query counts for `not_run`, `scalar_host`, `cooperative_grid`, and `exact_unit`. With `--delta-force-generic`, a valid fused/reduced sample requires `cooperative_grid == queries`; host requires `scalar_host == queries`. |
+| `controller_fallback_reasons`, `controller_fallback_queries` | Counts for `none`, callback, exact-unit bypass, generation budget, unsupported cooperative launch, capability/occupancy query failure, and no resident grid. Requested scalar host execution reports `none`, not a fallback. Reject an intended cooperative sample if any query falls back. |
+| `controller_diagnostics.cooperative_launches`, `controller_diagnostics.controller_publications` | Cooperative kernel launches and host-visible descriptor publications. They must equal each other and `controller_round_trips` for a completed cooperative run. |
+| `controller_diagnostics.controller_nonterminal_publications`, `controller_diagnostics.controller_terminal_publications` | Progress versus terminal descriptors; their sum must equal total publications. |
+| `controller_diagnostics.controller_action_slots_budgeted`, `controller_diagnostics.controller_actions_completed`, `controller_diagnostics.controller_unused_action_slots` | Bounded-work accounting. Completed plus unused slots must equal budgeted slots. Fused budgets one slot per launch; reduced budgets at most 64 per launch and should publish fewer times than completed actions on the intended workload. |
+| `controller_diagnostics.cooperative_grid_blocks_min/max`, active blocks per CU, and compute units | Effective occupancy/concurrency partition. Check that four-worker runs retain useful parallel width and that a small initial frontier does not collapse a multi-action batch to one block. |
+| `controller_diagnostics.cooperative_grid_barriers` | Device-wide controller phase barriers actually crossed. Compare it with actions and wall time to detect work amplification; it is not a host synchronization count. |
 | `compact_parent_fallback_events` | One when an automatic compact-parent vector-target query had to use legacy parents because its edge-to-source map was unavailable; otherwise zero. |
 | `current_queue_high_water`, `pending_queue_high_water`, `heavy_queue_high_water` | Maximum observed queue entry counts within one invocation. The exact-unit current queue is append-only, so its peak is cumulative rather than one BFS layer's width. The run-level JSON reports the maximum per-query value; these are entries, not bytes. |
 
@@ -461,13 +520,272 @@ opt-in JSON counters above for those ratios, but collect them separately from
 the uninstrumented timing baseline because telemetry deliberately adds device
 instrumentation.
 
-## AMD validation checklist for the bounded controller
+## gfx1151 three-arm controller acceptance
+
+Run this section on the target AMD host from the repository root. It supersedes
+the historical two-arm controller examples later in this file. The input names
+match the existing `logicnets_jscl` procedure; substitute absolute paths
+without changing controller flags if the artifacts live elsewhere.
+
+Build the normal timing binary explicitly for gfx1151, then run one strict,
+telemetry-free correctness pass for each arm:
+
+```bash
+set -euo pipefail
+validation_root=amd-validation/fused-controller
+mkdir -p "$validation_root/results" "$validation_root/work" \
+  "$validation_root/logs" "$validation_root/profiles" "$validation_root/timing"
+
+make -B ./PathFinderFile
+make -B ./pathfinder \
+  PATHFINDER_HIP_FLAGS='-std=c++17 -O3 -x hip --offload-arch=gfx1151'
+
+common_args=(
+  --logical-netlist logicnets_jscl.netlist
+  --device-graph xcvu3p.full-poc-base-wire.devicegraph
+  --sssp-engine delta-step --delta 1 --delta-force-generic
+  --parallel-net-workers 4 --strict-routing
+)
+
+run_correctness_arm() {
+  local arm=$1
+  shift
+  env PATHFINDER_PROFILE_COMMAND= ./PathFinderFile \
+    logicnets_jscl_unrouted.phys \
+    "$validation_root/results/${arm}.phys" \
+    "${common_args[@]}" \
+    --work-dir "$validation_root/work/${arm}" \
+    "$@" \
+    2>&1 | tee "$validation_root/logs/${arm}.log"
+}
+
+run_correctness_arm host \
+  --delta-controller host-checked
+run_correctness_arm fused \
+  --delta-controller fused-host-checked
+run_correctness_arm reduced-b4 \
+  --delta-controller reduced-round-trip --delta-controller-batch-size 4
+
+cmp "$validation_root/results/host.phys" \
+  "$validation_root/results/fused.phys"
+cmp "$validation_root/results/host.phys" \
+  "$validation_root/results/reduced-b4.phys"
+cmp "$validation_root/work/host/logicnets_jscl_PathFinderFile.routes.jsonl" \
+  "$validation_root/work/fused/logicnets_jscl_PathFinderFile.routes.jsonl"
+cmp "$validation_root/work/host/logicnets_jscl_PathFinderFile.routes.jsonl" \
+  "$validation_root/work/reduced-b4/logicnets_jscl_PathFinderFile.routes.jsonl"
+```
+
+Exact `cmp` equality is the strongest gate for this deterministic benchmark.
+Also retain the strict router/checker result and the route-depth check described
+below. If another workload permits multiple equally valid route encodings, use
+the CPU-reference distance/path checker instead of weakening semantic
+validation to a file-size or aggregate-cost comparison.
+
+Collect schema-3 telemetry in separate runs. These are diagnostics, never
+timing samples:
+
+```bash
+run_telemetry_arm() {
+  local arm=$1
+  shift
+  env PATHFINDER_PROFILE_COMMAND= ./PathFinderFile \
+    logicnets_jscl_unrouted.phys \
+    "$validation_root/results/${arm}-telemetry.phys" \
+    "${common_args[@]}" --delta-telemetry \
+    --work-dir "$validation_root/work/${arm}-telemetry" \
+    "$@" \
+    2>&1 | tee "$validation_root/logs/${arm}-telemetry.log"
+  grep '^{"type":"delta_stepping_telemetry"' \
+    "$validation_root/logs/${arm}-telemetry.log" \
+    > "$validation_root/results/${arm}-telemetry.json"
+}
+
+run_telemetry_arm host \
+  --delta-controller host-checked
+run_telemetry_arm fused \
+  --delta-controller fused-host-checked
+run_telemetry_arm reduced-b4 \
+  --delta-controller reduced-round-trip --delta-controller-batch-size 4
+
+python3 - <<'PY'
+import json
+import pathlib
+
+root = pathlib.Path("amd-validation/fused-controller/results")
+arms = {
+    "host": ("host_checked", "scalar_host"),
+    "fused": ("fused_host_checked", "cooperative_grid"),
+    "reduced-b4": ("reduced_round_trip", "cooperative_grid"),
+}
+
+for arm, (mode, backend) in arms.items():
+    record = json.loads((root / f"{arm}-telemetry.json").read_text())
+    queries = record["queries"]
+    assert record["schema_version"] == 3
+    assert record["completed_queries"] == queries
+    assert record["force_generic"] is True
+    assert record["execution_paths"]["exact_unit"] == 0
+    assert record["effective_controller_modes"][mode] == queries
+    assert record["controller_backends"][backend] == queries
+    assert record["controller_fallback_queries"] == 0
+    assert record["controller_fallback_reasons"]["none"] == queries
+
+    diagnostics = record["controller_diagnostics"]
+    if backend == "scalar_host":
+        assert diagnostics["cooperative_launches"] == 0
+        assert diagnostics["controller_publications"] == 0
+        continue
+
+    publications = diagnostics["controller_publications"]
+    launches = diagnostics["cooperative_launches"]
+    actions = diagnostics["controller_actions_completed"]
+    slots = diagnostics["controller_action_slots_budgeted"]
+    unused = diagnostics["controller_unused_action_slots"]
+    assert publications == launches
+    assert publications == record["counters"]["controller_round_trips"]
+    assert diagnostics["controller_nonterminal_publications"] + \
+        diagnostics["controller_terminal_publications"] == publications
+    assert actions + unused == slots
+    assert diagnostics["cooperative_grid_blocks_min"] > 0
+    assert diagnostics["cooperative_grid_blocks_max"] >= \
+        diagnostics["cooperative_grid_blocks_min"]
+    assert diagnostics["cooperative_grid_barriers"] >= 2 * launches
+    if arm == "fused":
+        assert slots == launches
+    else:
+        assert slots <= 64 * launches
+        assert publications < actions, "batch-four did not amortize publications"
+
+    print(
+        arm,
+        f"queries={queries}",
+        f"publications={publications}",
+        f"actions={actions}",
+        f"grid_barriers={diagnostics['cooperative_grid_barriers']}",
+    )
+PY
+```
+
+Then collect five uninstrumented samples per arm. The alternating order limits
+clock/thermal drift; the warm-up is deliberately not timed:
+
+```bash
+for arm in host fused reduced-b4; do
+  case "$arm" in
+    host) controller_args=(--delta-controller host-checked) ;;
+    fused) controller_args=(--delta-controller fused-host-checked) ;;
+    reduced-b4) controller_args=(--delta-controller reduced-round-trip \
+      --delta-controller-batch-size 4) ;;
+  esac
+  env PATHFINDER_PROFILE_COMMAND= ./PathFinderFile \
+    logicnets_jscl_unrouted.phys \
+    "$validation_root/timing/${arm}-warmup.phys" \
+    "${common_args[@]}" "${controller_args[@]}" \
+    --work-dir "$validation_root/work/${arm}-warmup"
+done
+
+for sample in 1 2 3 4 5; do
+  if (( sample % 2 )); then
+    arms=(host fused reduced-b4)
+  else
+    arms=(reduced-b4 fused host)
+  fi
+  for arm in "${arms[@]}"; do
+    case "$arm" in
+      host) controller_args=(--delta-controller host-checked) ;;
+      fused) controller_args=(--delta-controller fused-host-checked) ;;
+      reduced-b4) controller_args=(--delta-controller reduced-round-trip \
+        --delta-controller-batch-size 4) ;;
+    esac
+    /usr/bin/time -f 'wall_seconds=%e\npeak_rss_kib=%M' \
+      -o "$validation_root/logs/${arm}-time-${sample}.txt" \
+      env PATHFINDER_PROFILE_COMMAND= ./PathFinderFile \
+        logicnets_jscl_unrouted.phys \
+        "$validation_root/timing/${arm}-${sample}.phys" \
+        "${common_args[@]}" "${controller_args[@]}" \
+        --work-dir "$validation_root/work/${arm}-${sample}"
+  done
+done
+```
+
+For a worker/concurrency regression, rerun the same telemetry-free timing loop
+with `--parallel-net-workers` set to 1, 2, and 4 for every controller. The
+following exact sweep records one warm-up and three samples per cell:
+
+```bash
+for workers in 1 2 4; do
+  for arm in host fused reduced-b4; do
+    case "$arm" in
+      host) controller_args=(--delta-controller host-checked) ;;
+      fused) controller_args=(--delta-controller fused-host-checked) ;;
+      reduced-b4) controller_args=(--delta-controller reduced-round-trip \
+        --delta-controller-batch-size 4) ;;
+    esac
+    for sample in warmup 1 2 3; do
+      command=(env PATHFINDER_PROFILE_COMMAND= ./PathFinderFile \
+        logicnets_jscl_unrouted.phys \
+        "$validation_root/timing/${arm}-w${workers}-${sample}.phys" \
+        --logical-netlist logicnets_jscl.netlist \
+        --device-graph xcvu3p.full-poc-base-wire.devicegraph \
+        --sssp-engine delta-step --delta 1 --delta-force-generic \
+        --parallel-net-workers "$workers" --strict-routing \
+        "${controller_args[@]}" \
+        --work-dir "$validation_root/work/${arm}-w${workers}-${sample}")
+      if [[ "$sample" == warmup ]]; then
+        "${command[@]}"
+      else
+        /usr/bin/time -f 'wall_seconds=%e\npeak_rss_kib=%M' \
+          -o "$validation_root/logs/${arm}-w${workers}-time-${sample}.txt" \
+          "${command[@]}"
+      fi
+    done
+  done
+done
+```
+
+Finally rebuild with the ROCTx command above and capture one runtime trace per
+arm with telemetry disabled. `PathFinderFile` applies the profile command only
+to the GPU `pathfinder` child:
+
+```bash
+for arm in host fused reduced-b4; do
+  case "$arm" in
+    host) controller_args=(--delta-controller host-checked) ;;
+    fused) controller_args=(--delta-controller fused-host-checked) ;;
+    reduced-b4) controller_args=(--delta-controller reduced-round-trip \
+      --delta-controller-batch-size 4) ;;
+  esac
+  env PATHFINDER_PROFILE_COMMAND="rocprofv3 --runtime-trace --stats \
+    --output-directory $validation_root/profiles/${arm} --" \
+    ./PathFinderFile \
+      logicnets_jscl_unrouted.phys \
+      "$validation_root/results/${arm}-rocprof.phys" \
+      "${common_args[@]}" "${controller_args[@]}" \
+      --work-dir "$validation_root/work/${arm}-rocprof" \
+      2>&1 | tee "$validation_root/logs/${arm}-rocprof.log"
+  cmp "$validation_root/results/host.phys" \
+    "$validation_root/results/${arm}-rocprof.phys"
+done
+```
+
+For each trace report dispatches, `hipStreamSynchronize` calls, descriptor D2H
+copies, kernel-union idle time, concurrent active worker streams, and the
+`delta_step.scalar_host_controller` versus
+`delta_step.cooperative_controller` ROCTx ranges. The fused arm must materially
+reduce host boundaries before it is considered a controller win; the reduced
+arm must reduce publications beyond fused without increasing controller
+barriers/device work enough to lose profiler-free wall time.
+
+## Additional low-level AMD validation checklist
 
 Nothing in this section was run on the host that implemented the bounded
 controller pass: it has no HIP compiler, ROCm runtime, or AMD GPU. Run these
 commands from the repository root on a gfx1151 AMD system and retain every
-log. Keep both the reduced controller and generation-tagged membership opt-in
-until their complete matrix and repeated explicit-stream stress pass.
+log. Keep both cooperative controllers and generation-tagged membership opt-in
+until their complete matrix and repeated explicit-stream stress pass. Use the
+three-arm procedure above for current PathFinder acceptance; this section adds
+the lower-level storage, ownership, and reuse matrix.
 
 Record the checkout and device first, then build the production router and the
 two focused HIP regressions:
@@ -485,14 +803,14 @@ make ./PathFinderFile ./pathfinder
 test -x ./interchange_to_csr
 test -x ./routes_to_phys
 
-hipcc -std=c++17 -O2 -pthread -x hip \
+hipcc -std=c++17 -O2 -pthread -x hip --offload-arch=gfx1151 \
   -I HIP_kernel/bellman_ford/src \
   -I CongestionFreeRouting/unit_bfs \
   CongestionFreeRouting/tests/unit_bfs_hip_test.cpp \
   CongestionFreeRouting/unit_bfs/unit_bfs_hip_CSR.cpp \
   -o amd-validation/bin/unit_bfs_hip_test
 
-hipcc -std=c++17 -O2 -pthread -x hip \
+hipcc -std=c++17 -O2 -pthread -x hip --offload-arch=gfx1151 \
   -I HIP_kernel/bellman_ford/src \
   -I CongestionFreeRouting/delta_stepping \
   CongestionFreeRouting/tests/delta_stepping_hip_test.cpp \
@@ -504,8 +822,8 @@ The UnitBFS binary runs automatic-compact and forced-wide rows through all
 four extraction/visitation combinations: host offsets with sparse reset (the
 default), device offsets with sparse reset, host offsets with generation
 visitation, and device offsets with generation visitation. The Delta binary
-must run the Cartesian controller matrix: host-checked and
-reduced-round-trip (batch sizes 1 and 4), automatic-compact and forced-wide
+must run the Cartesian controller matrix: host-checked, fused-host-checked,
+and reduced-round-trip (batch sizes 1 and 4), automatic-compact and forced-wide
 row offsets, Boolean and generation membership, automatic compact and forced
 legacy parents, and path-producing and distances-only runs. Fixtures cover
 zero-weight SCCs, parallel edges, duplicate/multiple sources and targets,
@@ -529,16 +847,16 @@ DELTA_MULTI_QUEUE_STRESS_RUNS=1200 \
   2>&1 | tee amd-validation/logs/delta-explicit-stream-stress.log
 ```
 
-`DELTA_REQUIRE_REDUCED_CONTROLLER=1` makes every instrumented reduced-mode
-matrix/stress probe fail on a capability fallback; callback probes still
+`DELTA_REQUIRE_REDUCED_CONTROLLER=1` makes every instrumented fused/reduced
+matrix or stress probe fail on a capability fallback; callback probes still
 require their intentional host fallback. The Delta stress must keep at least
 four nonblocking streams active, reuse each
 workspace for thousands of queries, force generation rollover repeatedly, and
 exercise a callback exception/abort followed by a successful query on the
 same workspace. Confirm exact distance/path equivalence and outgoing-row edge
-ownership after every run. Confirm telemetry reports reduced mode (not
-fallback) for every intended reduced query, while callback queries report a
-host-checked fallback. A passing low-level suite is required before
+ownership after every run. Confirm telemetry reports the requested cooperative
+mode and backend (not fallback) for every intended fused/reduced query, while
+callback queries report a host-checked fallback. A passing low-level suite is required before
 interpreting timing.
 
 For `logicnets_jscl`, first create a small route-tree depth checker. It treats
@@ -621,11 +939,12 @@ cp logicnets_jscl_PathFinderFile.wirelength \
   amd-validation/results/logicnets-unit-w4.wirelength
 ```
 
-Repeat the full routing validation with forced-generic classic Delta-Stepping,
-`delta=1`, four workers, and each controller. Automatic compact row offsets
-and Boolean membership are the production settings here; the wider storage,
-membership, parent, and distances-only matrix remains in the low-level suite.
-Run the host reference first:
+The retained route-depth example below shows the older host/reduced workflow;
+use the three-arm procedure above for current controller acceptance. It uses
+forced-generic classic Delta-Stepping, `delta=1`, four workers, automatic
+compact row offsets, and Boolean membership. The wider storage, membership,
+parent, and distances-only matrix remains in the low-level suite. Run the host
+reference first:
 
 ```bash
 rm -f logicnets_jscl_PathFinderFile.phys \
@@ -709,11 +1028,12 @@ Inspect the telemetry JSON and require `completed_queries == queries`,
 only the final `.check` marker. Four workers are a controlled benchmark input,
 not a default to embed in portable workspace behavior.
 
-Finally collect profiler-free end-to-end samples and peak resident memory.
-The commands below use GNU `time`, keep telemetry and profilers disabled,
-perform one warm-up for each Delta controller, and then record five fresh
-conversion, routing, and reconstruction runs per controller. Keep all inputs
-except the controller flags identical:
+The historical commands below collect profiler-free end-to-end samples for
+the host/reduced pair. The three-arm alternating-order procedure above
+supersedes them for this pass. They use GNU `time`, keep telemetry and profilers
+disabled, perform one warm-up per arm, and then record five fresh conversion,
+routing, and reconstruction runs. Keep all inputs except the controller flags
+identical:
 
 ```bash
 env PATHFINDER_PROFILE_COMMAND= ./PathFinderFile \

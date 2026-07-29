@@ -87,6 +87,21 @@ int main() {
                        "--delta-telemetry") == 1,
             "router did not forward delta telemetry exactly once");
 
+    const Options fused = parse(
+        {"PathFinderFile",
+         "design_unrouted.phys",
+         "design_routed.phys",
+         "--sssp-engine",
+         "delta-step",
+         "--delta-controller",
+         "fused-host-checked"});
+    require(fused.pathfinder_args ==
+                std::vector<std::string>({"--sssp-engine",
+                                          "delta-step",
+                                          "--delta-controller",
+                                          "fused-host-checked"}),
+            "router did not forward the fused host-checked controller");
+
     const Options shorthand = parse(
         {"PathFinderFile",
          "design_unrouted.phys",
@@ -121,6 +136,50 @@ int main() {
     }
     require(missing_controller_batch_rejected,
             "router accepted a controller batch option without its value");
+
+    for (const std::string& controller :
+         std::vector<std::string>({"host-checked", "fused-host-checked"})) {
+      bool incompatible_batch_rejected = false;
+      try {
+        (void)parse({"PathFinderFile",
+                     "design_unrouted.phys",
+                     "design_routed.phys",
+                     "--delta-controller",
+                     controller,
+                     "--delta-controller-batch-size",
+                     "4"});
+      } catch (const std::runtime_error&) {
+        incompatible_batch_rejected = true;
+      }
+      require(incompatible_batch_rejected,
+              "router accepted a controller batch size with " + controller);
+    }
+
+    bool batch_without_controller_rejected = false;
+    try {
+      (void)parse({"PathFinderFile",
+                   "design_unrouted.phys",
+                   "design_routed.phys",
+                   "--delta-controller-batch-size",
+                   "4"});
+    } catch (const std::runtime_error&) {
+      batch_without_controller_rejected = true;
+    }
+    require(batch_without_controller_rejected,
+            "router accepted a controller batch size without a controller");
+
+    bool invalid_controller_rejected = false;
+    try {
+      (void)parse({"PathFinderFile",
+                   "design_unrouted.phys",
+                   "design_routed.phys",
+                   "--delta-controller",
+                   "fast"});
+    } catch (const std::runtime_error&) {
+      invalid_controller_rejected = true;
+    }
+    require(invalid_controller_rejected,
+            "router accepted an unknown Delta controller mode");
 
     for (const std::string& weight_family :
          std::vector<std::string>({"unit", "all-light", "all-heavy"})) {

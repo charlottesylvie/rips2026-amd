@@ -280,6 +280,7 @@ struct CooperativeDeltaControllerState {
   std::uint32_t pending_queue_parity = 0;
   std::uint32_t generation_cursor = 0;
   std::uint32_t reserved = 0;
+  unsigned long long grid_barriers = 0;
 };
 
 static_assert(std::is_standard_layout<CooperativeDeltaControllerState>::value,
@@ -289,6 +290,15 @@ static_assert(std::is_trivially_copyable<
               "cooperative Delta controller state must be trivially copyable");
 static_assert(offsetof(CooperativeDeltaControllerState, descriptor) == 0,
               "the published Delta controller descriptor must be first");
+
+struct CooperativeLaunchConfiguration {
+  bool initialized = false;
+  int max_blocks = 0;
+  int active_blocks_per_compute_unit = 0;
+  int compute_units = 0;
+  DeltaSteppingCsrControllerFallbackReason fallback_reason =
+      DeltaSteppingCsrControllerFallbackReason::kNone;
+};
 
 struct DeltaSteppingScratch {
   Offset rows = 0;
@@ -339,15 +349,24 @@ struct DeltaSteppingScratch {
   // Persistent pinned staging for the host-checked controller's per-block
   // pending-bucket minima.  It outlives every asynchronous copy that uses it.
   std::unique_ptr<PinnedHostBuffer<int>> host_pending_bucket_block_mins;
-  std::unique_ptr<
-      PinnedHostBuffer<DeltaSteppingCsrControllerDescriptor>>
-      host_controller_descriptor;
+  // One workspace-owned pinned record stages both the initial H2D state and
+  // each descriptor D2H publication. It outlives every asynchronous transfer
+  // on the workspace stream, including exception cleanup.
+  std::unique_ptr<PinnedHostBuffer<CooperativeDeltaControllerState>>
+      host_controller_state;
   bool unit_initialized = false;
   bool generic_initialized = false;
   bool parent_key_initialized = false;
   bool legacy_predecessors_initialized = false;
   std::uint32_t current_generation = 0;
   std::uint32_t controller_query_sequence = 0;
+  std::uint32_t controller_concurrency_hint = 1;
+  // Each bit selects one compile-time controller trait: current-generation,
+  // parent tracking, compact edge parent, and telemetry. A workspace is bound
+  // to one immutable graph/device, so both successful and unsupported
+  // occupancy results remain valid for its lifetime.
+  std::array<CooperativeLaunchConfiguration, 16>
+      cooperative_launch_configurations{};
 
   DeltaSteppingScratch() = default;
   explicit DeltaSteppingScratch(Offset rows_)
@@ -429,9 +448,9 @@ struct DeltaSteppingScratch {
     if (controller_state.size() == 0) {
       controller_state.reset(1);
     }
-    if (!host_controller_descriptor) {
-      host_controller_descriptor = std::make_unique<
-          PinnedHostBuffer<DeltaSteppingCsrControllerDescriptor>>(1);
+    if (!host_controller_state) {
+      host_controller_state = std::make_unique<
+          PinnedHostBuffer<CooperativeDeltaControllerState>>(1);
     }
   }
 
@@ -2337,6 +2356,34 @@ __device__ inline unsigned int controller_atomic_load_u32(
   return atomicAdd(const_cast<unsigned int*>(address), 0U);
 }
 
+// These reads are used only after a cooperative grid barrier. Unlike the
+// atomic status read used while sticky failure bits may still be arriving,
+// the referenced values are stable and globally visible at those sites.
+// Avoid turning uniform controller state into one contended no-op atomic per
+// participating thread.
+__device__ inline unsigned int controller_stable_load_u32(
+    const unsigned int* address) {
+  return *reinterpret_cast<const volatile unsigned int*>(address);
+}
+
+__device__ inline int controller_stable_load_int(const int* address) {
+  return *reinterpret_cast<const volatile int*>(address);
+}
+
+__device__ inline std::uint64_t controller_stable_load_u64(
+    const std::uint64_t* address) {
+  return *reinterpret_cast<const volatile std::uint64_t*>(address);
+}
+
+__device__ inline DeltaSteppingCsrControllerPhase
+controller_phase_after_grid_sync(
+    const CooperativeDeltaControllerState* state) {
+  const auto* const phase = reinterpret_cast<const unsigned int*>(
+      &state->descriptor.phase);
+  return static_cast<DeltaSteppingCsrControllerPhase>(
+      controller_stable_load_u32(phase));
+}
+
 __device__ inline void controller_set_status(
     CooperativeDeltaControllerState* state,
     DeltaSteppingCsrControllerStatus status) {
@@ -2350,14 +2397,16 @@ __device__ inline unsigned int controller_status_bits(
       &state->descriptor.status));
 }
 
-__device__ inline bool controller_has_fatal_status(
+__device__ inline bool controller_has_fatal_status_after_grid_sync(
     const CooperativeDeltaControllerState* state) {
   constexpr unsigned int kFatal =
       static_cast<unsigned int>(
           DeltaSteppingCsrControllerStatus::kQueueOverflow) |
       static_cast<unsigned int>(
           DeltaSteppingCsrControllerStatus::kInvalidState);
-  return (controller_status_bits(state) & kFatal) != 0U;
+  const auto* const status =
+      reinterpret_cast<const unsigned int*>(&state->descriptor.status);
+  return (controller_stable_load_u32(status) & kFatal) != 0U;
 }
 
 __device__ inline DeltaSteppingCsrControllerAction
@@ -2408,12 +2457,12 @@ __device__ inline int controller_bounded_append(
     int capacity,
     CooperativeDeltaControllerState* state) {
   if (!append) return -1;
-  int observed = atomic_load_counter(queue_tail);
-  while (observed >= 0 && observed < capacity) {
-    const int prior = atomicCAS(queue_tail, observed, observed + 1);
-    if (prior == observed) return observed;
-    observed = prior;
-  }
+  // Membership/distance claims bound successful reservations to one per
+  // vertex. A single atomic reservation is therefore sufficient on the valid
+  // path; the post-check retains sticky diagnostics and prevents any OOB
+  // payload write if an invariant is violated.
+  const int observed = atomicAdd(queue_tail, 1);
+  if (observed >= 0 && observed < capacity) return observed;
   controller_set_status(
       state,
       observed < 0 ? DeltaSteppingCsrControllerStatus::kInvalidState
@@ -2421,12 +2470,18 @@ __device__ inline int controller_bounded_append(
   return -1;
 }
 
-template <typename Grid>
-__device__ inline void controller_grid_release_sync(Grid& grid) {
-  // grid.sync() supplies the execution barrier.  The explicit fence documents
-  // and enforces publication of queue payloads/counts before a later phase on
-  // the same cooperative launch consumes them, including on gfx1151.
-  __threadfence();
+template <bool CollectTelemetry, typename Grid>
+__device__ inline void controller_grid_release_sync(
+    Grid& grid,
+    CooperativeDeltaControllerState* state) {
+  // Cooperative grid synchronization completes prior global/shared accesses
+  // and makes them visible to the next grid phase. The old per-thread
+  // __threadfence duplicated that contract at every phase boundary and was a
+  // major source of controller work amplification. Keep the system-scope
+  // fence at final host publication below.
+  if constexpr (CollectTelemetry) {
+    if (grid.thread_rank() == 0) ++state->grid_barriers;
+  }
   grid.sync();
 }
 
@@ -2747,8 +2802,21 @@ __device__ void cooperative_reduce_min_pending(
       ++stale;
     }
   }
-  if (local_min < kNoBucket) {
-    atomicMin(args.min_pending_bucket, local_min);
+  // Publish at most one global minimum candidate per block. The previous
+  // implementation sent one contended atomicMin from every participating
+  // thread, even when most threads observed no pending entry.
+  __shared__ int block_min[kBlockSize];
+  block_min[threadIdx.x] = local_min;
+  __syncthreads();
+  for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+    if (threadIdx.x < stride) {
+      const int rhs = block_min[threadIdx.x + stride];
+      if (rhs < block_min[threadIdx.x]) block_min[threadIdx.x] = rhs;
+    }
+    __syncthreads();
+  }
+  if (threadIdx.x == 0 && block_min[0] < kNoBucket) {
+    atomicMin(args.min_pending_bucket, block_min[0]);
   }
   if constexpr (CollectTelemetry) {
     if (examined != 0) {
@@ -2883,20 +2951,21 @@ __global__ void cooperative_delta_controller_kernel(
       args.state->generation_cursor = args.generation_first;
     }
   }
-  controller_grid_release_sync(grid);
+  controller_grid_release_sync<CollectTelemetry>(grid, args.state);
 
   for (std::uint32_t action = 0; action < args.batch_size; ++action) {
-    if (controller_has_fatal_status(args.state)) break;
+    if (controller_has_fatal_status_after_grid_sync(args.state))
+      break;
     const std::uint32_t current_parity =
-        controller_atomic_load_u32(&args.state->current_queue_parity);
+        controller_stable_load_u32(&args.state->current_queue_parity);
     const std::uint32_t pending_parity =
-        controller_atomic_load_u32(&args.state->pending_queue_parity);
+        controller_stable_load_u32(&args.state->pending_queue_parity);
     if (current_parity > 1U || pending_parity > 1U) {
       if (leader) {
         controller_finish(
             args.state, DeltaSteppingCsrControllerStatus::kInvalidState);
       }
-      controller_grid_release_sync(grid);
+      controller_grid_release_sync<CollectTelemetry>(grid, args.state);
       break;
     }
     int* const current_queue =
@@ -2911,9 +2980,14 @@ __global__ void cooperative_delta_controller_kernel(
         pending_parity == 0U ? args.pending_queue_0 : args.pending_queue_1;
     int* const pending_count_ptr =
         pending_parity == 0U ? args.pending_count_0 : args.pending_count_1;
-    const int current_count = atomic_load_counter(current_count_ptr);
+    const int current_count = controller_stable_load_int(current_count_ptr);
+    const std::uint64_t raw_current_bucket = controller_stable_load_u64(
+        &args.state->descriptor.current_bucket);
     const int current_bucket =
-        static_cast<int>(args.state->descriptor.current_bucket);
+        raw_current_bucket <= static_cast<std::uint64_t>(
+                                  std::numeric_limits<int>::max())
+            ? static_cast<int>(raw_current_bucket)
+            : -1;
     if (leader) {
       if (current_count <= 0 || current_count > capacity ||
           current_bucket < 0 || current_bucket >= kNoBucket) {
@@ -2929,8 +3003,9 @@ __global__ void cooperative_delta_controller_kernel(
             kDeltaSteppingCsrNoControllerBucket;
       }
     }
-    controller_grid_release_sync(grid);
-    if (controller_has_fatal_status(args.state)) break;
+    controller_grid_release_sync<CollectTelemetry>(grid, args.state);
+    if (controller_has_fatal_status_after_grid_sync(args.state))
+      break;
 
     if constexpr (!UseCurrentGenerations) {
       const long long global_thread =
@@ -2947,20 +3022,22 @@ __global__ void cooperative_delta_controller_kernel(
           args.in_current[vertex] = 0U;
         }
       }
-      controller_grid_release_sync(grid);
-      if (controller_has_fatal_status(args.state)) break;
+      controller_grid_release_sync<CollectTelemetry>(grid, args.state);
+      if (controller_has_fatal_status_after_grid_sync(args.state))
+        break;
     }
 
     const std::uint32_t next_generation =
-        controller_atomic_load_u32(&args.state->generation_cursor);
+        controller_stable_load_u32(&args.state->generation_cursor);
     cooperative_relax_light_range<RowOffset, UseCurrentGenerations,
                                    TrackParents, UseEdgeParent,
                                    CollectTelemetry>(
         args, current_queue, current_count, current_bucket, next_queue,
         next_count_ptr, next_generation, pending_queue, pending_count_ptr);
-    controller_grid_release_sync(grid);
-    const int next_count = atomic_load_counter(next_count_ptr);
-    const int observed_pending_count = atomic_load_counter(pending_count_ptr);
+    controller_grid_release_sync<CollectTelemetry>(grid, args.state);
+    const int next_count = controller_stable_load_int(next_count_ptr);
+    const int observed_pending_count =
+        controller_stable_load_int(pending_count_ptr);
     if (leader) {
       if (next_count < 0 || next_count > capacity ||
           observed_pending_count < 0 || observed_pending_count > capacity) {
@@ -2985,23 +3062,27 @@ __global__ void cooperative_delta_controller_kernel(
         }
       }
     }
-    controller_grid_release_sync(grid);
-    if (controller_has_fatal_status(args.state)) break;
-    if (next_count > 0) continue;
+    controller_grid_release_sync<CollectTelemetry>(grid, args.state);
+    if (controller_has_fatal_status_after_grid_sync(args.state))
+      break;
+    if (next_count > 0)
+      continue;
 
     if (args.skip_heavy_edges == 0 && current_bucket != kNoBucket - 1) {
-      const int heavy_count = atomic_load_counter(args.heavy_count);
+      const int heavy_count = controller_stable_load_int(args.heavy_count);
       if (leader && (heavy_count < 0 || heavy_count > capacity)) {
         controller_finish(
             args.state, DeltaSteppingCsrControllerStatus::kInvalidState);
       }
-      controller_grid_release_sync(grid);
-      if (controller_has_fatal_status(args.state)) break;
+      controller_grid_release_sync<CollectTelemetry>(grid, args.state);
+      if (controller_has_fatal_status_after_grid_sync(args.state))
+        break;
       cooperative_relax_heavy_range<RowOffset, TrackParents, UseEdgeParent,
                                     CollectTelemetry>(
           args, current_bucket, pending_queue, pending_count_ptr, heavy_count);
-      controller_grid_release_sync(grid);
-      if (controller_has_fatal_status(args.state)) break;
+      controller_grid_release_sync<CollectTelemetry>(grid, args.state);
+      if (controller_has_fatal_status_after_grid_sync(args.state))
+        break;
     }
 
     // Preserve the established host controller's observable stop boundary:
@@ -3030,7 +3111,7 @@ __global__ void cooperative_delta_controller_kernel(
         }
       }
     }
-    controller_grid_release_sync(grid);
+    controller_grid_release_sync<CollectTelemetry>(grid, args.state);
     if (leader) {
       if (args.state->descriptor.iterations ==
           std::numeric_limits<std::uint64_t>::max()) {
@@ -3059,14 +3140,14 @@ __global__ void cooperative_delta_controller_kernel(
             args.state, DeltaSteppingCsrControllerStatus::kTargetSettled);
       }
     }
-    controller_grid_release_sync(grid);
-    if (controller_has_fatal_status(args.state) ||
-        args.state->descriptor.phase ==
-        DeltaSteppingCsrControllerPhase::kFinished) {
+    controller_grid_release_sync<CollectTelemetry>(grid, args.state);
+    if (controller_has_fatal_status_after_grid_sync(args.state) ||
+        controller_phase_after_grid_sync(args.state) ==
+            DeltaSteppingCsrControllerPhase::kFinished) {
       break;
     }
 
-    const int pending_count = atomic_load_counter(pending_count_ptr);
+    const int pending_count = controller_stable_load_int(pending_count_ptr);
     if (leader) {
       if (pending_count < 0 || pending_count > capacity) {
         controller_finish(
@@ -3075,12 +3156,13 @@ __global__ void cooperative_delta_controller_kernel(
         atomicExch(args.min_pending_bucket, kNoBucket);
       }
     }
-    controller_grid_release_sync(grid);
-    if (controller_has_fatal_status(args.state)) break;
+    controller_grid_release_sync<CollectTelemetry>(grid, args.state);
+    if (controller_has_fatal_status_after_grid_sync(args.state))
+      break;
     cooperative_reduce_min_pending<RowOffset, CollectTelemetry>(
         args, pending_queue, pending_count, current_bucket);
-    controller_grid_release_sync(grid);
-    const int next_bucket = atomic_load_counter(args.min_pending_bucket);
+    controller_grid_release_sync<CollectTelemetry>(grid, args.state);
+    const int next_bucket = controller_stable_load_int(args.min_pending_bucket);
     if constexpr (CollectTelemetry) {
       if (leader) {
         telemetry_atomic_max(
@@ -3104,8 +3186,8 @@ __global__ void cooperative_delta_controller_kernel(
             args.state, DeltaSteppingCsrControllerStatus::kComplete);
       }
     }
-    controller_grid_release_sync(grid);
-    if (args.state->descriptor.phase ==
+    controller_grid_release_sync<CollectTelemetry>(grid, args.state);
+    if (controller_phase_after_grid_sync(args.state) ==
         DeltaSteppingCsrControllerPhase::kFinished) {
       break;
     }
@@ -3118,21 +3200,21 @@ __global__ void cooperative_delta_controller_kernel(
         next_pending_parity == 0U ? args.pending_count_0
                                   : args.pending_count_1;
     const std::uint32_t compact_generation =
-        controller_atomic_load_u32(&args.state->generation_cursor);
+        controller_stable_load_u32(&args.state->generation_cursor);
     if (leader) {
       atomicExch(next_count_ptr, 0);
       atomicExch(new_pending_count_ptr, 0);
     }
-    controller_grid_release_sync(grid);
+    controller_grid_release_sync<CollectTelemetry>(grid, args.state);
     cooperative_compact_pending<RowOffset, UseCurrentGenerations,
                                 CollectTelemetry>(
         args, pending_queue, pending_count, next_bucket, compact_generation,
-        next_queue, next_count_ptr, new_pending_queue,
-        new_pending_count_ptr);
-    controller_grid_release_sync(grid);
-    const int compacted_current_count = atomic_load_counter(next_count_ptr);
+        next_queue, next_count_ptr, new_pending_queue, new_pending_count_ptr);
+    controller_grid_release_sync<CollectTelemetry>(grid, args.state);
+    const int compacted_current_count =
+        controller_stable_load_int(next_count_ptr);
     const int compacted_pending_count =
-        atomic_load_counter(new_pending_count_ptr);
+        controller_stable_load_int(new_pending_count_ptr);
     if (leader) {
       if (compacted_current_count <= 0 ||
           compacted_current_count > capacity ||
@@ -3166,19 +3248,18 @@ __global__ void cooperative_delta_controller_kernel(
         }
       }
     }
-    controller_grid_release_sync(grid);
-    if (args.state->descriptor.phase ==
+    controller_grid_release_sync<CollectTelemetry>(grid, args.state);
+    if (controller_phase_after_grid_sync(args.state) ==
         DeltaSteppingCsrControllerPhase::kFinished) {
       break;
     }
   }
 
   if (leader) {
-    if (controller_has_fatal_status(args.state)) {
-      controller_finish(args.state,
-                        DeltaSteppingCsrControllerStatus::kNone);
-    } else if (args.state->descriptor.phase !=
-        DeltaSteppingCsrControllerPhase::kFinished) {
+    if (controller_has_fatal_status_after_grid_sync(args.state)) {
+      controller_finish(args.state, DeltaSteppingCsrControllerStatus::kNone);
+    } else if (controller_phase_after_grid_sync(args.state) !=
+               DeltaSteppingCsrControllerPhase::kFinished) {
       args.state->descriptor.phase =
           DeltaSteppingCsrControllerPhase::kLightClosure;
       args.state->descriptor.action =
@@ -3191,45 +3272,74 @@ __global__ void cooperative_delta_controller_kernel(
     } else {
       ++args.state->descriptor.publication_sequence;
     }
+    if constexpr (CollectTelemetry) {
+      ++args.state->grid_barriers;
+    }
     __threadfence_system();
   }
   grid.sync();
 }
 
-template <typename RowOffset,
-          bool UseCurrentGenerations,
-          bool TrackParents,
-          bool UseEdgeParent,
-          bool CollectTelemetry>
-int cooperative_delta_controller_blocks(Offset rows) {
+template <typename RowOffset, bool UseCurrentGenerations, bool TrackParents,
+          bool UseEdgeParent, bool CollectTelemetry>
+CooperativeLaunchConfiguration
+query_cooperative_launch_configuration(Offset rows,
+                                       std::uint32_t concurrency_hint) {
+  CooperativeLaunchConfiguration configuration;
+  configuration.initialized = true;
   int device = -1;
-  DS_DELTA_HIP_CHECK(hipGetDevice(&device));
+  const hipError_t device_status = hipGetDevice(&device);
+  if (device_status != hipSuccess) {
+    (void)hipGetLastError();
+    configuration.fallback_reason =
+        DeltaSteppingCsrControllerFallbackReason::kCapabilityQueryFailed;
+    return configuration;
+  }
   int cooperative_launch = 0;
-  const hipError_t capability_status =
-      hipDeviceGetAttribute(&cooperative_launch,
-                            hipDeviceAttributeCooperativeLaunch,
-                            device);
-  if (capability_status != hipSuccess || cooperative_launch == 0) {
-    if (capability_status != hipSuccess) (void)hipGetLastError();
-    return 0;
+  const hipError_t capability_status = hipDeviceGetAttribute(
+      &cooperative_launch, hipDeviceAttributeCooperativeLaunch, device);
+  if (capability_status != hipSuccess) {
+    (void)hipGetLastError();
+    configuration.fallback_reason =
+        DeltaSteppingCsrControllerFallbackReason::kCapabilityQueryFailed;
+    return configuration;
+  }
+  if (cooperative_launch == 0) {
+    configuration.fallback_reason =
+        DeltaSteppingCsrControllerFallbackReason::kCooperativeUnsupported;
+    return configuration;
   }
 
   hipDeviceProp_t properties{};
-  DS_DELTA_HIP_CHECK(hipGetDeviceProperties(&properties, device));
+  const hipError_t properties_status =
+      hipGetDeviceProperties(&properties, device);
+  if (properties_status != hipSuccess) {
+    (void)hipGetLastError();
+    configuration.fallback_reason =
+        DeltaSteppingCsrControllerFallbackReason::kCapabilityQueryFailed;
+    return configuration;
+  }
+  configuration.compute_units = properties.multiProcessorCount;
   int active_blocks_per_compute_unit = 0;
   const hipError_t occupancy_status =
       hipOccupancyMaxActiveBlocksPerMultiprocessor(
           &active_blocks_per_compute_unit,
-          cooperative_delta_controller_kernel<
-              RowOffset, UseCurrentGenerations, TrackParents,
-              UseEdgeParent, CollectTelemetry>,
-          kBlockSize,
-          0);
-  if (occupancy_status != hipSuccess ||
-      active_blocks_per_compute_unit <= 0 ||
+          cooperative_delta_controller_kernel<RowOffset, UseCurrentGenerations,
+                                              TrackParents, UseEdgeParent,
+                                              CollectTelemetry>,
+          kBlockSize, 0);
+  if (occupancy_status != hipSuccess) {
+    (void)hipGetLastError();
+    configuration.fallback_reason =
+        DeltaSteppingCsrControllerFallbackReason::kOccupancyQueryFailed;
+    return configuration;
+  }
+  configuration.active_blocks_per_compute_unit = active_blocks_per_compute_unit;
+  if (active_blocks_per_compute_unit <= 0 ||
       properties.multiProcessorCount <= 0) {
-    if (occupancy_status != hipSuccess) (void)hipGetLastError();
-    return 0;
+    configuration.fallback_reason =
+        DeltaSteppingCsrControllerFallbackReason::kNoResidentGrid;
+    return configuration;
   }
 
   const Offset row_blocks =
@@ -3238,20 +3348,45 @@ int cooperative_delta_controller_blocks(Offset rows) {
   const Offset legal_resident_limit =
       static_cast<Offset>(active_blocks_per_compute_unit) *
       static_cast<Offset>(properties.multiProcessorCount);
-  // Grid-stride loops make one block per compute unit sufficient.  This is a
-  // runtime-derived legal subset of the exact kernel's occupancy bound and
-  // leaves cooperative residency available to independent routing streams.
-  const Offset concurrency_friendly_limit =
-      static_cast<Offset>(properties.multiProcessorCount);
-  const Offset blocks =
-      std::min(row_blocks,
-               std::min(legal_resident_limit,
-                        concurrency_friendly_limit));
+  // Grid-stride loops permit a workspace to use only its share of the CUs.
+  // PathFinder gives every worker the same actual-concurrency hint, avoiding
+  // four CU-wide cooperative grids that can serialize while still retaining
+  // a bounded, nonshrinking grid when a frontier grows inside one batch.
+  const Offset concurrency_friendly_limit = std::max<Offset>(
+      1,
+      static_cast<Offset>(properties.multiProcessorCount) /
+          static_cast<Offset>(concurrency_hint));
+  const Offset blocks = std::min(
+      row_blocks, std::min(legal_resident_limit, concurrency_friendly_limit));
   if (blocks <= 0 ||
       blocks > static_cast<Offset>(std::numeric_limits<int>::max())) {
-    return 0;
+    configuration.fallback_reason =
+        DeltaSteppingCsrControllerFallbackReason::kNoResidentGrid;
+    return configuration;
   }
-  return static_cast<int>(blocks);
+  configuration.max_blocks = static_cast<int>(blocks);
+  return configuration;
+}
+
+template <typename RowOffset, bool UseCurrentGenerations, bool TrackParents,
+          bool UseEdgeParent, bool CollectTelemetry>
+const CooperativeLaunchConfiguration& cooperative_launch_configuration(
+    DeltaSteppingScratch& scratch,
+    Offset rows) {
+  constexpr std::size_t key = (UseCurrentGenerations ? std::size_t{1} : 0) |
+                              (TrackParents ? std::size_t{2} : 0) |
+                              (UseEdgeParent ? std::size_t{4} : 0) |
+                              (CollectTelemetry ? std::size_t{8} : 0);
+  CooperativeLaunchConfiguration& configuration =
+      scratch.cooperative_launch_configurations[key];
+  if (!configuration.initialized) {
+    configuration =
+        query_cooperative_launch_configuration<RowOffset, UseCurrentGenerations,
+                                               TrackParents, UseEdgeParent,
+                                               CollectTelemetry>(
+            rows, scratch.controller_concurrency_hint);
+  }
+  return configuration;
 }
 
 inline bool controller_generation_batch_is_representable(
@@ -3319,7 +3454,8 @@ void launch_cooperative_delta_controller(
 inline DeltaSteppingCsrControllerDescriptor
 copy_controller_descriptor_to_host(DeltaSteppingScratch& scratch,
                                    hipStream_t stream) {
-  auto* const destination = scratch.host_controller_descriptor->get();
+  auto* const destination =
+      &scratch.host_controller_state->get()->descriptor;
   DS_DELTA_HIP_CHECK(hipMemcpyAsync(
       destination,
       scratch.controller_state.get(),
@@ -3493,12 +3629,25 @@ void copy_device_telemetry_to_host(DeltaSteppingScratch& scratch,
                                    DeltaSteppingCsrTelemetry& telemetry,
                                    hipStream_t stream) {
   std::array<unsigned long long, kTelemetryCounterCount> counters{};
+  unsigned long long controller_grid_barriers = 0;
   DS_DELTA_HIP_CHECK(hipMemcpyAsync(
       counters.data(),
       scratch.telemetry_counters.get(),
       sssp_capacity::checked_bytes<unsigned long long>(counters.size()),
       hipMemcpyDeviceToHost,
       stream));
+  if (telemetry.controller_backend ==
+          DeltaSteppingCsrControllerBackend::kCooperativeGrid &&
+      scratch.controller_state.size() != 0 &&
+      telemetry.cooperative_launches != 0) {
+    const auto* const controller_bytes =
+        reinterpret_cast<const unsigned char*>(scratch.controller_state.get());
+    DS_DELTA_HIP_CHECK(hipMemcpyAsync(
+        &controller_grid_barriers,
+        controller_bytes +
+            offsetof(CooperativeDeltaControllerState, grid_barriers),
+        sizeof(controller_grid_barriers), hipMemcpyDeviceToHost, stream));
+  }
   DS_DELTA_HIP_CHECK(hipStreamSynchronize(stream));
   telemetry.frontier_entries_processed =
       counters[kTelemetryFrontierEntries];
@@ -3532,6 +3681,7 @@ void copy_device_telemetry_to_host(DeltaSteppingScratch& scratch,
       counters[kTelemetryPendingQueueHighWater];
   telemetry.heavy_queue_high_water =
       counters[kTelemetryHeavyQueueHighWater];
+  telemetry.cooperative_grid_barriers = controller_grid_barriers;
 }
 
 void initialize_legacy_predecessors_once(DeltaSteppingScratch& scratch,
@@ -4415,31 +4565,53 @@ DeltaSteppingCsrResult run_delta_stepping_impl(
   delta_stepping_validate_controller_policy(controller_policy);
 
   const Offset n = d_adjacency.rows;
-  const bool reduced_controller_requested =
-      controller_mode ==
-      DeltaSteppingCsrControllerMode::kReducedRoundTrip;
-  int cooperative_blocks = 0;
-  if (reduced_controller_requested && progress_callback == nullptr &&
-      (!UseCurrentGenerations ||
-       controller_generation_batch_is_representable(
-           controller_batch_size))) {
-    cooperative_blocks =
-        cooperative_delta_controller_blocks<
-            RowOffset, UseCurrentGenerations, TrackParents,
-            UseEdgeParent, CollectTelemetry>(n);
+  const bool cooperative_controller_requested =
+      controller_mode == DeltaSteppingCsrControllerMode::kFusedHostChecked ||
+      controller_mode == DeltaSteppingCsrControllerMode::kReducedRoundTrip;
+  const std::uint32_t cooperative_action_budget =
+      delta_stepping_effective_controller_batch_size(controller_policy);
+  CooperativeLaunchConfiguration cooperative_configuration;
+  DeltaSteppingCsrControllerFallbackReason controller_fallback_reason =
+      DeltaSteppingCsrControllerFallbackReason::kNone;
+  if (cooperative_controller_requested && progress_callback != nullptr) {
+    controller_fallback_reason =
+        DeltaSteppingCsrControllerFallbackReason::kProgressCallback;
+  } else if (cooperative_controller_requested && UseCurrentGenerations &&
+             !controller_generation_batch_is_representable(
+                 cooperative_action_budget)) {
+    controller_fallback_reason =
+        DeltaSteppingCsrControllerFallbackReason::kGenerationBudget;
+  } else if (cooperative_controller_requested) {
+    cooperative_configuration =
+        cooperative_launch_configuration<RowOffset, UseCurrentGenerations,
+                                         TrackParents, UseEdgeParent,
+                                         CollectTelemetry>(scratch, n);
+    controller_fallback_reason = cooperative_configuration.fallback_reason;
   }
-  const bool use_reduced_controller =
-      reduced_controller_requested && progress_callback == nullptr &&
-      cooperative_blocks > 0;
+  const bool use_cooperative_controller =
+      cooperative_controller_requested && progress_callback == nullptr &&
+      controller_fallback_reason ==
+          DeltaSteppingCsrControllerFallbackReason::kNone &&
+      cooperative_configuration.max_blocks > 0;
   if constexpr (CollectTelemetry) {
     telemetry->effective_controller_mode =
-        use_reduced_controller
-            ? DeltaSteppingCsrControllerMode::kReducedRoundTrip
+        use_cooperative_controller
+            ? controller_mode
             : DeltaSteppingCsrControllerMode::kHostChecked;
     telemetry->effective_controller_batch_size =
-        use_reduced_controller ? controller_batch_size : 1U;
+        use_cooperative_controller ? cooperative_action_budget : 1U;
     telemetry->controller_fallback =
-        reduced_controller_requested && !use_reduced_controller;
+        cooperative_controller_requested && !use_cooperative_controller;
+    telemetry->controller_backend =
+        use_cooperative_controller
+            ? DeltaSteppingCsrControllerBackend::kCooperativeGrid
+            : DeltaSteppingCsrControllerBackend::kScalarHost;
+    telemetry->controller_fallback_reason = controller_fallback_reason;
+    telemetry->cooperative_active_blocks_per_compute_unit =
+        static_cast<std::uint32_t>(std::max(
+            0, cooperative_configuration.active_blocks_per_compute_unit));
+    telemetry->cooperative_compute_units = static_cast<std::uint32_t>(
+        std::max(0, cooperative_configuration.compute_units));
   }
   std::vector<int> deduplicated_sources;
   std::unordered_set<int> source_set;
@@ -4501,8 +4673,13 @@ DeltaSteppingCsrResult run_delta_stepping_impl(
   // Keep the per-block staging lazy: a supported reduced controller never
   // performs this host reduction.  Allocate before any query work is enqueued
   // so allocation failure cannot leave partially mutated asynchronous state.
-  if (!use_reduced_controller) {
+  if (!use_cooperative_controller) {
     scratch.ensure_host_checked_reduction_storage();
+  } else {
+    // Allocate publication storage before any query work is enqueued.
+    // hipMalloc/hipHostMalloc may synchronize internally, but this first-use
+    // cost remains outside the repeated controller path.
+    scratch.ensure_controller_storage();
   }
   if constexpr (CollectTelemetry) {
     prepare_device_telemetry(scratch, stream);
@@ -4511,16 +4688,36 @@ DeltaSteppingCsrResult run_delta_stepping_impl(
       !use_target_set && target >= 0 && zero_distance_within_limit &&
       is_effective_source(target);
 
+  CooperativeDeltaControllerState initial_controller_state{};
+  if (use_cooperative_controller) {
+    if (scratch.controller_query_sequence ==
+        std::numeric_limits<std::uint32_t>::max()) {
+      scratch.controller_query_sequence = 1;
+    } else {
+      ++scratch.controller_query_sequence;
+      if (scratch.controller_query_sequence == 0) {
+        scratch.controller_query_sequence = 1;
+      }
+    }
+    initial_controller_state.descriptor.version =
+        DeltaSteppingCsrControllerDescriptor::kVersion;
+    initial_controller_state.descriptor.query_sequence =
+        scratch.controller_query_sequence;
+    initial_controller_state.descriptor.phase =
+        DeltaSteppingCsrControllerPhase::kLightClosure;
+    initial_controller_state.descriptor.action =
+        DeltaSteppingCsrControllerAction::kContinueDevice;
+    initial_controller_state.descriptor.current_count =
+        static_cast<std::uint32_t>(source_count);
+    initial_controller_state.descriptor.current_bucket = 0;
+    initial_controller_state.descriptor.next_bucket =
+        kDeltaSteppingCsrNoControllerBucket;
+  }
+
   scratch.ensure_source_capacity(effective_sources->size());
   // Generic state is lazy because exact-unit workers never need it. Allocate
   // and initialize its scalars before target setup touches settled_count.
   prepare_delta_scratch(scratch, n, inf, stream);
-  // Allocate the optional controller publication buffers before sources or
-  // target state mutate this query. Allocation failure therefore leaves no
-  // sparse state that would require exception cleanup.
-  if (use_reduced_controller) {
-    scratch.ensure_controller_storage();
-  }
   if constexpr (TrackParents) {
     initialize_parent_keys_once(scratch, n, stream);
   }
@@ -4569,16 +4766,34 @@ DeltaSteppingCsrResult run_delta_stepping_impl(
   }
   const std::uint32_t source_generation =
       acquire_current_generation<UseCurrentGenerations>(scratch, stream);
-  initialize_delta_sources_kernel<TrackParents && !UseEdgeParent>
-      <<<grid_for_items(source_count), kBlockSize, 0, stream>>>(
-          scratch.sources.get(), source_count, scratch.dist.get(),
-          scratch.in_current.get(), source_generation,
-          scratch.current_queue.get(),
-          scratch.current_count.get(), scratch.pred_node.get(),
-          scratch.pred_edge.get(), scratch.touched_queue.get(),
-          scratch.touched_count.get());
-  DS_DELTA_HIP_CHECK(hipGetLastError());
-  synchronize_explicit_stream(stream);
+  try {
+    if (use_cooperative_controller) {
+      // The controller state and source frontier are independent producers.
+      // Enqueue both before the existing source-publication completion so a
+      // cooperative query does not add a third setup drain.
+      *scratch.host_controller_state->get() = initial_controller_state;
+      DS_DELTA_HIP_CHECK(hipMemcpyAsync(
+          scratch.controller_state.get(), scratch.host_controller_state->get(),
+          sizeof(initial_controller_state), hipMemcpyHostToDevice, stream));
+    }
+    initialize_delta_sources_kernel<TrackParents && !UseEdgeParent>
+        <<<grid_for_items(source_count), kBlockSize, 0, stream>>>(
+            scratch.sources.get(), source_count, scratch.dist.get(),
+            scratch.in_current.get(), source_generation,
+            scratch.current_queue.get(),
+            scratch.current_count.get(), scratch.pred_node.get(),
+            scratch.pred_edge.get(), scratch.touched_queue.get(),
+            scratch.touched_count.get());
+    DS_DELTA_HIP_CHECK(hipGetLastError());
+    synchronize_explicit_stream(stream);
+  } catch (...) {
+    // A synchronous launch rejection can leave the preceding pinned-state
+    // upload queued. Complete it before callers may retry and overwrite that
+    // workspace-owned staging record.
+    const std::exception_ptr setup_exception = std::current_exception();
+    DS_DELTA_HIP_CHECK(hipStreamSynchronize(stream));
+    std::rethrow_exception(setup_exception);
+  }
 
   int* current_queue = scratch.current_queue.get();
   int* next_queue = scratch.next_queue.get();
@@ -4688,49 +4903,18 @@ DeltaSteppingCsrResult run_delta_stepping_impl(
     }
   };
 
-  if (use_reduced_controller && !result.stopped_on_target && max_iters > 0 &&
+  if (use_cooperative_controller && !result.stopped_on_target &&
+      max_iters > 0 &&
       !(has_distance_limit && current_bucket > last_allowed_bucket)) {
-    if (scratch.controller_query_sequence ==
-        std::numeric_limits<std::uint32_t>::max()) {
-      scratch.controller_query_sequence = 1;
-    } else {
-      ++scratch.controller_query_sequence;
-      if (scratch.controller_query_sequence == 0) {
-        scratch.controller_query_sequence = 1;
-      }
-    }
-    CooperativeDeltaControllerState initial_state{};
-    initial_state.descriptor.version =
-        DeltaSteppingCsrControllerDescriptor::kVersion;
-    initial_state.descriptor.query_sequence =
-        scratch.controller_query_sequence;
-    initial_state.descriptor.phase =
-        DeltaSteppingCsrControllerPhase::kLightClosure;
-    initial_state.descriptor.action =
-        DeltaSteppingCsrControllerAction::kContinueDevice;
-    initial_state.descriptor.current_count =
-        static_cast<std::uint32_t>(source_count);
-    initial_state.descriptor.current_bucket = 0;
-    initial_state.descriptor.next_bucket =
-        kDeltaSteppingCsrNoControllerBucket;
-
+    PATHFINDER_PROFILE_RANGE("delta_step.cooperative_controller");
     std::uint32_t previous_publication = 0;
+    DeltaSteppingCsrControllerDescriptor previous_descriptor =
+        initial_controller_state.descriptor;
     try {
-      DS_DELTA_HIP_CHECK(hipMemcpyAsync(
-          scratch.controller_state.get(),
-          &initial_state,
-          sizeof(initial_state),
-          hipMemcpyHostToDevice,
-          stream));
-      // Establish one real explicit-stream publication boundary before the
-      // first cooperative grid. All later intra-launch dependencies use
-      // release fences plus grid-wide barriers, and each relaunch follows the
-      // descriptor D2H completion boundary.
-      synchronize_explicit_stream(stream);
       while (true) {
         std::uint32_t generation_first = 0;
         if (!reserve_controller_generations<UseCurrentGenerations>(
-                scratch, controller_batch_size, stream,
+                scratch, cooperative_action_budget, stream,
                 &generation_first)) {
           throw std::runtime_error(
               "Delta-Stepping controller generation budget is not "
@@ -4770,17 +4954,38 @@ DeltaSteppingCsrResult run_delta_stepping_impl(
         args.scalar_target = target;
         args.max_iters = max_iters;
         args.last_allowed_bucket = last_allowed_bucket;
-        args.batch_size = controller_batch_size;
+        args.batch_size = cooperative_action_budget;
         args.generation_first = generation_first;
         args.has_distance_limit = has_distance_limit ? 1 : 0;
         args.skip_heavy_edges = skip_heavy_edges ? 1 : 0;
         args.telemetry_counters =
             CollectTelemetry ? scratch.telemetry_counters.get() : nullptr;
         args.state = scratch.controller_state.get();
-        launch_cooperative_delta_controller<
-            RowOffset, UseCurrentGenerations, TrackParents,
-            UseEdgeParent, CollectTelemetry>(
-                args, cooperative_blocks, stream);
+        const int launch_blocks = cooperative_configuration.max_blocks;
+        if (launch_blocks <= 0) {
+          throw std::runtime_error(
+              "Delta-Stepping cooperative controller selected an empty "
+              "concurrency-partitioned grid");
+        }
+        if constexpr (CollectTelemetry) {
+          const std::uint32_t observed_blocks =
+              static_cast<std::uint32_t>(launch_blocks);
+          if (telemetry->cooperative_grid_blocks_min == 0) {
+            telemetry->cooperative_grid_blocks_min = observed_blocks;
+          } else {
+            telemetry->cooperative_grid_blocks_min = std::min(
+                telemetry->cooperative_grid_blocks_min, observed_blocks);
+          }
+          telemetry->cooperative_grid_blocks_max =
+              std::max(telemetry->cooperative_grid_blocks_max, observed_blocks);
+          ++telemetry->cooperative_launches;
+          telemetry->controller_action_slots_budgeted +=
+              cooperative_action_budget;
+        }
+        launch_cooperative_delta_controller<RowOffset, UseCurrentGenerations,
+                                            TrackParents, UseEdgeParent,
+                                            CollectTelemetry>(
+            args, launch_blocks, stream);
         const DeltaSteppingCsrControllerDescriptor descriptor =
             copy_controller_descriptor_to_host(scratch, stream);
         ++controller_round_trips;
@@ -4791,7 +4996,31 @@ DeltaSteppingCsrResult run_delta_stepping_impl(
               "Delta-Stepping cooperative controller published an invalid "
               "descriptor");
         }
+        const std::uint64_t completed_actions =
+            static_cast<std::uint64_t>(descriptor.light_rounds) -
+            static_cast<std::uint64_t>(previous_descriptor.light_rounds);
+        if (descriptor.light_rounds <= previous_descriptor.light_rounds ||
+            completed_actions > cooperative_action_budget ||
+            (descriptor.status == DeltaSteppingCsrControllerStatus::kNone &&
+             completed_actions != cooperative_action_budget)) {
+          throw std::runtime_error(
+              "Delta-Stepping cooperative controller published an invalid "
+              "action count");
+        }
         previous_publication = descriptor.publication_sequence;
+        if constexpr (CollectTelemetry) {
+          telemetry->controller_actions_completed += completed_actions;
+          telemetry->controller_unused_action_slots +=
+              static_cast<std::uint64_t>(cooperative_action_budget) -
+              completed_actions;
+          ++telemetry->controller_publications;
+          if (descriptor.status == DeltaSteppingCsrControllerStatus::kNone) {
+            ++telemetry->controller_nonterminal_publications;
+          } else {
+            ++telemetry->controller_terminal_publications;
+          }
+        }
+        previous_descriptor = descriptor;
         total_light_rounds = descriptor.light_rounds;
         result.iterations_used = static_cast<int>(descriptor.iterations);
         if (descriptor.status ==
@@ -4855,13 +5084,14 @@ DeltaSteppingCsrResult run_delta_stepping_impl(
           scratch, n, inf, stream);
       std::rethrow_exception(controller_exception);
     }
-  } else if (use_reduced_controller &&
-             has_distance_limit && current_bucket > last_allowed_bucket &&
+  } else if (use_cooperative_controller && has_distance_limit &&
+             current_bucket > last_allowed_bucket &&
              !result.stopped_on_target) {
     result.stopped_on_distance_limit = true;
   }
 
-  if (!use_reduced_controller) {
+  if (!use_cooperative_controller) {
+    PATHFINDER_PROFILE_RANGE("delta_step.scalar_host_controller");
     for (int iter = 0;
          iter < max_iters && !result.stopped_on_target;
          ++iter) {
@@ -5343,6 +5573,9 @@ void begin_telemetry_record(DeltaSteppingCsrTelemetry* telemetry,
   telemetry->requested_controller_batch_size = controller_batch_size;
   telemetry->effective_controller_batch_size = 1;
   telemetry->controller_fallback = false;
+  telemetry->controller_backend = DeltaSteppingCsrControllerBackend::kNotRun;
+  telemetry->controller_fallback_reason =
+      DeltaSteppingCsrControllerFallbackReason::kNone;
 }
 
 }  // namespace ds_delta_detail
@@ -5360,6 +5593,44 @@ const char* delta_stepping_execution_path_name(
       return "legacy_generic";
     case DeltaSteppingCsrExecutionPath::kGenericDistancesOnly:
       return "generic_distances_only";
+  }
+  return "unknown";
+}
+
+const char* delta_stepping_controller_backend_name(
+    DeltaSteppingCsrControllerBackend backend) noexcept {
+  switch (backend) {
+    case DeltaSteppingCsrControllerBackend::kNotRun:
+      return "not_run";
+    case DeltaSteppingCsrControllerBackend::kScalarHost:
+      return "scalar_host";
+    case DeltaSteppingCsrControllerBackend::kCooperativeGrid:
+      return "cooperative_grid";
+    case DeltaSteppingCsrControllerBackend::kExactUnit:
+      return "exact_unit";
+  }
+  return "unknown";
+}
+
+const char* delta_stepping_controller_fallback_reason_name(
+    DeltaSteppingCsrControllerFallbackReason reason) noexcept {
+  switch (reason) {
+    case DeltaSteppingCsrControllerFallbackReason::kNone:
+      return "none";
+    case DeltaSteppingCsrControllerFallbackReason::kProgressCallback:
+      return "progress_callback";
+    case DeltaSteppingCsrControllerFallbackReason::kExactUnitBypass:
+      return "exact_unit_bypass";
+    case DeltaSteppingCsrControllerFallbackReason::kGenerationBudget:
+      return "generation_budget";
+    case DeltaSteppingCsrControllerFallbackReason::kCooperativeUnsupported:
+      return "cooperative_unsupported";
+    case DeltaSteppingCsrControllerFallbackReason::kCapabilityQueryFailed:
+      return "capability_query_failed";
+    case DeltaSteppingCsrControllerFallbackReason::kOccupancyQueryFailed:
+      return "occupancy_query_failed";
+    case DeltaSteppingCsrControllerFallbackReason::kNoResidentGrid:
+      return "no_resident_grid";
   }
   return "unknown";
 }
@@ -5592,6 +5863,12 @@ DeltaSteppingCsrWorkspace::DeltaSteppingCsrWorkspace(
   controller_batch_size_ = options.controller_batch_size;
   controller_generation_seed_for_testing_ =
       options.controller_generation_seed_for_testing;
+  if (options.controller_concurrency_hint == 0) {
+    throw std::invalid_argument(
+        "Delta-Stepping controller concurrency hint must be positive");
+  }
+  impl_->scratch.controller_concurrency_hint =
+      options.controller_concurrency_hint;
   impl_->scratch.reserve_query_capacity(options.capacity_hints,
                                         impl_->path_capable);
 }
@@ -5615,6 +5892,12 @@ DeltaSteppingCsrWorkspace::DeltaSteppingCsrWorkspace(
   controller_batch_size_ = options.controller_batch_size;
   controller_generation_seed_for_testing_ =
       options.controller_generation_seed_for_testing;
+  if (options.controller_concurrency_hint == 0) {
+    throw std::invalid_argument(
+        "Delta-Stepping controller concurrency hint must be positive");
+  }
+  impl_->scratch.controller_concurrency_hint =
+      options.controller_concurrency_hint;
   impl_->scratch.reserve_query_capacity(options.capacity_hints,
                                         impl_->path_capable);
 }
@@ -5854,12 +6137,16 @@ DeltaSteppingCsrResult DeltaSteppingCsrWorkspace::run(
           delta, false, false, false,
           impl_->max_edge_value <= delta, false,
           controller_mode_, controller_batch_size_);
-      if (active_telemetry_ != nullptr &&
-          controller_mode_ ==
-              DeltaSteppingCsrControllerMode::kReducedRoundTrip) {
-        // The reduced controller is defined only for classic generic Delta.
-        // Exact-unit specialization bypasses it and reports that explicitly.
-        active_telemetry_->controller_fallback = true;
+      if (active_telemetry_ != nullptr) {
+        active_telemetry_->controller_backend =
+            DeltaSteppingCsrControllerBackend::kExactUnit;
+        if (controller_mode_ != DeltaSteppingCsrControllerMode::kHostChecked) {
+          // Cooperative controllers are defined only for classic generic
+          // Delta. Exact-unit specialization bypasses them explicitly.
+          active_telemetry_->controller_fallback = true;
+          active_telemetry_->controller_fallback_reason =
+              DeltaSteppingCsrControllerFallbackReason::kExactUnitBypass;
+        }
       }
       if (active_telemetry_ != nullptr) {
         return run_unit_weight_specialization<RowOffset, true>(

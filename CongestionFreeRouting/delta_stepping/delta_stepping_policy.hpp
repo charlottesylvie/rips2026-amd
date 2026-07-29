@@ -23,16 +23,19 @@ enum class DeltaSteppingCsrCurrentMembershipMode {
   kGeneration,
 };
 
-// The host-checked controller preserves the established synchronization
-// behavior.  The reduced-round-trip controller is an explicit opt-in until it
-// has passed repeated target-GPU validation.
+// Host-checked preserves the established scalar controller and remains the
+// correctness/performance reference. Fused-host-checked explicitly selects a
+// one-action cooperative publication for target-GPU A/B work, while
+// reduced-round-trip may execute more than one light action per publication.
+// Both cooperative modes fall back to host-checked when unsupported.
 enum class DeltaSteppingCsrControllerMode : std::uint32_t {
   kHostChecked = 0,
   kReducedRoundTrip = 1,
+  kFusedHostChecked = 2,
 };
 
-constexpr std::uint32_t
-    kDeltaSteppingCsrRecommendedControllerBatchSize = 4;
+constexpr std::uint32_t kDeltaSteppingCsrRecommendedControllerBatchSize = 4;
+constexpr std::uint32_t kDeltaSteppingCsrMaxControllerBatchSize = 64;
 
 struct DeltaSteppingCsrControllerPolicy {
   DeltaSteppingCsrControllerMode mode =
@@ -46,6 +49,7 @@ inline void delta_stepping_validate_controller_policy(
   switch (policy.mode) {
     case DeltaSteppingCsrControllerMode::kHostChecked:
     case DeltaSteppingCsrControllerMode::kReducedRoundTrip:
+    case DeltaSteppingCsrControllerMode::kFusedHostChecked:
       break;
     default:
       throw std::invalid_argument(
@@ -56,20 +60,19 @@ inline void delta_stepping_validate_controller_policy(
         "Delta-Stepping controller batch size must be positive");
   }
   if (policy.mode == DeltaSteppingCsrControllerMode::kReducedRoundTrip &&
-      std::uint64_t{2} * policy.batch_size >=
-          std::numeric_limits<std::uint32_t>::max()) {
+      policy.batch_size > kDeltaSteppingCsrMaxControllerBatchSize) {
     throw std::invalid_argument(
-        "Delta-Stepping controller batch size exceeds its bounded token "
-        "range");
+        "Delta-Stepping controller batch size exceeds the bounded device "
+        "watchdog limit");
   }
 }
 
 inline std::uint32_t delta_stepping_effective_controller_batch_size(
     const DeltaSteppingCsrControllerPolicy& policy) {
   delta_stepping_validate_controller_policy(policy);
-  return policy.mode == DeltaSteppingCsrControllerMode::kHostChecked
-             ? std::uint32_t{1}
-             : policy.batch_size;
+  return policy.mode == DeltaSteppingCsrControllerMode::kReducedRoundTrip
+             ? policy.batch_size
+             : std::uint32_t{1};
 }
 
 // These types deliberately use fixed-width representations: a device may
@@ -622,7 +625,7 @@ class DeltaSteppingCsrControllerSequentialModel {
       finish_with(DeltaSteppingCsrControllerStatus::kNone);
       return;
     }
-    if (mode_ == DeltaSteppingCsrControllerMode::kReducedRoundTrip &&
+    if (mode_ != DeltaSteppingCsrControllerMode::kHostChecked &&
         descriptor_.rounds_since_host_check >= effective_batch_size_) {
       publish_host_check();
     } else {

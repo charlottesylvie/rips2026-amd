@@ -199,7 +199,7 @@ void print_usage(const char* program) {
       << "  --delta-force-legacy-parent    Forwarded for generic Delta parent-path A/B comparison.\n"
       << "  --delta <float|auto>           Forwarded to pathfinder.\n"
       << "  --delta-multiplier <float>     Forwarded for an automatic-delta sweep.\n"
-      << "  --delta-controller <host-checked|reduced-round-trip>\n"
+      << "  --delta-controller <host-checked|fused-host-checked|reduced-round-trip>\n"
       << "                                 Forward generic Delta controller selection.\n"
       << "  --delta-controller-batch-size <positive-int>\n"
       << "                                 Forward reduced-round-trip controller batch size.\n"
@@ -242,6 +242,9 @@ Options parse_args(int argc, char** argv) {
   std::string delta_benchmark_weights;
   bool delta_benchmark_weight_seed_provided = false;
   bool delta_telemetry = false;
+  std::string delta_controller;
+  bool delta_controller_provided = false;
+  bool delta_controller_batch_size_provided = false;
 
   for (int i = 3; i < argc; ++i) {
     const std::string option = argv[i];
@@ -288,11 +291,24 @@ Options parse_args(int argc, char** argv) {
       delta_benchmark_weight_seed_provided = true;
       options.pathfinder_args.push_back(option);
       options.pathfinder_args.push_back(seed);
+    } else if (option == "--delta-controller") {
+      delta_controller = require_value("--delta-controller");
+      if (delta_controller != "host-checked" &&
+          delta_controller != "fused-host-checked" &&
+          delta_controller != "reduced-round-trip") {
+        throw std::runtime_error(
+            "invalid --delta-controller value: " + delta_controller);
+      }
+      delta_controller_provided = true;
+      options.pathfinder_args.push_back(option);
+      options.pathfinder_args.push_back(delta_controller);
+    } else if (option == "--delta-controller-batch-size") {
+      delta_controller_batch_size_provided = true;
+      options.pathfinder_args.push_back(option);
+      options.pathfinder_args.push_back(require_value(option.c_str()));
     } else if (option == "--sssp-engine" ||
                option == "--delta" ||
                option == "--delta-multiplier" ||
-               option == "--delta-controller" ||
-               option == "--delta-controller-batch-size" ||
                option == "--max-pathfinder-iters" ||
                option == "--max-sssp-iters" ||
                option == "--net-limit" ||
@@ -317,6 +333,13 @@ Options parse_args(int argc, char** argv) {
     throw std::runtime_error(
         "--delta-benchmark-weight-seed requires "
         "--delta-benchmark-weights mixed");
+  }
+  if (delta_controller_batch_size_provided &&
+      (!delta_controller_provided ||
+       delta_controller != "reduced-round-trip")) {
+    throw std::runtime_error(
+        "--delta-controller-batch-size requires "
+        "--delta-controller reduced-round-trip");
   }
   return options;
 }

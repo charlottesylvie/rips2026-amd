@@ -1,8 +1,8 @@
 # GPU SSSP Development Status
 
-Updated 2026-07-27 for the bounded UnitBFS/classic-Delta optimization pass,
-the optional reduced-round-trip Delta controller, and the FPGA Interchange
-import correctness audit.
+Updated 2026-07-29 for the bounded UnitBFS/classic-Delta optimization pass,
+the experimental fused-host-checked and reduced-round-trip Delta controllers,
+and the FPGA Interchange import correctness audit.
 All GPU changes below are implemented but HIP-unvalidated.
 
 This file is the concise source of truth for landed work, confidence, and the
@@ -51,7 +51,7 @@ throughput, so the real multi-sink result remains provisional.
 | UnitBFS controller | Cooperative-capable devices run at most 32 levels per grid-synchronized launch on the null/default stream. Explicit worker streams always use the synchronized host-controlled level handoff required on gfx1151; unsupported devices and progress callbacks retain their fallbacks, and the null-stream noncooperative fallback can batch four levels. |
 | UnitBFS extraction | Host-built offsets remain the default. An opt-in two-pass device path measures target lengths, scans deterministic offsets, publishes one totals/status descriptor, grows demand-sized compact buffers, validates paths, and copies the result without the host prefix sum or two H2D offset copies. |
 | Generic Delta | Multi-source/multi-target classic Delta-Stepping with one thread per active row, separate light/heavy semantics, a flat pending set with minimum reduction and compaction, and sparse touched reset. Immutable CSR row offsets are automatically `uint32_t` only when the complete range fits; `kForce64Bit` retains the wide A/B path and public edge IDs stay 64-bit. |
-| Delta controller | The established host-checked controller remains the default. An opt-in reduced-round-trip mode uses a capability-gated cooperative grid to keep dependent light closure, target settlement, heavy work, pending minimum, and compaction state on the device for a bounded batch, then publishes one descriptor. Unsupported kernels and progress callbacks retain a complete host fallback; requested/effective mode and fallback are visible in telemetry. |
+| Delta controller | The established `host-checked` scalar controller remains the trusted default/reference. Experimental opt-in cooperative modes keep dependent light closure, target settlement, heavy work, pending minimum, and compaction state on-device: `fused-host-checked` publishes after one action, while `reduced-round-trip` executes a bounded configurable multi-action batch. Unsupported kernels and progress callbacks retain the complete scalar fallback; requested/effective mode, backend, fallback reason, and controller diagnostics are visible in telemetry. |
 | Delta parents | Automatic vector-target runs use a compact 64-bit `{distance_bits, original_edge_id}` key and a shared 32-bit edge-to-source map when eligible. Legacy predecessor arrays are lazy fallback state. |
 | Delta modes | Exact-unit specialization for eligible small graphs, compile-time no-parent `run_distances()`, strict distances-only graph storage, exclusive distance bounds, exact-unit automatic width `1 * multiplier`, weighted graph-aware seeding, deterministic weight families, force/controller controls, and opt-in telemetry are implemented. Boolean `in_current` plus its guarded clear remains the default; generation-tagged membership is opt-in and rollover-safe. |
 | Delta capacity | Source/target hints pre-reserve only applicable state. Query and compact-path buffers retain geometric high-water capacity; compact-parent runs avoid legacy predecessor arrays, and strict distances-only storage ignores target/path hints. |
@@ -122,7 +122,7 @@ Python reconstruction coverage, not a substitute compile claim.
    long enough to expose reuse failures rather than accepting one successful
    run. Use four workers for the future production timing baseline.
 3. Establish weighted Delta correctness against CPU Dijkstra and record AMD
-   baselines for host/reduced controllers, compact/wide rows, and
+   baselines for host/fused/reduced controllers, compact/wide rows, and
    Boolean/generation membership in compact-parent, legacy-parent, and
    distances-only modes. Include all-light, all-heavy, mixed, zero-weight, and
    skewed-degree cases plus callback abort/reuse and explicit-stream stress.
@@ -143,11 +143,12 @@ Python reconstruction coverage, not a substitute compile claim.
 - Generic Delta serially scans each active row, scans mixed rows in both light
   and heavy phases, scans the flat pending set to find the next bucket, and
   scans it again to compact that bucket.
-- The default explicit-stream generic Delta path checks every light-closure
+- The default scalar `host-checked` explicit-stream generic Delta path checks every light-closure
   round on the host because dependent batched dispatches previously exposed
-  controller-state failures on gfx1151. The opt-in controller avoids that
-  cross-dispatch handoff only inside one cooperative, grid-synchronized kernel;
-  it remains HIP-unvalidated and may select the host fallback.
+  controller-state failures on gfx1151. The experimental fused and reduced
+  controllers avoid that cross-dispatch handoff only inside a cooperative,
+  grid-synchronized kernel; they remain HIP-unvalidated and may select the
+  scalar host fallback.
 - Default UnitBFS still has host-visible per-query setup, status,
   compact-offset, and extraction boundaries even when its inner level loop is
   cooperative. The device-offset alternative is opt-in pending AMD validation.
@@ -155,9 +156,9 @@ Python reconstruction coverage, not a substitute compile claim.
   Compact paths remain demand-sized because graph-sized or otherwise
   speculative path reservation is intentionally prohibited.
 - Generation-stamped UnitBFS visitation, generation-tagged Delta current
-  membership, and the reduced-round-trip Delta controller are opt-in. Sparse
-  reset, Boolean/clear membership, and host-checked control remain the enabled
-  defaults until the AMD checklist passes.
+  membership, and the fused-host-checked/reduced-round-trip Delta controllers
+  are opt-in. Sparse reset, Boolean/clear membership, and scalar host-checked
+  control remain the enabled defaults until the AMD checklist passes.
 - The production full-device graph has more than `2^24` rows, so Delta's
   exact-unit specialization is ineligible and Delta selection exercises the
   generic scheduler even though the converter emits unit weights.

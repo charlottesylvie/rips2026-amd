@@ -215,7 +215,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     )
     parser.add_argument(
         "--delta-controller",
-        choices=("host-checked", "reduced-round-trip"),
+        choices=("host-checked", "fused-host-checked", "reduced-round-trip"),
         help="generic delta-stepping controller mode",
     )
     parser.add_argument(

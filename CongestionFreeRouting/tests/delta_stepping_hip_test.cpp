@@ -147,6 +147,9 @@ constexpr ControllerTestCase kHostCheckedControllerTestCase{
     DeltaSteppingCsrControllerMode::kHostChecked,
     kDeltaSteppingCsrRecommendedControllerBatchSize,
     "host-checked"};
+constexpr ControllerTestCase kFusedHostCheckedControllerTestCase{
+    DeltaSteppingCsrControllerMode::kFusedHostChecked,
+    kDeltaSteppingCsrRecommendedControllerBatchSize, "fused-host-checked"};
 constexpr ControllerTestCase kReducedBatchOneControllerTestCase{
     DeltaSteppingCsrControllerMode::kReducedRoundTrip,
     1,
@@ -157,6 +160,7 @@ constexpr ControllerTestCase kReducedBatchFourControllerTestCase{
     "reduced-batch-4"};
 constexpr ControllerTestCase kControllerTestCases[] = {
     kHostCheckedControllerTestCase,
+    kFusedHostCheckedControllerTestCase,
     kReducedBatchOneControllerTestCase,
     kReducedBatchFourControllerTestCase,
 };
@@ -175,34 +179,65 @@ void require_controller_telemetry(
     require(telemetry.effective_controller_mode ==
                     DeltaSteppingCsrControllerMode::kHostChecked &&
                 telemetry.effective_controller_batch_size == 1 &&
-                !telemetry.controller_fallback,
+                !telemetry.controller_fallback &&
+                telemetry.controller_backend ==
+                    DeltaSteppingCsrControllerBackend::kScalarHost &&
+                telemetry.controller_fallback_reason ==
+                    DeltaSteppingCsrControllerFallbackReason::kNone,
             label + ": host-checked controller telemetry is inconsistent");
     return;
   }
 
-  const bool reduced_selected =
-      telemetry.effective_controller_mode ==
-          DeltaSteppingCsrControllerMode::kReducedRoundTrip &&
-      telemetry.effective_controller_batch_size == requested.batch_size &&
-      !telemetry.controller_fallback;
+  const std::uint32_t expected_batch =
+      requested.mode == DeltaSteppingCsrControllerMode::kReducedRoundTrip
+          ? requested.batch_size
+          : 1U;
+  const bool cooperative_selected =
+      telemetry.effective_controller_mode == requested.mode &&
+      telemetry.effective_controller_batch_size == expected_batch &&
+      !telemetry.controller_fallback &&
+      telemetry.controller_backend ==
+          DeltaSteppingCsrControllerBackend::kCooperativeGrid &&
+      telemetry.controller_fallback_reason ==
+          DeltaSteppingCsrControllerFallbackReason::kNone;
   const bool capability_fallback =
       telemetry.effective_controller_mode ==
           DeltaSteppingCsrControllerMode::kHostChecked &&
       telemetry.effective_controller_batch_size == 1 &&
-      telemetry.controller_fallback;
+      telemetry.controller_fallback &&
+      telemetry.controller_backend ==
+          DeltaSteppingCsrControllerBackend::kScalarHost &&
+      telemetry.controller_fallback_reason !=
+          DeltaSteppingCsrControllerFallbackReason::kNone;
   if (require_host_fallback) {
     require(capability_fallback,
             label + ": reduced request did not report required host fallback");
   } else if (require_reduced_controller_selection()) {
-    require(reduced_selected,
-            label +
-                ": DELTA_REQUIRE_REDUCED_CONTROLLER=1 rejected a host "
-                "capability fallback");
+    require(cooperative_selected,
+            label + ": DELTA_REQUIRE_REDUCED_CONTROLLER=1 rejected a host "
+                    "capability fallback");
   } else {
-    require(reduced_selected || capability_fallback,
-            label +
-                ": reduced request reported neither selection nor capability "
-                "fallback");
+    require(
+        cooperative_selected || capability_fallback,
+        label +
+            ": cooperative request reported neither selection nor capability "
+            "fallback");
+  }
+  if (cooperative_selected && telemetry.cooperative_launches != 0) {
+    require(telemetry.controller_publications ==
+                    telemetry.cooperative_launches &&
+                telemetry.controller_round_trips ==
+                    telemetry.controller_publications &&
+                telemetry.controller_actions_completed ==
+                    telemetry.light_relaxation_rounds &&
+                telemetry.controller_action_slots_budgeted ==
+                    telemetry.cooperative_launches * expected_batch &&
+                telemetry.controller_actions_completed +
+                        telemetry.controller_unused_action_slots ==
+                    telemetry.controller_action_slots_budgeted &&
+                telemetry.cooperative_grid_barriers >=
+                    2 * telemetry.cooperative_launches,
+            label + ": cooperative publication diagnostics are inconsistent");
   }
 }
 

@@ -221,6 +221,7 @@ def main() -> None:
         ["--delta-telemetry"],
         ["--delta-force-legacy-parent"],
         ["--delta-controller", "host-checked"],
+        ["--delta-controller", "fused-host-checked"],
         ["--delta-controller", "reduced-round-trip"],
         [
             "--delta-controller",
@@ -275,6 +276,32 @@ def main() -> None:
             "4",
         ],
         "controller batch size was accepted with host-checked mode",
+    )
+    require_parse_rejected(
+        [
+            "--sssp-engine",
+            "delta-step",
+            "--delta-controller",
+            "fused-host-checked",
+            "--delta-controller-batch-size",
+            "4",
+        ],
+        "controller batch size was accepted with fused-host-checked mode",
+    )
+    fused = benchmark.parse_args(
+        [
+            "input.phys",
+            "output.phys",
+            "--sssp-engine",
+            "delta-step",
+            "--delta-controller",
+            "fused-host-checked",
+        ]
+    )
+    require(
+        benchmark.pathfinder_args(fused)[-2:]
+        == ["--delta-controller", "fused-host-checked"],
+        "fused host-checked controller mode was not forwarded",
     )
     reduced_default_batch = benchmark.parse_args(
         [

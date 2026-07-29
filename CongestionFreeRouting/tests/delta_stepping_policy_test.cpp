@@ -60,10 +60,30 @@ void test_controller_policy_and_descriptor() {
               delta_stepping_effective_controller_batch_size(defaults) == 1,
           "default controller policy did not preserve host checking");
 
+  require(static_cast<std::uint32_t>(
+              DeltaSteppingCsrControllerMode::kFusedHostChecked) == 2U,
+          "fused host-checked controller mode lost its stable value");
+  const DeltaSteppingCsrControllerPolicy host_checked{
+      DeltaSteppingCsrControllerMode::kHostChecked,
+      kDeltaSteppingCsrMaxControllerBatchSize};
+  const DeltaSteppingCsrControllerPolicy fused_host_checked{
+      DeltaSteppingCsrControllerMode::kFusedHostChecked,
+      kDeltaSteppingCsrMaxControllerBatchSize};
+  require(delta_stepping_effective_controller_batch_size(host_checked) == 1 &&
+              delta_stepping_effective_controller_batch_size(
+                  fused_host_checked) == 1,
+          "host and fused-host controllers must remain one-action modes");
+
   const DeltaSteppingCsrControllerPolicy reduced{
       DeltaSteppingCsrControllerMode::kReducedRoundTrip, 7};
   require(delta_stepping_effective_controller_batch_size(reduced) == 7,
           "reduced controller did not retain its bounded batch size");
+  const DeltaSteppingCsrControllerPolicy maximum_reduced{
+      DeltaSteppingCsrControllerMode::kReducedRoundTrip,
+      kDeltaSteppingCsrMaxControllerBatchSize};
+  require(delta_stepping_effective_controller_batch_size(maximum_reduced) ==
+              kDeltaSteppingCsrMaxControllerBatchSize,
+          "maximum bounded reduced-controller batch was rejected");
   require_throws<std::invalid_argument>(
       [] {
         delta_stepping_validate_controller_policy(
@@ -74,9 +94,9 @@ void test_controller_policy_and_descriptor() {
       [] {
         delta_stepping_validate_controller_policy(
             {DeltaSteppingCsrControllerMode::kReducedRoundTrip,
-             std::numeric_limits<std::uint32_t>::max()});
+             kDeltaSteppingCsrMaxControllerBatchSize + 1U});
       },
-      "unrepresentable controller token budget was accepted");
+      "reduced controller accepted a batch beyond its watchdog cap");
   require_throws<std::invalid_argument>(
       [] {
         delta_stepping_validate_controller_policy(
@@ -451,21 +471,90 @@ void test_controller_batch_one_equivalence() {
   };
   DeltaSteppingCsrControllerSequentialModel host_checked(
       {DeltaSteppingCsrControllerMode::kHostChecked, 32});
+  DeltaSteppingCsrControllerSequentialModel fused_host_checked(
+      {DeltaSteppingCsrControllerMode::kFusedHostChecked, 32});
   DeltaSteppingCsrControllerSequentialModel reduced_one(
       {DeltaSteppingCsrControllerMode::kReducedRoundTrip, 1});
   const auto host_states = host_checked.run(trace);
+  const auto fused_states = fused_host_checked.run(trace);
   const auto reduced_states = reduced_one.run(trace);
-  require(host_states.size() == reduced_states.size(),
+  require(host_checked.effective_batch_size() == 1 &&
+              fused_host_checked.effective_batch_size() == 1 &&
+              reduced_one.effective_batch_size() == 1,
+          "a batch-one controller exposed a wider action budget");
+  require(host_states.size() == fused_states.size() &&
+              host_states.size() == reduced_states.size(),
           "batch-one comparison produced different trace lengths");
   for (std::size_t i = 0; i < host_states.size(); ++i) {
+    require(same_controller_semantics(host_states[i], fused_states[i]),
+            "fused host-checked controller diverged from scalar semantics");
     require(same_controller_semantics(host_states[i], reduced_states[i]),
             "reduced batch size one diverged from host controller semantics");
   }
   require(host_states[3].action ==
               DeltaSteppingCsrControllerAction::kContinueDevice &&
+              fused_states[3].action ==
+                  DeltaSteppingCsrControllerAction::kPublishHostCheck &&
               reduced_states[3].action ==
                   DeltaSteppingCsrControllerAction::kPublishHostCheck,
-          "batch-one model did not publish after atomic reduced compaction");
+          "batch-one mode-specific compaction boundary changed unexpectedly");
+}
+
+void test_controller_publication_accounting() {
+  constexpr std::uint64_t kBatchSize = 4;
+  DeltaSteppingCsrControllerSequentialModel model(
+      {DeltaSteppingCsrControllerMode::kReducedRoundTrip,
+       static_cast<std::uint32_t>(kBatchSize)});
+  const auto states = model.run({
+      DeltaSteppingCsrControllerTraceStep::begin_query(1),
+      DeltaSteppingCsrControllerTraceStep::light_round(0, 1, 1),
+      DeltaSteppingCsrControllerTraceStep::light_round(0, 1, 1),
+      DeltaSteppingCsrControllerTraceStep::light_round(0, 1, 1),
+      DeltaSteppingCsrControllerTraceStep::light_round(0, 1, 1),
+      DeltaSteppingCsrControllerTraceStep::light_round(
+          0, 0, 1, kDeltaSteppingCsrNoControllerBucket,
+          DeltaSteppingCsrControllerStatus::kComplete),
+  });
+
+  std::uint64_t publications = 0;
+  std::uint64_t nonterminal_publications = 0;
+  std::uint64_t terminal_publications = 0;
+  std::uint64_t action_slots_budgeted = 0;
+  std::uint64_t actions_completed = 0;
+  std::uint64_t unused_action_slots = 0;
+  std::uint32_t previous_publication = 0;
+  std::uint32_t previous_light_rounds = 0;
+  for (const auto& state : states) {
+    if (state.publication_sequence == previous_publication) continue;
+    require(state.publication_sequence == previous_publication + 1U,
+            "controller publication sequence skipped a descriptor");
+    const std::uint64_t completed =
+        static_cast<std::uint64_t>(state.light_rounds) -
+        static_cast<std::uint64_t>(previous_light_rounds);
+    require(completed > 0 && completed <= kBatchSize,
+            "published action count exceeded its bounded batch");
+    if (state.status == DeltaSteppingCsrControllerStatus::kNone) {
+      require(completed == kBatchSize &&
+                  state.action ==
+                      DeltaSteppingCsrControllerAction::kPublishHostCheck,
+              "nonterminal publication did not consume its full batch");
+      ++nonterminal_publications;
+    } else {
+      ++terminal_publications;
+    }
+    ++publications;
+    action_slots_budgeted += kBatchSize;
+    actions_completed += completed;
+    unused_action_slots += kBatchSize - completed;
+    previous_publication = state.publication_sequence;
+    previous_light_rounds = state.light_rounds;
+  }
+
+  require(publications == 2 && nonterminal_publications == 1 &&
+              terminal_publications == 1 &&
+              action_slots_budgeted == 8 && actions_completed == 5 &&
+              unused_action_slots == 3,
+          "controller publication/action diagnostics accounting diverged");
 }
 
 void test_row_offset_policy() {
@@ -645,6 +734,7 @@ int main() {
   test_controller_terminal_statuses();
   test_controller_callback_abort_and_reuse();
   test_controller_batch_one_equivalence();
+  test_controller_publication_accounting();
   test_row_offset_policy();
   test_result_shape_policy();
   test_generation_membership_model();
