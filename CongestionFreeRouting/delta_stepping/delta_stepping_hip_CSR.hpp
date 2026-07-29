@@ -69,6 +69,11 @@ struct DeltaSteppingCsrTelemetry {
   std::uint64_t pending_queue_high_water = 0;
   std::uint64_t heavy_queue_high_water = 0;
   std::uint64_t controller_round_trips = 0;
+  // Host-controller diagnostics. These remain zero unless the caller opts in
+  // to telemetry, and count only the generic Delta controller path.
+  std::uint64_t scalar_d2h_readbacks = 0;
+  std::uint64_t explicit_stream_waits = 0;
+  std::uint64_t batched_status_readbacks = 0;
   std::uint64_t compact_parent_fallback_events = 0;
   DeltaSteppingCsrControllerMode requested_controller_mode =
       DeltaSteppingCsrControllerMode::kHostChecked;

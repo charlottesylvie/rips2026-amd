@@ -482,7 +482,7 @@ uninstrumented kernel instantiations and does not allocate, reset, or copy the
 device counter buffer. `--delta-telemetry` selects instrumented kernels and is
 intended for diagnosis, not clean wall-time measurement. After a successful
 worker join, PathFinder writes one JSON line to standard output with
-`type="delta_stepping_telemetry"` and `schema_version=2`; filter mixed logs on
+`type="delta_stepping_telemetry"` and `schema_version=3`; filter mixed logs on
 that type. `queries` counts actual collected net searches, counter fields are
 sums across searches, and queue fields under `maxima` are per-search maxima
 combined with `max`, not sums. Execution-path counts distinguish exact-unit,
@@ -494,7 +494,11 @@ from being mistaken for a reduced-controller measurement.
 The counters measure bucket/light/heavy rounds, frontier and edge visits,
 distance atomic attempts/successes/CAS retries, logical queue insertions and
 peaks, repeated pending-token examinations, unique reached vertices,
-controller status round trips, and compact-parent fallbacks. In particular,
+controller status round trips, and compact-parent fallbacks. Generic-controller
+diagnostics also report scalar D2H readbacks, explicit-stream waits, and
+batched compact-path/controller status readbacks; these are zero for other
+execution paths.
+In particular,
 pending examinations may count one retained token in multiple scheduler scans,
 edge visits are phase examinations rather than unique light/heavy edges, queue
 peaks are entries rather than bytes, and controller round trips are counted

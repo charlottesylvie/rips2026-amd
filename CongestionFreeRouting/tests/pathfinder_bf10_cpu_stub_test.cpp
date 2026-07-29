@@ -874,6 +874,13 @@ void populate_stub_delta_telemetry(
   telemetry.pending_queue_high_water = 20 * token;
   telemetry.heavy_queue_high_water = 21 * token;
   telemetry.controller_round_trips = 22 * token;
+  if (execution_path != DeltaSteppingCsrExecutionPath::kExactUnit) {
+    telemetry.scalar_d2h_readbacks = 23 * token;
+    telemetry.explicit_stream_waits = 24 * token;
+  }
+  if (execution_path == DeltaSteppingCsrExecutionPath::kCompactGeneric) {
+    telemetry.batched_status_readbacks = 25 * token;
+  }
   telemetry.compact_parent_fallback_events = 23 * token;
   telemetry.requested_controller_mode = requested_controller_mode;
   telemetry.requested_controller_batch_size =
@@ -2496,6 +2503,9 @@ int main() {
               telemetry_sums.stale_pending_entry_examinations == 170 &&
               telemetry_sums.reached_vertices == 180 &&
               telemetry_sums.controller_round_trips == 220 &&
+              telemetry_sums.scalar_d2h_readbacks == 207 &&
+              telemetry_sums.explicit_stream_waits == 216 &&
+              telemetry_sums.batched_status_readbacks == 50 &&
               telemetry_sums.compact_parent_fallback_events == 230,
           "telemetry aggregation must sum every counter and ignore empty slots");
   require(telemetry_totals.current_queue_high_water == 76 &&
@@ -2515,7 +2525,7 @@ int main() {
   const std::string aggregate_json = routing::delta_telemetry_aggregate_json(
       aggregate_records, aggregate_json_options, 2.5f, 64, 3);
   require(aggregate_json.find('\n') == std::string::npos &&
-              aggregate_json.find("\"schema_version\":2") !=
+              aggregate_json.find("\"schema_version\":3") !=
                   std::string::npos &&
               aggregate_json.find("\"queries\":4") != std::string::npos &&
               aggregate_json.find("\"completed_queries\":3") !=
@@ -2532,6 +2542,11 @@ int main() {
                   "\"execution_paths\":{\"exact_unit\":1,"
                   "\"compact_generic\":1,\"legacy_generic\":1,"
                   "\"generic_distances_only\":1}") != std::string::npos &&
+              aggregate_json.find(
+                  "\"scalar_d2h_readbacks\":207,"
+                  "\"explicit_stream_waits\":216,"
+                  "\"batched_status_readbacks\":50") !=
+                  std::string::npos &&
               aggregate_json.find(
                   "\"maxima\":{\"current_queue_high_water\":76,"
                   "\"pending_queue_high_water\":80,"
@@ -2741,7 +2756,7 @@ int main() {
       single_delta_telemetry_json_line(parallel_telemetry_stdout);
   require(parallel_telemetry_json.find("\"queries\":2") !=
                   std::string::npos &&
-              parallel_telemetry_json.find("\"schema_version\":2") !=
+              parallel_telemetry_json.find("\"schema_version\":3") !=
                   std::string::npos &&
               parallel_telemetry_json.find("\"completed_queries\":2") !=
                   std::string::npos &&
@@ -2768,6 +2783,11 @@ int main() {
                   "\"outer_buckets_processed\":3") != std::string::npos &&
               parallel_telemetry_json.find(
                   "\"controller_round_trips\":66") != std::string::npos &&
+              parallel_telemetry_json.find(
+                  "\"scalar_d2h_readbacks\":0,"
+                  "\"explicit_stream_waits\":0,"
+                  "\"batched_status_readbacks\":0") !=
+                  std::string::npos &&
               parallel_telemetry_json.find(
                   "\"maxima\":{\"current_queue_high_water\":38,"
                   "\"pending_queue_high_water\":40,"

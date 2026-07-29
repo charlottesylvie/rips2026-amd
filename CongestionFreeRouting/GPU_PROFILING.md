@@ -232,7 +232,7 @@ grep '^{"type":"delta_stepping_telemetry"' \
 ```
 
 After all workers join, `pathfinder` writes exactly one compact JSON line to
-standard output with `type="delta_stepping_telemetry"`, `schema_version=2`,
+standard output with `type="delta_stepping_telemetry"`, `schema_version=3`,
 and `scope="pathfinder_run"`. `queries` counts actual SSSP invocations, not net
 slots; a net with no unresolved target leaves its slot uncollected.
 `completed_queries` counts records whose cleanup and final synchronization
@@ -270,6 +270,9 @@ The counters are exact under these definitions:
 | `stale_pending_entry_examinations` | Those examinations whose token is inactive or no longer names a valid future bucket for that scan. It has the same repeated-examination behavior. |
 | `reached_vertices` | Unique vertices whose distance became finite during the invocation, including deduplicated sources. |
 | `controller_round_trips` | Explicitly counted host-visible status/count transfers used for control decisions. It is not a count of every HIP call or synchronization. |
+| `scalar_d2h_readbacks` | Generic-controller scalar D2H transfers completed for host decisions or sparse-reset counts. |
+| `explicit_stream_waits` | Completion waits issued by the generic controller and its cleanup, separate from scalar/status readback completion. Null-stream no-op helper calls, one-time workspace setup, and result/path/telemetry materialization waits are excluded. |
+| `batched_status_readbacks` | Generic compact-path status tuples that include sparse-reset state, plus reduced-controller descriptor transfers that publish several fields with one D2H copy and wait. Non-generic paths report zero. |
 | `controller_mode`, `controller_batch_size` | Run-level requested A/B configuration. These fields alone do not prove that the reduced controller executed. |
 | `effective_controller_modes`, `controller_fallback_queries` | Query counts by controller actually used and the number that fell back to host checking. Reject a performance sample when either total does not match the intended A/B arm. |
 | `compact_parent_fallback_events` | One when an automatic compact-parent vector-target query had to use legacy parents because its edge-to-source map was unavailable; otherwise zero. |

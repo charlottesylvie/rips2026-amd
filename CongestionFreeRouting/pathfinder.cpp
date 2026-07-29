@@ -1755,6 +1755,10 @@ DeltaTelemetryTotals aggregate_delta_telemetry(
     totals.sums.reached_vertices += record.reached_vertices;
     totals.sums.controller_round_trips +=
         record.controller_round_trips;
+    totals.sums.scalar_d2h_readbacks += record.scalar_d2h_readbacks;
+    totals.sums.explicit_stream_waits += record.explicit_stream_waits;
+    totals.sums.batched_status_readbacks +=
+        record.batched_status_readbacks;
     totals.sums.compact_parent_fallback_events +=
         record.compact_parent_fallback_events;
     totals.current_queue_high_water =
@@ -1781,7 +1785,7 @@ std::string delta_telemetry_aggregate_json(
   std::ostringstream out;
   out.precision(std::numeric_limits<float>::max_digits10);
   out << "{\"type\":\"delta_stepping_telemetry\""
-      << ",\"schema_version\":2"
+      << ",\"schema_version\":3"
       << ",\"scope\":\"pathfinder_run\""
       << ",\"queries\":" << totals.queries
       << ",\"completed_queries\":" << totals.completed_queries
@@ -1844,6 +1848,12 @@ std::string delta_telemetry_aggregate_json(
       << ",\"reached_vertices\":" << sums.reached_vertices
       << ",\"controller_round_trips\":"
       << sums.controller_round_trips
+      << ",\"scalar_d2h_readbacks\":"
+      << sums.scalar_d2h_readbacks
+      << ",\"explicit_stream_waits\":"
+      << sums.explicit_stream_waits
+      << ",\"batched_status_readbacks\":"
+      << sums.batched_status_readbacks
       << ",\"compact_parent_fallback_events\":"
       << sums.compact_parent_fallback_events
       << "},\"maxima\":{"

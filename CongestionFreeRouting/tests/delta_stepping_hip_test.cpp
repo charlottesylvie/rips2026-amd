@@ -1508,6 +1508,61 @@ void test_runtime_telemetry_modes_and_reset(hipStream_t stream) {
               generic.execution_path ==
                   DeltaSteppingCsrExecutionPath::kCompactGeneric,
           "forced-generic telemetry reported the wrong mode");
+  require(generic.scalar_d2h_readbacks > 0 &&
+              generic.explicit_stream_waits > 0 &&
+              generic.batched_status_readbacks == 1,
+          "forced-generic host-controller diagnostics are inconsistent");
+
+  DeltaSteppingCsrTelemetry source_target_telemetry;
+  const DeltaSteppingCsrResult source_target_result = forced_generic.run(
+      sources, sources.front(), 1.0f, -1,
+      DeltaSteppingCsrRunOptions{&source_target_telemetry}, stream, nullptr,
+      nullptr);
+  validate_single_target_predecessors(
+      "telemetry forced-generic source target", unit_graph, sources,
+      sources.front(), 0.0f, source_target_result);
+  require(source_target_telemetry.collected &&
+              source_target_telemetry.completed &&
+              source_target_telemetry.scalar_d2h_readbacks == 0 &&
+              source_target_telemetry.controller_round_trips == 0,
+          "source-target generic run performed an avoidable scalar readback");
+
+  const std::vector<int> all_source_targets = {sources.front(),
+                                                sources.front()};
+  DeltaSteppingCsrTelemetry all_source_targets_telemetry;
+  const DeltaSteppingCsrResult all_source_targets_result = forced_generic.run(
+      sources, all_source_targets, 1.0f, -1,
+      DeltaSteppingCsrRunOptions{&all_source_targets_telemetry}, stream,
+      nullptr, nullptr);
+  validate_compact_target_paths("telemetry forced-generic source targets",
+                                unit_graph,
+                                sources,
+                                all_source_targets,
+                                expected,
+                                all_source_targets_result);
+  require(all_source_targets_telemetry.collected &&
+              all_source_targets_telemetry.completed &&
+              all_source_targets_telemetry.execution_path ==
+                  DeltaSteppingCsrExecutionPath::kCompactGeneric &&
+              all_source_targets_telemetry.scalar_d2h_readbacks == 0 &&
+              all_source_targets_telemetry.batched_status_readbacks == 1 &&
+              all_source_targets_telemetry.controller_round_trips == 0,
+          "all-source compact run did not batch sparse-reset status");
+
+  DeltaSteppingCsrTelemetry reused_generic_telemetry;
+  const DeltaSteppingCsrResult reused_generic_result = forced_generic.run(
+      sources, targets, 1.0f, -1,
+      DeltaSteppingCsrRunOptions{&reused_generic_telemetry}, stream, nullptr,
+      nullptr);
+  validate_compact_target_paths("telemetry forced-generic reused workspace",
+                                unit_graph,
+                                sources,
+                                targets,
+                                expected,
+                                reused_generic_result);
+  require(reused_generic_telemetry.completed &&
+              reused_generic_telemetry.batched_status_readbacks == 1,
+          "compact status batching left the workspace unsafe to reuse");
 
   DeltaSteppingCsrWorkspace forced_legacy(
       unit_graph, stream, DeltaSteppingCsrParentMode::kForceLegacy);
