@@ -175,7 +175,6 @@ PATHFINDER_SCHEMA_DIR ?=
 PATHFINDER_SSSP_ENGINE ?= unit-bfs
 PATHFINDER_ARGS ?=
 PATHFINDER_DEVICE_GRAPH ?= xcvu3p.full-poc-base-wire.devicegraph
-PATHFINDER_COMPONENT_BINS := $(PATHFINDER_ROUTER_BIN) $(INTERCHANGE_TO_CSR) $(PATHFINDER_BIN) $(ROUTES_TO_PHYS)
 export INTERCHANGE_TO_CSR PATHFINDER_BIN ROUTES_TO_PHYS
 
 PATHFINDER_GPU_SOURCES := \
@@ -191,11 +190,11 @@ PATHFINDER_GPU_HEADERS := \
 	$(wildcard CongestionFreeRouting/unit_bfs/*.hpp) \
 	HIP_kernel/bellman_ford/src/bf_hip_CSR.hpp
 
-# Rebuild binaries changed in this repository before timing them. Generated
-# FPGA Interchange schemas are not present in every checkout, so the default
-# converter/reconstructor targets become Make-managed only when their schema
-# directory is supplied explicitly. Helpers at non-default paths remain
-# caller-managed.
+# Explicit local binary build recipes. Benchmark output targets deliberately
+# treat the configured executables as caller-managed rather than file
+# prerequisites. Generated FPGA Interchange schemas are not present in every
+# checkout, so converter/reconstructor recipes are available only when their
+# schema directory is supplied explicitly.
 ./PathFinderFile: CongestionFreeRouting/pathfinder_router.cpp
 	$(PATHFINDER_HOST_CXX) $(PATHFINDER_HOST_FLAGS) $< -o $@
 
@@ -290,7 +289,7 @@ endif
 .PHONY: pathfinder-profile-force
 pathfinder-profile-force:
 
-%_PathFinderFile.phys: %_unrouted.phys %.netlist $(PATHFINDER_DEVICE_GRAPH) $(PATHFINDER_COMPONENT_BINS) $(if $(filter-out none,$(PATHFINDER_PROFILE)),pathfinder-profile-force)
+%_PathFinderFile.phys: %_unrouted.phys %.netlist $(PATHFINDER_DEVICE_GRAPH) $(if $(filter-out none,$(PATHFINDER_PROFILE)),pathfinder-profile-force)
 	(time env PATHFINDER_PROFILE_COMMAND='$(PATHFINDER_PROFILE_COMMAND)' $(PATHFINDER_ROUTER_BIN) $< $@ --logical-netlist $*.netlist --device-graph $(PATHFINDER_DEVICE_GRAPH) --sssp-engine $(PATHFINDER_SSSP_ENGINE) $(PATHFINDER_ARGS)) $(call log_and_or_display,$@.log)
 
 #### END ROUTER RECIPES
