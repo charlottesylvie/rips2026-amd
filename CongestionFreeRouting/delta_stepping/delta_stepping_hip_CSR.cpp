@@ -2392,15 +2392,13 @@ __device__ inline int controller_bounded_append(
     int capacity,
     CooperativeDeltaControllerState* state) {
   if (!append) return -1;
-  int observed = atomic_load_counter(queue_tail);
-  while (observed >= 0 && observed < capacity) {
-    const int prior = atomicCAS(queue_tail, observed, observed + 1);
-    if (prior == observed) return observed;
-    observed = prior;
+  const int position = atomicAdd(queue_tail, 1);
+  if (position >= 0 && position < capacity) {
+    return position;
   }
   controller_set_status(
       state,
-      observed < 0 ? DeltaSteppingCsrControllerStatus::kInvalidState
+      position < 0 ? DeltaSteppingCsrControllerStatus::kInvalidState
                    : DeltaSteppingCsrControllerStatus::kQueueOverflow);
   return -1;
 }
