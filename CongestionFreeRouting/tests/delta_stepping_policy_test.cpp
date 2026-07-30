@@ -74,6 +74,55 @@ void test_controller_policy_and_descriptor() {
                   fused_host_checked) == 1,
           "host and fused-host controllers must remain one-action modes");
 
+  require(kDeltaSteppingCsrRecommendedQueryBatchWidth == 4 &&
+              kDeltaSteppingCsrMaxQueryBatchWidth == 8,
+          "multi-query controller width bounds changed unexpectedly");
+  require(delta_stepping_effective_query_batch_width(0, 4) == 0 &&
+              delta_stepping_effective_query_batch_width(4, 0) == 0,
+          "zero producers or requested width must disable query batching");
+  require(delta_stepping_effective_query_batch_width(1, 4) == 1 &&
+              delta_stepping_effective_query_batch_width(4, 4) == 4 &&
+              delta_stepping_effective_query_batch_width(7, 4) == 4 &&
+              delta_stepping_effective_query_batch_width(4, 7) == 4 &&
+              delta_stepping_effective_query_batch_width(
+                  std::numeric_limits<std::uint32_t>::max(),
+                  std::numeric_limits<std::uint32_t>::max()) ==
+                  kDeltaSteppingCsrMaxQueryBatchWidth,
+          "effective query width must clamp to producers, request, and cap");
+  require(delta_stepping_query_batch_action_bound_is_valid(1, 1) &&
+              delta_stepping_query_batch_action_bound_is_valid(4, 4) &&
+              delta_stepping_query_batch_action_bound_is_valid(
+                  kDeltaSteppingCsrMaxQueryBatchWidth,
+                  kDeltaSteppingCsrMaxControllerBatchSize),
+          "valid fused/reduced multi-query watchdog bounds were rejected");
+  require(!delta_stepping_query_batch_action_bound_is_valid(0, 1) &&
+              !delta_stepping_query_batch_action_bound_is_valid(1, 0) &&
+              !delta_stepping_query_batch_action_bound_is_valid(
+                  kDeltaSteppingCsrMaxQueryBatchWidth + 1U, 1) &&
+              !delta_stepping_query_batch_action_bound_is_valid(
+                  1, kDeltaSteppingCsrMaxControllerBatchSize + 1U),
+          "multi-query controller accepted an unbounded width/action product");
+  require(kDeltaSteppingCsrRecommendedBatchBlocksPerComputeUnit == 1 &&
+              kDeltaSteppingCsrMaxBatchBlocksPerComputeUnit == 8,
+          "cooperative batch blocks-per-CU bounds changed unexpectedly");
+  require(delta_stepping_batch_blocks_per_compute_unit_is_valid(1) &&
+              delta_stepping_batch_blocks_per_compute_unit_is_valid(
+                  kDeltaSteppingCsrMaxBatchBlocksPerComputeUnit) &&
+              !delta_stepping_batch_blocks_per_compute_unit_is_valid(0) &&
+              !delta_stepping_batch_blocks_per_compute_unit_is_valid(
+                  kDeltaSteppingCsrMaxBatchBlocksPerComputeUnit + 1U),
+          "cooperative batch blocks-per-CU validation lost its hard cap");
+  require(delta_stepping_effective_batch_blocks_per_compute_unit(1, 8) == 1 &&
+              delta_stepping_effective_batch_blocks_per_compute_unit(8, 4) ==
+                  4 &&
+              delta_stepping_effective_batch_blocks_per_compute_unit(4, 8) ==
+                  4 &&
+              delta_stepping_effective_batch_blocks_per_compute_unit(1, 0) ==
+                  0 &&
+              delta_stepping_effective_batch_blocks_per_compute_unit(0, 8) ==
+                  0,
+          "effective batch blocks per CU must clamp to legal kernel occupancy");
+
   const DeltaSteppingCsrControllerPolicy reduced{
       DeltaSteppingCsrControllerMode::kReducedRoundTrip, 7};
   require(delta_stepping_effective_controller_batch_size(reduced) == 7,

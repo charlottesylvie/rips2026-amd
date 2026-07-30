@@ -78,7 +78,9 @@ def main() -> None:
     )
     require(
         defaults.delta_controller is None
-        and defaults.delta_controller_batch_size is None,
+        and defaults.delta_controller_batch_size is None
+        and defaults.delta_query_batch_width is None
+        and defaults.delta_batch_blocks_per_cu is None,
         "controller controls must remain unset by default",
     )
     require(
@@ -147,6 +149,10 @@ def main() -> None:
             "reduced-round-trip",
             "--delta-controller-batch-size",
             "7",
+            "--delta-query-batch-width",
+            "3",
+            "--delta-batch-blocks-per-cu",
+            "2",
             "--delta-benchmark-weights",
             "mixed",
             "--delta-benchmark-weight-seed",
@@ -166,6 +172,10 @@ def main() -> None:
             "reduced-round-trip",
             "--delta-controller-batch-size",
             "7",
+            "--delta-query-batch-width",
+            "3",
+            "--delta-batch-blocks-per-cu",
+            "2",
             "--delta-benchmark-weights",
             "mixed",
             "--delta-benchmark-weight-seed",
@@ -223,6 +233,8 @@ def main() -> None:
         ["--delta-controller", "host-checked"],
         ["--delta-controller", "fused-host-checked"],
         ["--delta-controller", "reduced-round-trip"],
+        ["--delta-query-batch-width", "4"],
+        ["--delta-batch-blocks-per-cu", "1"],
         [
             "--delta-controller",
             "reduced-round-trip",
@@ -303,6 +315,62 @@ def main() -> None:
         == ["--delta-controller", "fused-host-checked"],
         "fused host-checked controller mode was not forwarded",
     )
+    fused_batch = benchmark.parse_args(
+        [
+            "input.phys",
+            "output.phys",
+            "--sssp-engine",
+            "delta-step",
+            "--delta-controller",
+            "fused-host-checked",
+            "--delta-query-batch-width",
+            "3",
+            "--delta-batch-blocks-per-cu",
+            "2",
+        ]
+    )
+    require(
+        benchmark.pathfinder_args(fused_batch)[-6:]
+        == [
+            "--delta-controller",
+            "fused-host-checked",
+            "--delta-query-batch-width",
+            "3",
+            "--delta-batch-blocks-per-cu",
+            "2",
+        ],
+        "cooperative query width and block cap were not forwarded canonically",
+    )
+    for batching_option in (
+        "--delta-query-batch-width",
+        "--delta-batch-blocks-per-cu",
+    ):
+        require_parse_rejected(
+            ["--sssp-engine", "delta-step", batching_option, "2"],
+            f"{batching_option} was accepted without a cooperative controller",
+        )
+        require_parse_rejected(
+            [
+                "--sssp-engine",
+                "delta-step",
+                "--delta-controller",
+                "host-checked",
+                batching_option,
+                "2",
+            ],
+            f"{batching_option} was accepted with host-checked control",
+        )
+        require_parse_rejected(
+            [
+                "--sssp-engine",
+                "delta-step",
+                "--delta-controller",
+                "fused-host-checked",
+                batching_option,
+                "9",
+            ],
+            f"{batching_option} accepted a value above its hard cap",
+        )
     reduced_default_batch = benchmark.parse_args(
         [
             "input.phys",

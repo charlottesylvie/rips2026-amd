@@ -16,14 +16,20 @@ figures as the host-checked baseline, not as measurements of the opt-in
 controller in this checkout. Reproduce correctness and profiler-free timing
 before using archived percentages to rank current code.
 
-The user later observed that the old `reduced-round-trip` controller was
-dramatically slower than `host-checked`. That report is an important rejection
-signal, but it did not include a retained timing series and is not promoted to
-a measurement here. This pass keeps `host-checked` as the unchanged scalar
-correctness reference, adds the explicit experimental `fused-host-checked`
-cooperative batch-one arm, and keeps `reduced-round-trip` as the explicit
-multi-action arm. No cooperative result in this checkout has been compiled or
-run on AMD hardware, and no speedup is claimed.
+The superseded independent-worker cooperative path was exercised on gfx1151.
+One retained four-worker run completed 27,960 queries with 170,929 logical
+cooperative publications/round trips (6.11 per query), 2,225,246 grid barriers
+(about 13.0 per publication), 5.944 billion frontier entries, and 25.831
+billion light-edge visits. Each worker grid was restricted to five blocks by
+dividing 20 CUs among four workers even though occupancy allowed eight blocks
+per CU. The user also observed severe slowdown and a multiworker crash from
+that design. These results motivate, but do not measure, the current
+multi-query coordinator: ready private workspaces now share one physical
+cooperative launch, and the full admitted grid visits slots sequentially with
+uniform barriers. This pass keeps `host-checked` as the unchanged scalar
+correctness reference, retains explicit `fused-host-checked` and
+`reduced-round-trip` arms, and claims no speedup for the HIP-unvalidated
+redesign.
 
 The full profiling workflow has a manual one-time device stage followed by
 three Make-driven per-test processes:
@@ -103,7 +109,8 @@ make ROUTER=PathFinderFile BENCHMARKS="logicnets_jscl" VERBOSE=1 \
 make ROUTER=PathFinderFile BENCHMARKS="logicnets_jscl" VERBOSE=1 \
   PATHFINDER_SSSP_ENGINE=delta-step \
   PATHFINDER_ARGS="--delta 1 --delta-force-generic \
-    --delta-controller fused-host-checked --parallel-net-workers 4" \
+    --delta-controller fused-host-checked --parallel-net-workers 4 \
+    --delta-query-batch-width 4 --delta-batch-blocks-per-cu 1" \
   PATHFINDER_PROFILE=rocprofv3 \
   PATHFINDER_PROFILE_RUN=delta-fused-host-checked-w4
 
@@ -111,7 +118,8 @@ make ROUTER=PathFinderFile BENCHMARKS="logicnets_jscl" VERBOSE=1 \
   PATHFINDER_SSSP_ENGINE=delta-step \
   PATHFINDER_ARGS="--delta 1 --delta-force-generic \
     --delta-controller reduced-round-trip \
-    --delta-controller-batch-size 4 --parallel-net-workers 4" \
+    --delta-controller-batch-size 4 --parallel-net-workers 4 \
+    --delta-query-batch-width 4 --delta-batch-blocks-per-cu 1" \
   PATHFINDER_PROFILE=rocprofv3 \
   PATHFINDER_PROFILE_RUN=delta-reduced-b4-w4
 ```
@@ -125,24 +133,35 @@ reference; it never silently selects the cooperative backend.
 `fused-host-checked` is an explicit experimental cooperative controller with a
 fixed one-action budget. `reduced-round-trip` is the explicit multi-action
 controller, with batch size four as the initial candidate and a hard maximum
-of 64. Both cooperative modes capability-check before traversal and fall back
-to the scalar controller when unsupported; callbacks also require host bucket
-boundaries. Always pair a profile with telemetry from a separate run and
-require the requested effective mode, `cooperative_grid` backend, and zero
-unexpected fallbacks before naming a sample fused or reduced.
+of 64. With multiple workers, both modes rendezvous ready queries into one
+coordinator-owned launch; all blocks process slot 0, then slot 1, and so on,
+which keeps every `grid.sync()` uniform and makes the maximum number of
+concurrent cooperative launches exactly one. Width four is the initial query
+batch. The physical grid defaults to one block per CU, not the legal occupancy
+maximum; the runtime clamps it further by graph size and occupancy. After the
+three-arm correctness gate, sweep `--delta-batch-blocks-per-cu` over `1`, `2`,
+`4`, and `8` because more barrier participants can be slower despite higher
+occupancy. Both modes capability-check before traversal and retain their
+ordinary unsupported/callback fallback behavior.
 
-For a successful all-light vector-target query on an explicit stream, let `L`
-be light actions, `B` processed buckets, and `K` the reduced action budget. The
-static synchronization inventory is `2L + 4B + 5` for host-checked, `L + 8`
-for fused-host-checked, and `ceil(L / K) + 8` for reduced-round-trip. At
-`L = B = 8`, those are 53, 16, and 10 synchronizations (`K = 4`); at
-`L = B = 10`, they are 65, 18, and 11. The cooperative fixed term includes
-one fewer boundary than the prior pass because initial controller-state H2D is
-queued before source initialization and completed by the already-required
-post-source publication synchronization. These formulas count blocking API
-boundaries, not saved wall time.
+For one successful all-light vector-target query, let `L` be light actions,
+`B` processed buckets, and `K` the reduced action budget. The scalar reference
+retains `2L + 4B + 5` blocking boundaries. A query produces `L` logical fused
+publications or `ceil(L / K)` logical reduced publications, plus its bounded
+setup/extraction boundaries. In a multiworker run those logical publications
+are rendezvoused: if `P` slot publications are simultaneously batchable at
+width `W`, the ideal physical-completion term is `ceil(P / W)` rather than
+`P`; skew and tail batches can raise it. Therefore schema-4
+`query_batching.physical_completions` is the authoritative dynamic count. Do
+not add per-query formulas or equate logical publications with physical
+cooperative launches when interpreting a four-worker trace. Applied only as
+an ideal packing estimate to the archived 170,929 publications, width four
+would approach 42,733 physical completions; if a four-action reduced arm also
+cut logical publications by four, the corresponding ideal is about 10,684.
+Query skew, early terminals, and tail batches can make either count higher;
+neither number is a measured result.
 
-The old cooperative mechanics could make fewer host waits slower: a Boolean
+The cooperative mechanics can still make fewer host waits slower: a Boolean
 all-light bucket-closing action that compacted and continued crossed 12 phase
 barriers, while the Boolean target-settled terminal branch crossed six; other
 branches have different counts, and every launch adds entry/final publication
@@ -151,10 +170,13 @@ scalar reads around phase changes, queue reservation used a CAS loop, pending
 minimum used one global atomic per thread, and each query could span a
 one-block-per-CU grid. The repair uses grid-barrier ordering with
 one final system fence, stable post-barrier loads, one `atomicAdd` reservation,
-a block minimum followed by one global atomic per block, and a
-concurrency-partitioned grid that does not shrink from the batch's starting
-frontier. Treat telemetry's publications, completed actions, grid size, and
-grid barriers as acceptance data; fewer publications alone is insufficient.
+a block minimum followed by one global atomic per block. The current physical
+batch uses one admitted grid for every sequential query slot instead of
+partitioning CUs among workers; at the default one block per CU, the cited
+20-CU device can use up to 20 blocks for a sufficiently large graph rather
+than five. That is a design expectation, not a measurement. Treat physical
+completions, logical slot publications, completed actions, grid size, and grid
+barriers as acceptance data; fewer publications alone is insufficient.
 
 Important: the current FPGA Interchange converter writes every CSR edge weight
 as `1.0f`. A graph at or below the exact-unit specialization's `2^24`-row
@@ -265,6 +287,7 @@ make ROUTER=PathFinderFile BENCHMARKS="logicnets_jscl" VERBOSE=1 \
   PATHFINDER_ARGS="--delta 2 --delta-force-generic \
     --delta-benchmark-weights mixed --delta-benchmark-weight-seed 17 \
     --delta-controller fused-host-checked --parallel-net-workers 4 \
+    --delta-query-batch-width 4 --delta-batch-blocks-per-cu 1 \
     --delta-telemetry" \
   PATHFINDER_PROFILE=none 2>&1 | tee delta-mixed-fused-telemetry.log
 
@@ -274,6 +297,7 @@ make ROUTER=PathFinderFile BENCHMARKS="logicnets_jscl" VERBOSE=1 \
     --delta-benchmark-weights mixed --delta-benchmark-weight-seed 17 \
     --delta-controller reduced-round-trip \
     --delta-controller-batch-size 4 --parallel-net-workers 4 \
+    --delta-query-batch-width 4 --delta-batch-blocks-per-cu 1 \
     --delta-telemetry" \
   PATHFINDER_PROFILE=none 2>&1 | tee delta-mixed-reduced-telemetry.log
 
@@ -283,7 +307,7 @@ grep '^{"type":"delta_stepping_telemetry"' \
 ```
 
 After all workers join, `pathfinder` writes exactly one compact JSON line to
-standard output with `type="delta_stepping_telemetry"`, `schema_version=3`,
+standard output with `type="delta_stepping_telemetry"`, `schema_version=4`,
 and `scope="pathfinder_run"`. `queries` counts actual SSSP invocations, not net
 slots; a net with no unresolved target leaves its slot uncollected.
 `completed_queries` counts records whose cleanup and final synchronization
@@ -293,7 +317,11 @@ resolved numeric delta, runtime wavefront size, actual worker count,
 auto-delta/multiplier values, force-mode flags, configured `controller_mode`
 and `controller_batch_size`, per-query `effective_controller_modes` counts,
 `controller_fallback_queries`, backend/fallback-reason histograms, and a
-`controller_diagnostics` object. The configured names use `host_checked`,
+`controller_diagnostics` object. Schema 4 adds a `query_batching` object that
+separates physical batch launches/completions from logical slot publications,
+records slot/action utilization and relaunches, and exposes the selected grid
+and the maximum number of simultaneous cooperative launches. The configured
+names use `host_checked`,
 `fused_host_checked`, and `reduced_round_trip` in JSON even though the CLI
 uses hyphens. Counter fields are summed across queries; controller grid minima
 and maxima summarize selected cooperative queries, and the three queue
@@ -326,10 +354,15 @@ The counters are exact under these definitions:
 | `effective_controller_modes` | Query counts by effective mode: `host_checked`, `fused_host_checked`, and `reduced_round_trip`. Host must remain host; a fused or reduced sample must put every generic query in its requested bucket. |
 | `controller_backends` | Query counts for `not_run`, `scalar_host`, `cooperative_grid`, and `exact_unit`. With `--delta-force-generic`, a valid fused/reduced sample requires `cooperative_grid == queries`; host requires `scalar_host == queries`. |
 | `controller_fallback_reasons`, `controller_fallback_queries` | Counts for `none`, callback, exact-unit bypass, generation budget, unsupported cooperative launch, capability/occupancy query failure, and no resident grid. Requested scalar host execution reports `none`, not a fallback. Reject an intended cooperative sample if any query falls back. |
-| `controller_diagnostics.cooperative_launches`, `controller_diagnostics.controller_publications` | Cooperative kernel launches and host-visible descriptor publications. They must equal each other and `controller_round_trips` for a completed cooperative run. |
+| `query_batching.enabled`, `configured_width`, `effective_width` | Physical multi-query coordinator selection and its bounded width. Four-worker fused/reduced acceptance requires enabled batching and effective width four; host-checked requires disabled batching. |
+| `query_batching.physical_launch_attempts`, `physical_launches`, `physical_completions`, `max_concurrent_cooperative_launches` | Physical coordinator boundaries. Successful acceptance requires launches and completions to match, no launch failure, and maximum concurrency exactly one. Attempts can exceed launches only on a reported failure. |
+| `query_batching.logical_queries_admitted/completed`, `slot_dispatches`, `slot_relaunches`, `active_slots_sum`, `unused_slots` | Logical query-to-slot accounting. `slot_dispatches` is the sum of active slots across physical attempts; it can greatly exceed physical launches and equals logical per-query publications on a successful forced-generic run. |
+| `query_batching.action_slots_budgeted`, `actions_completed`, `unused_action_slots` | Physical-batch view of bounded query actions. Completed plus unused action slots equals budgeted slots. |
+| `query_batching.requested_blocks_per_compute_unit`, selected/occupancy blocks per CU, and `grid_blocks_min/max` | The requested cap, runtime occupancy ceiling, selected cap, and actual physical grid. Default request is one block per CU even if occupancy legally permits up to eight. |
+| `controller_diagnostics.cooperative_launches`, `controller_diagnostics.controller_publications` | Per-query diagnostics retained for direct/single-query compatibility. In a coordinated multi-query run, `controller_publications` and `controller_round_trips` count logical slot publications, while physical launches live only under `query_batching`; never require publications to equal physical launches. |
 | `controller_diagnostics.controller_nonterminal_publications`, `controller_diagnostics.controller_terminal_publications` | Progress versus terminal descriptors; their sum must equal total publications. |
-| `controller_diagnostics.controller_action_slots_budgeted`, `controller_diagnostics.controller_actions_completed`, `controller_diagnostics.controller_unused_action_slots` | Bounded-work accounting. Completed plus unused slots must equal budgeted slots. Fused budgets one slot per launch; reduced budgets at most 64 per launch and should publish fewer times than completed actions on the intended workload. |
-| `controller_diagnostics.cooperative_grid_blocks_min/max`, active blocks per CU, and compute units | Effective occupancy/concurrency partition. Check that four-worker runs retain useful parallel width and that a small initial frontier does not collapse a multi-action batch to one block. |
+| `controller_diagnostics.controller_action_slots_budgeted`, `controller_diagnostics.controller_actions_completed`, `controller_diagnostics.controller_unused_action_slots` | Bounded-work accounting. Completed plus unused slots must equal budgeted slots. Fused budgets one action per logical publication; reduced budgets at most 64 and should publish fewer times than completed actions on the intended workload. |
+| `controller_diagnostics.cooperative_grid_blocks_min/max`, active blocks per CU, and compute units | Per-query view of the admitted physical grid. In a coordinated run it must agree with `query_batching.grid_blocks_min/max`; the grid is no longer divided by worker count. |
 | `controller_diagnostics.cooperative_grid_barriers` | Device-wide controller phase barriers actually crossed. Compare it with actions and wall time to detect work amplification; it is not a host synchronization count. |
 | `compact_parent_fallback_events` | One when an automatic compact-parent vector-target query had to use legacy parents because its edge-to-source map was unavailable; otherwise zero. |
 | `current_queue_high_water`, `pending_queue_high_water`, `heavy_queue_high_water` | Maximum observed queue entry counts within one invocation. The exact-unit current queue is append-only, so its peak is cumulative rather than one BFS layer's width. The run-level JSON reports the maximum per-query value; these are entries, not bytes. |
@@ -562,9 +595,11 @@ run_correctness_arm() {
 run_correctness_arm host \
   --delta-controller host-checked
 run_correctness_arm fused \
-  --delta-controller fused-host-checked
+  --delta-controller fused-host-checked \
+  --delta-query-batch-width 4 --delta-batch-blocks-per-cu 1
 run_correctness_arm reduced-b4 \
-  --delta-controller reduced-round-trip --delta-controller-batch-size 4
+  --delta-controller reduced-round-trip --delta-controller-batch-size 4 \
+  --delta-query-batch-width 4 --delta-batch-blocks-per-cu 1
 
 cmp "$validation_root/results/host.phys" \
   "$validation_root/results/fused.phys"
@@ -582,7 +617,7 @@ below. If another workload permits multiple equally valid route encodings, use
 the CPU-reference distance/path checker instead of weakening semantic
 validation to a file-size or aggregate-cost comparison.
 
-Collect schema-3 telemetry in separate runs. These are diagnostics, never
+Collect schema-4 telemetry in separate runs. These are diagnostics, never
 timing samples:
 
 ```bash
@@ -604,9 +639,11 @@ run_telemetry_arm() {
 run_telemetry_arm host \
   --delta-controller host-checked
 run_telemetry_arm fused \
-  --delta-controller fused-host-checked
+  --delta-controller fused-host-checked \
+  --delta-query-batch-width 4 --delta-batch-blocks-per-cu 1
 run_telemetry_arm reduced-b4 \
-  --delta-controller reduced-round-trip --delta-controller-batch-size 4
+  --delta-controller reduced-round-trip --delta-controller-batch-size 4 \
+  --delta-query-batch-width 4 --delta-batch-blocks-per-cu 1
 
 python3 - <<'PY'
 import json
@@ -622,7 +659,7 @@ arms = {
 for arm, (mode, backend) in arms.items():
     record = json.loads((root / f"{arm}-telemetry.json").read_text())
     queries = record["queries"]
-    assert record["schema_version"] == 3
+    assert record["schema_version"] == 4
     assert record["completed_queries"] == queries
     assert record["force_generic"] is True
     assert record["execution_paths"]["exact_unit"] == 0
@@ -632,35 +669,61 @@ for arm, (mode, backend) in arms.items():
     assert record["controller_fallback_reasons"]["none"] == queries
 
     diagnostics = record["controller_diagnostics"]
+    batching = record["query_batching"]
     if backend == "scalar_host":
+        assert batching["enabled"] is False
+        assert batching["physical_launches"] == 0
         assert diagnostics["cooperative_launches"] == 0
         assert diagnostics["controller_publications"] == 0
         continue
 
     publications = diagnostics["controller_publications"]
-    launches = diagnostics["cooperative_launches"]
+    physical_launches = batching["physical_launches"]
     actions = diagnostics["controller_actions_completed"]
     slots = diagnostics["controller_action_slots_budgeted"]
     unused = diagnostics["controller_unused_action_slots"]
-    assert publications == launches
+    assert batching["enabled"] is True
+    assert batching["configured_width"] == 4
+    assert batching["effective_width"] == 4
+    assert batching["requested_blocks_per_compute_unit"] == 1
+    assert batching["max_concurrent_cooperative_launches"] == 1
+    assert batching["physical_launch_attempts"] == physical_launches
+    assert physical_launches == batching["physical_completions"]
+    assert batching["cancellations"] == 0
+    assert batching["launch_failures"] == 0
+    assert batching["descriptor_failures"] == 0
+    assert batching["logical_queries_admitted"] == queries
+    assert batching["logical_queries_completed"] == queries
+    assert batching["slot_dispatches"] == publications
+    assert batching["slot_relaunches"] == publications - queries
+    assert physical_launches <= publications
     assert publications == record["counters"]["controller_round_trips"]
     assert diagnostics["controller_nonterminal_publications"] + \
         diagnostics["controller_terminal_publications"] == publications
     assert actions + unused == slots
+    assert batching["actions_completed"] == actions
+    assert batching["action_slots_budgeted"] == slots
+    assert batching["unused_action_slots"] == unused
+    assert batching["active_slots_sum"] == publications
+    assert batching["active_slots_sum"] + batching["unused_slots"] == \
+        batching["physical_launch_attempts"] * batching["effective_width"]
+    assert batching["grid_blocks_min"] > 0
+    assert batching["grid_blocks_max"] >= batching["grid_blocks_min"]
     assert diagnostics["cooperative_grid_blocks_min"] > 0
     assert diagnostics["cooperative_grid_blocks_max"] >= \
         diagnostics["cooperative_grid_blocks_min"]
-    assert diagnostics["cooperative_grid_barriers"] >= 2 * launches
+    assert diagnostics["cooperative_grid_barriers"] >= 2 * publications
     if arm == "fused":
-        assert slots == launches
+        assert slots == publications
     else:
-        assert slots <= 64 * launches
+        assert slots <= 64 * publications
         assert publications < actions, "batch-four did not amortize publications"
 
     print(
         arm,
         f"queries={queries}",
-        f"publications={publications}",
+        f"logical_publications={publications}",
+        f"physical_completions={batching['physical_completions']}",
         f"actions={actions}",
         f"grid_barriers={diagnostics['cooperative_grid_barriers']}",
     )
@@ -674,9 +737,11 @@ clock/thermal drift; the warm-up is deliberately not timed:
 for arm in host fused reduced-b4; do
   case "$arm" in
     host) controller_args=(--delta-controller host-checked) ;;
-    fused) controller_args=(--delta-controller fused-host-checked) ;;
+    fused) controller_args=(--delta-controller fused-host-checked \
+      --delta-query-batch-width 4 --delta-batch-blocks-per-cu 1) ;;
     reduced-b4) controller_args=(--delta-controller reduced-round-trip \
-      --delta-controller-batch-size 4) ;;
+      --delta-controller-batch-size 4 --delta-query-batch-width 4 \
+      --delta-batch-blocks-per-cu 1) ;;
   esac
   env PATHFINDER_PROFILE_COMMAND= ./PathFinderFile \
     logicnets_jscl_unrouted.phys \
@@ -694,9 +759,11 @@ for sample in 1 2 3 4 5; do
   for arm in "${arms[@]}"; do
     case "$arm" in
       host) controller_args=(--delta-controller host-checked) ;;
-      fused) controller_args=(--delta-controller fused-host-checked) ;;
+      fused) controller_args=(--delta-controller fused-host-checked \
+        --delta-query-batch-width 4 --delta-batch-blocks-per-cu 1) ;;
       reduced-b4) controller_args=(--delta-controller reduced-round-trip \
-        --delta-controller-batch-size 4) ;;
+        --delta-controller-batch-size 4 --delta-query-batch-width 4 \
+        --delta-batch-blocks-per-cu 1) ;;
     esac
     /usr/bin/time -f 'wall_seconds=%e\npeak_rss_kib=%M' \
       -o "$validation_root/logs/${arm}-time-${sample}.txt" \
@@ -718,9 +785,11 @@ for workers in 1 2 4; do
   for arm in host fused reduced-b4; do
     case "$arm" in
       host) controller_args=(--delta-controller host-checked) ;;
-      fused) controller_args=(--delta-controller fused-host-checked) ;;
+      fused) controller_args=(--delta-controller fused-host-checked \
+        --delta-query-batch-width 4 --delta-batch-blocks-per-cu 1) ;;
       reduced-b4) controller_args=(--delta-controller reduced-round-trip \
-        --delta-controller-batch-size 4) ;;
+        --delta-controller-batch-size 4 --delta-query-batch-width 4 \
+        --delta-batch-blocks-per-cu 1) ;;
     esac
     for sample in warmup 1 2 3; do
       command=(env PATHFINDER_PROFILE_COMMAND= ./PathFinderFile \
@@ -752,9 +821,11 @@ to the GPU `pathfinder` child:
 for arm in host fused reduced-b4; do
   case "$arm" in
     host) controller_args=(--delta-controller host-checked) ;;
-    fused) controller_args=(--delta-controller fused-host-checked) ;;
+    fused) controller_args=(--delta-controller fused-host-checked \
+      --delta-query-batch-width 4 --delta-batch-blocks-per-cu 1) ;;
     reduced-b4) controller_args=(--delta-controller reduced-round-trip \
-      --delta-controller-batch-size 4) ;;
+      --delta-controller-batch-size 4 --delta-query-batch-width 4 \
+      --delta-batch-blocks-per-cu 1) ;;
   esac
   env PATHFINDER_PROFILE_COMMAND="rocprofv3 --runtime-trace --stats \
     --output-directory $validation_root/profiles/${arm} --" \
@@ -987,6 +1058,7 @@ make ROUTER=PathFinderFile BENCHMARKS="logicnets_jscl" VERBOSE=1 \
   PATHFINDER_ARGS="--delta 1 --delta-force-generic \
     --delta-controller reduced-round-trip \
     --delta-controller-batch-size 4 \
+    --delta-query-batch-width 4 --delta-batch-blocks-per-cu 1 \
     --parallel-net-workers 4 --strict-routing \
     --work-dir amd-validation/work/logicnets-delta-reduced-b4-w4" \
   run-PathFinderFile \
@@ -1012,6 +1084,7 @@ make ROUTER=PathFinderFile BENCHMARKS="logicnets_jscl" VERBOSE=1 \
   PATHFINDER_ARGS="--delta 1 --delta-force-generic \
     --delta-controller reduced-round-trip \
     --delta-controller-batch-size 4 --delta-telemetry \
+    --delta-query-batch-width 4 --delta-batch-blocks-per-cu 1 \
     --parallel-net-workers 4 --strict-routing \
     --work-dir amd-validation/work/logicnets-delta-reduced-telemetry" \
   run-PathFinderFile \
@@ -1055,6 +1128,7 @@ env PATHFINDER_PROFILE_COMMAND= ./PathFinderFile \
   --sssp-engine delta-step --delta 1 --delta-force-generic \
   --delta-controller reduced-round-trip \
   --delta-controller-batch-size 4 \
+  --delta-query-batch-width 4 --delta-batch-blocks-per-cu 1 \
   --parallel-net-workers 4 --strict-routing
 
 for validation_run in 1 2 3 4 5; do
@@ -1083,6 +1157,7 @@ for validation_run in 1 2 3 4 5; do
       --sssp-engine delta-step --delta 1 --delta-force-generic \
       --delta-controller reduced-round-trip \
       --delta-controller-batch-size 4 \
+      --delta-query-batch-width 4 --delta-batch-blocks-per-cu 1 \
       --parallel-net-workers 4 --strict-routing
 done
 

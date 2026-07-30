@@ -61,6 +61,10 @@ int main() {
          "reduced-round-trip",
          "--delta-controller-batch-size",
          "7",
+         "--delta-query-batch-width",
+         "3",
+         "--delta-batch-blocks-per-cu",
+         "2",
          "--delta-benchmark-weights",
          "mixed",
          "--delta-benchmark-weight-seed",
@@ -77,6 +81,10 @@ int main() {
                                           "reduced-round-trip",
                                           "--delta-controller-batch-size",
                                           "7",
+                                          "--delta-query-batch-width",
+                                          "3",
+                                          "--delta-batch-blocks-per-cu",
+                                          "2",
                                           "--delta-benchmark-weights",
                                           "mixed",
                                           "--delta-benchmark-weight-seed",
@@ -167,6 +175,42 @@ int main() {
     }
     require(batch_without_controller_rejected,
             "router accepted a controller batch size without a controller");
+
+    for (const std::string& batching_option :
+         std::vector<std::string>({"--delta-query-batch-width",
+                                   "--delta-batch-blocks-per-cu"})) {
+      bool without_cooperative_controller_rejected = false;
+      try {
+        (void)parse({"PathFinderFile",
+                     "design_unrouted.phys",
+                     "design_routed.phys",
+                     batching_option,
+                     "2"});
+      } catch (const std::runtime_error&) {
+        without_cooperative_controller_rejected = true;
+      }
+      require(without_cooperative_controller_rejected,
+              "router accepted " + batching_option +
+                  " without an explicit cooperative controller");
+
+      for (const std::string& invalid :
+           std::vector<std::string>({"0", "9", "not-an-integer"})) {
+        bool invalid_bound_rejected = false;
+        try {
+          (void)parse({"PathFinderFile",
+                       "design_unrouted.phys",
+                       "design_routed.phys",
+                       "--delta-controller",
+                       "fused-host-checked",
+                       batching_option,
+                       invalid});
+        } catch (const std::runtime_error&) {
+          invalid_bound_rejected = true;
+        }
+        require(invalid_bound_rejected,
+                "router accepted out-of-range " + batching_option);
+      }
+    }
 
     bool invalid_controller_rejected = false;
     try {

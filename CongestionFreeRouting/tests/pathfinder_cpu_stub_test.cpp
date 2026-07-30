@@ -403,6 +403,137 @@ BellmanFordCsrResult BellmanFord10CsrWorkspace::run(
              progress_user_data);
 }
 
+// This legacy CPU adapter does not execute cooperative Delta kernels, but it
+// must model the coordinator's public producer lifetime so pathfinder.cpp
+// remains link- and exception-safe when the API grows. The BF10 CPU-stub suite
+// contains the full batching/tail/action behavioral model.
+struct DeltaSteppingCsrBatchCoordinator::Impl {
+  explicit Impl(std::size_t expected,
+                std::uint32_t requested_blocks_per_compute_unit)
+      : active(expected, false),
+        requested_blocks_per_compute_unit(
+            requested_blocks_per_compute_unit) {}
+
+  std::vector<std::uint8_t> active;
+  std::uint32_t requested_blocks_per_compute_unit = 0;
+  std::exception_ptr failure;
+  DeltaSteppingCsrBatchTelemetry telemetry_record;
+  mutable std::mutex mutex;
+};
+
+DeltaSteppingCsrBatchCoordinator::DeltaSteppingCsrBatchCoordinator(
+    std::size_t expected_producers,
+    std::size_t requested_width,
+    std::uint32_t requested_blocks_per_compute_unit)
+    : impl_(std::make_unique<Impl>(expected_producers,
+                                  requested_blocks_per_compute_unit)) {
+  impl_->telemetry_record.configured_width =
+      static_cast<std::uint32_t>(requested_width);
+  impl_->telemetry_record.effective_width =
+      delta_stepping_effective_query_batch_width(
+          static_cast<std::uint32_t>(expected_producers),
+          static_cast<std::uint32_t>(requested_width));
+  impl_->telemetry_record.requested_blocks_per_compute_unit =
+      requested_blocks_per_compute_unit;
+}
+
+DeltaSteppingCsrBatchCoordinator::~DeltaSteppingCsrBatchCoordinator() =
+    default;
+
+DeltaSteppingCsrBatchCoordinator::ProducerLease::ProducerLease(
+    DeltaSteppingCsrBatchCoordinator* owner,
+    std::size_t producer_index) noexcept
+    : owner_(owner), producer_index_(producer_index) {}
+
+DeltaSteppingCsrBatchCoordinator::ProducerLease::~ProducerLease() {
+  release();
+}
+
+DeltaSteppingCsrBatchCoordinator::ProducerLease::ProducerLease(
+    ProducerLease&& other) noexcept
+    : owner_(other.owner_), producer_index_(other.producer_index_) {
+  other.owner_ = nullptr;
+}
+
+DeltaSteppingCsrBatchCoordinator::ProducerLease&
+DeltaSteppingCsrBatchCoordinator::ProducerLease::operator=(
+    ProducerLease&& other) noexcept {
+  if (this != &other) {
+    release();
+    owner_ = other.owner_;
+    producer_index_ = other.producer_index_;
+    other.owner_ = nullptr;
+  }
+  return *this;
+}
+
+void DeltaSteppingCsrBatchCoordinator::ProducerLease::release() noexcept {
+  if (owner_ != nullptr) {
+    owner_->retire_producer(producer_index_);
+    owner_ = nullptr;
+  }
+}
+
+DeltaSteppingCsrBatchCoordinator::ProducerLease
+DeltaSteppingCsrBatchCoordinator::acquire_producer(
+    std::size_t producer_index) {
+  if (!impl_) throw std::logic_error("missing fake Delta batch coordinator");
+  std::lock_guard<std::mutex> lock(impl_->mutex);
+  if (producer_index >= impl_->active.size() ||
+      impl_->active[producer_index]) {
+    throw std::logic_error("invalid fake Delta batch producer");
+  }
+  impl_->active[producer_index] = true;
+  return ProducerLease(this, producer_index);
+}
+
+void DeltaSteppingCsrBatchCoordinator::retire_producer(
+    std::size_t producer_index) noexcept {
+  if (!impl_) return;
+  std::lock_guard<std::mutex> lock(impl_->mutex);
+  if (producer_index < impl_->active.size()) {
+    impl_->active[producer_index] = false;
+  }
+}
+
+void DeltaSteppingCsrBatchCoordinator::abandon_unstarted_producers(
+    std::size_t) noexcept {}
+
+void DeltaSteppingCsrBatchCoordinator::cancel(
+    std::exception_ptr failure) noexcept {
+  if (!impl_) return;
+  std::lock_guard<std::mutex> lock(impl_->mutex);
+  if (!impl_->failure) impl_->failure = failure;
+}
+
+void DeltaSteppingCsrBatchCoordinator::finish() {
+  if (!impl_) return;
+  std::exception_ptr failure;
+  {
+    std::lock_guard<std::mutex> lock(impl_->mutex);
+    failure = impl_->failure;
+  }
+  if (failure) std::rethrow_exception(failure);
+}
+
+DeltaSteppingCsrBatchTelemetry
+DeltaSteppingCsrBatchCoordinator::telemetry() const {
+  if (!impl_) return {};
+  std::lock_guard<std::mutex> lock(impl_->mutex);
+  return impl_->telemetry_record;
+}
+
+std::uint32_t
+DeltaSteppingCsrBatchCoordinator::configured_blocks_per_compute_unit()
+    const noexcept {
+  return impl_ ? impl_->requested_blocks_per_compute_unit : 0;
+}
+
+DeltaSteppingCsrBatchCoordinator::Impl*
+DeltaSteppingCsrBatchCoordinator::implementation_for_delta() noexcept {
+  return impl_.get();
+}
+
 struct DeltaSteppingCsrGraph::Impl {
   explicit Impl(const HostCsrF32& adjacency) : graph(adjacency) {}
 

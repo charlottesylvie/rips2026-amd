@@ -8,7 +8,9 @@
 #include <hip/hip_runtime.h>
 
 #include <cmath>
+#include <cstddef>
 #include <cstdint>
+#include <exception>
 #include <limits>
 #include <memory>
 #include <stdexcept>
@@ -24,6 +26,92 @@
 using DeltaSteppingCsrProgress = BellmanFordCsrProgress;
 using DeltaSteppingCsrProgressCallback = BellmanFordCsrProgressCallback;
 using DeltaSteppingCsrResult = BellmanFordCsrResult;
+
+// Physical multi-query controller telemetry. These counters belong to the
+// rendezvous coordinator rather than to any individual SSSP query: one
+// physical cooperative launch may advance several query slots.
+struct DeltaSteppingCsrBatchTelemetry {
+  std::uint32_t configured_width = 0;
+  std::uint32_t effective_width = 0;
+  std::uint32_t requested_blocks_per_compute_unit = 0;
+  std::uint32_t selected_blocks_per_compute_unit_min = 0;
+  std::uint32_t selected_blocks_per_compute_unit_max = 0;
+  std::uint32_t occupancy_active_blocks_per_compute_unit_min = 0;
+  std::uint32_t occupancy_active_blocks_per_compute_unit_max = 0;
+  std::uint32_t compute_units = 0;
+  std::uint64_t physical_launch_attempts = 0;
+  std::uint64_t physical_launches = 0;
+  std::uint64_t physical_completions = 0;
+  std::uint64_t logical_queries_admitted = 0;
+  std::uint64_t logical_queries_completed = 0;
+  std::uint64_t slot_dispatches = 0;
+  std::uint64_t slot_relaunches = 0;
+  std::uint64_t active_slots_sum = 0;
+  std::uint32_t active_slots_min = 0;
+  std::uint32_t active_slots_max = 0;
+  std::uint64_t unused_slots = 0;
+  std::uint64_t action_slots_budgeted = 0;
+  std::uint64_t actions_completed = 0;
+  std::uint64_t unused_action_slots = 0;
+  std::uint32_t grid_blocks_min = 0;
+  std::uint32_t grid_blocks_max = 0;
+  std::uint32_t max_concurrent_cooperative_launches = 0;
+  std::uint64_t cancellations = 0;
+  std::uint64_t launch_failures = 0;
+  std::uint64_t descriptor_failures = 0;
+};
+
+// A PathFinder run owns one coordinator for all of its cooperative Delta
+// workers. The implementation is opaque; the public producer lease is used by
+// PathFinder to make tail publication and cancellation deterministic.
+class DeltaSteppingCsrBatchCoordinator {
+ public:
+  struct Impl;
+
+  class ProducerLease {
+   public:
+    ProducerLease() = default;
+    ~ProducerLease();
+    ProducerLease(const ProducerLease&) = delete;
+    ProducerLease& operator=(const ProducerLease&) = delete;
+    ProducerLease(ProducerLease&& other) noexcept;
+    ProducerLease& operator=(ProducerLease&& other) noexcept;
+
+   private:
+    ProducerLease(DeltaSteppingCsrBatchCoordinator* owner,
+                  std::size_t producer_index) noexcept;
+    void release() noexcept;
+
+    DeltaSteppingCsrBatchCoordinator* owner_ = nullptr;
+    std::size_t producer_index_ = 0;
+    friend class DeltaSteppingCsrBatchCoordinator;
+  };
+
+  DeltaSteppingCsrBatchCoordinator(std::size_t expected_producers,
+                                   std::size_t requested_width,
+                                   std::uint32_t requested_blocks_per_compute_unit =
+                                       kDeltaSteppingCsrRecommendedBatchBlocksPerComputeUnit);
+  ~DeltaSteppingCsrBatchCoordinator();
+  DeltaSteppingCsrBatchCoordinator(
+      const DeltaSteppingCsrBatchCoordinator&) = delete;
+  DeltaSteppingCsrBatchCoordinator& operator=(
+      const DeltaSteppingCsrBatchCoordinator&) = delete;
+
+  ProducerLease acquire_producer(std::size_t producer_index);
+  void abandon_unstarted_producers(std::size_t first_producer) noexcept;
+  void cancel(std::exception_ptr failure) noexcept;
+  void finish();
+  DeltaSteppingCsrBatchTelemetry telemetry() const;
+  std::uint32_t configured_blocks_per_compute_unit() const noexcept;
+
+  // Internal Delta implementation seam. This remains opaque to callers but
+  // lets the translation unit's typed launch adapters reach the coordinator.
+  Impl* implementation_for_delta() noexcept;
+
+ private:
+  void retire_producer(std::size_t producer_index) noexcept;
+  std::unique_ptr<Impl> impl_;
+};
 
 enum class DeltaSteppingCsrExecutionPath {
   kNotRun,
@@ -197,6 +285,11 @@ struct DeltaSteppingCsrWorkspaceOptions {
   // concurrent workspace streams. PathFinder supplies its actual worker
   // count; low-level callers retain one full-grid controller by default.
   std::uint32_t controller_concurrency_hint = 1;
+  // Nonnull only for a multiworker cooperative PathFinder run. The
+  // coordinator owns the sole physical cooperative launch stream while every
+  // workspace retains private mutable query state.
+  std::shared_ptr<DeltaSteppingCsrBatchCoordinator>
+      controller_batch_coordinator;
 };
 
 struct DeltaSteppingCsrGraphOptions {

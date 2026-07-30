@@ -321,6 +321,47 @@ void validate_options(const PathfinderOptions& options) {
         "Delta-Stepping controller batch size requires reduced-round-trip "
         "controller mode");
   }
+  if (options.delta_query_batch_width <= 0 ||
+      static_cast<std::uint64_t>(options.delta_query_batch_width) >
+          kDeltaSteppingCsrMaxQueryBatchWidth) {
+    throw std::invalid_argument(
+        "Delta-Stepping query batch width must be in the bounded range [1, " +
+        std::to_string(kDeltaSteppingCsrMaxQueryBatchWidth) + "]");
+  }
+  if (options.delta_batch_blocks_per_cu <= 0 ||
+      !delta_stepping_batch_blocks_per_compute_unit_is_valid(
+          static_cast<std::uint32_t>(options.delta_batch_blocks_per_cu))) {
+    throw std::invalid_argument(
+        "Delta-Stepping batch blocks per CU must be in the bounded range [1, " +
+        std::to_string(kDeltaSteppingCsrMaxBatchBlocksPerComputeUnit) + "]");
+  }
+  const bool cooperative_controller =
+      options.delta_controller_mode ==
+          DeltaSteppingCsrControllerMode::kFusedHostChecked ||
+      options.delta_controller_mode ==
+          DeltaSteppingCsrControllerMode::kReducedRoundTrip;
+  if (!cooperative_controller &&
+      (options.delta_query_batch_width !=
+           static_cast<int>(kDeltaSteppingCsrRecommendedQueryBatchWidth) ||
+       options.delta_batch_blocks_per_cu != static_cast<int>(
+           kDeltaSteppingCsrRecommendedBatchBlocksPerComputeUnit))) {
+    throw std::invalid_argument(
+        "Delta-Stepping query batching controls require a cooperative "
+        "controller mode");
+  }
+  const std::uint32_t controller_actions_per_slot =
+      options.delta_controller_mode ==
+              DeltaSteppingCsrControllerMode::kReducedRoundTrip
+          ? static_cast<std::uint32_t>(options.delta_controller_batch_size)
+          : 1U;
+  if (cooperative_controller &&
+      !delta_stepping_query_batch_action_bound_is_valid(
+          static_cast<std::uint32_t>(options.delta_query_batch_width),
+          controller_actions_per_slot)) {
+    throw std::invalid_argument(
+        "Delta-Stepping query batch exceeds the bounded device action "
+        "watchdog");
+  }
   if (options.sssp_engine != SsspEngine::kDeltaStep) {
     if (options.delta_force_generic ||
         options.delta_force_legacy_parent ||
@@ -333,7 +374,11 @@ void validate_options(const PathfinderOptions& options) {
             DeltaSteppingCsrControllerMode::kHostChecked ||
         options.delta_controller_batch_size !=
             static_cast<int>(
-                kDeltaSteppingCsrRecommendedControllerBatchSize)) {
+                kDeltaSteppingCsrRecommendedControllerBatchSize) ||
+        options.delta_query_batch_width !=
+            static_cast<int>(kDeltaSteppingCsrRecommendedQueryBatchWidth) ||
+        options.delta_batch_blocks_per_cu != static_cast<int>(
+            kDeltaSteppingCsrRecommendedBatchBlocksPerComputeUnit)) {
       throw std::invalid_argument(
           "Delta-Stepping controls require --sssp-engine delta-step or "
           "--use-delta-step");
@@ -1515,7 +1560,10 @@ void route_all_nets_with_workspace(const HostCsrF32& base_graph,
                                    std::vector<std::vector<DeltaSteppingCsrTelemetry>>*
                                        delta_telemetry_records = nullptr,
                                    UnitBfsPathDiagnostic*
-                                       unit_bfs_diagnostic = nullptr) {
+                                       unit_bfs_diagnostic = nullptr,
+                                   std::shared_ptr<
+                                       DeltaSteppingCsrBatchCoordinator>
+                                       delta_batch_coordinator = nullptr) {
   if (delta_telemetry_records != nullptr &&
       delta_telemetry_records->size() != route_request_count) {
     throw std::invalid_argument(
@@ -1526,6 +1574,11 @@ void route_all_nets_with_workspace(const HostCsrF32& base_graph,
                             std::max<std::size_t>(1, route_request_count));
   if (stream != nullptr) {
     worker_count = 1;
+  }
+  if (delta_batch_coordinator != nullptr &&
+      (worker_count <= 1 || route_request_count <= 1)) {
+    throw std::logic_error(
+        "Delta query batch coordinator requires multiple routing workers");
   }
 
   if (worker_count <= 1 || route_request_count <= 1) {
@@ -1595,8 +1648,18 @@ void route_all_nets_with_workspace(const HostCsrF32& base_graph,
     }
   };
 
-  auto worker = [&]() {
+  auto worker = [&](std::size_t worker_index) {
+    // Keep the lease alive through the catch block so cancellation is
+    // published before this producer retires and potentially flushes a tail.
+    DeltaSteppingCsrBatchCoordinator::ProducerLease batch_producer;
     try {
+      if (delta_batch_coordinator != nullptr) {
+        // The coordinator's expected-producer count includes every worker.
+        // Acquire before workspace construction so allocation/setup failure is
+        // represented by an active producer that can cancel all peers.
+        batch_producer =
+            delta_batch_coordinator->acquire_producer(worker_index);
+      }
       select_worker_device(worker_device);
       WorkerStream worker_stream(stream == nullptr);
       hipStream_t local_stream = worker_stream.get(stream);
@@ -1648,10 +1711,14 @@ void route_all_nets_with_workspace(const HostCsrF32& base_graph,
         report_progress(completed);
       }
     } catch (...) {
+      const std::exception_ptr worker_failure = std::current_exception();
       failed.store(true, std::memory_order_relaxed);
+      if (delta_batch_coordinator != nullptr) {
+        delta_batch_coordinator->cancel(worker_failure);
+      }
       std::lock_guard<std::mutex> lock(exception_mutex);
       if (!first_exception) {
-        first_exception = std::current_exception();
+        first_exception = worker_failure;
       }
     }
   };
@@ -1667,20 +1734,46 @@ void route_all_nets_with_workspace(const HostCsrF32& base_graph,
   };
   try {
     for (std::size_t i = 0; i < worker_count; ++i) {
-      workers.emplace_back(worker);
+      workers.emplace_back(worker, i);
     }
   } catch (...) {
     // If std::thread construction fails after one or more workers have
     // started, those joinable threads must be stopped and joined before the
     // vector is destroyed. Otherwise std::thread::~thread calls terminate()
     // instead of allowing the construction error to reach the caller.
+    const std::exception_ptr construction_failure = std::current_exception();
     failed.store(true, std::memory_order_relaxed);
+    if (delta_batch_coordinator != nullptr) {
+      // Indices [workers.size(), worker_count) can never acquire leases. Drop
+      // them from the deterministic tail predicate before cancelling peers.
+      delta_batch_coordinator->abandon_unstarted_producers(workers.size());
+      delta_batch_coordinator->cancel(construction_failure);
+    }
     join_workers();
-    throw;
+    if (delta_batch_coordinator != nullptr) {
+      try {
+        delta_batch_coordinator->finish();
+      } catch (...) {
+        // Preserve the thread-construction failure; finish is still mandatory
+        // here to join the coordinator and release its stream/storage.
+      }
+    }
+    std::rethrow_exception(construction_failure);
   }
   join_workers();
+  std::exception_ptr coordinator_exception;
+  if (delta_batch_coordinator != nullptr) {
+    try {
+      delta_batch_coordinator->finish();
+    } catch (...) {
+      coordinator_exception = std::current_exception();
+    }
+  }
   if (first_exception) {
     std::rethrow_exception(first_exception);
+  }
+  if (coordinator_exception) {
+    std::rethrow_exception(coordinator_exception);
   }
 }
 
@@ -1882,13 +1975,14 @@ std::string delta_telemetry_aggregate_json(
     const PathfinderOptions& options,
     float resolved_delta,
     int wavefront_size,
-    std::size_t worker_count) {
+    std::size_t worker_count,
+    const DeltaSteppingCsrBatchTelemetry* batch_telemetry = nullptr) {
   const DeltaTelemetryTotals totals = aggregate_delta_telemetry(records);
   const DeltaSteppingCsrTelemetry& sums = totals.sums;
   std::ostringstream out;
   out.precision(std::numeric_limits<float>::max_digits10);
   out << "{\"type\":\"delta_stepping_telemetry\""
-      << ",\"schema_version\":3"
+      << ",\"schema_version\":4"
       << ",\"scope\":\"pathfinder_run\""
       << ",\"queries\":" << totals.queries
       << ",\"completed_queries\":" << totals.completed_queries
@@ -1906,6 +2000,98 @@ std::string delta_telemetry_aggregate_json(
       << "\""
       << ",\"controller_batch_size\":"
       << options.delta_controller_batch_size
+      << ",\"query_batching\":{"
+      << "\"enabled\":" << (batch_telemetry != nullptr ? "true" : "false")
+      << ",\"configured_width\":"
+      << (batch_telemetry != nullptr
+              ? batch_telemetry->configured_width
+              : static_cast<std::uint32_t>(options.delta_query_batch_width))
+      << ",\"effective_width\":"
+      << (batch_telemetry != nullptr ? batch_telemetry->effective_width : 0)
+      << ",\"requested_blocks_per_compute_unit\":"
+      << (batch_telemetry != nullptr
+              ? batch_telemetry->requested_blocks_per_compute_unit
+              : static_cast<std::uint32_t>(
+                    options.delta_batch_blocks_per_cu))
+      << ",\"selected_blocks_per_compute_unit_min\":"
+      << (batch_telemetry != nullptr
+              ? batch_telemetry->selected_blocks_per_compute_unit_min
+              : 0)
+      << ",\"selected_blocks_per_compute_unit_max\":"
+      << (batch_telemetry != nullptr
+              ? batch_telemetry->selected_blocks_per_compute_unit_max
+              : 0)
+      << ",\"occupancy_active_blocks_per_compute_unit_min\":"
+      << (batch_telemetry != nullptr
+              ? batch_telemetry
+                    ->occupancy_active_blocks_per_compute_unit_min
+              : 0)
+      << ",\"occupancy_active_blocks_per_compute_unit_max\":"
+      << (batch_telemetry != nullptr
+              ? batch_telemetry
+                    ->occupancy_active_blocks_per_compute_unit_max
+              : 0)
+      << ",\"compute_units\":"
+      << (batch_telemetry != nullptr ? batch_telemetry->compute_units : 0)
+      << ",\"physical_launch_attempts\":"
+      << (batch_telemetry != nullptr
+              ? batch_telemetry->physical_launch_attempts
+              : 0)
+      << ",\"physical_launches\":"
+      << (batch_telemetry != nullptr ? batch_telemetry->physical_launches : 0)
+      << ",\"physical_completions\":"
+      << (batch_telemetry != nullptr
+              ? batch_telemetry->physical_completions
+              : 0)
+      << ",\"logical_queries_admitted\":"
+      << (batch_telemetry != nullptr
+              ? batch_telemetry->logical_queries_admitted
+              : 0)
+      << ",\"logical_queries_completed\":"
+      << (batch_telemetry != nullptr
+              ? batch_telemetry->logical_queries_completed
+              : 0)
+      << ",\"slot_dispatches\":"
+      << (batch_telemetry != nullptr ? batch_telemetry->slot_dispatches : 0)
+      << ",\"slot_relaunches\":"
+      << (batch_telemetry != nullptr ? batch_telemetry->slot_relaunches : 0)
+      << ",\"active_slots_sum\":"
+      << (batch_telemetry != nullptr ? batch_telemetry->active_slots_sum : 0)
+      << ",\"active_slots_min\":"
+      << (batch_telemetry != nullptr ? batch_telemetry->active_slots_min : 0)
+      << ",\"active_slots_max\":"
+      << (batch_telemetry != nullptr ? batch_telemetry->active_slots_max : 0)
+      << ",\"unused_slots\":"
+      << (batch_telemetry != nullptr ? batch_telemetry->unused_slots : 0)
+      << ",\"action_slots_budgeted\":"
+      << (batch_telemetry != nullptr
+              ? batch_telemetry->action_slots_budgeted
+              : 0)
+      << ",\"actions_completed\":"
+      << (batch_telemetry != nullptr
+              ? batch_telemetry->actions_completed
+              : 0)
+      << ",\"unused_action_slots\":"
+      << (batch_telemetry != nullptr
+              ? batch_telemetry->unused_action_slots
+              : 0)
+      << ",\"grid_blocks_min\":"
+      << (batch_telemetry != nullptr ? batch_telemetry->grid_blocks_min : 0)
+      << ",\"grid_blocks_max\":"
+      << (batch_telemetry != nullptr ? batch_telemetry->grid_blocks_max : 0)
+      << ",\"max_concurrent_cooperative_launches\":"
+      << (batch_telemetry != nullptr
+              ? batch_telemetry->max_concurrent_cooperative_launches
+              : 0)
+      << ",\"cancellations\":"
+      << (batch_telemetry != nullptr ? batch_telemetry->cancellations : 0)
+      << ",\"launch_failures\":"
+      << (batch_telemetry != nullptr ? batch_telemetry->launch_failures : 0)
+      << ",\"descriptor_failures\":"
+      << (batch_telemetry != nullptr
+              ? batch_telemetry->descriptor_failures
+              : 0)
+      << "}"
       << ",\"effective_controller_modes\":{"
       << "\"host_checked\":" << totals.effective_controller_counts[0]
       << ",\"fused_host_checked\":"
@@ -2196,7 +2382,9 @@ DeltaSteppingCsrControllerMode parse_delta_controller_arg(const char* text) {
 void validate_delta_controller_cli_controls(
     const PathfinderOptions& options,
     bool controller_seen,
-    bool controller_batch_size_seen) {
+    bool controller_batch_size_seen,
+    bool query_batch_width_seen = false,
+    bool batch_blocks_per_cu_seen = false) {
   if (controller_batch_size_seen &&
       (!controller_seen ||
        options.delta_controller_mode !=
@@ -2204,6 +2392,22 @@ void validate_delta_controller_cli_controls(
     throw std::runtime_error(
         "--delta-controller-batch-size requires --delta-controller "
         "reduced-round-trip");
+  }
+  const bool cooperative_controller_seen =
+      controller_seen &&
+      (options.delta_controller_mode ==
+           DeltaSteppingCsrControllerMode::kFusedHostChecked ||
+       options.delta_controller_mode ==
+           DeltaSteppingCsrControllerMode::kReducedRoundTrip);
+  if (query_batch_width_seen && !cooperative_controller_seen) {
+    throw std::runtime_error(
+        "--delta-query-batch-width requires "
+        "an explicit fused-host-checked or reduced-round-trip controller");
+  }
+  if (batch_blocks_per_cu_seen && !cooperative_controller_seen) {
+    throw std::runtime_error(
+        "--delta-batch-blocks-per-cu requires "
+        "an explicit fused-host-checked or reduced-round-trip controller");
   }
 }
 
@@ -2252,6 +2456,10 @@ void print_usage(const char* program) {
       << "                                  Generic Delta controller. Default: host-checked\n"
       << "  --delta-controller-batch-size <positive-int>\n"
       << "                                  Reduced-round-trip controller batch size. Default: 4\n"
+      << "  --delta-query-batch-width <1..8>\n"
+      << "                                  Maximum logical queries per cooperative launch. Default: 4\n"
+      << "  --delta-batch-blocks-per-cu <1..8>\n"
+      << "                                  Cooperative batch grid cap per compute unit. Default: 1\n"
       << "  --delta-telemetry               Emit one aggregate Delta-Stepping telemetry JSON record.\n"
       << "  --delta-benchmark-weights <unit|all-light|all-heavy|mixed>\n"
       << "                                  Replace CSR weights deterministically for numeric-delta benchmarks.\n"
@@ -2810,6 +3018,25 @@ PathfinderResult run_pathfinder(const HostCsrF32& base_graph,
               : std::min<std::size_t>(
                     delta_options.parallel_net_workers,
                     std::max<std::size_t>(1, route_request_count));
+      const bool cooperative_controller_requested =
+          delta_options.delta_controller_mode ==
+              DeltaSteppingCsrControllerMode::kFusedHostChecked ||
+          delta_options.delta_controller_mode ==
+              DeltaSteppingCsrControllerMode::kReducedRoundTrip;
+      std::shared_ptr<DeltaSteppingCsrBatchCoordinator>
+          delta_batch_coordinator;
+      if (cooperative_controller_requested &&
+          actual_delta_worker_count > 1) {
+        // A single coordinator owns the only physical cooperative launch
+        // stream. Worker workspaces remain private logical query producers.
+        delta_batch_coordinator =
+            std::make_shared<DeltaSteppingCsrBatchCoordinator>(
+                actual_delta_worker_count,
+                static_cast<std::size_t>(
+                    delta_options.delta_query_batch_width),
+                static_cast<std::uint32_t>(
+                    delta_options.delta_batch_blocks_per_cu));
+      }
       DeltaSteppingCsrWorkspaceOptions workspace_options;
       workspace_options.parent_mode =
           delta_options.delta_force_legacy_parent
@@ -2829,6 +3056,8 @@ PathfinderResult run_pathfinder(const HostCsrF32& base_graph,
               std::min<std::size_t>(
                   actual_delta_worker_count,
                   std::numeric_limits<std::uint32_t>::max())));
+      workspace_options.controller_batch_coordinator =
+          delta_batch_coordinator;
       workspace_options.capacity_hints = query_capacity_hints;
       if (workspace_options.execution_mode ==
           DeltaSteppingCsrExecutionMode::kForceGeneric) {
@@ -2856,8 +3085,17 @@ PathfinderResult run_pathfinder(const HostCsrF32& base_graph,
             return DeltaSteppingCsrWorkspace(shared_graph, worker_stream,
                                              workspace_options);
           },
-          delta_options.delta_telemetry ? &delta_telemetry_records : nullptr);
+          delta_options.delta_telemetry ? &delta_telemetry_records : nullptr,
+          nullptr,
+          delta_batch_coordinator);
       if (delta_options.delta_telemetry) {
+        DeltaSteppingCsrBatchTelemetry delta_batch_telemetry;
+        const DeltaSteppingCsrBatchTelemetry* delta_batch_telemetry_ptr =
+            nullptr;
+        if (delta_batch_coordinator != nullptr) {
+          delta_batch_telemetry = delta_batch_coordinator->telemetry();
+          delta_batch_telemetry_ptr = &delta_batch_telemetry;
+        }
         std::vector<DeltaSteppingCsrTelemetry> flattened_telemetry;
         std::size_t telemetry_query_count = 0;
         for (const auto& net_records : delta_telemetry_records) {
@@ -2874,7 +3112,8 @@ PathfinderResult run_pathfinder(const HostCsrF32& base_graph,
                          delta_options,
                          delta_options.delta,
                          automatic_delta_wavefront_size,
-                         actual_delta_worker_count)
+                         actual_delta_worker_count,
+                         delta_batch_telemetry_ptr)
                   << '\n';
       }
       break;
@@ -3174,6 +3413,8 @@ int main(int argc, char** argv) {
     bool delta_option_seen = false;
     bool delta_controller_seen = false;
     bool delta_controller_batch_size_seen = false;
+    bool delta_query_batch_width_seen = false;
+    bool delta_batch_blocks_per_cu_seen = false;
     bool delta_benchmark_weights_seen = false;
     bool delta_benchmark_weight_seed_seen = false;
     bool net_limit_seen = false;
@@ -3248,6 +3489,18 @@ int main(int argc, char** argv) {
             "delta-controller-batch-size");
         options.delta_controller_controls_explicit = true;
         delta_controller_batch_size_seen = true;
+      } else if (option == "--delta-query-batch-width") {
+        options.delta_query_batch_width = routing::parse_int_arg(
+            require_value("--delta-query-batch-width"),
+            "delta-query-batch-width");
+        options.delta_controller_controls_explicit = true;
+        delta_query_batch_width_seen = true;
+      } else if (option == "--delta-batch-blocks-per-cu") {
+        options.delta_batch_blocks_per_cu = routing::parse_int_arg(
+            require_value("--delta-batch-blocks-per-cu"),
+            "delta-batch-blocks-per-cu");
+        options.delta_controller_controls_explicit = true;
+        delta_batch_blocks_per_cu_seen = true;
       } else if (option == "--delta-telemetry") {
         options.delta_telemetry = true;
       } else if (option == "--delta-benchmark-weights") {
@@ -3326,7 +3579,9 @@ int main(int argc, char** argv) {
     routing::validate_delta_controller_cli_controls(
         options,
         delta_controller_seen,
-        delta_controller_batch_size_seen);
+        delta_controller_batch_size_seen,
+        delta_query_batch_width_seen,
+        delta_batch_blocks_per_cu_seen);
     if (diagnose_net_seen != diagnose_sink_seen) {
       throw std::runtime_error(
           "--diagnose-net and --diagnose-sink must be specified together");

@@ -1,8 +1,8 @@
 # GPU SSSP Development Status
 
-Updated 2026-07-29 for the bounded UnitBFS/classic-Delta optimization pass,
-the experimental fused-host-checked and reduced-round-trip Delta controllers,
-and the FPGA Interchange import correctness audit.
+Updated 2026-07-30 for the bounded UnitBFS/classic-Delta optimization pass,
+the experimental multi-query fused-host-checked and reduced-round-trip Delta
+controllers, and the FPGA Interchange import correctness audit.
 All GPU changes below are implemented but HIP-unvalidated.
 
 This file is the concise source of truth for landed work, confidence, and the
@@ -51,7 +51,7 @@ throughput, so the real multi-sink result remains provisional.
 | UnitBFS controller | Cooperative-capable devices run at most 32 levels per grid-synchronized launch on the null/default stream. Explicit worker streams always use the synchronized host-controlled level handoff required on gfx1151; unsupported devices and progress callbacks retain their fallbacks, and the null-stream noncooperative fallback can batch four levels. |
 | UnitBFS extraction | Host-built offsets remain the default. An opt-in two-pass device path measures target lengths, scans deterministic offsets, publishes one totals/status descriptor, grows demand-sized compact buffers, validates paths, and copies the result without the host prefix sum or two H2D offset copies. |
 | Generic Delta | Multi-source/multi-target classic Delta-Stepping with one thread per active row, separate light/heavy semantics, a flat pending set with minimum reduction and compaction, and sparse touched reset. Immutable CSR row offsets are automatically `uint32_t` only when the complete range fits; `kForce64Bit` retains the wide A/B path and public edge IDs stay 64-bit. |
-| Delta controller | The established `host-checked` scalar controller remains the trusted default/reference. Experimental opt-in cooperative modes keep dependent light closure, target settlement, heavy work, pending minimum, and compaction state on-device: `fused-host-checked` publishes after one action, while `reduced-round-trip` executes a bounded configurable multi-action batch. Unsupported kernels and progress callbacks retain the complete scalar fallback; requested/effective mode, backend, fallback reason, and controller diagnostics are visible in telemetry. |
+| Delta controller | The established `host-checked` scalar controller remains the trusted default/reference. Experimental opt-in cooperative modes keep dependent light closure, target settlement, heavy work, pending minimum, and compaction state on-device: `fused-host-checked` publishes after one action, while `reduced-round-trip` executes a bounded configurable multi-action batch. Multiworker PathFinder runs rendezvous ready private workspaces into one bounded physical launch; its full grid processes query slots sequentially so every block crosses each grid barrier uniformly and concurrent cooperative launches are structurally impossible. Query width defaults to four, while the conservative grid cap defaults to one block per CU and is clamped to legal occupancy. Unsupported kernels and progress callbacks retain the complete scalar fallback; schema-4 telemetry separates physical batch launches from logical per-query publications. |
 | Delta parents | Automatic vector-target runs use a compact 64-bit `{distance_bits, original_edge_id}` key and a shared 32-bit edge-to-source map when eligible. Legacy predecessor arrays are lazy fallback state. |
 | Delta modes | Exact-unit specialization for eligible small graphs, compile-time no-parent `run_distances()`, strict distances-only graph storage, exclusive distance bounds, exact-unit automatic width `1 * multiplier`, weighted graph-aware seeding, deterministic weight families, force/controller controls, and opt-in telemetry are implemented. Boolean `in_current` plus its guarded clear remains the default; generation-tagged membership is opt-in and rollover-safe. |
 | Delta capacity | Source/target hints pre-reserve only applicable state. Query and compact-path buffers retain geometric high-water capacity; compact-parent runs avoid legacy predecessor arrays, and strict distances-only storage ignores target/path hints. |
@@ -147,8 +147,10 @@ Python reconstruction coverage, not a substitute compile claim.
   round on the host because dependent batched dispatches previously exposed
   controller-state failures on gfx1151. The experimental fused and reduced
   controllers avoid that cross-dispatch handoff only inside a cooperative,
-  grid-synchronized kernel; they remain HIP-unvalidated and may select the
-  scalar host fallback.
+  grid-synchronized kernel. Multiworker cooperative execution now uses one
+  coordinator-owned stream and grid rather than independent worker launches;
+  this redesign remains HIP-unvalidated and may select the scalar host
+  fallback for ordinary capability/callback reasons.
 - Default UnitBFS still has host-visible per-query setup, status,
   compact-offset, and extraction boundaries even when its inner level loop is
   cooperative. The device-offset alternative is opt-in pending AMD validation.

@@ -95,6 +95,20 @@ std::string command_to_string(const std::vector<std::string>& argv) {
   return out.str();
 }
 
+void validate_bounded_positive_int(const std::string& text,
+                                   const char* option,
+                                   long maximum) {
+  char* end = nullptr;
+  errno = 0;
+  const long value = std::strtol(text.c_str(), &end, 10);
+  if (errno == ERANGE || end == text.c_str() || *end != '\0' || value <= 0 ||
+      value > maximum) {
+    throw std::runtime_error(std::string(option) +
+                             " must be an integer in [1, " +
+                             std::to_string(maximum) + "]");
+  }
+}
+
 void print_progress(int completed, int total, const std::string& label) {
   constexpr int kWidth = 28;
   const int filled = total == 0 ? kWidth : (completed * kWidth) / total;
@@ -203,6 +217,10 @@ void print_usage(const char* program) {
       << "                                 Forward generic Delta controller selection.\n"
       << "  --delta-controller-batch-size <positive-int>\n"
       << "                                 Forward reduced-round-trip controller batch size.\n"
+      << "  --delta-query-batch-width <1..8>\n"
+      << "                                 Forward the bounded cooperative query batch width.\n"
+      << "  --delta-batch-blocks-per-cu <1..8>\n"
+      << "                                 Forward the cooperative batch grid cap per CU.\n"
       << "  --delta-benchmark-weights <unit|all-light|all-heavy|mixed>\n"
       << "                                 Forward a reproducible benchmark weight family.\n"
       << "  --delta-benchmark-weight-seed <nonnegative-int>\n"
@@ -245,6 +263,8 @@ Options parse_args(int argc, char** argv) {
   std::string delta_controller;
   bool delta_controller_provided = false;
   bool delta_controller_batch_size_provided = false;
+  bool delta_query_batch_width_provided = false;
+  bool delta_batch_blocks_per_cu_provided = false;
 
   for (int i = 3; i < argc; ++i) {
     const std::string option = argv[i];
@@ -306,6 +326,17 @@ Options parse_args(int argc, char** argv) {
       delta_controller_batch_size_provided = true;
       options.pathfinder_args.push_back(option);
       options.pathfinder_args.push_back(require_value(option.c_str()));
+    } else if (option == "--delta-query-batch-width" ||
+               option == "--delta-batch-blocks-per-cu") {
+      const std::string value = require_value(option.c_str());
+      validate_bounded_positive_int(value, option.c_str(), 8);
+      if (option == "--delta-query-batch-width") {
+        delta_query_batch_width_provided = true;
+      } else {
+        delta_batch_blocks_per_cu_provided = true;
+      }
+      options.pathfinder_args.push_back(option);
+      options.pathfinder_args.push_back(value);
     } else if (option == "--sssp-engine" ||
                option == "--delta" ||
                option == "--delta-multiplier" ||
@@ -340,6 +371,15 @@ Options parse_args(int argc, char** argv) {
     throw std::runtime_error(
         "--delta-controller-batch-size requires "
         "--delta-controller reduced-round-trip");
+  }
+  if ((delta_query_batch_width_provided ||
+       delta_batch_blocks_per_cu_provided) &&
+      (!delta_controller_provided ||
+       (delta_controller != "fused-host-checked" &&
+        delta_controller != "reduced-round-trip"))) {
+    throw std::runtime_error(
+        "Delta cooperative batching controls require an explicit "
+        "--delta-controller fused-host-checked or reduced-round-trip");
   }
   return options;
 }

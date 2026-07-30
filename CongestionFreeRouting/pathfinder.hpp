@@ -142,6 +142,12 @@ struct PathfinderOptions {
   int delta_controller_batch_size =
       static_cast<int>(kDeltaSteppingCsrRecommendedControllerBatchSize);
   bool delta_controller_controls_explicit = false;
+  // Cooperative PathFinder workers rendezvous into one physical device
+  // launch. These appended controls preserve older aggregate initializers.
+  int delta_query_batch_width =
+      static_cast<int>(kDeltaSteppingCsrRecommendedQueryBatchWidth);
+  int delta_batch_blocks_per_cu = static_cast<int>(
+      kDeltaSteppingCsrRecommendedBatchBlocksPerComputeUnit);
 };
 
 struct PathfinderResult {

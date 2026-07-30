@@ -36,6 +36,53 @@ enum class DeltaSteppingCsrControllerMode : std::uint32_t {
 
 constexpr std::uint32_t kDeltaSteppingCsrRecommendedControllerBatchSize = 4;
 constexpr std::uint32_t kDeltaSteppingCsrMaxControllerBatchSize = 64;
+constexpr std::uint32_t kDeltaSteppingCsrRecommendedQueryBatchWidth = 4;
+constexpr std::uint32_t kDeltaSteppingCsrMaxQueryBatchWidth = 8;
+// One block per CU is a conservative starting point for a whole-grid barrier
+// kernel. It covers every CU but intentionally does not claim full resident
+// occupancy. Target-GPU sweeps may raise this bounded cap; the runtime still
+// clamps it to the kernel's occupancy-derived active-block limit.
+constexpr std::uint32_t
+    kDeltaSteppingCsrRecommendedBatchBlocksPerComputeUnit = 1;
+constexpr std::uint32_t kDeltaSteppingCsrMaxBatchBlocksPerComputeUnit = 8;
+
+constexpr std::uint32_t delta_stepping_effective_query_batch_width(
+    std::uint32_t expected_producers,
+    std::uint32_t requested_width) noexcept {
+  if (expected_producers == 0 || requested_width == 0) return 0;
+  return std::min(expected_producers,
+                  std::min(requested_width,
+                           kDeltaSteppingCsrMaxQueryBatchWidth));
+}
+
+constexpr bool delta_stepping_query_batch_action_bound_is_valid(
+    std::uint32_t width,
+    std::uint32_t actions_per_slot) noexcept {
+  return width != 0 && width <= kDeltaSteppingCsrMaxQueryBatchWidth &&
+         actions_per_slot != 0 &&
+         actions_per_slot <= kDeltaSteppingCsrMaxControllerBatchSize &&
+         static_cast<std::uint64_t>(width) * actions_per_slot <=
+             static_cast<std::uint64_t>(
+                 kDeltaSteppingCsrMaxQueryBatchWidth) *
+                 kDeltaSteppingCsrMaxControllerBatchSize;
+}
+
+constexpr bool delta_stepping_batch_blocks_per_compute_unit_is_valid(
+    std::uint32_t requested) noexcept {
+  return requested != 0 &&
+         requested <= kDeltaSteppingCsrMaxBatchBlocksPerComputeUnit;
+}
+
+constexpr std::uint32_t
+delta_stepping_effective_batch_blocks_per_compute_unit(
+    std::uint32_t requested,
+    std::uint32_t occupancy_active_blocks) noexcept {
+  if (!delta_stepping_batch_blocks_per_compute_unit_is_valid(requested) ||
+      occupancy_active_blocks == 0) {
+    return 0;
+  }
+  return std::min(requested, occupancy_active_blocks);
+}
 
 struct DeltaSteppingCsrControllerPolicy {
   DeltaSteppingCsrControllerMode mode =

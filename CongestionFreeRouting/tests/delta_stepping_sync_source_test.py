@@ -202,15 +202,15 @@ def test_cooperative_memory_ordering(source: str) -> None:
         "pending minimum must reduce within each block before one global atomic",
     )
 
-    controller_kernel = source_between(
+    controller_slot = source_between(
         source,
+        "__device__ void cooperative_delta_controller_slot(",
         "__global__ void cooperative_delta_controller_kernel(",
-        "query_cooperative_launch_configuration(",
     )
     require(
         "for (std::uint32_t action = 0; action < args.batch_size; ++action)"
-        in controller_kernel,
-        "the cooperative kernel no longer owns a bounded multi-action batch",
+        in controller_slot,
+        "the shared cooperative slot body no longer owns a bounded action batch",
     )
     for stable_load in (
         "controller_stable_load_u32(&args.state->current_queue_parity)",
@@ -224,49 +224,88 @@ def test_cooperative_memory_ordering(source: str) -> None:
         "controller_stable_load_int(args.min_pending_bucket)",
     ):
         require(
-            stable_load in controller_kernel,
+            stable_load in controller_slot,
             f"controller state lost stable load: {stable_load}",
         )
     require(
         "controller_atomic_load_u32(&args.state->current_queue_parity)"
-        not in controller_kernel
+        not in controller_slot
         and "controller_atomic_load_u32(&args.state->pending_queue_parity)"
-        not in controller_kernel
+        not in controller_slot
         and "controller_atomic_load_u32(&args.state->generation_cursor)"
-        not in controller_kernel,
+        not in controller_slot,
         "stable controller state reintroduced contended no-op atomic loads",
     )
     require(
         "controller_stable_load_u64(\n"
-        "        &args.state->descriptor.current_bucket)" in controller_kernel
-        and controller_kernel.count(
+        "        &args.state->descriptor.current_bucket)" in controller_slot
+        and controller_slot.count(
             "controller_phase_after_grid_sync(args.state)"
         ) == 4
         and "static_cast<int>(args.state->descriptor.current_bucket)"
-        not in controller_kernel,
+        not in controller_slot,
         "grid-uniform bucket/phase control must use stable post-barrier reads",
     )
     require(
-        controller_kernel.count(
+        controller_slot.count(
             "controller_grid_release_sync<CollectTelemetry>"
         ) == 16
-        and controller_kernel.count("grid.sync();") == 1,
-        "the cooperative kernel must retain diagnosed phase barriers plus "
+        and controller_slot.count("grid.sync();") == 1,
+        "the cooperative slot must retain diagnosed phase barriers plus "
         "exactly one final publication barrier",
     )
     require(
-        controller_kernel.count("__threadfence_system();") == 1
-        and "__threadfence();" not in controller_kernel,
+        controller_slot.count("__threadfence_system();") == 1
+        and "__threadfence();" not in controller_slot,
         "only final host descriptor publication may retain a system fence",
     )
-    final_publication = controller_kernel[controller_kernel.rfind("  if (leader) {") :]
+    final_publication = controller_slot[controller_slot.rfind("  if (leader) {") :]
     require(
         "++args.state->descriptor.publication_sequence;" in final_publication
+        and "publication->descriptor = args.state->descriptor;"
+        in final_publication
         and "++args.state->grid_barriers;" in final_publication
         and final_publication.find("__threadfence_system();")
         < final_publication.find("grid.sync();"),
-        "final descriptor publication must be sequenced and system-visible "
-        "before kernel completion",
+        "final slot publication must be sequenced and system-visible before "
+        "the barrier that releases every block to the next slot",
+    )
+
+    batch_kernel = source_between(
+        source,
+        "__global__ void cooperative_delta_controller_batch_kernel(",
+        "CooperativeLaunchConfiguration\nquery_cooperative_launch_configuration(",
+    )
+    slot_loop = source_between(
+        batch_kernel,
+        "for (std::uint32_t slot_position = 0;",
+        "}\n}",
+    )
+    require(
+        "slot_position < active_slots" in slot_loop
+        and "const CooperativeDeltaBatchSlot<RowOffset>& slot = "
+        "slots[slot_position];" in slot_loop
+        and "grid, slot.args, &publications[slot_position]," in slot_loop
+        and "slot.submission_sequence, slot.slot_index" in slot_loop,
+        "the physical batch grid must visit every active query slot in one "
+        "uniform sequential order",
+    )
+    require(
+        "blockIdx" not in batch_kernel
+        and "threadIdx" not in batch_kernel
+        and "return;" not in batch_kernel,
+        "batch slot selection must not diverge by block/thread or return early",
+    )
+
+    single_kernel = source_between(
+        source,
+        "__global__ void cooperative_delta_controller_kernel(",
+        "__global__ void cooperative_delta_controller_batch_kernel(",
+    )
+    require(
+        "cooperative_delta_controller_slot<" in single_kernel
+        and "grid, args, nullptr, 0, 0" in single_kernel,
+        "the scalar cooperative A/B wrapper must reuse the exact slot body",
     )
 
 
@@ -274,7 +313,7 @@ def test_publication_diagnostics(source: str, header: str) -> None:
     descriptor_copy = source_between(
         source,
         "copy_controller_descriptor_to_host(",
-        "template <bool TrackParents, bool UseEdgeParent>",
+        "struct CooperativeDeltaBatchSubmitResult",
     )
     require(
         descriptor_copy.count("hipMemcpyAsync(") == 1
@@ -334,6 +373,175 @@ def test_publication_diagnostics(source: str, header: str) -> None:
     )
 
 
+def test_multi_query_controller(source: str, header: str, policy: str) -> None:
+    for policy_symbol in (
+        "kDeltaSteppingCsrRecommendedQueryBatchWidth = 4",
+        "kDeltaSteppingCsrMaxQueryBatchWidth = 8",
+        "delta_stepping_effective_query_batch_width(",
+        "delta_stepping_query_batch_action_bound_is_valid(",
+        "kDeltaSteppingCsrRecommendedBatchBlocksPerComputeUnit = 1",
+        "kDeltaSteppingCsrMaxBatchBlocksPerComputeUnit = 8",
+        "delta_stepping_effective_batch_blocks_per_compute_unit(",
+    ):
+        require(
+            policy_symbol in policy,
+            f"missing bounded multi-query policy: {policy_symbol}",
+        )
+
+    launch_configuration = source_between(
+        source,
+        "CooperativeLaunchConfiguration\nquery_cooperative_launch_configuration(",
+        "const CooperativeLaunchConfiguration& cooperative_launch_configuration(",
+    )
+    require(
+        "if constexpr (Batched)" in launch_configuration
+        and "cooperative_delta_controller_batch_kernel<"
+        in launch_configuration
+        and "active_blocks_per_compute_unit" in launch_configuration,
+        "batch occupancy must be queried for the physical batch kernel",
+    )
+    require(
+        "const Offset legal_resident_limit =\n"
+        "      static_cast<Offset>(active_blocks_per_compute_unit) *\n"
+        "      static_cast<Offset>(properties.multiProcessorCount);"
+        in launch_configuration
+        and "delta_stepping_effective_batch_blocks_per_compute_unit("
+        in launch_configuration
+        and "requested_batch_blocks_per_cu" in launch_configuration
+        and "configuration.selected_blocks_per_compute_unit =\n"
+        "        static_cast<int>(selected_blocks_per_cu);"
+        in launch_configuration
+        and "static_cast<Offset>(selected_blocks_per_cu) *\n"
+        "        static_cast<Offset>(properties.multiProcessorCount)"
+        in launch_configuration
+        and "row_blocks, std::min(legal_resident_limit, "
+        "concurrency_friendly_limit)" in launch_configuration,
+        "the batch grid must clamp requested blocks per CU to occupancy and "
+        "never exceed row work or legal whole-grid residency",
+    )
+
+    executor = source_between(
+        source,
+        "class DeltaBatchExecutor final",
+        "void DeltaSteppingCsrBatchCoordinator::Impl::run() noexcept",
+    )
+    require(
+        executor.count("hipLaunchCooperativeKernel(") == 1
+        and "cooperative_delta_controller_batch_kernel<" in executor
+        and "coordinator->note_launch_accepted();" in executor
+        and "coordinator->note_launch_finished(true);" in executor,
+        "only the coordinator executor may own a physical multi-query launch",
+    )
+    require(
+        "hipMemcpyDeviceToHost" in executor
+        and executor.count("hipStreamSynchronize(stream)") == 2
+        and "Validate every publication before exposing any result"
+        in executor,
+        "one successful batch publication must complete its descriptor array "
+        "before any worker resumes (plus one cold failure-path drain)",
+    )
+    require(
+        "publication.submission_sequence == record.submission_sequence"
+        in executor
+        and "publication.slot_index == i" in executor
+        and "descriptor.query_sequence == record.expected_query_sequence"
+        in executor
+        and "descriptor.publication_sequence ==\n"
+        "              record.expected_publication_sequence" in executor,
+        "batch publication validation lost slot/query/submission association",
+    )
+    require(
+        "std::unordered_set" not in executor
+        and "std::array<std::array<const void*, 23>," in executor
+        and "query_owned_addresses_by_slot" in executor,
+        "bounded batch alias validation must use fixed storage instead of a "
+        "per-publication hash allocation",
+    )
+    for block_field in (
+        "requested_blocks_per_compute_unit",
+        "selected_blocks_per_compute_unit_min",
+        "selected_blocks_per_compute_unit_max",
+        "occupancy_active_blocks_per_compute_unit_min",
+        "occupancy_active_blocks_per_compute_unit_max",
+        "compute_units",
+    ):
+        require(
+            block_field in header,
+            f"batch launch telemetry lost {block_field}",
+        )
+    require(
+        "record->selected_blocks_per_compute_unit == 0" in executor
+        and "record->occupancy_active_blocks_per_compute_unit == 0"
+        in executor
+        and "record->compute_units == 0" in executor
+        and "coordinator->note_launch_attempt(\n"
+        "        record_count, launch_blocks, selected_blocks_per_compute_unit,\n"
+        "        occupancy_active_blocks_per_compute_unit, compute_units);"
+        in executor,
+        "physical batch telemetry must distinguish the selected block cap from "
+        "the runtime occupancy limit",
+    )
+
+    coordinator_run = source_between(
+        source,
+        "void DeltaSteppingCsrBatchCoordinator::Impl::run() noexcept",
+        "DeltaSteppingCsrBatchCoordinator::Impl::submit_record(",
+    )
+    require(
+        coordinator_run.count(
+            "executor->execute(batch.data(), batch_size, stream, this);"
+        )
+        == 1
+        and "hipLaunchCooperativeKernel" not in coordinator_run
+        and "hipStreamCreateWithFlags(&stream, hipStreamNonBlocking)"
+        in coordinator_run,
+        "one coordinator thread/stream must funnel every physical batch launch",
+    )
+
+    submit_path = source_between(
+        source,
+        "DeltaSteppingCsrBatchCoordinator::Impl::submit_record(",
+        "void DeltaSteppingCsrBatchCoordinator::Impl::acquire(",
+    )
+    require(
+        "std::make_shared" not in submit_path
+        and ".resize(" not in submit_path
+        and "free_records.back()" in submit_path
+        and "std::memcpy(record->argument_bytes.data(),"
+        in submit_path
+        and "free_records.push_back(record);" in submit_path,
+        "steady-state submission must reuse a fixed record/argument pool "
+        "without per-publication shared/vector allocation",
+    )
+
+    controller_loop = source_between(
+        source,
+        "if (use_cooperative_controller && !result.stopped_on_target",
+        "} else if (use_cooperative_controller &&",
+    )
+    require(
+        "if (use_query_batch_coordinator)" in controller_loop
+        and "submit_cooperative_delta_controller_batch<" in controller_loop
+        and "} else {\n"
+        "          launch_cooperative_delta_controller<" in controller_loop,
+        "multiworker queries must submit to the shared batch coordinator while "
+        "the one-query A/B path retains its direct launch",
+    )
+    require(
+        "if (!use_query_batch_coordinator) {\n"
+        "            ++telemetry->cooperative_launches;\n"
+        "          }" in controller_loop
+        and "physical_launches" in header
+        and "max_concurrent_cooperative_launches" in header,
+        "per-query telemetry must not double-count one shared physical launch",
+    )
+    require(
+        source.count("hipLaunchCooperativeKernel(") == 2,
+        "cooperative launches must remain limited to the one-query reference "
+        "helper and the sole multi-query coordinator executor",
+    )
+
+
 def test_initial_controller_publication_lifetime(source: str) -> None:
     controller_storage = source_between(
         source,
@@ -381,6 +589,7 @@ def main() -> None:
     test_scalar_host_reduction(source)
     test_cooperative_memory_ordering(source)
     test_publication_diagnostics(source, header)
+    test_multi_query_controller(source, header, policy)
     test_initial_controller_publication_lifetime(source)
     print(
         "Delta-Stepping synchronization source policy test passed "

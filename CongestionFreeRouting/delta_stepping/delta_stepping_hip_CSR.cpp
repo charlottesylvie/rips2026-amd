@@ -10,11 +10,15 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <condition_variable>
+#include <cstring>
 #include <exception>
 #include <limits>
+#include <mutex>
 #include <sstream>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <type_traits>
 #include <unordered_set>
 #include <utility>
@@ -296,6 +300,7 @@ struct CooperativeLaunchConfiguration {
   int max_blocks = 0;
   int active_blocks_per_compute_unit = 0;
   int compute_units = 0;
+  int selected_blocks_per_compute_unit = 0;
   DeltaSteppingCsrControllerFallbackReason fallback_reason =
       DeltaSteppingCsrControllerFallbackReason::kNone;
 };
@@ -361,11 +366,14 @@ struct DeltaSteppingScratch {
   std::uint32_t current_generation = 0;
   std::uint32_t controller_query_sequence = 0;
   std::uint32_t controller_concurrency_hint = 1;
+  std::shared_ptr<DeltaSteppingCsrBatchCoordinator>
+      controller_batch_coordinator;
   // Each bit selects one compile-time controller trait: current-generation,
-  // parent tracking, compact edge parent, and telemetry. A workspace is bound
-  // to one immutable graph/device, so both successful and unsupported
-  // occupancy results remain valid for its lifetime.
-  std::array<CooperativeLaunchConfiguration, 16>
+  // parent tracking, compact edge parent, telemetry, and physical multi-query
+  // batching. A workspace is bound to one immutable graph/device, so both
+  // successful and unsupported occupancy results remain valid for its
+  // lifetime.
+  std::array<CooperativeLaunchConfiguration, 32>
       cooperative_launch_configurations{};
 
   DeltaSteppingScratch() = default;
@@ -2351,6 +2359,48 @@ struct CooperativeDeltaControllerArgs {
   CooperativeDeltaControllerState* state;
 };
 
+template <typename RowOffset>
+struct CooperativeDeltaBatchSlot {
+  CooperativeDeltaControllerArgs<RowOffset> args;
+  std::uint64_t submission_sequence;
+  std::uint32_t slot_index;
+  std::uint32_t reserved;
+};
+
+struct CooperativeDeltaBatchPublication {
+  std::uint64_t submission_sequence;
+  std::uint32_t slot_index;
+  std::uint32_t reserved;
+  DeltaSteppingCsrControllerDescriptor descriptor;
+};
+
+static_assert(
+    std::is_standard_layout<CooperativeDeltaBatchSlot<CompactRowOffset>>::value,
+    "compact cooperative Delta batch slots must have standard layout");
+static_assert(
+    std::is_trivially_copyable<
+        CooperativeDeltaBatchSlot<CompactRowOffset>>::value,
+    "compact cooperative Delta batch slots must be trivially copyable");
+static_assert(
+    std::is_standard_layout<CooperativeDeltaBatchSlot<Offset>>::value,
+    "wide cooperative Delta batch slots must have standard layout");
+static_assert(
+    std::is_trivially_copyable<CooperativeDeltaBatchSlot<Offset>>::value,
+    "wide cooperative Delta batch slots must be trivially copyable");
+static_assert(std::is_standard_layout<CooperativeDeltaBatchPublication>::value,
+              "cooperative Delta batch publications must have standard "
+              "layout");
+static_assert(
+    std::is_trivially_copyable<CooperativeDeltaBatchPublication>::value,
+    "cooperative Delta batch publications must be trivially copyable");
+static_assert(offsetof(CooperativeDeltaBatchPublication, descriptor) == 16,
+              "cooperative Delta batch publication identity must precede "
+              "the descriptor without hidden padding");
+static_assert(
+    sizeof(CooperativeDeltaBatchPublication) ==
+        16 + sizeof(DeltaSteppingCsrControllerDescriptor),
+    "cooperative Delta batch publication ABI must be tightly bounded");
+
 __device__ inline unsigned int controller_atomic_load_u32(
     const unsigned int* address) {
   return atomicAdd(const_cast<unsigned int*>(address), 0U);
@@ -2922,9 +2972,12 @@ template <typename RowOffset,
           bool TrackParents,
           bool UseEdgeParent,
           bool CollectTelemetry>
-__global__ void cooperative_delta_controller_kernel(
-    CooperativeDeltaControllerArgs<RowOffset> args) {
-  cooperative_groups::grid_group grid = cooperative_groups::this_grid();
+__device__ void cooperative_delta_controller_slot(
+    cooperative_groups::grid_group& grid,
+    const CooperativeDeltaControllerArgs<RowOffset>& args,
+    CooperativeDeltaBatchPublication* publication,
+    std::uint64_t submission_sequence,
+    std::uint32_t slot_index) {
   const bool leader = grid.thread_rank() == 0;
   const int capacity = static_cast<int>(args.rows);
   if (leader) {
@@ -3275,16 +3328,62 @@ __global__ void cooperative_delta_controller_kernel(
     if constexpr (CollectTelemetry) {
       ++args.state->grid_barriers;
     }
+    if (publication != nullptr) {
+      publication->submission_sequence = submission_sequence;
+      publication->slot_index = slot_index;
+      publication->reserved = 0;
+      publication->descriptor = args.state->descriptor;
+    }
     __threadfence_system();
   }
   grid.sync();
 }
 
+template <typename RowOffset,
+          bool UseCurrentGenerations,
+          bool TrackParents,
+          bool UseEdgeParent,
+          bool CollectTelemetry>
+__global__ void cooperative_delta_controller_kernel(
+    CooperativeDeltaControllerArgs<RowOffset> args) {
+  cooperative_groups::grid_group grid = cooperative_groups::this_grid();
+  cooperative_delta_controller_slot<RowOffset, UseCurrentGenerations,
+                                    TrackParents, UseEdgeParent,
+                                    CollectTelemetry>(
+      grid, args, nullptr, 0, 0);
+}
+
+template <typename RowOffset,
+          bool UseCurrentGenerations,
+          bool TrackParents,
+          bool UseEdgeParent,
+          bool CollectTelemetry>
+__global__ void cooperative_delta_controller_batch_kernel(
+    const CooperativeDeltaBatchSlot<RowOffset>* slots,
+    std::uint32_t active_slots,
+    CooperativeDeltaBatchPublication* publications) {
+  cooperative_groups::grid_group grid = cooperative_groups::this_grid();
+  // Every block traverses every active slot in the same order. Each slot ends
+  // with the controller's existing full-grid publication barrier, so slots may
+  // take different uniform controller paths without allowing any block to
+  // advance to the next query early.
+  for (std::uint32_t slot_position = 0; slot_position < active_slots;
+       ++slot_position) {
+    const CooperativeDeltaBatchSlot<RowOffset>& slot = slots[slot_position];
+    cooperative_delta_controller_slot<RowOffset, UseCurrentGenerations,
+                                      TrackParents, UseEdgeParent,
+                                      CollectTelemetry>(
+        grid, slot.args, &publications[slot_position],
+        slot.submission_sequence, slot.slot_index);
+  }
+}
+
 template <typename RowOffset, bool UseCurrentGenerations, bool TrackParents,
-          bool UseEdgeParent, bool CollectTelemetry>
+          bool UseEdgeParent, bool CollectTelemetry, bool Batched>
 CooperativeLaunchConfiguration
 query_cooperative_launch_configuration(Offset rows,
-                                       std::uint32_t concurrency_hint) {
+                                       std::uint32_t concurrency_hint,
+                                       std::uint32_t requested_batch_blocks_per_cu) {
   CooperativeLaunchConfiguration configuration;
   configuration.initialized = true;
   int device = -1;
@@ -3321,13 +3420,22 @@ query_cooperative_launch_configuration(Offset rows,
   }
   configuration.compute_units = properties.multiProcessorCount;
   int active_blocks_per_compute_unit = 0;
-  const hipError_t occupancy_status =
-      hipOccupancyMaxActiveBlocksPerMultiprocessor(
-          &active_blocks_per_compute_unit,
-          cooperative_delta_controller_kernel<RowOffset, UseCurrentGenerations,
-                                              TrackParents, UseEdgeParent,
-                                              CollectTelemetry>,
-          kBlockSize, 0);
+  hipError_t occupancy_status = hipSuccess;
+  if constexpr (Batched) {
+    occupancy_status = hipOccupancyMaxActiveBlocksPerMultiprocessor(
+        &active_blocks_per_compute_unit,
+        cooperative_delta_controller_batch_kernel<
+            RowOffset, UseCurrentGenerations, TrackParents, UseEdgeParent,
+            CollectTelemetry>,
+        kBlockSize, 0);
+  } else {
+    occupancy_status = hipOccupancyMaxActiveBlocksPerMultiprocessor(
+        &active_blocks_per_compute_unit,
+        cooperative_delta_controller_kernel<RowOffset, UseCurrentGenerations,
+                                            TrackParents, UseEdgeParent,
+                                            CollectTelemetry>,
+        kBlockSize, 0);
+  }
   if (occupancy_status != hipSuccess) {
     (void)hipGetLastError();
     configuration.fallback_reason =
@@ -3348,14 +3456,34 @@ query_cooperative_launch_configuration(Offset rows,
   const Offset legal_resident_limit =
       static_cast<Offset>(active_blocks_per_compute_unit) *
       static_cast<Offset>(properties.multiProcessorCount);
-  // Grid-stride loops permit a workspace to use only its share of the CUs.
-  // PathFinder gives every worker the same actual-concurrency hint, avoiding
-  // four CU-wide cooperative grids that can serialize while still retaining
-  // a bounded, nonshrinking grid when a frontier grows inside one batch.
-  const Offset concurrency_friendly_limit = std::max<Offset>(
-      1,
-      static_cast<Offset>(properties.multiProcessorCount) /
-          static_cast<Offset>(concurrency_hint));
+  // A physical multi-query launch is the device's only cooperative grid and
+  // visits slots sequentially. Its explicit blocks-per-CU cap is conservative
+  // by default because every additional resident block participates in every
+  // whole-grid barrier. It is always bounded by the occupancy-derived legal
+  // resident limit. The legacy single-query path retains its defensive
+  // concurrency partition for low-level callers without a coordinator.
+  Offset concurrency_friendly_limit = 0;
+  if constexpr (Batched) {
+    const std::uint32_t selected_blocks_per_cu =
+        delta_stepping_effective_batch_blocks_per_compute_unit(
+            requested_batch_blocks_per_cu,
+            static_cast<std::uint32_t>(active_blocks_per_compute_unit));
+    if (selected_blocks_per_cu == 0) {
+      configuration.fallback_reason =
+          DeltaSteppingCsrControllerFallbackReason::kNoResidentGrid;
+      return configuration;
+    }
+    configuration.selected_blocks_per_compute_unit =
+        static_cast<int>(selected_blocks_per_cu);
+    concurrency_friendly_limit =
+        static_cast<Offset>(selected_blocks_per_cu) *
+        static_cast<Offset>(properties.multiProcessorCount);
+  } else {
+    concurrency_friendly_limit = std::max<Offset>(
+        1,
+        static_cast<Offset>(properties.multiProcessorCount) /
+            static_cast<Offset>(concurrency_hint));
+  }
   const Offset blocks = std::min(
       row_blocks, std::min(legal_resident_limit, concurrency_friendly_limit));
   if (blocks <= 0 ||
@@ -3373,18 +3501,30 @@ template <typename RowOffset, bool UseCurrentGenerations, bool TrackParents,
 const CooperativeLaunchConfiguration& cooperative_launch_configuration(
     DeltaSteppingScratch& scratch,
     Offset rows) {
-  constexpr std::size_t key = (UseCurrentGenerations ? std::size_t{1} : 0) |
-                              (TrackParents ? std::size_t{2} : 0) |
-                              (UseEdgeParent ? std::size_t{4} : 0) |
-                              (CollectTelemetry ? std::size_t{8} : 0);
+  const bool batched = scratch.controller_batch_coordinator != nullptr;
+  const std::size_t key = (UseCurrentGenerations ? std::size_t{1} : 0) |
+                          (TrackParents ? std::size_t{2} : 0) |
+                          (UseEdgeParent ? std::size_t{4} : 0) |
+                          (CollectTelemetry ? std::size_t{8} : 0) |
+                          (batched ? std::size_t{16} : 0);
   CooperativeLaunchConfiguration& configuration =
       scratch.cooperative_launch_configurations[key];
   if (!configuration.initialized) {
-    configuration =
-        query_cooperative_launch_configuration<RowOffset, UseCurrentGenerations,
-                                               TrackParents, UseEdgeParent,
-                                               CollectTelemetry>(
-            rows, scratch.controller_concurrency_hint);
+    const std::uint32_t requested_batch_blocks_per_cu = batched
+        ? scratch.controller_batch_coordinator
+              ->configured_blocks_per_compute_unit()
+        : kDeltaSteppingCsrRecommendedBatchBlocksPerComputeUnit;
+    if (batched) {
+      configuration = query_cooperative_launch_configuration<
+          RowOffset, UseCurrentGenerations, TrackParents, UseEdgeParent,
+          CollectTelemetry, true>(rows, scratch.controller_concurrency_hint,
+                                  requested_batch_blocks_per_cu);
+    } else {
+      configuration = query_cooperative_launch_configuration<
+          RowOffset, UseCurrentGenerations, TrackParents, UseEdgeParent,
+          CollectTelemetry, false>(rows, scratch.controller_concurrency_hint,
+                                   requested_batch_blocks_per_cu);
+    }
   }
   return configuration;
 }
@@ -3464,6 +3604,952 @@ copy_controller_descriptor_to_host(DeltaSteppingScratch& scratch,
       stream));
   DS_DELTA_HIP_CHECK(hipStreamSynchronize(stream));
   return *destination;
+}
+
+struct CooperativeDeltaBatchSubmitResult {
+  DeltaSteppingCsrControllerDescriptor descriptor{};
+  std::uint64_t logical_query_sequence = 0;
+  std::uint32_t grid_blocks = 0;
+};
+
+}  // namespace ds_delta_detail
+
+struct DeltaSteppingCsrBatchCoordinator::Impl {
+  enum class ProducerState : std::uint8_t {
+    kExpected,
+    kActive,
+    kRetired,
+    kAbandoned,
+  };
+
+  struct Completion {
+    bool done = false;
+    std::exception_ptr failure;
+    ds_delta_detail::CooperativeDeltaBatchPublication publication{};
+    std::uint64_t logical_query_sequence = 0;
+    std::uint32_t grid_blocks = 0;
+  };
+
+  struct ExecutorBase;
+  using ExecutorFactory =
+      std::unique_ptr<ExecutorBase> (*)(std::size_t capacity);
+
+  static constexpr std::size_t kMaxArgumentBytes =
+      sizeof(ds_delta_detail::CooperativeDeltaControllerArgs<
+                 ds_delta_detail::CompactRowOffset>) >
+              sizeof(ds_delta_detail::CooperativeDeltaControllerArgs<
+                     minplus_sparse::Offset>)
+          ? sizeof(ds_delta_detail::CooperativeDeltaControllerArgs<
+                   ds_delta_detail::CompactRowOffset>)
+          : sizeof(ds_delta_detail::CooperativeDeltaControllerArgs<
+                   minplus_sparse::Offset>);
+
+  struct Record {
+    std::uint32_t family_key = 0;
+    alignas(std::max_align_t)
+        std::array<std::byte, kMaxArgumentBytes> argument_bytes{};
+    std::size_t argument_size = 0;
+    ExecutorFactory executor_factory = nullptr;
+    std::uint64_t submission_sequence = 0;
+    std::uint64_t logical_query_sequence = 0;
+    std::uint32_t expected_query_sequence = 0;
+    std::uint32_t expected_publication_sequence = 0;
+    std::uint32_t previous_light_rounds = 0;
+    std::uint32_t action_budget = 0;
+    std::uint32_t launch_blocks = 0;
+    std::uint32_t selected_blocks_per_compute_unit = 0;
+    std::uint32_t occupancy_active_blocks_per_compute_unit = 0;
+    std::uint32_t compute_units = 0;
+    Completion completion{};
+  };
+
+  struct ExecutorBase {
+    virtual ~ExecutorBase() = default;
+    virtual std::uint32_t family_key() const noexcept = 0;
+    virtual void execute(Record* const* records,
+                         std::size_t record_count,
+                         hipStream_t stream,
+                         Impl* coordinator) = 0;
+  };
+
+  Impl(std::size_t expected_producers,
+       std::size_t requested_width,
+       std::uint32_t requested_blocks_per_compute_unit,
+       int device)
+      : expected_producers(expected_producers),
+        width(static_cast<std::size_t>(
+            delta_stepping_effective_query_batch_width(
+                static_cast<std::uint32_t>(std::min<std::size_t>(
+                    expected_producers,
+                    std::numeric_limits<std::uint32_t>::max())),
+                static_cast<std::uint32_t>(std::min<std::size_t>(
+                    requested_width,
+                    std::numeric_limits<std::uint32_t>::max()))))),
+        remaining_producers(expected_producers),
+        producer_states(expected_producers, ProducerState::kExpected),
+        record_pool(expected_producers),
+        ready_queue(expected_producers, nullptr),
+        requested_blocks_per_compute_unit(
+            requested_blocks_per_compute_unit),
+        device(device) {
+    if (expected_producers == 0 || requested_width == 0 || width == 0) {
+      throw std::invalid_argument(
+          "Delta-Stepping query batch coordinator requires positive "
+          "producer and width counts");
+    }
+    if (!delta_stepping_batch_blocks_per_compute_unit_is_valid(
+            requested_blocks_per_compute_unit)) {
+      throw std::invalid_argument(
+          "Delta-Stepping batch blocks per compute unit must be in [1, 8]");
+    }
+    telemetry_record.configured_width = static_cast<std::uint32_t>(
+        std::min<std::size_t>(requested_width,
+                              std::numeric_limits<std::uint32_t>::max()));
+    telemetry_record.effective_width =
+        static_cast<std::uint32_t>(width);
+    telemetry_record.requested_blocks_per_compute_unit =
+        requested_blocks_per_compute_unit;
+    free_records.reserve(expected_producers);
+    for (Record& record : record_pool) free_records.push_back(&record);
+    coordinator_thread = std::thread([this] { run(); });
+  }
+
+  ~Impl() = default;
+
+  void run() noexcept;
+  ds_delta_detail::CooperativeDeltaBatchSubmitResult submit_record(
+      std::uint32_t family_key,
+      const void* argument_bytes,
+      std::size_t argument_size,
+      ExecutorFactory executor_factory,
+      std::uint64_t logical_query_sequence,
+      std::uint32_t expected_query_sequence,
+      std::uint32_t expected_publication_sequence,
+      std::uint32_t previous_light_rounds,
+      std::uint32_t action_budget,
+      std::uint32_t launch_blocks,
+      std::uint32_t selected_blocks_per_compute_unit,
+      std::uint32_t occupancy_active_blocks_per_compute_unit,
+      std::uint32_t compute_units);
+  void acquire(std::size_t producer_index);
+  void retire(std::size_t producer_index) noexcept;
+  void abandon_from(std::size_t first_producer) noexcept;
+  void request_cancel(std::exception_ptr failure) noexcept;
+  void join_and_rethrow();
+
+  void note_launch_attempt(
+      std::size_t active_slots,
+      std::uint32_t blocks,
+      std::uint32_t selected_blocks_per_compute_unit,
+      std::uint32_t occupancy_active_blocks_per_compute_unit,
+      std::uint32_t compute_units) {
+    std::lock_guard<std::mutex> lock(telemetry_mutex);
+    ++telemetry_record.physical_launch_attempts;
+    telemetry_record.slot_dispatches += active_slots;
+    telemetry_record.active_slots_sum += active_slots;
+    const auto observed = static_cast<std::uint32_t>(active_slots);
+    if (telemetry_record.active_slots_min == 0) {
+      telemetry_record.active_slots_min = observed;
+    } else {
+      telemetry_record.active_slots_min =
+          std::min(telemetry_record.active_slots_min, observed);
+    }
+    telemetry_record.active_slots_max =
+        std::max(telemetry_record.active_slots_max, observed);
+    telemetry_record.unused_slots += width - active_slots;
+    if (telemetry_record.grid_blocks_min == 0) {
+      telemetry_record.grid_blocks_min = blocks;
+    } else {
+      telemetry_record.grid_blocks_min =
+          std::min(telemetry_record.grid_blocks_min, blocks);
+    }
+    telemetry_record.grid_blocks_max =
+        std::max(telemetry_record.grid_blocks_max, blocks);
+    auto update_nonzero_range = [](std::uint32_t observed,
+                                   std::uint32_t* minimum,
+                                   std::uint32_t* maximum) {
+      if (*minimum == 0) {
+        *minimum = observed;
+      } else {
+        *minimum = std::min(*minimum, observed);
+      }
+      *maximum = std::max(*maximum, observed);
+    };
+    update_nonzero_range(
+        selected_blocks_per_compute_unit,
+        &telemetry_record.selected_blocks_per_compute_unit_min,
+        &telemetry_record.selected_blocks_per_compute_unit_max);
+    update_nonzero_range(
+        occupancy_active_blocks_per_compute_unit,
+        &telemetry_record.occupancy_active_blocks_per_compute_unit_min,
+        &telemetry_record.occupancy_active_blocks_per_compute_unit_max);
+    if (telemetry_record.compute_units == 0) {
+      telemetry_record.compute_units = compute_units;
+    }
+  }
+
+  void note_launch_accepted() {
+    std::lock_guard<std::mutex> lock(telemetry_mutex);
+    ++telemetry_record.physical_launches;
+    ++in_flight_launches;
+    telemetry_record.max_concurrent_cooperative_launches = std::max(
+        telemetry_record.max_concurrent_cooperative_launches,
+        in_flight_launches);
+  }
+
+  void note_launch_finished(bool completed) {
+    std::lock_guard<std::mutex> lock(telemetry_mutex);
+    if (completed) ++telemetry_record.physical_completions;
+    if (in_flight_launches != 0) --in_flight_launches;
+  }
+
+  void note_launch_failure() {
+    std::lock_guard<std::mutex> lock(telemetry_mutex);
+    ++telemetry_record.launch_failures;
+  }
+
+  void note_descriptor_failure() {
+    std::lock_guard<std::mutex> lock(telemetry_mutex);
+    ++telemetry_record.descriptor_failures;
+  }
+
+  void note_validated_slot(const Record& record,
+                           const DeltaSteppingCsrControllerDescriptor& descriptor,
+                           std::uint64_t completed_actions) {
+    std::lock_guard<std::mutex> lock(telemetry_mutex);
+    if (record.expected_publication_sequence == 1) {
+      ++telemetry_record.logical_queries_admitted;
+    } else {
+      ++telemetry_record.slot_relaunches;
+    }
+    if (descriptor.status != DeltaSteppingCsrControllerStatus::kNone) {
+      ++telemetry_record.logical_queries_completed;
+    }
+    telemetry_record.action_slots_budgeted += record.action_budget;
+    telemetry_record.actions_completed += completed_actions;
+    telemetry_record.unused_action_slots +=
+        static_cast<std::uint64_t>(record.action_budget) - completed_actions;
+  }
+
+  DeltaSteppingCsrBatchTelemetry telemetry() const {
+    std::lock_guard<std::mutex> lock(telemetry_mutex);
+    return telemetry_record;
+  }
+
+  void fail_records_locked(
+      Record* const* records,
+      std::size_t record_count,
+      const std::exception_ptr& failure) {
+    for (std::size_t i = 0; i < record_count; ++i) {
+      Record* const record = records[i];
+      record->completion.failure = failure;
+      record->completion.done = true;
+    }
+  }
+
+  void push_ready_locked(Record* record) noexcept {
+    ready_queue[ready_tail] = record;
+    ready_tail = (ready_tail + 1) % ready_queue.size();
+    ++ready_count;
+  }
+
+  Record* pop_ready_locked() noexcept {
+    Record* const record = ready_queue[ready_head];
+    ready_queue[ready_head] = nullptr;
+    ready_head = (ready_head + 1) % ready_queue.size();
+    --ready_count;
+    return record;
+  }
+
+  void fail_ready_locked(const std::exception_ptr& failure) {
+    while (ready_count != 0) {
+      Record* const record = pop_ready_locked();
+      record->completion.failure = failure;
+      record->completion.done = true;
+    }
+  }
+
+  const std::size_t expected_producers;
+  const std::size_t width;
+  std::size_t remaining_producers;
+  std::vector<ProducerState> producer_states;
+  const std::uint32_t requested_blocks_per_compute_unit;
+  const int device;
+
+  mutable std::mutex mutex;
+  std::condition_variable condition;
+  std::vector<Record> record_pool;
+  std::vector<Record*> free_records;
+  std::vector<Record*> ready_queue;
+  std::size_t ready_head = 0;
+  std::size_t ready_tail = 0;
+  std::size_t ready_count = 0;
+  std::exception_ptr failure;
+  bool cancel_requested = false;
+  bool stopped = false;
+  std::uint64_t next_submission_sequence = 1;
+  std::uint64_t next_logical_query_sequence = 1;
+  std::thread coordinator_thread;
+
+  mutable std::mutex telemetry_mutex;
+  DeltaSteppingCsrBatchTelemetry telemetry_record;
+  std::uint32_t in_flight_launches = 0;
+};
+
+namespace {
+
+template <typename RowOffset,
+          bool UseCurrentGenerations,
+          bool TrackParents,
+          bool UseEdgeParent,
+          bool CollectTelemetry>
+constexpr std::uint32_t delta_batch_family_key() noexcept {
+  return (std::is_same<RowOffset, ds_delta_detail::CompactRowOffset>::value
+              ? std::uint32_t{1}
+              : std::uint32_t{0}) |
+         (UseCurrentGenerations ? std::uint32_t{2} : 0) |
+         (TrackParents ? std::uint32_t{4} : 0) |
+         (UseEdgeParent ? std::uint32_t{8} : 0) |
+         (CollectTelemetry ? std::uint32_t{16} : 0);
+}
+
+template <typename RowOffset,
+          bool UseCurrentGenerations,
+          bool TrackParents,
+          bool UseEdgeParent,
+          bool CollectTelemetry>
+class DeltaBatchExecutor final
+    : public DeltaSteppingCsrBatchCoordinator::Impl::ExecutorBase {
+ public:
+  using Args = ds_delta_detail::CooperativeDeltaControllerArgs<RowOffset>;
+  using Slot = ds_delta_detail::CooperativeDeltaBatchSlot<RowOffset>;
+  using Publication = ds_delta_detail::CooperativeDeltaBatchPublication;
+  using Record = DeltaSteppingCsrBatchCoordinator::Impl::Record;
+
+  explicit DeltaBatchExecutor(std::size_t capacity)
+      : capacity_(capacity),
+        host_slots_(capacity),
+        host_publications_(capacity),
+        device_slots_(capacity),
+        device_publications_(capacity) {}
+
+  std::uint32_t family_key() const noexcept override {
+    return delta_batch_family_key<RowOffset, UseCurrentGenerations,
+                                  TrackParents, UseEdgeParent,
+                                  CollectTelemetry>();
+  }
+
+  void execute(Record* const* records,
+               std::size_t record_count,
+               hipStream_t stream,
+               DeltaSteppingCsrBatchCoordinator::Impl* coordinator) override {
+    if (records == nullptr || record_count == 0 || record_count > capacity_) {
+      throw std::logic_error(
+          "Delta-Stepping cooperative query batch has invalid active width");
+    }
+
+    const RowOffset* shared_rowptr = nullptr;
+    const minplus_sparse::Index* shared_colind = nullptr;
+    const float* shared_values = nullptr;
+    minplus_sparse::Offset shared_rows = 0;
+    std::uint32_t launch_blocks = 0;
+    std::uint32_t selected_blocks_per_compute_unit = 0;
+    std::uint32_t occupancy_active_blocks_per_compute_unit = 0;
+    std::uint32_t compute_units = 0;
+    std::array<std::array<const void*, 23>,
+               kDeltaSteppingCsrMaxQueryBatchWidth>
+        query_owned_addresses_by_slot{};
+
+    for (std::size_t i = 0; i < record_count; ++i) {
+      const Record* const record = records[i];
+      if (record->family_key != family_key() ||
+          record->argument_size != sizeof(Args) ||
+          record->launch_blocks == 0 ||
+          record->selected_blocks_per_compute_unit == 0 ||
+          record->occupancy_active_blocks_per_compute_unit == 0 ||
+          record->compute_units == 0) {
+        throw std::logic_error(
+            "Delta-Stepping cooperative query batch mixes kernel variants");
+      }
+      Args args{};
+      std::memcpy(&args, record->argument_bytes.data(), sizeof(args));
+      if (i == 0) {
+        shared_rows = args.rows;
+        shared_rowptr = args.rowptr;
+        shared_colind = args.colind;
+        shared_values = args.values;
+        launch_blocks = record->launch_blocks;
+        selected_blocks_per_compute_unit =
+            record->selected_blocks_per_compute_unit;
+        occupancy_active_blocks_per_compute_unit =
+            record->occupancy_active_blocks_per_compute_unit;
+        compute_units = record->compute_units;
+      } else if (args.rows != shared_rows || args.rowptr != shared_rowptr ||
+                 args.colind != shared_colind ||
+                 args.values != shared_values ||
+                 record->launch_blocks != launch_blocks ||
+                 record->selected_blocks_per_compute_unit !=
+                     selected_blocks_per_compute_unit ||
+                 record->occupancy_active_blocks_per_compute_unit !=
+                     occupancy_active_blocks_per_compute_unit ||
+                 record->compute_units != compute_units) {
+        throw std::logic_error(
+            "Delta-Stepping cooperative query batch mixes graph or launch "
+            "configuration");
+      }
+
+      auto& query_owned_addresses = query_owned_addresses_by_slot[i];
+      query_owned_addresses = {
+          args.dist,
+          args.parent_key,
+          args.in_current,
+          args.in_pending,
+          args.in_heavy,
+          args.touched_queue,
+          args.touched_count,
+          args.current_queue_0,
+          args.current_queue_1,
+          args.current_count_0,
+          args.current_count_1,
+          args.pending_queue_0,
+          args.pending_queue_1,
+          args.pending_count_0,
+          args.pending_count_1,
+          args.heavy_queue,
+          args.heavy_count,
+          args.min_pending_bucket,
+          args.targets,
+          args.target_settled,
+          args.settled_target_count,
+          args.telemetry_counters,
+          args.state};
+      // Width is bounded to eight, so pairwise checks are cheaper and more
+      // predictable than constructing a hash table on every publication.
+      // Check both accidental aliases inside one workspace and cross-slot
+      // reuse of storage that may still be in flight.
+      for (std::size_t address_index = 0;
+           address_index < query_owned_addresses.size(); ++address_index) {
+        const void* const address = query_owned_addresses[address_index];
+        if (address == nullptr) continue;
+        for (std::size_t previous_index = 0;
+             previous_index < address_index; ++previous_index) {
+          if (address == query_owned_addresses[previous_index]) {
+            throw std::logic_error(
+                "Delta-Stepping cooperative query batch aliases query-owned "
+                "storage");
+          }
+        }
+        for (std::size_t previous_slot = 0; previous_slot < i;
+             ++previous_slot) {
+          for (const void* const previous_address :
+               query_owned_addresses_by_slot[previous_slot]) {
+            if (address == previous_address) {
+              throw std::logic_error(
+                  "Delta-Stepping cooperative query batch aliases "
+                  "query-owned storage across slots");
+            }
+          }
+        }
+      }
+
+      host_slots_.get()[i] =
+          Slot{args, record->submission_sequence,
+               static_cast<std::uint32_t>(i), 0};
+    }
+
+    coordinator->note_launch_attempt(
+        record_count, launch_blocks, selected_blocks_per_compute_unit,
+        occupancy_active_blocks_per_compute_unit, compute_units);
+    bool launch_started = false;
+    try {
+      DS_DELTA_HIP_CHECK(hipMemcpyAsync(
+          device_slots_.get(), host_slots_.get(),
+          sssp_capacity::checked_bytes<Slot>(record_count),
+          hipMemcpyHostToDevice, stream));
+      const Slot* slot_pointer = device_slots_.get();
+      std::uint32_t active_slots =
+          static_cast<std::uint32_t>(record_count);
+      Publication* publication_pointer = device_publications_.get();
+      void* kernel_arguments[] = {
+          &slot_pointer, &active_slots, &publication_pointer};
+      DS_DELTA_HIP_CHECK(hipLaunchCooperativeKernel(
+          ds_delta_detail::cooperative_delta_controller_batch_kernel<
+              RowOffset, UseCurrentGenerations, TrackParents, UseEdgeParent,
+              CollectTelemetry>,
+          dim3(launch_blocks), dim3(ds_delta_detail::kBlockSize),
+          kernel_arguments, 0, stream));
+      coordinator->note_launch_accepted();
+      launch_started = true;
+      DS_DELTA_HIP_CHECK(hipMemcpyAsync(
+          host_publications_.get(), device_publications_.get(),
+          sssp_capacity::checked_bytes<Publication>(record_count),
+          hipMemcpyDeviceToHost, stream));
+      DS_DELTA_HIP_CHECK(hipStreamSynchronize(stream));
+      coordinator->note_launch_finished(true);
+      launch_started = false;
+    } catch (...) {
+      // Host slot/publication staging and every referenced workspace must stay
+      // alive until the one batch stream has stopped consuming them.
+      (void)hipStreamSynchronize(stream);
+      if (launch_started) coordinator->note_launch_finished(false);
+      coordinator->note_launch_failure();
+      throw;
+    }
+
+    // Validate every publication before exposing any result to a worker. One
+    // corrupt slot cancels the complete physical batch atomically.
+    for (std::size_t i = 0; i < record_count; ++i) {
+      const auto& record = *records[i];
+      const Publication& publication = host_publications_.get()[i];
+      const auto& descriptor = publication.descriptor;
+      const std::uint64_t completed_actions =
+          static_cast<std::uint64_t>(descriptor.light_rounds) -
+          static_cast<std::uint64_t>(record.previous_light_rounds);
+      const bool valid =
+          publication.submission_sequence == record.submission_sequence &&
+          publication.slot_index == i &&
+          delta_stepping_controller_descriptor_is_valid(descriptor) &&
+          descriptor.query_sequence == record.expected_query_sequence &&
+          descriptor.publication_sequence ==
+              record.expected_publication_sequence &&
+          descriptor.light_rounds > record.previous_light_rounds &&
+          completed_actions <= record.action_budget &&
+          (descriptor.status != DeltaSteppingCsrControllerStatus::kNone ||
+           completed_actions == record.action_budget);
+      if (!valid) {
+        coordinator->note_descriptor_failure();
+        throw std::runtime_error(
+            "Delta-Stepping cooperative query batch published an invalid "
+            "slot descriptor");
+      }
+    }
+
+    for (std::size_t i = 0; i < record_count; ++i) {
+      auto& record = *records[i];
+      const Publication publication = host_publications_.get()[i];
+      const std::uint64_t completed_actions =
+          static_cast<std::uint64_t>(publication.descriptor.light_rounds) -
+          static_cast<std::uint64_t>(record.previous_light_rounds);
+      record.completion.publication = publication;
+      record.completion.grid_blocks = launch_blocks;
+      coordinator->note_validated_slot(
+          record, publication.descriptor, completed_actions);
+    }
+  }
+
+ private:
+  std::size_t capacity_;
+  ds_delta_detail::PinnedHostBuffer<Slot> host_slots_;
+  ds_delta_detail::PinnedHostBuffer<Publication> host_publications_;
+  ds_delta_detail::DeviceBuffer<Slot> device_slots_;
+  ds_delta_detail::DeviceBuffer<Publication> device_publications_;
+};
+
+template <typename RowOffset,
+          bool UseCurrentGenerations,
+          bool TrackParents,
+          bool UseEdgeParent,
+          bool CollectTelemetry>
+std::unique_ptr<DeltaSteppingCsrBatchCoordinator::Impl::ExecutorBase>
+make_delta_batch_executor(std::size_t capacity) {
+  return std::make_unique<
+      DeltaBatchExecutor<RowOffset, UseCurrentGenerations, TrackParents,
+                         UseEdgeParent, CollectTelemetry>>(capacity);
+}
+
+}  // namespace
+
+void DeltaSteppingCsrBatchCoordinator::Impl::run() noexcept {
+  hipStream_t stream = nullptr;
+  std::unique_ptr<ExecutorBase> executor;
+  std::array<Record*, kDeltaSteppingCsrMaxQueryBatchWidth> batch{};
+  try {
+    DS_DELTA_HIP_CHECK(hipSetDevice(device));
+    DS_DELTA_HIP_CHECK(
+        hipStreamCreateWithFlags(&stream, hipStreamNonBlocking));
+
+    while (true) {
+      std::size_t batch_size = 0;
+      {
+        std::unique_lock<std::mutex> lock(mutex);
+        condition.wait(lock, [&] {
+          return cancel_requested || remaining_producers == 0 ||
+                 ready_count >= width ||
+                 (ready_count != 0 &&
+                  ready_count >= remaining_producers);
+        });
+        if (cancel_requested) {
+          fail_ready_locked(failure);
+          stopped = true;
+          condition.notify_all();
+          break;
+        }
+        if (remaining_producers == 0 && ready_count == 0) {
+          stopped = true;
+          condition.notify_all();
+          break;
+        }
+
+        batch_size = std::min(width, ready_count);
+        if (batch_size == 0) continue;
+        for (std::size_t i = 0; i < batch_size; ++i) {
+          batch[i] = pop_ready_locked();
+        }
+      }
+
+      std::exception_ptr batch_failure;
+      try {
+        if (!executor) {
+          if (batch[0]->executor_factory == nullptr) {
+            throw std::logic_error(
+                "Delta-Stepping query batch has no kernel executor");
+          }
+          executor = batch[0]->executor_factory(width);
+        }
+        for (std::size_t i = 0; i < batch_size; ++i) {
+          const Record* const record = batch[i];
+          if (record->family_key != executor->family_key() ||
+              record->executor_factory != batch[0]->executor_factory) {
+            throw std::logic_error(
+                "Delta-Stepping query batch mixes controller "
+                "specializations");
+          }
+        }
+        executor->execute(batch.data(), batch_size, stream, this);
+      } catch (...) {
+        batch_failure = std::current_exception();
+      }
+
+      {
+        std::lock_guard<std::mutex> lock(mutex);
+        if (batch_failure && !failure) failure = batch_failure;
+        if (cancel_requested || batch_failure) {
+          cancel_requested = true;
+          const std::exception_ptr reported =
+              failure ? failure : batch_failure;
+          fail_records_locked(batch.data(), batch_size, reported);
+          fail_ready_locked(reported);
+        } else {
+          for (std::size_t i = 0; i < batch_size; ++i) {
+            batch[i]->completion.done = true;
+          }
+        }
+        condition.notify_all();
+        if (cancel_requested) {
+          stopped = true;
+          break;
+        }
+      }
+    }
+
+    // Release all batch device/pinned storage on the selected coordinator
+    // device before destroying its sole launch stream.
+    executor.reset();
+    DS_DELTA_HIP_CHECK(hipStreamDestroy(stream));
+    stream = nullptr;
+  } catch (...) {
+    const std::exception_ptr coordinator_failure = std::current_exception();
+    if (stream != nullptr) {
+      (void)hipStreamSynchronize(stream);
+      executor.reset();
+      (void)hipStreamDestroy(stream);
+    }
+    std::lock_guard<std::mutex> lock(mutex);
+    if (!failure) failure = coordinator_failure;
+    cancel_requested = true;
+    stopped = true;
+    fail_ready_locked(failure);
+    condition.notify_all();
+  }
+}
+
+ds_delta_detail::CooperativeDeltaBatchSubmitResult
+DeltaSteppingCsrBatchCoordinator::Impl::submit_record(
+    std::uint32_t family_key,
+    const void* argument_bytes,
+    std::size_t argument_size,
+    ExecutorFactory executor_factory,
+    std::uint64_t logical_query_sequence,
+    std::uint32_t expected_query_sequence,
+    std::uint32_t expected_publication_sequence,
+    std::uint32_t previous_light_rounds,
+    std::uint32_t action_budget,
+    std::uint32_t launch_blocks,
+    std::uint32_t selected_blocks_per_compute_unit,
+    std::uint32_t occupancy_active_blocks_per_compute_unit,
+    std::uint32_t compute_units) {
+  if (argument_bytes == nullptr || argument_size == 0 ||
+      argument_size > kMaxArgumentBytes || executor_factory == nullptr) {
+    throw std::invalid_argument(
+        "Delta-Stepping query batch submission has invalid fixed storage");
+  }
+  std::unique_lock<std::mutex> lock(mutex);
+  if (failure) std::rethrow_exception(failure);
+  if (cancel_requested || stopped) {
+    throw std::runtime_error(
+        "Delta-Stepping query batch coordinator is stopped");
+  }
+  if (logical_query_sequence == 0) {
+    if (next_logical_query_sequence == 0) {
+      throw std::overflow_error(
+          "Delta-Stepping batch logical query sequence exhausted");
+    }
+    logical_query_sequence = next_logical_query_sequence++;
+  }
+  if (next_submission_sequence == 0) {
+    throw std::overflow_error(
+        "Delta-Stepping batch submission sequence exhausted");
+  }
+  // A producer cannot have more than one outstanding synchronous submission.
+  // The pool therefore has exactly the expected producer count and exhaustion
+  // identifies API misuse rather than a condition worth waiting on with the
+  // caller's stack-local argument record still uncopied.
+  if (free_records.empty()) {
+    throw std::logic_error(
+        "Delta-Stepping query batch fixed submission pool is exhausted");
+  }
+  Record* const record = free_records.back();
+  free_records.pop_back();
+  *record = Record{};
+  record->family_key = family_key;
+  record->argument_size = argument_size;
+  std::memcpy(record->argument_bytes.data(), argument_bytes, argument_size);
+  record->executor_factory = executor_factory;
+  record->logical_query_sequence = logical_query_sequence;
+  record->submission_sequence = next_submission_sequence++;
+  record->expected_query_sequence = expected_query_sequence;
+  record->expected_publication_sequence = expected_publication_sequence;
+  record->previous_light_rounds = previous_light_rounds;
+  record->action_budget = action_budget;
+  record->launch_blocks = launch_blocks;
+  record->selected_blocks_per_compute_unit =
+      selected_blocks_per_compute_unit;
+  record->occupancy_active_blocks_per_compute_unit =
+      occupancy_active_blocks_per_compute_unit;
+  record->compute_units = compute_units;
+  record->completion.logical_query_sequence = logical_query_sequence;
+  push_ready_locked(record);
+  condition.notify_all();
+  condition.wait(lock, [&] { return record->completion.done; });
+
+  const std::exception_ptr completion_failure = record->completion.failure;
+  ds_delta_detail::CooperativeDeltaBatchSubmitResult result;
+  result.descriptor = record->completion.publication.descriptor;
+  result.logical_query_sequence =
+      record->completion.logical_query_sequence;
+  result.grid_blocks = record->completion.grid_blocks;
+  free_records.push_back(record);
+  condition.notify_all();
+  // The coordinator completed its HIP stream before taking mutex and setting
+  // done. This acquire resumes the worker only after all batch writes and D2H
+  // descriptors are complete; subsequent extraction may safely enqueue on the
+  // worker's original stream without a device-wide synchronization.
+  lock.unlock();
+  if (completion_failure) std::rethrow_exception(completion_failure);
+  return result;
+}
+
+void DeltaSteppingCsrBatchCoordinator::Impl::acquire(
+    std::size_t producer_index) {
+  std::lock_guard<std::mutex> lock(mutex);
+  if (failure) std::rethrow_exception(failure);
+  if (producer_index >= producer_states.size() ||
+      producer_states[producer_index] != ProducerState::kExpected) {
+    throw std::logic_error(
+        "Delta-Stepping batch producer lease is invalid or duplicated");
+  }
+  producer_states[producer_index] = ProducerState::kActive;
+}
+
+void DeltaSteppingCsrBatchCoordinator::Impl::retire(
+    std::size_t producer_index) noexcept {
+  std::lock_guard<std::mutex> lock(mutex);
+  if (producer_index >= producer_states.size() ||
+      producer_states[producer_index] != ProducerState::kActive) {
+    return;
+  }
+  producer_states[producer_index] = ProducerState::kRetired;
+  if (remaining_producers != 0) --remaining_producers;
+  condition.notify_all();
+}
+
+void DeltaSteppingCsrBatchCoordinator::Impl::abandon_from(
+    std::size_t first_producer) noexcept {
+  std::lock_guard<std::mutex> lock(mutex);
+  for (std::size_t i = first_producer; i < producer_states.size(); ++i) {
+    if (producer_states[i] == ProducerState::kExpected) {
+      producer_states[i] = ProducerState::kAbandoned;
+      if (remaining_producers != 0) --remaining_producers;
+    }
+  }
+  condition.notify_all();
+}
+
+void DeltaSteppingCsrBatchCoordinator::Impl::request_cancel(
+    std::exception_ptr requested_failure) noexcept {
+  if (!requested_failure) {
+    try {
+      throw std::runtime_error(
+          "Delta-Stepping query batch coordinator cancelled");
+    } catch (...) {
+      requested_failure = std::current_exception();
+    }
+  }
+  {
+    std::lock_guard<std::mutex> telemetry_lock(telemetry_mutex);
+    ++telemetry_record.cancellations;
+  }
+  std::lock_guard<std::mutex> lock(mutex);
+  if (!failure) failure = requested_failure;
+  cancel_requested = true;
+  condition.notify_all();
+}
+
+void DeltaSteppingCsrBatchCoordinator::Impl::join_and_rethrow() {
+  if (coordinator_thread.joinable()) coordinator_thread.join();
+  std::lock_guard<std::mutex> lock(mutex);
+  if (failure) std::rethrow_exception(failure);
+}
+
+DeltaSteppingCsrBatchCoordinator::DeltaSteppingCsrBatchCoordinator(
+    std::size_t expected_producers,
+    std::size_t requested_width,
+    std::uint32_t requested_blocks_per_compute_unit) {
+  int device = 0;
+  DS_DELTA_HIP_CHECK(hipGetDevice(&device));
+  impl_ = std::make_unique<Impl>(expected_producers, requested_width,
+                                 requested_blocks_per_compute_unit, device);
+}
+
+DeltaSteppingCsrBatchCoordinator::~DeltaSteppingCsrBatchCoordinator() {
+  if (impl_ && impl_->coordinator_thread.joinable()) {
+    impl_->request_cancel(nullptr);
+    impl_->coordinator_thread.join();
+  }
+}
+
+DeltaSteppingCsrBatchCoordinator::ProducerLease::ProducerLease(
+    DeltaSteppingCsrBatchCoordinator* owner,
+    std::size_t producer_index) noexcept
+    : owner_(owner), producer_index_(producer_index) {}
+
+DeltaSteppingCsrBatchCoordinator::ProducerLease::~ProducerLease() {
+  release();
+}
+
+DeltaSteppingCsrBatchCoordinator::ProducerLease::ProducerLease(
+    ProducerLease&& other) noexcept
+    : owner_(other.owner_), producer_index_(other.producer_index_) {
+  other.owner_ = nullptr;
+}
+
+DeltaSteppingCsrBatchCoordinator::ProducerLease&
+DeltaSteppingCsrBatchCoordinator::ProducerLease::operator=(
+    ProducerLease&& other) noexcept {
+  if (this != &other) {
+    release();
+    owner_ = other.owner_;
+    producer_index_ = other.producer_index_;
+    other.owner_ = nullptr;
+  }
+  return *this;
+}
+
+void DeltaSteppingCsrBatchCoordinator::ProducerLease::release() noexcept {
+  if (owner_ != nullptr) {
+    owner_->retire_producer(producer_index_);
+    owner_ = nullptr;
+  }
+}
+
+DeltaSteppingCsrBatchCoordinator::ProducerLease
+DeltaSteppingCsrBatchCoordinator::acquire_producer(
+    std::size_t producer_index) {
+  if (!impl_) throw std::logic_error("Delta batch coordinator is moved");
+  impl_->acquire(producer_index);
+  return ProducerLease(this, producer_index);
+}
+
+void DeltaSteppingCsrBatchCoordinator::retire_producer(
+    std::size_t producer_index) noexcept {
+  if (impl_) impl_->retire(producer_index);
+}
+
+void DeltaSteppingCsrBatchCoordinator::abandon_unstarted_producers(
+    std::size_t first_producer) noexcept {
+  if (impl_) impl_->abandon_from(first_producer);
+}
+
+void DeltaSteppingCsrBatchCoordinator::cancel(
+    std::exception_ptr failure) noexcept {
+  if (impl_) impl_->request_cancel(failure);
+}
+
+void DeltaSteppingCsrBatchCoordinator::finish() {
+  if (impl_) impl_->join_and_rethrow();
+}
+
+DeltaSteppingCsrBatchTelemetry
+DeltaSteppingCsrBatchCoordinator::telemetry() const {
+  return impl_ ? impl_->telemetry() : DeltaSteppingCsrBatchTelemetry{};
+}
+
+std::uint32_t
+DeltaSteppingCsrBatchCoordinator::configured_blocks_per_compute_unit()
+    const noexcept {
+  return impl_ ? impl_->requested_blocks_per_compute_unit : 0;
+}
+
+DeltaSteppingCsrBatchCoordinator::Impl*
+DeltaSteppingCsrBatchCoordinator::implementation_for_delta() noexcept {
+  return impl_.get();
+}
+
+namespace ds_delta_detail {
+
+template <typename RowOffset,
+          bool UseCurrentGenerations,
+          bool TrackParents,
+          bool UseEdgeParent,
+          bool CollectTelemetry>
+CooperativeDeltaBatchSubmitResult submit_cooperative_delta_controller_batch(
+    DeltaSteppingCsrBatchCoordinator& coordinator,
+    const CooperativeDeltaControllerArgs<RowOffset>& args,
+    std::uint64_t logical_query_sequence,
+    std::uint32_t expected_query_sequence,
+    std::uint32_t expected_publication_sequence,
+    std::uint32_t previous_light_rounds,
+    std::uint32_t action_budget,
+    std::uint32_t launch_blocks,
+    std::uint32_t selected_blocks_per_compute_unit,
+    std::uint32_t occupancy_active_blocks_per_compute_unit,
+    std::uint32_t compute_units) {
+  auto* const implementation = coordinator.implementation_for_delta();
+  if (implementation == nullptr) {
+    throw std::logic_error(
+        "Delta-Stepping query batch coordinator has no implementation");
+  }
+  if (!delta_stepping_query_batch_action_bound_is_valid(
+          static_cast<std::uint32_t>(implementation->width),
+          action_budget)) {
+    throw std::invalid_argument(
+        "Delta-Stepping cooperative query batch exceeds its bounded action "
+        "watchdog");
+  }
+  // submit_record copies the complete value into its preallocated fixed pool
+  // before this stack-local argument record can go out of scope. Steady-state
+  // publications perform no general heap allocation.
+  return implementation->submit_record(
+      delta_batch_family_key<RowOffset, UseCurrentGenerations, TrackParents,
+                             UseEdgeParent, CollectTelemetry>(),
+      &args, sizeof(args),
+      &make_delta_batch_executor<RowOffset, UseCurrentGenerations,
+                                 TrackParents, UseEdgeParent,
+                                 CollectTelemetry>,
+      logical_query_sequence, expected_query_sequence,
+      expected_publication_sequence, previous_light_rounds, action_budget,
+      launch_blocks, selected_blocks_per_compute_unit,
+      occupancy_active_blocks_per_compute_unit, compute_units);
 }
 
 template <bool TrackParents, bool UseEdgeParent>
@@ -3639,7 +4725,7 @@ void copy_device_telemetry_to_host(DeltaSteppingScratch& scratch,
   if (telemetry.controller_backend ==
           DeltaSteppingCsrControllerBackend::kCooperativeGrid &&
       scratch.controller_state.size() != 0 &&
-      telemetry.cooperative_launches != 0) {
+      telemetry.controller_publications != 0) {
     const auto* const controller_bytes =
         reinterpret_cast<const unsigned char*>(scratch.controller_state.get());
     DS_DELTA_HIP_CHECK(hipMemcpyAsync(
@@ -4568,6 +5654,15 @@ DeltaSteppingCsrResult run_delta_stepping_impl(
   const bool cooperative_controller_requested =
       controller_mode == DeltaSteppingCsrControllerMode::kFusedHostChecked ||
       controller_mode == DeltaSteppingCsrControllerMode::kReducedRoundTrip;
+  const bool use_query_batch_coordinator =
+      scratch.controller_batch_coordinator != nullptr;
+  if (cooperative_controller_requested &&
+      scratch.controller_concurrency_hint > 1 &&
+      !use_query_batch_coordinator && progress_callback == nullptr) {
+    throw std::invalid_argument(
+        "multiworker cooperative Delta-Stepping requires one shared query "
+        "batch coordinator");
+  }
   const std::uint32_t cooperative_action_budget =
       delta_stepping_effective_controller_batch_size(controller_policy);
   CooperativeLaunchConfiguration cooperative_configuration;
@@ -4908,6 +6003,7 @@ DeltaSteppingCsrResult run_delta_stepping_impl(
       !(has_distance_limit && current_bucket > last_allowed_bucket)) {
     PATHFINDER_PROFILE_RANGE("delta_step.cooperative_controller");
     std::uint32_t previous_publication = 0;
+    std::uint64_t coordinator_query_sequence = 0;
     DeltaSteppingCsrControllerDescriptor previous_descriptor =
         initial_controller_state.descriptor;
     try {
@@ -4978,16 +6074,48 @@ DeltaSteppingCsrResult run_delta_stepping_impl(
           }
           telemetry->cooperative_grid_blocks_max =
               std::max(telemetry->cooperative_grid_blocks_max, observed_blocks);
-          ++telemetry->cooperative_launches;
+          if (!use_query_batch_coordinator) {
+            ++telemetry->cooperative_launches;
+          }
           telemetry->controller_action_slots_budgeted +=
               cooperative_action_budget;
         }
-        launch_cooperative_delta_controller<RowOffset, UseCurrentGenerations,
-                                            TrackParents, UseEdgeParent,
-                                            CollectTelemetry>(
-            args, launch_blocks, stream);
-        const DeltaSteppingCsrControllerDescriptor descriptor =
-            copy_controller_descriptor_to_host(scratch, stream);
+        DeltaSteppingCsrControllerDescriptor descriptor{};
+        if (use_query_batch_coordinator) {
+          const CooperativeDeltaBatchSubmitResult batch_result =
+              submit_cooperative_delta_controller_batch<
+                  RowOffset, UseCurrentGenerations, TrackParents,
+                  UseEdgeParent, CollectTelemetry>(
+                  *scratch.controller_batch_coordinator, args,
+                  coordinator_query_sequence,
+                  scratch.controller_query_sequence,
+                  previous_publication + 1U,
+                  previous_descriptor.light_rounds,
+                  cooperative_action_budget,
+                  static_cast<std::uint32_t>(launch_blocks),
+                  static_cast<std::uint32_t>(
+                      cooperative_configuration
+                          .selected_blocks_per_compute_unit),
+                  static_cast<std::uint32_t>(
+                      cooperative_configuration
+                          .active_blocks_per_compute_unit),
+                  static_cast<std::uint32_t>(
+                      cooperative_configuration.compute_units));
+          descriptor = batch_result.descriptor;
+          coordinator_query_sequence =
+              batch_result.logical_query_sequence;
+          if (batch_result.grid_blocks !=
+              static_cast<std::uint32_t>(launch_blocks)) {
+            throw std::runtime_error(
+                "Delta-Stepping query batch returned a mismatched grid "
+                "configuration");
+          }
+        } else {
+          launch_cooperative_delta_controller<
+              RowOffset, UseCurrentGenerations, TrackParents, UseEdgeParent,
+              CollectTelemetry>(args, launch_blocks, stream);
+          descriptor = copy_controller_descriptor_to_host(scratch, stream);
+        }
         ++controller_round_trips;
         if (!delta_stepping_controller_descriptor_is_valid(descriptor) ||
             descriptor.query_sequence != scratch.controller_query_sequence ||
@@ -5867,8 +6995,14 @@ DeltaSteppingCsrWorkspace::DeltaSteppingCsrWorkspace(
     throw std::invalid_argument(
         "Delta-Stepping controller concurrency hint must be positive");
   }
+  if (options.controller_batch_coordinator != nullptr && stream == nullptr) {
+    throw std::invalid_argument(
+        "Delta-Stepping query batching requires an explicit producer stream");
+  }
   impl_->scratch.controller_concurrency_hint =
       options.controller_concurrency_hint;
+  impl_->scratch.controller_batch_coordinator =
+      std::move(options.controller_batch_coordinator);
   impl_->scratch.reserve_query_capacity(options.capacity_hints,
                                         impl_->path_capable);
 }
@@ -5896,8 +7030,14 @@ DeltaSteppingCsrWorkspace::DeltaSteppingCsrWorkspace(
     throw std::invalid_argument(
         "Delta-Stepping controller concurrency hint must be positive");
   }
+  if (options.controller_batch_coordinator != nullptr && stream == nullptr) {
+    throw std::invalid_argument(
+        "Delta-Stepping query batching requires an explicit producer stream");
+  }
   impl_->scratch.controller_concurrency_hint =
       options.controller_concurrency_hint;
+  impl_->scratch.controller_batch_coordinator =
+      std::move(options.controller_batch_coordinator);
   impl_->scratch.reserve_query_capacity(options.capacity_hints,
                                         impl_->path_capable);
 }

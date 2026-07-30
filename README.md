@@ -111,9 +111,13 @@ The generic controller has explicit correctness-first A/B controls. The
 existing `host-checked` scalar controller remains the trusted default and
 reference. Two experimental cooperative modes are opt-in:
 `fused-host-checked` executes one generic Delta action per publication, while
-`reduced-round-trip` uses a bounded configurable multi-action batch. Both
-report whether runtime cooperative-launch checks selected them or fell back to
-the scalar host path:
+`reduced-round-trip` uses a bounded configurable multi-action batch. With
+multiple PathFinder workers, ready queries rendezvous at one coordinator: one
+physical cooperative grid processes the private query slots sequentially, so
+all blocks cross every whole-grid barrier in the same order and the process
+never issues concurrent cooperative launches on independent worker streams.
+Both modes report whether runtime cooperative-launch checks selected them or
+fell back to the scalar host path:
 
 ```bash
 # Existing/default controller.
@@ -126,17 +130,25 @@ make ROUTER=PathFinderFile BENCHMARKS="boom_med_pb" VERBOSE=1 \
 make ROUTER=PathFinderFile BENCHMARKS="boom_med_pb" VERBOSE=1 \
   PATHFINDER_SSSP_ENGINE=delta-step \
   PATHFINDER_ARGS="--delta 1 --delta-force-generic \
-    --parallel-net-workers 4 --delta-controller fused-host-checked"
+    --parallel-net-workers 4 --delta-controller fused-host-checked \
+    --delta-query-batch-width 4 --delta-batch-blocks-per-cu 1"
 
 # Experimental bounded multi-action cooperative controller.
 make ROUTER=PathFinderFile BENCHMARKS="boom_med_pb" VERBOSE=1 \
   PATHFINDER_SSSP_ENGINE=delta-step \
   PATHFINDER_ARGS="--delta 1 --delta-force-generic \
     --parallel-net-workers 4 --delta-controller reduced-round-trip \
-    --delta-controller-batch-size 4"
+    --delta-controller-batch-size 4 --delta-query-batch-width 4 \
+    --delta-batch-blocks-per-cu 1"
 ```
 
-Batch size one is the state-machine equivalence control. Progress callbacks
+Batch size one is the state-machine equivalence control. Query width defaults
+to four and is capped at eight. The conservative grid default is one block per
+CU, even when occupancy permits more resident blocks; after correctness passes,
+sweep `--delta-batch-blocks-per-cu 1`, `2`, `4`, and `8` with telemetry and
+profiler-free timing rather than assuming the occupancy maximum is fastest.
+The two batching controls require an explicitly selected cooperative mode and
+are invalid with `host-checked`. Progress callbacks
 and unsupported cooperative kernels use the complete host-checked fallback;
 use Delta telemetry to confirm the effective controller before interpreting a
 profile or timing run.
@@ -427,13 +439,15 @@ Tuning options:
 | `--delta-force-legacy-parent` | unset | Select legacy predecessor recovery for generic vector-target Delta runs; combine with force-generic for a parent-policy A/B test. |
 | `--delta-controller <host-checked\|fused-host-checked\|reduced-round-trip>` | `host-checked` | Select the trusted scalar host reference, the experimental fixed-one-action cooperative controller, or the experimental bounded multi-action cooperative controller. |
 | `--delta-controller-batch-size <int>` | `4` in reduced mode | Positive device-control budget; valid only with an explicitly selected reduced-round-trip controller. |
+| `--delta-query-batch-width <1..8>` | `4` | Maximum ready generic Delta queries combined into one physical cooperative launch; valid only with an explicitly selected fused or reduced controller. Tail batches of fewer queries are supported. |
+| `--delta-batch-blocks-per-cu <1..8>` | `1` | Conservative physical batch-grid cap per compute unit. The runtime clamps it to legal cooperative occupancy and graph size; valid only with an explicitly selected fused or reduced controller. |
 | `--delta-telemetry` | unset | Emit one aggregate Delta-Stepping telemetry JSON record after all net workers join. |
 | `--delta-benchmark-weights <unit\|all-light\|all-heavy\|mixed>` | unset | Deterministically replace in-memory CSR weights for a benchmark; requires an explicit numeric delta. |
 | `--delta-benchmark-weight-seed <uint>` | `0` | Seed the `mixed` family; rejected for every other family. |
 | `--max-sssp-iters <int>` | `-1` | Delta buckets, unit-BFS depth, or Bellman-Ford rounds; `-1` uses the default. |
 | `--capacity <int>` | `1` | Capacity used only for overuse diagnostics. |
 | `--net-limit <count>` | unset | Route only the first `count` requests. |
-| `--parallel-net-workers <count>` | `0` | Independent net workers; `0` enables engine-dependent auto-selection. Workers share one immutable CSR across worker-private search state. |
+| `--parallel-net-workers <count>` | `0` | Net producers; `0` enables engine-dependent auto-selection. Workers share one immutable CSR across worker-private search state. Multiworker fused/reduced queries rendezvous through one cooperative batch coordinator. |
 | `--diagnose-net <zero-based>` | unset | Replay the route-request prefix through this net and emit one UnitBFS diagnostic JSON record. Requires `--diagnose-sink`. |
 | `--diagnose-sink <zero-based>` | unset | Compare the selected sink's raw batched result, a fresh same-workspace result, and CPU/GPU searches from the exact expanded route tree. |
 | `--routes-out <path>` | unset | Write routed PIP tree data as JSONL. |
@@ -446,7 +460,8 @@ delta, benchmark weight families require an explicit numeric delta, and the
 seed is valid only with `mixed`. A controller batch size requires an explicit
 `--delta-controller reduced-round-trip`; `host-checked` preserves the existing
 scalar null-stream and explicit-stream behavior, while `fused-host-checked`
-always uses its fixed one-action budget. Force-generic and force-legacy-parent may be
+always uses its fixed one-action budget. Query width and batch blocks per CU
+require an explicit fused or reduced controller. Force-generic and force-legacy-parent may be
 combined: the first chooses generic execution and the second chooses its
 parent representation. Force-legacy-parent by itself also makes the fixed
 exact-unit parent path ineligible, so use force-generic with automatic parents
@@ -491,7 +506,7 @@ uninstrumented kernel instantiations and does not allocate, reset, or copy the
 device counter buffer. `--delta-telemetry` selects instrumented kernels and is
 intended for diagnosis, not clean wall-time measurement. After a successful
 worker join, PathFinder writes one JSON line to standard output with
-`type="delta_stepping_telemetry"` and `schema_version=3`; filter mixed logs on
+`type="delta_stepping_telemetry"` and `schema_version=4`; filter mixed logs on
 that type. `queries` counts actual collected net searches, counter fields are
 sums across searches, and queue fields under `maxima` are per-search maxima
 combined with `max`, not sums. Execution-path counts distinguish exact-unit,
@@ -499,7 +514,14 @@ compact generic, legacy generic, and generic distances-only work. The record
 also includes the configured controller and batch, effective host/fused/reduced
 query counts, selected backend, fallback-reason counts, cooperative controller
 diagnostics, and `controller_fallback_queries`; this prevents a capability
-fallback from being mistaken for a cooperative-controller measurement.
+fallback from being mistaken for a cooperative-controller measurement. Schema
+4 also adds `query_batching`: physical launch/completion counts, logical slots
+submitted/completed, active and unused slots, relaunches, action accounting,
+selected versus occupancy-legal blocks per CU, grid blocks, failures, and the
+required `max_concurrent_cooperative_launches == 1` invariant when batching is
+enabled. Per-query
+controller publications are logical slot publications and therefore no longer
+equal physical cooperative launches in a multi-query run.
 
 The counters measure bucket/light/heavy rounds, frontier and edge visits,
 distance atomic attempts/successes/CAS retries, logical queue insertions and
@@ -587,7 +609,7 @@ Useful wrapper options:
 | `--interchange-to-csr <path>` | Override converter executable. Env: `INTERCHANGE_TO_CSR`. |
 | `--pathfinder <path>` | Override PathFinder executable. Env: `PATHFINDER_BIN`. |
 | `--routes-to-phys <path>` | Override route reconstructor. Env: `ROUTES_TO_PHYS`. |
-| `--sssp-engine`, `--use-delta-step`, `--delta`, `--delta-multiplier`, `--delta-force-generic`, `--delta-force-legacy-parent`, `--delta-controller`, `--delta-controller-batch-size`, `--delta-telemetry`, `--delta-benchmark-weights`, `--delta-benchmark-weight-seed`, `--max-sssp-iters`, `--net-limit`, `--parallel-net-workers`, `--capacity` | Forwarded to `pathfinder`. |
+| `--sssp-engine`, `--use-delta-step`, `--delta`, `--delta-multiplier`, `--delta-force-generic`, `--delta-force-legacy-parent`, `--delta-controller`, `--delta-controller-batch-size`, `--delta-query-batch-width`, `--delta-batch-blocks-per-cu`, `--delta-telemetry`, `--delta-benchmark-weights`, `--delta-benchmark-weight-seed`, `--max-sssp-iters`, `--net-limit`, `--parallel-net-workers`, `--capacity` | Forwarded to `pathfinder`. |
 | `--max-pathfinder-iters`, `--present-factor`, `--present-multiplier`, `--history-factor`, `--route-batch-size` | Compatibility-only; forwarded to `pathfinder` and ignored. |
 
 ## File Formats And Artifacts

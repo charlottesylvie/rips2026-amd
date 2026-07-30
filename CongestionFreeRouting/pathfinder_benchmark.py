@@ -224,6 +224,16 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         help="positive batch size for the reduced-round-trip controller",
     )
     parser.add_argument(
+        "--delta-query-batch-width",
+        type=positive_int_arg,
+        help="bounded cooperative query batch width (1..8)",
+    )
+    parser.add_argument(
+        "--delta-batch-blocks-per-cu",
+        type=positive_int_arg,
+        help="cooperative batch grid cap per compute unit (1..8)",
+    )
+    parser.add_argument(
         "--delta-benchmark-weights",
         choices=("unit", "all-light", "all-heavy", "mixed"),
         help="reproducible benchmark edge-weight family forwarded to PathFinder",
@@ -291,6 +301,8 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         or args.delta_telemetry
         or args.delta_controller is not None
         or args.delta_controller_batch_size is not None
+        or args.delta_query_batch_width is not None
+        or args.delta_batch_blocks_per_cu is not None
         or args.delta_benchmark_weights is not None
         or args.delta_benchmark_weight_seed is not None
     )
@@ -307,6 +319,23 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         parser.error(
             "--delta-controller-batch-size requires "
             "--delta-controller reduced-round-trip"
+        )
+    for value, option in (
+        (args.delta_query_batch_width, "--delta-query-batch-width"),
+        (args.delta_batch_blocks_per_cu, "--delta-batch-blocks-per-cu"),
+    ):
+        if value is not None and value > 8:
+            parser.error(f"{option} must be in the bounded range [1, 8]")
+    if (
+        args.delta_query_batch_width is not None
+        or args.delta_batch_blocks_per_cu is not None
+    ) and args.delta_controller not in (
+        "fused-host-checked",
+        "reduced-round-trip",
+    ):
+        parser.error(
+            "Delta cooperative batching controls require an explicit "
+            "--delta-controller fused-host-checked or reduced-round-trip"
         )
     if args.delta_benchmark_weights is not None and (
         args.delta is None or args.delta == "auto"
@@ -341,6 +370,8 @@ def pathfinder_args(args: argparse.Namespace) -> list[str]:
         ("delta_multiplier", "--delta-multiplier"),
         ("delta_controller", "--delta-controller"),
         ("delta_controller_batch_size", "--delta-controller-batch-size"),
+        ("delta_query_batch_width", "--delta-query-batch-width"),
+        ("delta_batch_blocks_per_cu", "--delta-batch-blocks-per-cu"),
         ("delta_benchmark_weights", "--delta-benchmark-weights"),
         ("delta_benchmark_weight_seed", "--delta-benchmark-weight-seed"),
         ("max_pathfinder_iters", "--max-pathfinder-iters"),
