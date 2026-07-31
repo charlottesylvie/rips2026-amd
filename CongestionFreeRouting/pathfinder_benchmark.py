@@ -214,6 +214,11 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         help="force legacy generic-delta predecessor recovery",
     )
     parser.add_argument(
+        "--delta-current-membership",
+        choices=("boolean", "generation"),
+        help="generic delta-stepping current-frontier membership representation",
+    )
+    parser.add_argument(
         "--delta-controller",
         choices=("host-checked", "reduced-round-trip"),
         help="generic delta-stepping controller mode",
@@ -289,6 +294,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         or args.delta_force_generic
         or args.delta_force_legacy_parent
         or args.delta_telemetry
+        or args.delta_current_membership is not None
         or args.delta_controller is not None
         or args.delta_controller_batch_size is not None
         or args.delta_benchmark_weights is not None
@@ -339,6 +345,7 @@ def pathfinder_args(args: argparse.Namespace) -> list[str]:
         ("sssp_engine", "--sssp-engine"),
         ("delta", "--delta"),
         ("delta_multiplier", "--delta-multiplier"),
+        ("delta_current_membership", "--delta-current-membership"),
         ("delta_controller", "--delta-controller"),
         ("delta_controller_batch_size", "--delta-controller-batch-size"),
         ("delta_benchmark_weights", "--delta-benchmark-weights"),

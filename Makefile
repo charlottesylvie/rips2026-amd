@@ -168,6 +168,7 @@ ROUTES_TO_PHYS ?= ./routes_to_phys
 PATHFINDER_HIPCC ?= hipcc
 PATHFINDER_HOST_CXX ?= g++
 PATHFINDER_HIP_FLAGS ?= -std=c++17 -O3 -x hip
+PATHFINDER_HIP_LIBS ?=
 PATHFINDER_HOST_FLAGS ?= -std=c++17 -O2
 PATHFINDER_INTERCHANGE_FLAGS ?= -std=c++17 -O3
 PATHFINDER_INTERCHANGE_LIBS ?= -lcapnp -lkj -lz
@@ -204,7 +205,7 @@ PATHFINDER_GPU_HEADERS := \
 		-I CongestionFreeRouting/bellman_ford \
 		-I CongestionFreeRouting/delta_stepping \
 		-I CongestionFreeRouting/unit_bfs \
-		$(PATHFINDER_GPU_SOURCES) -pthread -o $@
+		$(PATHFINDER_GPU_SOURCES) -pthread $(PATHFINDER_HIP_LIBS) -o $@
 
 ifneq ($(strip $(PATHFINDER_SCHEMA_DIR)),)
 PATHFINDER_INTERCHANGE_HEADERS := \
@@ -288,6 +289,10 @@ endif
 
 .PHONY: pathfinder-profile-force
 pathfinder-profile-force:
+
+.PHONY: profile-bf10-logicnets
+profile-bf10-logicnets:
+	bash CongestionFreeRouting/profiling/profile_bf10_logicnets.sh
 
 %_PathFinderFile.phys: %_unrouted.phys %.netlist $(PATHFINDER_DEVICE_GRAPH) $(if $(filter-out none,$(PATHFINDER_PROFILE)),pathfinder-profile-force)
 	(time env PATHFINDER_PROFILE_COMMAND='$(PATHFINDER_PROFILE_COMMAND)' $(PATHFINDER_ROUTER_BIN) $< $@ --logical-netlist $*.netlist --device-graph $(PATHFINDER_DEVICE_GRAPH) --sssp-engine $(PATHFINDER_SSSP_ENGINE) $(PATHFINDER_ARGS)) $(call log_and_or_display,$@.log)

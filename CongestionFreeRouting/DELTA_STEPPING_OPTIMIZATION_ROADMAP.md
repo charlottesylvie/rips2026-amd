@@ -1,9 +1,9 @@
 # Classic Delta-Stepping Optimization Roadmap
 
-Updated 2026-07-27 for the bounded controller pass. Compact row offsets,
-generation-tagged current membership, capacity pre-reservation, and the
-optional reduced-round-trip controller are implemented and host-tested, but
-not compiled or run with HIP.
+Updated 2026-07-31 for the reduced-controller audit, exposed generation
+membership, unsigned distance-atomic A/B, and reached-row telemetry gate.
+These changes are implemented in source but have not been compiled or run with
+HIP on the target AMD GPU.
 
 ## Scope
 
@@ -36,8 +36,17 @@ path, and cannot rank genuinely mixed-weight behavior.
   keeps those dependent phases in one grid-synchronized cooperative kernel for
   a bounded batch and publishes one compact descriptor; callbacks and
   unsupported kernels use the full host fallback.
+- The reduced controller uses one grid-uniform fatal-status snapshot before
+  any terminal branch, one pending-minimum atomic per block, and an occupancy
+  budget divided by the caller's actual concurrent workspace count. Runtime
+  capability/occupancy results are cached per thread, device, and exact kernel
+  specialization.
 - Scalar global atomics publish every competing distance update, queue claim,
   and queue reservation.
+- Uninstrumented generic relaxation has a compile-time
+  `DS_DELTA_USE_UINT_ATOMIC_MIN` A/B. CAS remains the default, and instrumented
+  kernels retain CAS so retry telemetry continues to describe a measured
+  reference primitive.
 - Compact vector-target runs use a 64-bit `{distance_bits,
   original_edge_id}` parent key. The old predecessor-row recovery is only a
   forced legacy or allocation fallback.
@@ -51,9 +60,15 @@ path, and cannot rank genuinely mixed-weight behavior.
   path. Boolean `in_current` plus its clear kernel remains the default. An
   opt-in generation-tagged representation removes that clear and its dependent
   synchronization in either controller, with a full reset before token reuse.
+  PathFinder, its router, and its benchmark wrapper expose it as
+  `--delta-current-membership generation`.
 - Deterministic weighted families, force-generic and force-legacy controls,
   opt-in telemetry, distances-only storage, and an exclusive distance bound
   are implemented and covered by test source.
+- Schema-4 telemetry counts active light-frontier rows in nine degree bins,
+  touched-queue insertions, classified controller fallbacks/launches, and safe
+  aggregate work/queue/atomic ratios. This is the evidence gate for any hybrid
+  long-row or wave-reservation implementation.
 - PathFinder supplies checked source/target capacity hints. Query and compact
   path buffers grow geometrically and retain high-water capacity; compact paths
   are never guessed from graph size. Compact-parent queries avoid legacy parent
@@ -67,7 +82,7 @@ hardware result:
 
 | Dependency boundary | Host-checked/default | Reduced-round-trip/opt-in |
 | --- | --- | --- |
-| Same-bucket light round | Boolean mode launches a membership clear, preserves its explicit-stream completion boundary, launches relaxation, copies the next-frontier count to host, and synchronizes. Generation mode removes only the clear. | Boolean clear and light relaxation are grid phases; generation uses a fresh reserved token. Queue payloads and counts cross a device fence plus cooperative grid barrier. |
+| Same-bucket light round | Boolean mode launches a membership clear, preserves its explicit-stream completion boundary, launches relaxation, copies the next-frontier count to host, and synchronizes. Generation mode removes only the clear. | Boolean clear and light relaxation are grid phases; generation uses a fresh reserved token. Queue payloads and counts cross HIP's cooperative grid barrier; the audited path does not add a redundant per-thread device fence. |
 | Target settlement | A vector target launches mark/count then copies the count; a scalar target copies its distance. Each host decision synchronizes. | Settlement follows completed light closure in the cooperative grid and becomes a sticky terminal descriptor status before any future-bucket heavy work. |
 | Heavy phase | A separate relaxation launch runs after closure; vector-target consumers retain an explicit-stream dependency boundary. | Heavy relaxation is another grid phase in the same launch. |
 | Pending minimum | The host initializes the minimum, synchronizes explicit streams, launches the full pending reduction, then copies/synchronizes the scalar minimum. | The leader initializes the minimum; the grid reduces it and crosses a grid barrier without a host scalar. |
@@ -116,15 +131,16 @@ workload, with broader weighted-graph upside called out separately.
 | ---: | --- | --- | --- | --- | --- |
 | 1 | Keep classic-Delta bucket and light-closure control on the GPU | Implemented, opt-in, HIP-unvalidated | 20--50% end-to-end on control-bound searches; potentially larger for many shallow buckets | Very high | The reduced controller fuses dependent light/bucket phases behind cooperative grid barriers and publishes one descriptor per bounded batch. The host-checked path remains default, and target-gfx1151 correctness/performance gates are outstanding. |
 | 2 | Generation-tagged `in_current` | Implemented, opt-in, HIP-unvalidated | 10--30% end-to-end, 15--40% traversal when many vertices are touched | High | The new representation removes only the current-membership clear path. Sparse reset of distance, parent, pending, and heavy state remains necessary. Boolean/clear remains default until AMD validation. |
-| 3 | Eligible 32-bit device row offsets with forced-wide A/B | Implemented, automatic, HIP-unvalidated | 5--15% traversal plus 4 B/V shared-graph savings | Medium | Complete-range eligibility is exact at `UINT32_MAX`; every row-reading kernel is typed, while the public CSR/path edge identity remains 64-bit. |
-| 4 | Add a degree-aware outgoing-edge expander | Not implemented | 0--15% on the mostly short-row routing graph; 10--40% on skewed weighted graphs | High | Thread-per-row is appropriate for short rows but serializes long rows. Use lane groups, wave-per-row, and CTA/edge-balanced paths only above measured reached-degree thresholds. |
-| 5 | Reduce candidates by destination before global atomics | Not implemented | 0--10% on low-collision routing frontiers; 10--30% when destinations collide heavily | High | The current kernel performs one distance atomic and queue decision per eligible edge. Wave/block aggregation is worthwhile only after convergent edge assignment and collision telemetry exist. |
-| 6 | Batch independent searches in one launch | Not implemented | 5--30% throughput when individual frontiers underfill the GPU | Very high | It can amortize launches and fill small frontiers, but the retained worker sweep was nearly flat from 2 to 8 workers and the old trace already showed high overlap. Implement only after per-query state is smaller and current single-query control is measured. |
-| 7 | Prepartition immutable adjacency into light and heavy edge ranges | Not implemented | 0% for all-light routing runs; 10--35% for truly mixed fixed weights | High | It avoids rescanning mixed rows, but a new delta or destination-cost update can invalidate the partition. Keep the existing direct path for all-light and mutable-cost workloads. |
-| 8 | Replace flat pending scans with circular/windowed buckets plus a nonempty bitmap | Not implemented | About 0--5% on the retained all-light profile; 5--30% on broad weighted bucket spans | High | Pending management was only about 1% in the historical unit-weight trace, so this must be justified by new weighted telemetry before implementation. |
-| 9 | Tune weighted automatic delta and refresh it after mutable value/cost updates | Partially implemented | 0--25% on weighted workloads | Low--Medium | Exact-unit effective weights now select the natural width `1 * multiplier`; weighted graphs retain the graph-aware seed. The remaining work is a target-GPU weighted multiplier sweep and an optional workspace-owned statistic refresh after updates. |
-| 10 | Pre-reserve and geometrically retain query/path buffers | Implemented, enabled, HIP-unvalidated | 2--8% where allocation/free is visible | Low | Metadata-derived source/target reservations are active, all growth retains geometric high water, and compact paths remain demand-sized. |
-| 11 | Tune block sizes, launch bounds, architecture flags, and compiler options | Not implemented | 0--10% | Low | Useful after structural kernels stabilize; it cannot remove the present controller or state traffic. |
+| 3 | Unsigned 32-bit distance `atomicMin` | Implemented compile-time A/B, CAS default, HIP-unvalidated | 0--10% relaxation time, workload dependent | Low | Nonnegative float bit order permits the contained experiment, but generated `gfx1151` ISA and contention/real-frontier timing must justify it. Instrumented kernels remain the CAS reference. |
+| 4 | Eligible 32-bit device row offsets with forced-wide A/B | Implemented, automatic, HIP-unvalidated | 5--15% traversal plus 4 B/V shared-graph savings | Medium | Complete-range eligibility is exact at `UINT32_MAX`; every row-reading kernel is typed, while the public CSR/path edge identity remains 64-bit. |
+| 5 | Add a degree-aware outgoing-edge expander | Evidence counters implemented; kernel not implemented | 0--15% on the mostly short-row routing graph; 10--40% on skewed weighted graphs | High | Thread-per-row is appropriate for short rows but serializes long rows. Use the reached-row histogram before selecting lane groups, wave-per-row, or CTA paths. |
+| 6 | Reduce candidates by destination before global atomics | Queue/atomic ratios implemented; kernel not implemented | 0--10% on low-collision routing frontiers; 10--30% when destinations collide heavily | High | The current kernel performs one distance atomic and queue decision per eligible edge. Wave/block aggregation is worthwhile only after convergent edge assignment and destination-collision evidence exist. |
+| 7 | Batch independent searches in one launch | Not implemented | 5--30% throughput when individual frontiers underfill the GPU | Very high | It can amortize launches and fill small frontiers, but the retained worker sweep was nearly flat from 2 to 8 workers and the old trace already showed high overlap. Implement only after per-query state is smaller and current single-query control is measured. |
+| 8 | Prepartition immutable adjacency into light and heavy edge ranges | Not implemented | 0% for all-light routing runs; 10--35% for truly mixed fixed weights | High | It avoids rescanning mixed rows, but a new delta or destination-cost update can invalidate the partition. Keep the existing direct path for all-light and mutable-cost workloads. |
+| 9 | Replace flat pending scans with circular/windowed buckets plus a nonempty bitmap | Not implemented | About 0--5% on the retained all-light profile; 5--30% on broad weighted bucket spans | High | Pending management was only about 1% in the historical unit-weight trace, so this must be justified by new weighted telemetry before implementation. |
+| 10 | Tune weighted automatic delta and refresh it after mutable value/cost updates | Partially implemented | 0--25% on weighted workloads | Low--Medium | Exact-unit effective weights now select the natural width `1 * multiplier`; weighted graphs retain the graph-aware seed. The remaining work is a target-GPU weighted multiplier sweep and an optional workspace-owned statistic refresh after updates. |
+| 11 | Pre-reserve and geometrically retain query/path buffers | Implemented, enabled, HIP-unvalidated | 2--8% where allocation/free is visible | Low | Metadata-derived source/target reservations are active, all growth retains geometric high water, and compact paths remain demand-sized. |
+| 12 | Tune block sizes, launch bounds, architecture flags, and compiler options | Not implemented | 0--10% | Low | Useful after structural kernels stabilize; it cannot remove the present controller or state traffic. |
 
 ## Recommended implementation sequence
 
@@ -140,9 +156,9 @@ Before enabling or tuning the new kernel paths:
    representative real weighted CSR in both path-producing and distances-only
    modes. Use four PathFinder workers for the current routing baseline; worker
    count is a benchmark control, not a portable algorithm default.
-4. Capture telemetry with reached-degree histograms and
-   candidate-to-unique-destination ratios added to a diagnostic build. Keep
-   telemetry off for wall-time measurements.
+4. Capture the implemented reached-degree histogram and queue/atomic ratios.
+   Add candidate-to-unique-destination evidence only if contention remains a
+   candidate bottleneck. Keep telemetry off for wall-time measurements.
 5. Reprofile compact-parent execution; do not use the historical legacy-parent
    materialization share as a current result.
 
@@ -191,6 +207,11 @@ checks and callback policy select the unchanged host controller when the fused
 path cannot be used. Queue overflow and invalid state are sticky terminal
 statuses followed by full cleanup before workspace reuse.
 
+Capability and occupancy rejection fall back before traversal. A cooperative
+launch accepted by preflight but failing at launch/execution is not replayed
+through the host controller because the device may have partially mutated
+query state; that path performs the full reset and propagates the error.
+
 The batch bound is configurable, and batch size one is the host-model
 equivalence control. Boolean membership and the optional generation-tagged
 representation are both retained; generation rollover clears tags before
@@ -203,7 +224,21 @@ explicit-stream stress on gfx1151, preserve callback/iteration/target cleanup,
 and demonstrate fewer dispatches/synchronizations plus a profiler-free
 end-to-end win with identical route results.
 
-### Phase 4: shared edge expansion and contention control
+### Phase 4: unsigned distance atomic — implemented A/B, HIP-unvalidated
+
+Build otherwise identical CAS and `DS_DELTA_USE_UINT_ATOMIC_MIN=1` binaries.
+The optimized branch canonicalizes negative zero and relies on the existing
+nonnegative finite-weight/distance contract; telemetry deliberately keeps CAS
+so retry counts remain meaningful. Run signed-zero, equal-candidate,
+maximum-finite-distance, and high-fan-in fixtures plus the complete controller
+matrix and explicit-stream stress. Inspect the generated `gfx1151` device code
+and require a native unsigned 32-bit minimum before interpreting timing.
+
+Acceptance: exact output equivalence, unchanged termination/parent behavior,
+native target ISA, and a repeated relaxation or end-to-end improvement. CAS
+remains the default until all four conditions pass.
+
+### Phase 5: shared edge expansion and contention control
 
 Build a convergent degree-aware edge assignment:
 
@@ -216,7 +251,7 @@ Only then add wave-local queue reservation and destination grouping. Add a
 direct-atomic bypass for small or low-collision frontiers. Consider block-local
 aggregation before any global radix sort/reduce.
 
-### Phase 5: weighted scheduler refinements
+### Phase 6: weighted scheduler refinements
 
 Use new mixed-weight telemetry to choose between static light/heavy
 partitioning and circular/windowed buckets. These solve different measured

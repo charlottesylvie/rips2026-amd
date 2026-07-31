@@ -232,16 +232,18 @@ grep '^{"type":"delta_stepping_telemetry"' \
 ```
 
 After all workers join, `pathfinder` writes exactly one compact JSON line to
-standard output with `type="delta_stepping_telemetry"`, `schema_version=2`,
+standard output with `type="delta_stepping_telemetry"`, `schema_version=4`,
 and `scope="pathfinder_run"`. `queries` counts actual SSSP invocations, not net
 slots; a net with no unresolved target leaves its slot uncollected.
 `completed_queries` counts records whose cleanup and final synchronization
 finished. `execution_paths` counts `exact_unit`, `compact_generic`,
 `legacy_generic`, and `generic_distances_only`. The record also includes the
 resolved numeric delta, runtime wavefront size, actual worker count,
-auto-delta/multiplier values, force-mode flags, configured `controller_mode`
-and `controller_batch_size`, per-query `effective_controller_modes` counts,
-and `controller_fallback_queries`. The configured names use
+auto-delta/multiplier values, force-mode flags, configured
+`current_membership_mode`, `controller_mode`, and `controller_batch_size`,
+per-query `effective_controller_modes` counts, fallback-reason counts,
+accepted cooperative block/launch counts, and `controller_fallback_queries`.
+The configured names use
 `host_checked`/`reduced_round_trip` in JSON even though the CLI spells them
 `host-checked`/`reduced-round-trip`. Counter fields are summed across queries;
 the three queue high-water fields under `maxima` are maxima across queries,
@@ -269,11 +271,24 @@ The counters are exact under these definitions:
 | `pending_entry_examinations` | Pending tokens scanned by minimum-bucket reduction and compaction. A retained token can be examined and counted again in later scans. |
 | `stale_pending_entry_examinations` | Those examinations whose token is inactive or no longer names a valid future bucket for that scan. It has the same repeated-examination behavior. |
 | `reached_vertices` | Unique vertices whose distance became finite during the invocation, including deduplicated sources. |
+| `touched_queue_insertions` | Successful first-finite appends to the sparse-reset queue. For a completed invocation this plus the number of deduplicated initialized sources equals `reached_vertices`. |
 | `controller_round_trips` | Explicitly counted host-visible status/count transfers used for control decisions. It is not a count of every HIP call or synchronization. |
-| `controller_mode`, `controller_batch_size` | Run-level requested A/B configuration. These fields alone do not prove that the reduced controller executed. |
-| `effective_controller_modes`, `controller_fallback_queries` | Query counts by controller actually used and the number that fell back to host checking. Reject a performance sample when either total does not match the intended A/B arm. |
+| `current_membership_mode`, `controller_mode`, `controller_batch_size` | Run-level requested A/B configuration. These fields alone do not prove that the reduced controller executed. |
+| `effective_controller_modes`, `controller_fallback_queries`, `controller_fallback_reasons` | Query counts by controller actually used, the number that fell back, and the classified reason. Reject a performance sample when these do not match the intended A/B arm. |
+| `controller_cooperative_blocks`, `controller_launches` | Minimum/maximum accepted cooperative grid size across reduced queries and the total accepted launches. Zero launches distinguishes an eligible but trivial query from executed reduced work. |
 | `compact_parent_fallback_events` | One when an automatic compact-parent vector-target query had to use legacy parents because its edge-to-source map was unavailable; otherwise zero. |
 | `current_queue_high_water`, `pending_queue_high_water`, `heavy_queue_high_water` | Maximum observed queue entry counts within one invocation. The exact-unit current queue is append-only, so its peak is cumulative rather than one BFS layer's width. The run-level JSON reports the maximum per-query value; these are entries, not bytes. |
+
+`active_row_degree_histogram` counts active light-frontier rows in the bins
+`0`, `1`, `2`, `3_to_4`, `5_to_8`, `9_to_16`, `17_to_32`, `33_to_64`, and
+`over_64`. It does not scan or classify inactive graph rows. Its bin sum equals
+`active_vertices_processed` for a homogeneous completed aggregate.
+
+The `ratios` object derives light-edge visits per active row, successful
+relaxations per edge visit, current/pending/touched appends per successful
+relaxation, distance atomic attempts per successful relaxation, and CAS retries
+per distance attempt. A zero denominator produces numeric zero. These are
+ratios of aggregate sums, not means of per-query ratios.
 
 The exact-unit and generic definitions intentionally reflect their different
 controllers, especially for atomic attempts, light rounds, and current-queue
@@ -295,7 +310,69 @@ not allocate, clear, copy, or pass the device counter buffer. When enabled,
 hot-loop observations are reduced per block before global aggregation, but the
 extra instructions, registers, shared state, atomics, and final copy can still
 perturb performance. Compare instrumented runs by counter semantics and
-selected execution path; measure speed with telemetry off.
+selected execution path; measure speed with telemetry off. The nine local
+row-degree accumulators can also change register/local-memory pressure and the
+reported cooperative occupancy, so an instrumented launch geometry is not a
+production geometry measurement.
+
+### Unsigned distance-atomic A/B
+
+`DS_DELTA_USE_UINT_ATOMIC_MIN` is a compile-time switch for uninstrumented
+generic kernels. Zero (the default/reference) retains the float CAS loop; one
+uses unsigned 32-bit `atomicMin` under the validated nonnegative-distance
+invariant and canonicalizes negative zero. Instrumented kernels deliberately
+retain the CAS loop so `distance_cas_retries` remains a measured reference
+counter. The JSON `distance_atomic_primitives` object labels
+`generic_uninstrumented`, `generic_telemetry`, and exact-unit `cas_claim`
+separately, so a mixed execution-path aggregate cannot misattribute the
+primitive.
+
+Build and run otherwise identical low-level variants:
+
+```bash
+mkdir -p amd-validation/bin
+
+hipcc -std=c++17 -O2 -pthread -x hip \
+  -DDS_DELTA_USE_UINT_ATOMIC_MIN=0 \
+  -I HIP_kernel/bellman_ford/src \
+  -I CongestionFreeRouting/delta_stepping \
+  CongestionFreeRouting/tests/delta_stepping_hip_test.cpp \
+  CongestionFreeRouting/delta_stepping/delta_stepping_hip_CSR.cpp \
+  -o amd-validation/bin/delta_stepping_hip_test_cas
+
+hipcc -std=c++17 -O2 -pthread -x hip \
+  -DDS_DELTA_USE_UINT_ATOMIC_MIN=1 \
+  -I HIP_kernel/bellman_ford/src \
+  -I CongestionFreeRouting/delta_stepping \
+  CongestionFreeRouting/tests/delta_stepping_hip_test.cpp \
+  CongestionFreeRouting/delta_stepping/delta_stepping_hip_CSR.cpp \
+  -o amd-validation/bin/delta_stepping_hip_test_uint_min
+
+DELTA_REQUIRE_REDUCED_CONTROLLER=1 \
+  amd-validation/bin/delta_stepping_hip_test_cas
+DELTA_REQUIRE_REDUCED_CONTROLLER=1 \
+  amd-validation/bin/delta_stepping_hip_test_uint_min
+```
+
+Repeat the explicit-stream stress with both binaries. Build and retain two
+production binaries with the same global flag difference:
+
+```bash
+make -B ./pathfinder \
+  PATHFINDER_HIP_FLAGS="-std=c++17 -O3 -x hip \
+    -DDS_DELTA_USE_UINT_ATOMIC_MIN=0"
+cp ./pathfinder amd-validation/bin/pathfinder-cas
+
+make -B ./pathfinder \
+  PATHFINDER_HIP_FLAGS="-std=c++17 -O3 -x hip \
+    -DDS_DELTA_USE_UINT_ATOMIC_MIN=1"
+cp ./pathfinder amd-validation/bin/pathfinder-uint-min
+```
+
+Inspect the `gfx1151` saved device code. Keep unsigned `atomicMin` only if the
+selected uninstrumented relaxation emits a native 32-bit minimum rather than a
+generated CAS loop and improves repeated profiler-free time without changing
+results.
 
 ## Low-level distances-only experiments
 
@@ -622,10 +699,10 @@ cp logicnets_jscl_PathFinderFile.wirelength \
 ```
 
 Repeat the full routing validation with forced-generic classic Delta-Stepping,
-`delta=1`, four workers, and each controller. Automatic compact row offsets
-and Boolean membership are the production settings here; the wider storage,
-membership, parent, and distances-only matrix remains in the low-level suite.
-Run the host reference first:
+`delta=1`, four workers, and the complete controller/membership 2-by-2 matrix.
+Automatic compact row offsets remain the production setting here; wider
+storage, parent, and distances-only cases remain in the low-level suite. Run
+the host/Boolean reference first:
 
 ```bash
 rm -f logicnets_jscl_PathFinderFile.phys \
@@ -637,6 +714,7 @@ rm -f logicnets_jscl_PathFinderFile.phys \
 make ROUTER=PathFinderFile BENCHMARKS="logicnets_jscl" VERBOSE=1 \
   PATHFINDER_SSSP_ENGINE=delta-step \
   PATHFINDER_ARGS="--delta 1 --delta-force-generic \
+    --delta-current-membership boolean \
     --delta-controller host-checked \
     --parallel-net-workers 4 --strict-routing \
     --work-dir amd-validation/work/logicnets-delta-host-w4" \
@@ -666,6 +744,7 @@ rm -f logicnets_jscl_PathFinderFile.phys \
 make ROUTER=PathFinderFile BENCHMARKS="logicnets_jscl" VERBOSE=1 \
   PATHFINDER_SSSP_ENGINE=delta-step \
   PATHFINDER_ARGS="--delta 1 --delta-force-generic \
+    --delta-current-membership boolean \
     --delta-controller reduced-round-trip \
     --delta-controller-batch-size 4 \
     --parallel-net-workers 4 --strict-routing \
@@ -683,6 +762,11 @@ cp logicnets_jscl_PathFinderFile.wirelength \
   amd-validation/results/logicnets-delta-reduced-b4-w4.wirelength
 ```
 
+Repeat both commands with `--delta-current-membership generation`, unique
+work/log/result paths, and no other change. These four cells isolate Boolean
+versus generation membership from host-checked versus reduced control. Do not
+promote either opt-in default from a combined-only comparison.
+
 Collect telemetry in a separate, otherwise identical diagnostic run so its
 kernel instrumentation cannot contaminate correctness timing:
 
@@ -691,16 +775,17 @@ rm -f logicnets_jscl_PathFinderFile.phys
 make ROUTER=PathFinderFile BENCHMARKS="logicnets_jscl" VERBOSE=1 \
   PATHFINDER_SSSP_ENGINE=delta-step \
   PATHFINDER_ARGS="--delta 1 --delta-force-generic \
+    --delta-current-membership generation \
     --delta-controller reduced-round-trip \
     --delta-controller-batch-size 4 --delta-telemetry \
     --parallel-net-workers 4 --strict-routing \
-    --work-dir amd-validation/work/logicnets-delta-reduced-telemetry" \
+    --work-dir amd-validation/work/logicnets-delta-reduced-generation-telemetry" \
   run-PathFinderFile \
-  2>&1 | tee amd-validation/logs/logicnets-delta-reduced-telemetry.log
+  2>&1 | tee amd-validation/logs/logicnets-delta-reduced-generation-telemetry.log
 
 grep '^{"type":"delta_stepping_telemetry"' \
-  amd-validation/logs/logicnets-delta-reduced-telemetry.log \
-  > amd-validation/results/logicnets-delta-reduced-b4-w4-telemetry.json
+  amd-validation/logs/logicnets-delta-reduced-generation-telemetry.log \
+  > amd-validation/results/logicnets-delta-reduced-generation-b4-w4-telemetry.json
 ```
 
 Inspect the telemetry JSON and require `completed_queries == queries`,

@@ -31,6 +31,18 @@ enum class DeltaSteppingCsrControllerMode : std::uint32_t {
   kReducedRoundTrip = 1,
 };
 
+// Why an explicitly requested reduced controller ran through the established
+// host-checked path instead. Keep these values stable because aggregate
+// telemetry publishes them by name.
+enum class DeltaSteppingCsrControllerFallbackReason : std::uint32_t {
+  kNone = 0,
+  kProgressCallback = 1,
+  kGenerationBudget = 2,
+  kCooperativeLaunchUnsupported = 3,
+  kOccupancyUnavailable = 4,
+  kExecutionPathUnsupported = 5,
+};
+
 constexpr std::uint32_t
     kDeltaSteppingCsrRecommendedControllerBatchSize = 4;
 
@@ -71,6 +83,38 @@ inline std::uint32_t delta_stepping_effective_controller_batch_size(
              ? std::uint32_t{1}
              : policy.batch_size;
 }
+
+// Divide a one-block-per-CU cooperative residency budget among the workspaces
+// expected to run concurrently. Keep the aggregate budget at or below the CU
+// count when possible; an oversubscribed worker still retains one block and
+// makes grid-stride progress.
+constexpr std::uint32_t delta_stepping_controller_concurrency_block_limit(
+    std::uint32_t compute_units,
+    std::uint32_t concurrent_workspaces) noexcept {
+  if (compute_units == 0 || concurrent_workspaces == 0) return 0;
+  return std::max<std::uint32_t>(1, compute_units / concurrent_workspaces);
+}
+
+constexpr std::size_t kDeltaSteppingCsrRowDegreeBinCount = 9;
+
+#if defined(__HIPCC__) || defined(__CUDACC__)
+#define DS_DELTA_POLICY_HOST_DEVICE __host__ __device__
+#else
+#define DS_DELTA_POLICY_HOST_DEVICE
+#endif
+
+DS_DELTA_POLICY_HOST_DEVICE constexpr std::size_t
+delta_stepping_active_row_degree_bin(std::uint64_t degree) noexcept {
+  if (degree <= 2) return static_cast<std::size_t>(degree);
+  if (degree <= 4) return 3;
+  if (degree <= 8) return 4;
+  if (degree <= 16) return 5;
+  if (degree <= 32) return 6;
+  if (degree <= 64) return 7;
+  return 8;
+}
+
+#undef DS_DELTA_POLICY_HOST_DEVICE
 
 // These types deliberately use fixed-width representations: a device may
 // publish one descriptor and the host can inspect it without reconstructing

@@ -1,9 +1,8 @@
 # GPU SSSP Development Status
 
-Updated 2026-07-27 for the bounded UnitBFS/classic-Delta optimization pass,
-the optional reduced-round-trip Delta controller, and the FPGA Interchange
-import correctness audit.
-All GPU changes below are implemented but HIP-unvalidated.
+Updated 2026-07-31 for the serious reduced-controller audit, production
+generation-membership plumbing, unsigned distance-atomic A/B, and active-row
+telemetry gate. All GPU changes below remain HIP-unvalidated on `gfx1151`.
 
 This file is the concise source of truth for landed work, confidence, and the
 next development gates. Build instructions, public options, the routing
@@ -51,16 +50,17 @@ throughput, so the real multi-sink result remains provisional.
 | UnitBFS controller | Cooperative-capable devices run at most 32 levels per grid-synchronized launch on the null/default stream. Explicit worker streams always use the synchronized host-controlled level handoff required on gfx1151; unsupported devices and progress callbacks retain their fallbacks, and the null-stream noncooperative fallback can batch four levels. |
 | UnitBFS extraction | Host-built offsets remain the default. An opt-in two-pass device path measures target lengths, scans deterministic offsets, publishes one totals/status descriptor, grows demand-sized compact buffers, validates paths, and copies the result without the host prefix sum or two H2D offset copies. |
 | Generic Delta | Multi-source/multi-target classic Delta-Stepping with one thread per active row, separate light/heavy semantics, a flat pending set with minimum reduction and compaction, and sparse touched reset. Immutable CSR row offsets are automatically `uint32_t` only when the complete range fits; `kForce64Bit` retains the wide A/B path and public edge IDs stay 64-bit. |
-| Delta controller | The established host-checked controller remains the default. An opt-in reduced-round-trip mode uses a capability-gated cooperative grid to keep dependent light closure, target settlement, heavy work, pending minimum, and compaction state on the device for a bounded batch, then publishes one descriptor. Unsupported kernels and progress callbacks retain a complete host fallback; requested/effective mode and fallback are visible in telemetry. |
+| Delta controller | The established host-checked controller remains the default. The opt-in reduced controller now uses grid-uniform fatal-status snapshots, block-reduced pending minima, bounded unique-queue reservations, exact current-bucket narrowing checks, and a cooperative-grid budget divided by the caller's actual concurrent workspace count. Capability/occupancy results are cached per thread/device/specialization. Telemetry classifies fallbacks and distinguishes accepted block count from accepted launches. Progress callbacks retain the complete host fallback. |
 | Delta parents | Automatic vector-target runs use a compact 64-bit `{distance_bits, original_edge_id}` key and a shared 32-bit edge-to-source map when eligible. Legacy predecessor arrays are lazy fallback state. |
-| Delta modes | Exact-unit specialization for eligible small graphs, compile-time no-parent `run_distances()`, strict distances-only graph storage, exclusive distance bounds, exact-unit automatic width `1 * multiplier`, weighted graph-aware seeding, deterministic weight families, force/controller controls, and opt-in telemetry are implemented. Boolean `in_current` plus its guarded clear remains the default; generation-tagged membership is opt-in and rollover-safe. |
+| Delta modes | Exact-unit specialization for eligible small graphs, compile-time no-parent `run_distances()`, strict distances-only graph storage, exclusive distance bounds, exact-unit automatic width `1 * multiplier`, weighted graph-aware seeding, deterministic weight families, force/controller controls, and opt-in telemetry are implemented. Boolean `in_current` remains the default; rollover-safe generation membership is exposed end to end as `--delta-current-membership generation`. `DS_DELTA_USE_UINT_ATOMIC_MIN` selects a compile-time uninstrumented CAS/unsigned-min A/B while telemetry deliberately retains the CAS reference. |
+| Delta diagnostics | Schema-4 aggregate telemetry includes reached active-row degree bins, touched-queue insertions, safe work/queue/atomic ratios, membership configuration, controller fallback reasons/block/launch counts, and explicit instrumented/uninstrumented distance-atomic labels. No hybrid long-row kernel is enabled; the new evidence must justify it first. |
 | Delta capacity | Source/target hints pre-reserve only applicable state. Query and compact-path buffers retain geometric high-water capacity; compact-parent runs avoid legacy predecessor arrays, and strict distances-only storage ignores target/path hints. |
 | Bellman--Ford | BF10 is wired as the Bellman--Ford engine and retained as a reference/fallback, not a current optimization target. |
 
-## Verification completed in this audit
+## Verification state
 
-The following CPU/fake-HIP checks pass on the current macOS checkout with
-`-Wall -Wextra -Wpedantic -Werror` where applicable:
+The following CPU/fake-HIP checks passed on the earlier macOS audit checkout
+with `-Wall -Wextra -Wpedantic -Werror` where applicable:
 
 - `pathfinder_bf10_cpu_stub_test`;
 - `pathfinder_cpu_stub_test`;
@@ -74,7 +74,15 @@ The following CPU/fake-HIP checks pass on the current macOS checkout with
 - `gzip_io_test`; and
 - `pathfinder_benchmark_writer_test.py`.
 
-The PathFinder suites cover the current adapter, engine dispatch,
+The 2026-07-31 pass added controller fairness/fallback and bounded-relaunch
+regressions, the controller-by-membership matrix, generation CLI plumbing,
+signed-zero/maximum-finite/high-contention atomic fixtures, all nine active-row
+bins, and host/reduced touched-queue invariants. The Python benchmark argument
+suite and `git diff --check` pass on the current checkout. The new C++/HIP
+changes have not been compiled on this Windows host because no C++ or HIP
+compiler is installed.
+
+The earlier PathFinder suites cover the current adapter, engine dispatch,
 automatic Delta controls, worker behavior, compact results, telemetry
 aggregation, source rooting, and the critical-path regression through the fake
 HIP runtime. The interchange policy suites cover exact driverless OOC
@@ -89,14 +97,15 @@ The device-graph suite also exhausts all 4,096 four-node combinations of
 blocked, terminal-sink, and exclusive-source masks against the former
 two-mask reference policy.
 
-ASan+UBSan builds pass for both fake-HIP PathFinder suites and the host
+Earlier ASan+UBSan builds passed for both fake-HIP PathFinder suites and the host
 policy/model suites with `ASAN_OPTIONS=detect_leaks=0`; this macOS ASan runtime
 does not support leak detection. The Delta model covers bounded controller
 publication, sticky failure precedence, target/iteration stops, batch-size-one
 equivalence, callback-style abort/reuse, membership reuse, and rollover.
 `git diff --check` also passes.
 
-`hipcc`, ROCm, and an AMD GPU are unavailable on this host. Consequently the
+`hipcc`, a host C++ compiler, ROCm, and an AMD GPU are unavailable on this
+Windows host. Consequently the
 production `unit_bfs_hip_CSR.cpp`, `delta_stepping_hip_CSR.cpp`, the linked
 HIP `pathfinder` executable, the standalone `bf8.cpp`, `bf9.cpp`, and
 `bf10.cpp` HIP programs, and every HIP regression translation unit that uses
@@ -130,9 +139,10 @@ Python reconstruction coverage, not a substitute compile claim.
 4. Reprofile current compact-parent Delta. The retained profile used all-unit
    weights and the legacy parent materialization path, so its percentages are
    historical evidence rather than a measurement of current code.
-5. Collect reached-row degree histograms, per-frontier destination collision
-   ratios, reset time, path-extraction time, and controller time before choosing
-   collision- or degree-specific kernels.
+5. Collect and analyze the implemented reached-row degree histograms and queue
+   ratios, then add per-frontier destination-collision evidence, reset time,
+   path-extraction time, and controller time before choosing collision- or
+   degree-specific kernels.
 
 ## Known implementation limits
 

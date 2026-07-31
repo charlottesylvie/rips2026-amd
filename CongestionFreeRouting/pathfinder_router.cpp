@@ -199,6 +199,8 @@ void print_usage(const char* program) {
       << "  --delta-force-legacy-parent    Forwarded for generic Delta parent-path A/B comparison.\n"
       << "  --delta <float|auto>           Forwarded to pathfinder.\n"
       << "  --delta-multiplier <float>     Forwarded for an automatic-delta sweep.\n"
+      << "  --delta-current-membership <boolean|generation>\n"
+      << "                                 Forward current-frontier membership selection.\n"
       << "  --delta-controller <host-checked|reduced-round-trip>\n"
       << "                                 Forward generic Delta controller selection.\n"
       << "  --delta-controller-batch-size <positive-int>\n"
@@ -291,6 +293,7 @@ Options parse_args(int argc, char** argv) {
     } else if (option == "--sssp-engine" ||
                option == "--delta" ||
                option == "--delta-multiplier" ||
+               option == "--delta-current-membership" ||
                option == "--delta-controller" ||
                option == "--delta-controller-batch-size" ||
                option == "--max-pathfinder-iters" ||

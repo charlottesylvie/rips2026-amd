@@ -52,6 +52,24 @@ void test_controller_policy_and_descriptor() {
                 sizeof(std::uint32_t));
   static_assert(sizeof(DeltaSteppingCsrControllerAction) ==
                 sizeof(std::uint32_t));
+  static_assert(static_cast<std::uint32_t>(
+                    DeltaSteppingCsrControllerFallbackReason::kNone) == 0 &&
+                static_cast<std::uint32_t>(
+                    DeltaSteppingCsrControllerFallbackReason::
+                        kProgressCallback) == 1 &&
+                static_cast<std::uint32_t>(
+                    DeltaSteppingCsrControllerFallbackReason::
+                        kGenerationBudget) == 2 &&
+                static_cast<std::uint32_t>(
+                    DeltaSteppingCsrControllerFallbackReason::
+                        kCooperativeLaunchUnsupported) == 3 &&
+                static_cast<std::uint32_t>(
+                    DeltaSteppingCsrControllerFallbackReason::
+                        kOccupancyUnavailable) == 4 &&
+                static_cast<std::uint32_t>(
+                    DeltaSteppingCsrControllerFallbackReason::
+                        kExecutionPathUnsupported) == 5,
+                "controller fallback telemetry values must remain stable");
 
   const DeltaSteppingCsrControllerPolicy defaults;
   require(defaults.mode == DeltaSteppingCsrControllerMode::kHostChecked &&
@@ -64,6 +82,34 @@ void test_controller_policy_and_descriptor() {
       DeltaSteppingCsrControllerMode::kReducedRoundTrip, 7};
   require(delta_stepping_effective_controller_batch_size(reduced) == 7,
           "reduced controller did not retain its bounded batch size");
+  require(delta_stepping_controller_concurrency_block_limit(40, 1) == 40 &&
+              delta_stepping_controller_concurrency_block_limit(40, 4) == 10 &&
+              delta_stepping_controller_concurrency_block_limit(41, 4) == 10 &&
+              delta_stepping_controller_concurrency_block_limit(4, 8) == 1 &&
+              delta_stepping_controller_concurrency_block_limit(
+                  std::numeric_limits<std::uint32_t>::max(), 2) ==
+                  2147483647U &&
+              delta_stepping_controller_concurrency_block_limit(
+                  std::numeric_limits<std::uint32_t>::max(),
+                  std::numeric_limits<std::uint32_t>::max()) == 1 &&
+              delta_stepping_controller_concurrency_block_limit(0, 4) == 0 &&
+              delta_stepping_controller_concurrency_block_limit(40, 0) == 0,
+          "cooperative block fairness did not divide the CU budget safely");
+  require(delta_stepping_active_row_degree_bin(0) == 0 &&
+              delta_stepping_active_row_degree_bin(1) == 1 &&
+              delta_stepping_active_row_degree_bin(2) == 2 &&
+              delta_stepping_active_row_degree_bin(3) == 3 &&
+              delta_stepping_active_row_degree_bin(4) == 3 &&
+              delta_stepping_active_row_degree_bin(5) == 4 &&
+              delta_stepping_active_row_degree_bin(8) == 4 &&
+              delta_stepping_active_row_degree_bin(9) == 5 &&
+              delta_stepping_active_row_degree_bin(16) == 5 &&
+              delta_stepping_active_row_degree_bin(17) == 6 &&
+              delta_stepping_active_row_degree_bin(32) == 6 &&
+              delta_stepping_active_row_degree_bin(33) == 7 &&
+              delta_stepping_active_row_degree_bin(64) == 7 &&
+              delta_stepping_active_row_degree_bin(65) == 8,
+          "active-row degree telemetry bins changed at a boundary");
   require_throws<std::invalid_argument>(
       [] {
         delta_stepping_validate_controller_policy(

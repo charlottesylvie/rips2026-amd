@@ -292,6 +292,14 @@ void validate_csr_shape(const HostCsrF32& graph) {
 }
 
 void validate_options(const PathfinderOptions& options) {
+  switch (options.delta_current_membership_mode) {
+    case DeltaSteppingCsrCurrentMembershipMode::kBoolean:
+    case DeltaSteppingCsrCurrentMembershipMode::kGeneration:
+      break;
+    default:
+      throw std::invalid_argument(
+          "invalid Delta-Stepping current-membership mode");
+  }
   switch (options.delta_controller_mode) {
     case DeltaSteppingCsrControllerMode::kHostChecked:
     case DeltaSteppingCsrControllerMode::kReducedRoundTrip:
@@ -319,6 +327,9 @@ void validate_options(const PathfinderOptions& options) {
         options.delta_auto ||
         options.delta_multiplier != 1.0f ||
         options.delta_controls_explicit ||
+        options.delta_current_membership_controls_explicit ||
+        options.delta_current_membership_mode !=
+            DeltaSteppingCsrCurrentMembershipMode::kBoolean ||
         options.delta_controller_controls_explicit ||
         options.delta_controller_mode !=
             DeltaSteppingCsrControllerMode::kHostChecked ||
@@ -1681,6 +1692,12 @@ struct DeltaTelemetryTotals {
   std::array<std::uint64_t, 4> path_counts{};
   std::array<std::uint64_t, 2> effective_controller_counts{};
   std::uint64_t controller_fallback_queries = 0;
+  // Unspecified/legacy, callback, generation budget, unsupported launch,
+  // unavailable occupancy, unsupported execution path.
+  std::array<std::uint64_t, 6> controller_fallback_reason_counts{};
+  std::uint64_t controller_cooperative_blocks_min =
+      std::numeric_limits<std::uint64_t>::max();
+  std::uint64_t controller_cooperative_blocks_max = 0;
   DeltaSteppingCsrTelemetry sums;
   std::uint64_t current_queue_high_water = 0;
   std::uint64_t pending_queue_high_water = 0;
@@ -1722,6 +1739,41 @@ DeltaTelemetryTotals aggregate_delta_telemetry(
     }
     if (record.controller_fallback) {
       ++totals.controller_fallback_queries;
+      std::size_t reason_index = 0;
+      switch (record.controller_fallback_reason) {
+        case DeltaSteppingCsrControllerFallbackReason::kNone:
+          break;
+        case DeltaSteppingCsrControllerFallbackReason::kProgressCallback:
+          reason_index = 1;
+          break;
+        case DeltaSteppingCsrControllerFallbackReason::kGenerationBudget:
+          reason_index = 2;
+          break;
+        case DeltaSteppingCsrControllerFallbackReason::
+            kCooperativeLaunchUnsupported:
+          reason_index = 3;
+          break;
+        case DeltaSteppingCsrControllerFallbackReason::kOccupancyUnavailable:
+          reason_index = 4;
+          break;
+        case DeltaSteppingCsrControllerFallbackReason::
+            kExecutionPathUnsupported:
+          reason_index = 5;
+          break;
+      }
+      ++totals.controller_fallback_reason_counts[reason_index];
+    }
+    if (record.effective_controller_mode ==
+            DeltaSteppingCsrControllerMode::kReducedRoundTrip &&
+        record.controller_cooperative_blocks != 0) {
+      totals.controller_cooperative_blocks_min = std::min(
+          totals.controller_cooperative_blocks_min,
+          static_cast<std::uint64_t>(
+              record.controller_cooperative_blocks));
+      totals.controller_cooperative_blocks_max = std::max(
+          totals.controller_cooperative_blocks_max,
+          static_cast<std::uint64_t>(
+              record.controller_cooperative_blocks));
     }
     totals.sums.outer_buckets_processed +=
         record.outer_buckets_processed;
@@ -1753,8 +1805,16 @@ DeltaTelemetryTotals aggregate_delta_telemetry(
     totals.sums.stale_pending_entry_examinations +=
         record.stale_pending_entry_examinations;
     totals.sums.reached_vertices += record.reached_vertices;
+    totals.sums.touched_queue_insertions +=
+        record.touched_queue_insertions;
+    for (std::size_t bin = 0;
+         bin < totals.sums.active_row_degree_histogram.size(); ++bin) {
+      totals.sums.active_row_degree_histogram[bin] +=
+          record.active_row_degree_histogram[bin];
+    }
     totals.sums.controller_round_trips +=
         record.controller_round_trips;
+    totals.sums.controller_launches += record.controller_launches;
     totals.sums.compact_parent_fallback_events +=
         record.compact_parent_fallback_events;
     totals.current_queue_high_water =
@@ -1778,10 +1838,24 @@ std::string delta_telemetry_aggregate_json(
     std::size_t worker_count) {
   const DeltaTelemetryTotals totals = aggregate_delta_telemetry(records);
   const DeltaSteppingCsrTelemetry& sums = totals.sums;
+  const std::uint64_t controller_cooperative_blocks_min =
+      totals.controller_cooperative_blocks_min ==
+              std::numeric_limits<std::uint64_t>::max()
+          ? 0
+          : totals.controller_cooperative_blocks_min;
+  const auto safe_ratio = [](long double numerator,
+                             long double denominator) {
+    return denominator == 0.0L
+               ? 0.0
+               : static_cast<double>(numerator / denominator);
+  };
+  const long double total_edge_visits =
+      static_cast<long double>(sums.light_edge_visits) +
+      static_cast<long double>(sums.heavy_edge_visits);
   std::ostringstream out;
-  out.precision(std::numeric_limits<float>::max_digits10);
+  out.precision(std::numeric_limits<double>::max_digits10);
   out << "{\"type\":\"delta_stepping_telemetry\""
-      << ",\"schema_version\":2"
+      << ",\"schema_version\":4"
       << ",\"scope\":\"pathfinder_run\""
       << ",\"queries\":" << totals.queries
       << ",\"completed_queries\":" << totals.completed_queries
@@ -1794,6 +1868,12 @@ std::string delta_telemetry_aggregate_json(
       << (options.delta_force_generic ? "true" : "false")
       << ",\"force_legacy_parent\":"
       << (options.delta_force_legacy_parent ? "true" : "false")
+      << ",\"current_membership_mode\":\""
+      << (options.delta_current_membership_mode ==
+                  DeltaSteppingCsrCurrentMembershipMode::kGeneration
+              ? "generation"
+              : "boolean")
+      << "\""
       << ",\"controller_mode\":\""
       << (options.delta_controller_mode ==
                   DeltaSteppingCsrControllerMode::kReducedRoundTrip
@@ -1802,6 +1882,11 @@ std::string delta_telemetry_aggregate_json(
       << "\""
       << ",\"controller_batch_size\":"
       << options.delta_controller_batch_size
+      << ",\"distance_atomic_primitives\":{"
+      << "\"generic_uninstrumented\":\""
+      << delta_stepping_uninstrumented_distance_atomic_name()
+      << "\",\"generic_telemetry\":\"cas\""
+      << ",\"exact_unit\":\"cas_claim\"}"
       << ",\"effective_controller_modes\":{"
       << "\"host_checked\":" << totals.effective_controller_counts[0]
       << ",\"reduced_round_trip\":"
@@ -1809,6 +1894,24 @@ std::string delta_telemetry_aggregate_json(
       << "}"
       << ",\"controller_fallback_queries\":"
       << totals.controller_fallback_queries
+      << ",\"controller_fallback_reasons\":{"
+      << "\"unspecified\":"
+      << totals.controller_fallback_reason_counts[0]
+      << ",\"progress_callback\":"
+      << totals.controller_fallback_reason_counts[1]
+      << ",\"generation_budget\":"
+      << totals.controller_fallback_reason_counts[2]
+      << ",\"cooperative_launch_unsupported\":"
+      << totals.controller_fallback_reason_counts[3]
+      << ",\"occupancy_unavailable\":"
+      << totals.controller_fallback_reason_counts[4]
+      << ",\"execution_path_unsupported\":"
+      << totals.controller_fallback_reason_counts[5]
+      << "}"
+      << ",\"controller_cooperative_blocks\":{"
+      << "\"min\":" << controller_cooperative_blocks_min
+      << ",\"max\":" << totals.controller_cooperative_blocks_max
+      << "}"
       << ",\"execution_paths\":{"
       << "\"exact_unit\":" << totals.path_counts[0]
       << ",\"compact_generic\":" << totals.path_counts[1]
@@ -1842,10 +1945,45 @@ std::string delta_telemetry_aggregate_json(
       << ",\"stale_pending_entry_examinations\":"
       << sums.stale_pending_entry_examinations
       << ",\"reached_vertices\":" << sums.reached_vertices
+      << ",\"touched_queue_insertions\":"
+      << sums.touched_queue_insertions
       << ",\"controller_round_trips\":"
       << sums.controller_round_trips
+      << ",\"controller_launches\":" << sums.controller_launches
       << ",\"compact_parent_fallback_events\":"
       << sums.compact_parent_fallback_events
+      << "},\"active_row_degree_histogram\":{"
+      << "\"0\":" << sums.active_row_degree_histogram[0]
+      << ",\"1\":" << sums.active_row_degree_histogram[1]
+      << ",\"2\":" << sums.active_row_degree_histogram[2]
+      << ",\"3_to_4\":" << sums.active_row_degree_histogram[3]
+      << ",\"5_to_8\":" << sums.active_row_degree_histogram[4]
+      << ",\"9_to_16\":" << sums.active_row_degree_histogram[5]
+      << ",\"17_to_32\":" << sums.active_row_degree_histogram[6]
+      << ",\"33_to_64\":" << sums.active_row_degree_histogram[7]
+      << ",\"over_64\":" << sums.active_row_degree_histogram[8]
+      << "},\"ratios\":{"
+      << "\"light_edge_visits_per_active_row\":"
+      << safe_ratio(sums.light_edge_visits,
+                    sums.active_vertices_processed)
+      << ",\"successful_relaxations_per_edge_visit\":"
+      << safe_ratio(sums.successful_distance_relaxations,
+                    total_edge_visits)
+      << ",\"current_queue_insertions_per_successful_relaxation\":"
+      << safe_ratio(sums.current_queue_insertions,
+                    sums.successful_distance_relaxations)
+      << ",\"pending_queue_insertions_per_successful_relaxation\":"
+      << safe_ratio(sums.pending_queue_insertions,
+                    sums.successful_distance_relaxations)
+      << ",\"touched_queue_insertions_per_successful_relaxation\":"
+      << safe_ratio(sums.touched_queue_insertions,
+                    sums.successful_distance_relaxations)
+      << ",\"distance_atomic_attempts_per_successful_relaxation\":"
+      << safe_ratio(sums.distance_atomic_attempts,
+                    sums.successful_distance_relaxations)
+      << ",\"cas_retries_per_distance_atomic_attempt\":"
+      << safe_ratio(sums.distance_cas_retries,
+                    sums.distance_atomic_attempts)
       << "},\"maxima\":{"
       << "\"current_queue_high_water\":"
       << totals.current_queue_high_water
@@ -2034,6 +2172,36 @@ DeltaSteppingCsrControllerMode parse_delta_controller_arg(const char* text) {
   throw std::runtime_error("invalid delta-controller: " + value);
 }
 
+DeltaSteppingCsrCurrentMembershipMode parse_delta_current_membership_arg(
+    const char* text) {
+  const std::string value(text);
+  if (value == "boolean") {
+    return DeltaSteppingCsrCurrentMembershipMode::kBoolean;
+  }
+  if (value == "generation") {
+    return DeltaSteppingCsrCurrentMembershipMode::kGeneration;
+  }
+  throw std::runtime_error("invalid delta-current-membership: " + value);
+}
+
+void parse_delta_current_membership_cli_arg(
+    const char* text,
+    PathfinderOptions* options,
+    bool* option_seen) {
+  if (options == nullptr || option_seen == nullptr) {
+    throw std::invalid_argument(
+        "delta current-membership destinations must not be null");
+  }
+  if (*option_seen) {
+    throw std::runtime_error(
+        "--delta-current-membership may be specified only once");
+  }
+  options->delta_current_membership_mode =
+      parse_delta_current_membership_arg(text);
+  options->delta_current_membership_controls_explicit = true;
+  *option_seen = true;
+}
+
 void validate_delta_controller_cli_controls(
     const PathfinderOptions& options,
     bool controller_seen,
@@ -2089,6 +2257,8 @@ void print_usage(const char* program) {
       << "  --max-sssp-iters <int>          Delta rounds, BFS depth, or Bellman-Ford rounds; -1 for default.\n"
       << "  --delta-force-generic           Bypass exact-unit specialization; retain weights and delta.\n"
       << "  --delta-force-legacy-parent     Force generic Delta predecessor recovery for A/B comparison.\n"
+      << "  --delta-current-membership <boolean|generation>\n"
+      << "                                  Current-frontier membership representation. Default: boolean\n"
       << "  --delta-controller <host-checked|reduced-round-trip>\n"
       << "                                  Generic Delta controller. Default: host-checked\n"
       << "  --delta-controller-batch-size <positive-int>\n"
@@ -2654,10 +2824,25 @@ PathfinderResult run_pathfinder(const HostCsrF32& base_graph,
           delta_options.delta_force_generic
               ? DeltaSteppingCsrExecutionMode::kForceGeneric
               : DeltaSteppingCsrExecutionMode::kAutomatic;
+      workspace_options.current_membership_mode =
+          delta_options.delta_current_membership_mode;
       workspace_options.controller_mode =
           delta_options.delta_controller_mode;
       workspace_options.controller_batch_size =
           delta_options.delta_controller_batch_size;
+      const std::size_t concurrent_delta_workspaces =
+          stream != nullptr
+              ? 1
+              : std::min<std::size_t>(
+                    delta_options.parallel_net_workers,
+                    std::max<std::size_t>(1, route_request_count));
+      if (concurrent_delta_workspaces >
+          std::numeric_limits<std::uint32_t>::max()) {
+        throw std::invalid_argument(
+            "Delta-Stepping worker count exceeds the controller hint range");
+      }
+      workspace_options.controller_concurrent_workspace_hint =
+          static_cast<std::uint32_t>(concurrent_delta_workspaces);
       workspace_options.capacity_hints = query_capacity_hints;
       if (workspace_options.execution_mode ==
           DeltaSteppingCsrExecutionMode::kForceGeneric) {
@@ -2698,18 +2883,12 @@ PathfinderResult run_pathfinder(const HostCsrF32& base_graph,
                                      net_records.begin(),
                                      net_records.end());
         }
-        const std::size_t actual_worker_count =
-            stream != nullptr
-                ? 1
-                : std::min<std::size_t>(
-                      delta_options.parallel_net_workers,
-                      std::max<std::size_t>(1, route_request_count));
         std::cout << delta_telemetry_aggregate_json(
                          flattened_telemetry,
                          delta_options,
                          delta_options.delta,
                          automatic_delta_wavefront_size,
-                         actual_worker_count)
+                         concurrent_delta_workspaces)
                   << '\n';
       }
       break;
@@ -3007,6 +3186,7 @@ int main(int argc, char** argv) {
     bool allow_unrouted_routes = false;
     bool sssp_engine_control_seen = false;
     bool delta_option_seen = false;
+    bool delta_current_membership_seen = false;
     bool delta_controller_seen = false;
     bool delta_controller_batch_size_seen = false;
     bool delta_benchmark_weights_seen = false;
@@ -3071,6 +3251,11 @@ int main(int argc, char** argv) {
         options.delta_force_legacy_parent = true;
       } else if (option == "--delta-force-generic") {
         options.delta_force_generic = true;
+      } else if (option == "--delta-current-membership") {
+        routing::parse_delta_current_membership_cli_arg(
+            require_value("--delta-current-membership"),
+            &options,
+            &delta_current_membership_seen);
       } else if (option == "--delta-controller") {
         options.delta_controller_mode =
             routing::parse_delta_controller_arg(

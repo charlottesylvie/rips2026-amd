@@ -403,6 +403,10 @@ BellmanFordCsrResult BellmanFord10CsrWorkspace::run(
              progress_user_data);
 }
 
+const char* delta_stepping_uninstrumented_distance_atomic_name() noexcept {
+  return kDeltaSteppingCsrUsesUintAtomicMin ? "uint_atomic_min" : "cas";
+}
+
 struct DeltaSteppingCsrGraph::Impl {
   explicit Impl(const HostCsrF32& adjacency) : graph(adjacency) {}
 
@@ -458,6 +462,13 @@ DeltaSteppingCsrWorkspace::DeltaSteppingCsrWorkspace(
   current_membership_mode_ = options.current_membership_mode;
   controller_mode_ = options.controller_mode;
   controller_batch_size_ = options.controller_batch_size;
+  controller_concurrent_workspace_hint_ =
+      options.controller_concurrent_workspace_hint;
+  if (controller_concurrent_workspace_hint_ == 0) {
+    throw std::invalid_argument(
+        "Delta-Stepping controller concurrent-workspace hint must be "
+        "positive");
+  }
   sssp_capacity::validate_reservation(options.capacity_hints);
 }
 
@@ -471,6 +482,13 @@ DeltaSteppingCsrWorkspace::DeltaSteppingCsrWorkspace(
   current_membership_mode_ = options.current_membership_mode;
   controller_mode_ = options.controller_mode;
   controller_batch_size_ = options.controller_batch_size;
+  controller_concurrent_workspace_hint_ =
+      options.controller_concurrent_workspace_hint;
+  if (controller_concurrent_workspace_hint_ == 0) {
+    throw std::invalid_argument(
+        "Delta-Stepping controller concurrent-workspace hint must be "
+        "positive");
+  }
   sssp_capacity::validate_reservation(options.capacity_hints);
 }
 

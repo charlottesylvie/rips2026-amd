@@ -16,6 +16,7 @@
 #include <stdexcept>
 #include <string>
 #include <type_traits>
+#include <unordered_map>
 #include <unordered_set>
 #include <utility>
 #include <vector>
@@ -51,6 +52,16 @@ enum DeviceTelemetryCounter : int {
   kTelemetryHeavyQueueInsertions,
   kTelemetryPendingEntryExaminations,
   kTelemetryStalePendingEntryExaminations,
+  kTelemetryTouchedQueueInsertions,
+  kTelemetryRowDegree0,
+  kTelemetryRowDegree1,
+  kTelemetryRowDegree2,
+  kTelemetryRowDegree3To4,
+  kTelemetryRowDegree5To8,
+  kTelemetryRowDegree9To16,
+  kTelemetryRowDegree17To32,
+  kTelemetryRowDegree33To64,
+  kTelemetryRowDegreeOver64,
   kTelemetryCurrentQueueHighWater,
   kTelemetryPendingQueueHighWater,
   kTelemetryHeavyQueueHighWater,
@@ -278,7 +289,7 @@ struct CooperativeDeltaControllerState {
   std::uint32_t current_queue_parity = 0;
   std::uint32_t pending_queue_parity = 0;
   std::uint32_t generation_cursor = 0;
-  std::uint32_t reserved = 0;
+  std::uint32_t status_snapshot = 0;
 };
 
 static_assert(std::is_standard_layout<CooperativeDeltaControllerState>::value,
@@ -713,8 +724,15 @@ inline void synchronize_explicit_stream(hipStream_t stream) {
 // particular, return the old distance as a scalar so disabled telemetry does
 // not change the ABI/register handoff that controls parent publication.
 __device__ inline float atomic_min_float_nonnegative(float* addr,
-                                                     float value) {
+                                                      float value) {
   auto* addr_as_uint = reinterpret_cast<unsigned int*>(addr);
+#if DS_DELTA_USE_UINT_ATOMIC_MIN
+  unsigned int value_bits = __float_as_uint(value);
+  // IEEE-754 unsigned bit order matches numeric order for nonnegative finite
+  // values and +infinity. Canonicalize -0 so it cannot violate that invariant.
+  if (value_bits == 0x80000000U) value_bits = 0U;
+  return __uint_as_float(atomicMin(addr_as_uint, value_bits));
+#else
   unsigned int old = *addr_as_uint;
   while (value < __uint_as_float(old)) {
     const unsigned int assumed = old;
@@ -722,6 +740,7 @@ __device__ inline float atomic_min_float_nonnegative(float* addr,
     if (old == assumed) break;
   }
   return __uint_as_float(old);
+#endif
 }
 
 struct AtomicMinFloatResult {
@@ -755,6 +774,9 @@ template <bool CollectTelemetry>
 __device__ inline AtomicMinFloatResult atomic_min_float_nonnegative(
     float* addr,
     float value) {
+  // Telemetry deliberately retains the CAS reference primitive even when the
+  // uninstrumented binary uses unsigned atomicMin. distance_cas_retries is
+  // therefore measured, not silently reported as zero for a different op.
   auto* addr_as_uint = reinterpret_cast<unsigned int*>(addr);
   unsigned int old = *addr_as_uint;
   unsigned int retries = 0;
@@ -1134,6 +1156,13 @@ __device__ inline void expand_unit_frontier_range(
       ++telemetry[kTelemetryActiveVertices];
     }
     const int u = frontier_queue[i];
+    if constexpr (CollectTelemetry) {
+      const Offset degree = static_cast<Offset>(out_rowptr[u + 1]) -
+                            static_cast<Offset>(out_rowptr[u]);
+      ++telemetry[kTelemetryRowDegree0 +
+                  delta_stepping_active_row_degree_bin(
+                      static_cast<std::uint64_t>(degree))];
+    }
     for (Offset edge = static_cast<Offset>(out_rowptr[u]);
          edge < static_cast<Offset>(out_rowptr[u + 1]); ++edge) {
       if constexpr (CollectTelemetry) {
@@ -1155,6 +1184,7 @@ __device__ inline void expand_unit_frontier_range(
         if (claimed) {
           ++telemetry[kTelemetrySuccessfulRelaxations];
           ++telemetry[kTelemetryCurrentQueueInsertions];
+          ++telemetry[kTelemetryTouchedQueueInsertions];
         }
       }
       if (claimed) {
@@ -1713,6 +1743,13 @@ __global__ void relax_light_edges_kernel(const int* frontier,
     if constexpr (CollectTelemetry) {
       ++telemetry[active ? kTelemetryActiveVertices
                          : kTelemetryStaleFrontierEntries];
+      if (active) {
+        const Offset degree = static_cast<Offset>(out_rowptr[u + 1]) -
+                              static_cast<Offset>(out_rowptr[u]);
+        ++telemetry[kTelemetryRowDegree0 +
+                    delta_stepping_active_row_degree_bin(
+                        static_cast<std::uint64_t>(degree))];
+      }
     }
     if constexpr (CollectHeavy) {
       const bool append_heavy =
@@ -1810,7 +1847,12 @@ __global__ void relax_light_edges_kernel(const int* frontier,
             append_position(append_current, next_count);
         const int pending_pos =
             append_position(append_pending, pending_count);
-        if (append_touched) touched_queue[touched_pos] = v;
+        if (append_touched) {
+          touched_queue[touched_pos] = v;
+          if constexpr (CollectTelemetry) {
+            ++telemetry[kTelemetryTouchedQueueInsertions];
+          }
+        }
         if (append_current) {
           next_frontier[current_pos] = v;
           if constexpr (CollectTelemetry) {
@@ -1934,7 +1976,12 @@ __global__ void relax_heavy_edges_kernel(const int* heavy_vertices,
             append_position(append_touched, touched_count);
         const int pending_pos =
             append_position(append_pending, pending_count);
-        if (append_touched) touched_queue[touched_pos] = v;
+        if (append_touched) {
+          touched_queue[touched_pos] = v;
+          if constexpr (CollectTelemetry) {
+            ++telemetry[kTelemetryTouchedQueueInsertions];
+          }
+        }
         if (append_pending) {
           pending_queue[pending_pos] = v;
           if constexpr (CollectTelemetry) {
@@ -2310,9 +2357,29 @@ struct CooperativeDeltaControllerArgs {
   CooperativeDeltaControllerState* state;
 };
 
-__device__ inline unsigned int controller_atomic_load_u32(
-    const unsigned int* address) {
-  return atomicAdd(const_cast<unsigned int*>(address), 0U);
+__device__ inline unsigned int controller_load_u32_block_broadcast(
+    const unsigned int* address,
+    unsigned int* block_value) {
+  // Preserve the coherent atomic read required by gfx1151 across cooperative
+  // relaunches, but issue it once per block instead of once per grid thread.
+  // The leading barrier protects readers from reuse of the shared slot.
+  __syncthreads();
+  if (threadIdx.x == 0) {
+    *block_value = atomicAdd(const_cast<unsigned int*>(address), 0U);
+  }
+  __syncthreads();
+  return *block_value;
+}
+
+__device__ inline int controller_load_counter_block_broadcast(
+    const int* address,
+    int* block_value) {
+  __syncthreads();
+  if (threadIdx.x == 0) {
+    *block_value = atomic_load_counter(address);
+  }
+  __syncthreads();
+  return *block_value;
 }
 
 __device__ inline void controller_set_status(
@@ -2324,18 +2391,31 @@ __device__ inline void controller_set_status(
 
 __device__ inline unsigned int controller_status_bits(
     const CooperativeDeltaControllerState* state) {
-  return controller_atomic_load_u32(reinterpret_cast<const unsigned int*>(
-      &state->descriptor.status));
+  return atomicAdd(
+      const_cast<unsigned int*>(reinterpret_cast<const unsigned int*>(
+          &state->descriptor.status)),
+      0U);
 }
 
-__device__ inline bool controller_has_fatal_status(
-    const CooperativeDeltaControllerState* state) {
+template <typename Grid>
+__device__ inline bool controller_has_fatal_status_grid_snapshot(
+    Grid& grid,
+    bool leader,
+    CooperativeDeltaControllerState* state) {
   constexpr unsigned int kFatal =
       static_cast<unsigned int>(
           DeltaSteppingCsrControllerStatus::kQueueOverflow) |
       static_cast<unsigned int>(
           DeltaSteppingCsrControllerStatus::kInvalidState);
-  return (controller_status_bits(state) & kFatal) != 0U;
+  // A per-block snapshot can observe different epochs: a fast block may set a
+  // new fatal flag while a slow block is still reading the previous phase,
+  // causing only part of the grid to break before the next grid.sync(). Have
+  // the grid leader publish one snapshot and synchronize before branching.
+  if (leader) {
+    state->status_snapshot = controller_status_bits(state);
+  }
+  grid.sync();
+  return (state->status_snapshot & kFatal) != 0U;
 }
 
 __device__ inline DeltaSteppingCsrControllerAction
@@ -2386,12 +2466,13 @@ __device__ inline int controller_bounded_append(
     int capacity,
     CooperativeDeltaControllerState* state) {
   if (!append) return -1;
-  int observed = atomic_load_counter(queue_tail);
-  while (observed >= 0 && observed < capacity) {
-    const int prior = atomicCAS(queue_tail, observed, observed + 1);
-    if (prior == observed) return observed;
-    observed = prior;
-  }
+  // Membership claims make every valid queue vertex-unique, so a single
+  // atomic reservation is sufficient in the normal path. Keep the bounds
+  // check as a corruption guard and saturate the counter before the controller
+  // performs its full-reset error path.
+  const int observed = atomicAdd(queue_tail, 1);
+  if (observed >= 0 && observed < capacity) return observed;
+  atomicExch(queue_tail, capacity);
   controller_set_status(
       state,
       observed < 0 ? DeltaSteppingCsrControllerStatus::kInvalidState
@@ -2401,10 +2482,10 @@ __device__ inline int controller_bounded_append(
 
 template <typename Grid>
 __device__ inline void controller_grid_release_sync(Grid& grid) {
-  // grid.sync() supplies the execution barrier.  The explicit fence documents
-  // and enforces publication of queue payloads/counts before a later phase on
-  // the same cooperative launch consumes them, including on gfx1151.
-  __threadfence();
+  // HIP defines group synchronization as completing shared/global memory
+  // accesses and making them visible to the whole group.  An additional
+  // device-wide fence in every participating thread is redundant here and is
+  // especially expensive in this controller's frequent phase barriers.
   grid.sync();
 }
 
@@ -2457,6 +2538,13 @@ __device__ void cooperative_relax_light_range(
     if constexpr (CollectTelemetry) {
       ++telemetry[active ? kTelemetryActiveVertices
                          : kTelemetryStaleFrontierEntries];
+      if (active) {
+        const Offset degree = static_cast<Offset>(args.rowptr[u + 1]) -
+                              static_cast<Offset>(args.rowptr[u]);
+        ++telemetry[kTelemetryRowDegree0 +
+                    delta_stepping_active_row_degree_bin(
+                        static_cast<std::uint64_t>(degree))];
+      }
     }
     if (collect_heavy) {
       const bool append_heavy =
@@ -2551,7 +2639,12 @@ __device__ void cooperative_relax_light_range(
           append_current, next_count, capacity, args.state);
       const int pending_pos = controller_bounded_append(
           append_pending, pending_count, capacity, args.state);
-      if (touched_pos >= 0) args.touched_queue[touched_pos] = v;
+      if (touched_pos >= 0) {
+        args.touched_queue[touched_pos] = v;
+        if constexpr (CollectTelemetry) {
+          ++telemetry[kTelemetryTouchedQueueInsertions];
+        }
+      }
       if (current_pos >= 0) {
         next_frontier[current_pos] = v;
         if constexpr (CollectTelemetry) {
@@ -2667,7 +2760,12 @@ __device__ void cooperative_relax_heavy_range(
             append_touched, args.touched_count, capacity, args.state);
         const int pending_pos = controller_bounded_append(
             append_pending, pending_count, capacity, args.state);
-        if (touched_pos >= 0) args.touched_queue[touched_pos] = v;
+        if (touched_pos >= 0) {
+          args.touched_queue[touched_pos] = v;
+          if constexpr (CollectTelemetry) {
+            ++telemetry[kTelemetryTouchedQueueInsertions];
+          }
+        }
         if (pending_pos >= 0) {
           pending_queue[pending_pos] = v;
           if constexpr (CollectTelemetry) {
@@ -2693,7 +2791,8 @@ __device__ void cooperative_reduce_min_pending(
     const CooperativeDeltaControllerArgs<RowOffset>& args,
     const int* pending_queue,
     int pending_count,
-    int previous_bucket) {
+    int previous_bucket,
+    int* block_min) {
   unsigned long long examined = 0;
   unsigned long long stale = 0;
   const int capacity = static_cast<int>(args.rows);
@@ -2725,8 +2824,19 @@ __device__ void cooperative_reduce_min_pending(
       ++stale;
     }
   }
-  if (local_min < kNoBucket) {
-    atomicMin(args.min_pending_bucket, local_min);
+  block_min[threadIdx.x] = local_min;
+  __syncthreads();
+  for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+    if (threadIdx.x < stride) {
+      const int other = block_min[threadIdx.x + stride];
+      if (other < block_min[threadIdx.x]) {
+        block_min[threadIdx.x] = other;
+      }
+    }
+    __syncthreads();
+  }
+  if (threadIdx.x == 0 && block_min[0] < kNoBucket) {
+    atomicMin(args.min_pending_bucket, block_min[0]);
   }
   if constexpr (CollectTelemetry) {
     if (examined != 0) {
@@ -2837,6 +2947,9 @@ __global__ void cooperative_delta_controller_kernel(
   cooperative_groups::grid_group grid = cooperative_groups::this_grid();
   const bool leader = grid.thread_rank() == 0;
   const int capacity = static_cast<int>(args.rows);
+  __shared__ unsigned int block_controller_u32;
+  __shared__ int block_controller_i32;
+  __shared__ int block_min_pending[kBlockSize];
   if (leader) {
     const bool resumable =
         args.state->descriptor.version ==
@@ -2864,11 +2977,16 @@ __global__ void cooperative_delta_controller_kernel(
   controller_grid_release_sync(grid);
 
   for (std::uint32_t action = 0; action < args.batch_size; ++action) {
-    if (controller_has_fatal_status(args.state)) break;
+    if (controller_has_fatal_status_grid_snapshot(
+            grid, leader, args.state)) {
+      break;
+    }
     const std::uint32_t current_parity =
-        controller_atomic_load_u32(&args.state->current_queue_parity);
+        controller_load_u32_block_broadcast(
+            &args.state->current_queue_parity, &block_controller_u32);
     const std::uint32_t pending_parity =
-        controller_atomic_load_u32(&args.state->pending_queue_parity);
+        controller_load_u32_block_broadcast(
+            &args.state->pending_queue_parity, &block_controller_u32);
     if (current_parity > 1U || pending_parity > 1U) {
       if (leader) {
         controller_finish(
@@ -2889,12 +3007,19 @@ __global__ void cooperative_delta_controller_kernel(
         pending_parity == 0U ? args.pending_queue_0 : args.pending_queue_1;
     int* const pending_count_ptr =
         pending_parity == 0U ? args.pending_count_0 : args.pending_count_1;
-    const int current_count = atomic_load_counter(current_count_ptr);
-    const int current_bucket =
-        static_cast<int>(args.state->descriptor.current_bucket);
+    const int current_count =
+        controller_load_counter_block_broadcast(
+            current_count_ptr, &block_controller_i32);
+    const std::uint64_t current_bucket_u64 =
+        args.state->descriptor.current_bucket;
+    const bool current_bucket_representable =
+        current_bucket_u64 < static_cast<std::uint64_t>(kNoBucket);
+    const int current_bucket = current_bucket_representable
+                                   ? static_cast<int>(current_bucket_u64)
+                                   : -1;
     if (leader) {
       if (current_count <= 0 || current_count > capacity ||
-          current_bucket < 0 || current_bucket >= kNoBucket) {
+          !current_bucket_representable) {
         controller_finish(
             args.state, DeltaSteppingCsrControllerStatus::kInvalidState);
       } else {
@@ -2908,7 +3033,10 @@ __global__ void cooperative_delta_controller_kernel(
       }
     }
     controller_grid_release_sync(grid);
-    if (controller_has_fatal_status(args.state)) break;
+    if (controller_has_fatal_status_grid_snapshot(
+            grid, leader, args.state)) {
+      break;
+    }
 
     if constexpr (!UseCurrentGenerations) {
       const long long global_thread =
@@ -2926,19 +3054,27 @@ __global__ void cooperative_delta_controller_kernel(
         }
       }
       controller_grid_release_sync(grid);
-      if (controller_has_fatal_status(args.state)) break;
+      if (controller_has_fatal_status_grid_snapshot(
+              grid, leader, args.state)) {
+        break;
+      }
     }
 
     const std::uint32_t next_generation =
-        controller_atomic_load_u32(&args.state->generation_cursor);
+        controller_load_u32_block_broadcast(
+            &args.state->generation_cursor, &block_controller_u32);
     cooperative_relax_light_range<RowOffset, UseCurrentGenerations,
                                    TrackParents, UseEdgeParent,
                                    CollectTelemetry>(
         args, current_queue, current_count, current_bucket, next_queue,
         next_count_ptr, next_generation, pending_queue, pending_count_ptr);
     controller_grid_release_sync(grid);
-    const int next_count = atomic_load_counter(next_count_ptr);
-    const int observed_pending_count = atomic_load_counter(pending_count_ptr);
+    const int next_count =
+        controller_load_counter_block_broadcast(
+            next_count_ptr, &block_controller_i32);
+    const int observed_pending_count =
+        controller_load_counter_block_broadcast(
+            pending_count_ptr, &block_controller_i32);
     if (leader) {
       if (next_count < 0 || next_count > capacity ||
           observed_pending_count < 0 || observed_pending_count > capacity) {
@@ -2964,22 +3100,33 @@ __global__ void cooperative_delta_controller_kernel(
       }
     }
     controller_grid_release_sync(grid);
-    if (controller_has_fatal_status(args.state)) break;
+    if (controller_has_fatal_status_grid_snapshot(
+            grid, leader, args.state)) {
+      break;
+    }
     if (next_count > 0) continue;
 
     if (args.skip_heavy_edges == 0 && current_bucket != kNoBucket - 1) {
-      const int heavy_count = atomic_load_counter(args.heavy_count);
+      const int heavy_count =
+          controller_load_counter_block_broadcast(
+              args.heavy_count, &block_controller_i32);
       if (leader && (heavy_count < 0 || heavy_count > capacity)) {
         controller_finish(
             args.state, DeltaSteppingCsrControllerStatus::kInvalidState);
       }
       controller_grid_release_sync(grid);
-      if (controller_has_fatal_status(args.state)) break;
+      if (controller_has_fatal_status_grid_snapshot(
+              grid, leader, args.state)) {
+        break;
+      }
       cooperative_relax_heavy_range<RowOffset, TrackParents, UseEdgeParent,
                                     CollectTelemetry>(
           args, current_bucket, pending_queue, pending_count_ptr, heavy_count);
       controller_grid_release_sync(grid);
-      if (controller_has_fatal_status(args.state)) break;
+      if (controller_has_fatal_status_grid_snapshot(
+              grid, leader, args.state)) {
+        break;
+      }
     }
 
     // Preserve the established host controller's observable stop boundary:
@@ -3038,13 +3185,16 @@ __global__ void cooperative_delta_controller_kernel(
       }
     }
     controller_grid_release_sync(grid);
-    if (controller_has_fatal_status(args.state) ||
+    if (controller_has_fatal_status_grid_snapshot(
+            grid, leader, args.state) ||
         args.state->descriptor.phase ==
         DeltaSteppingCsrControllerPhase::kFinished) {
       break;
     }
 
-    const int pending_count = atomic_load_counter(pending_count_ptr);
+    const int pending_count =
+        controller_load_counter_block_broadcast(
+            pending_count_ptr, &block_controller_i32);
     if (leader) {
       if (pending_count < 0 || pending_count > capacity) {
         controller_finish(
@@ -3054,11 +3204,21 @@ __global__ void cooperative_delta_controller_kernel(
       }
     }
     controller_grid_release_sync(grid);
-    if (controller_has_fatal_status(args.state)) break;
+    if (controller_has_fatal_status_grid_snapshot(
+            grid, leader, args.state)) {
+      break;
+    }
     cooperative_reduce_min_pending<RowOffset, CollectTelemetry>(
-        args, pending_queue, pending_count, current_bucket);
+        args, pending_queue, pending_count, current_bucket,
+        block_min_pending);
     controller_grid_release_sync(grid);
-    const int next_bucket = atomic_load_counter(args.min_pending_bucket);
+    if (controller_has_fatal_status_grid_snapshot(
+            grid, leader, args.state)) {
+      break;
+    }
+    const int next_bucket =
+        controller_load_counter_block_broadcast(
+            args.min_pending_bucket, &block_controller_i32);
     if constexpr (CollectTelemetry) {
       if (leader) {
         telemetry_atomic_max(
@@ -3096,7 +3256,8 @@ __global__ void cooperative_delta_controller_kernel(
         next_pending_parity == 0U ? args.pending_count_0
                                   : args.pending_count_1;
     const std::uint32_t compact_generation =
-        controller_atomic_load_u32(&args.state->generation_cursor);
+        controller_load_u32_block_broadcast(
+            &args.state->generation_cursor, &block_controller_u32);
     if (leader) {
       atomicExch(next_count_ptr, 0);
       atomicExch(new_pending_count_ptr, 0);
@@ -3108,9 +3269,16 @@ __global__ void cooperative_delta_controller_kernel(
         next_queue, next_count_ptr, new_pending_queue,
         new_pending_count_ptr);
     controller_grid_release_sync(grid);
-    const int compacted_current_count = atomic_load_counter(next_count_ptr);
+    if (controller_has_fatal_status_grid_snapshot(
+            grid, leader, args.state)) {
+      break;
+    }
+    const int compacted_current_count =
+        controller_load_counter_block_broadcast(
+            next_count_ptr, &block_controller_i32);
     const int compacted_pending_count =
-        atomic_load_counter(new_pending_count_ptr);
+        controller_load_counter_block_broadcast(
+            new_pending_count_ptr, &block_controller_i32);
     if (leader) {
       if (compacted_current_count <= 0 ||
           compacted_current_count > capacity ||
@@ -3152,7 +3320,12 @@ __global__ void cooperative_delta_controller_kernel(
   }
 
   if (leader) {
-    if (controller_has_fatal_status(args.state)) {
+    constexpr unsigned int kFatal =
+        static_cast<unsigned int>(
+            DeltaSteppingCsrControllerStatus::kQueueOverflow) |
+        static_cast<unsigned int>(
+            DeltaSteppingCsrControllerStatus::kInvalidState);
+    if ((controller_status_bits(args.state) & kFatal) != 0U) {
       controller_finish(args.state,
                         DeltaSteppingCsrControllerStatus::kNone);
     } else if (args.state->descriptor.phase !=
@@ -3174,62 +3347,118 @@ __global__ void cooperative_delta_controller_kernel(
   grid.sync();
 }
 
+struct CooperativeDeltaControllerLaunchConfig {
+  int blocks = 0;
+  DeltaSteppingCsrControllerFallbackReason fallback_reason =
+      DeltaSteppingCsrControllerFallbackReason::kNone;
+};
+
+static_assert(kTelemetryRowDegreeOver64 - kTelemetryRowDegree0 + 1 ==
+                  static_cast<int>(kDeltaSteppingCsrRowDegreeBinCount),
+              "row-degree telemetry counters must stay contiguous");
+
 template <typename RowOffset,
           bool UseCurrentGenerations,
           bool TrackParents,
           bool UseEdgeParent,
           bool CollectTelemetry>
-int cooperative_delta_controller_blocks(Offset rows) {
+CooperativeDeltaControllerLaunchConfig
+cooperative_delta_controller_launch_config(
+    Offset rows,
+    std::uint32_t concurrent_workspace_hint) {
+  if (concurrent_workspace_hint == 0) {
+    return {0,
+            DeltaSteppingCsrControllerFallbackReason::kOccupancyUnavailable};
+  }
   int device = -1;
   DS_DELTA_HIP_CHECK(hipGetDevice(&device));
-  int cooperative_launch = 0;
-  const hipError_t capability_status =
-      hipDeviceGetAttribute(&cooperative_launch,
-                            hipDeviceAttributeCooperativeLaunch,
-                            device);
-  if (capability_status != hipSuccess || cooperative_launch == 0) {
-    if (capability_status != hipSuccess) (void)hipGetLastError();
-    return 0;
-  }
 
-  hipDeviceProp_t properties{};
-  DS_DELTA_HIP_CHECK(hipGetDeviceProperties(&properties, device));
-  int active_blocks_per_compute_unit = 0;
-  const hipError_t occupancy_status =
-      hipOccupancyMaxActiveBlocksPerMultiprocessor(
-          &active_blocks_per_compute_unit,
-          cooperative_delta_controller_kernel<
-              RowOffset, UseCurrentGenerations, TrackParents,
-              UseEdgeParent, CollectTelemetry>,
-          kBlockSize,
-          0);
-  if (occupancy_status != hipSuccess ||
-      active_blocks_per_compute_unit <= 0 ||
-      properties.multiProcessorCount <= 0) {
-    if (occupancy_status != hipSuccess) (void)hipGetLastError();
-    return 0;
+  struct CachedOccupancy {
+    int compute_units = 0;
+    int legal_resident_blocks = 0;
+    DeltaSteppingCsrControllerFallbackReason fallback_reason =
+        DeltaSteppingCsrControllerFallbackReason::kNone;
+  };
+  // PathFinder reuses each workspace from one host worker thread. A
+  // thread-local cache removes a process-wide mutex from every query launch
+  // while still amortizing the HIP capability and occupancy calls for that
+  // worker and exact kernel specialization.
+  static thread_local std::unordered_map<int, CachedOccupancy> cache;
+
+  CachedOccupancy occupancy;
+  const auto found = cache.find(device);
+  if (found != cache.end()) {
+    occupancy = found->second;
+  } else {
+    int cooperative_launch = 0;
+    const hipError_t capability_status =
+        hipDeviceGetAttribute(&cooperative_launch,
+                              hipDeviceAttributeCooperativeLaunch,
+                              device);
+    if (capability_status != hipSuccess || cooperative_launch == 0) {
+      if (capability_status != hipSuccess) (void)hipGetLastError();
+      occupancy.fallback_reason =
+          DeltaSteppingCsrControllerFallbackReason::
+              kCooperativeLaunchUnsupported;
+    } else {
+      hipDeviceProp_t properties{};
+      DS_DELTA_HIP_CHECK(hipGetDeviceProperties(&properties, device));
+      int active_blocks_per_compute_unit = 0;
+      const hipError_t occupancy_status =
+          hipOccupancyMaxActiveBlocksPerMultiprocessor(
+              &active_blocks_per_compute_unit,
+              cooperative_delta_controller_kernel<
+                  RowOffset, UseCurrentGenerations, TrackParents,
+                  UseEdgeParent, CollectTelemetry>,
+              kBlockSize,
+              0);
+      if (occupancy_status != hipSuccess ||
+          active_blocks_per_compute_unit <= 0 ||
+          properties.multiProcessorCount <= 0) {
+        if (occupancy_status != hipSuccess) (void)hipGetLastError();
+        occupancy.fallback_reason =
+            DeltaSteppingCsrControllerFallbackReason::kOccupancyUnavailable;
+      } else {
+        occupancy.compute_units = properties.multiProcessorCount;
+        const long long legal_resident_blocks =
+            static_cast<long long>(active_blocks_per_compute_unit) *
+            properties.multiProcessorCount;
+        if (legal_resident_blocks <= 0 ||
+            legal_resident_blocks > std::numeric_limits<int>::max()) {
+          occupancy.fallback_reason =
+              DeltaSteppingCsrControllerFallbackReason::
+                  kOccupancyUnavailable;
+        } else {
+          occupancy.legal_resident_blocks =
+              static_cast<int>(legal_resident_blocks);
+        }
+      }
+    }
+    cache.emplace(device, occupancy);
+  }
+  if (occupancy.fallback_reason !=
+      DeltaSteppingCsrControllerFallbackReason::kNone) {
+    return {0, occupancy.fallback_reason};
   }
 
   const Offset row_blocks =
       (rows + static_cast<Offset>(kBlockSize) - 1) /
       static_cast<Offset>(kBlockSize);
-  const Offset legal_resident_limit =
-      static_cast<Offset>(active_blocks_per_compute_unit) *
-      static_cast<Offset>(properties.multiProcessorCount);
-  // Grid-stride loops make one block per compute unit sufficient.  This is a
-  // runtime-derived legal subset of the exact kernel's occupancy bound and
-  // leaves cooperative residency available to independent routing streams.
-  const Offset concurrency_friendly_limit =
-      static_cast<Offset>(properties.multiProcessorCount);
+  const std::uint32_t concurrency_friendly_limit =
+      delta_stepping_controller_concurrency_block_limit(
+          static_cast<std::uint32_t>(occupancy.compute_units),
+          concurrent_workspace_hint);
   const Offset blocks =
       std::min(row_blocks,
-               std::min(legal_resident_limit,
-                        concurrency_friendly_limit));
+               std::min(static_cast<Offset>(occupancy.legal_resident_blocks),
+                        static_cast<Offset>(concurrency_friendly_limit)));
   if (blocks <= 0 ||
       blocks > static_cast<Offset>(std::numeric_limits<int>::max())) {
-    return 0;
+    return {0,
+            DeltaSteppingCsrControllerFallbackReason::kOccupancyUnavailable};
   }
-  return static_cast<int>(blocks);
+  return {static_cast<int>(blocks),
+          DeltaSteppingCsrControllerFallbackReason::kNone};
 }
 
 inline bool controller_generation_batch_is_representable(
@@ -3504,6 +3733,13 @@ void copy_device_telemetry_to_host(DeltaSteppingScratch& scratch,
       counters[kTelemetryPendingEntryExaminations];
   telemetry.stale_pending_entry_examinations =
       counters[kTelemetryStalePendingEntryExaminations];
+  telemetry.touched_queue_insertions =
+      counters[kTelemetryTouchedQueueInsertions];
+  for (std::size_t bin = 0;
+       bin < telemetry.active_row_degree_histogram.size(); ++bin) {
+    telemetry.active_row_degree_histogram[bin] =
+        counters[static_cast<std::size_t>(kTelemetryRowDegree0) + bin];
+  }
   telemetry.current_queue_high_water =
       counters[kTelemetryCurrentQueueHighWater];
   telemetry.pending_queue_high_water =
@@ -4370,6 +4606,7 @@ DeltaSteppingCsrResult run_delta_stepping_impl(
     DeltaSteppingCsrControllerMode controller_mode,
     std::uint32_t controller_batch_size,
     std::uint32_t controller_generation_seed_for_testing,
+    std::uint32_t controller_concurrent_workspace_hint,
     DeltaSteppingCsrTelemetry* telemetry) {
   if (max_iters < 0) max_iters = std::numeric_limits<int>::max();
 
@@ -4381,19 +4618,32 @@ DeltaSteppingCsrResult run_delta_stepping_impl(
   const bool reduced_controller_requested =
       controller_mode ==
       DeltaSteppingCsrControllerMode::kReducedRoundTrip;
-  int cooperative_blocks = 0;
-  if (reduced_controller_requested && progress_callback == nullptr &&
-      (!UseCurrentGenerations ||
-       controller_generation_batch_is_representable(
-           controller_batch_size))) {
-    cooperative_blocks =
-        cooperative_delta_controller_blocks<
-            RowOffset, UseCurrentGenerations, TrackParents,
-            UseEdgeParent, CollectTelemetry>(n);
+  CooperativeDeltaControllerLaunchConfig cooperative_config;
+  DeltaSteppingCsrControllerFallbackReason controller_fallback_reason =
+      DeltaSteppingCsrControllerFallbackReason::kNone;
+  if (reduced_controller_requested) {
+    if (progress_callback != nullptr) {
+      controller_fallback_reason =
+          DeltaSteppingCsrControllerFallbackReason::kProgressCallback;
+    } else if (UseCurrentGenerations &&
+               !controller_generation_batch_is_representable(
+                   controller_batch_size)) {
+      controller_fallback_reason =
+          DeltaSteppingCsrControllerFallbackReason::kGenerationBudget;
+    } else {
+      cooperative_config = cooperative_delta_controller_launch_config<
+          RowOffset, UseCurrentGenerations, TrackParents,
+          UseEdgeParent, CollectTelemetry>(
+              n, controller_concurrent_workspace_hint);
+      controller_fallback_reason = cooperative_config.fallback_reason;
+    }
   }
+  const int cooperative_blocks = cooperative_config.blocks;
   const bool use_reduced_controller =
       reduced_controller_requested && progress_callback == nullptr &&
-      cooperative_blocks > 0;
+      cooperative_blocks > 0 &&
+      controller_fallback_reason ==
+          DeltaSteppingCsrControllerFallbackReason::kNone;
   if constexpr (CollectTelemetry) {
     telemetry->effective_controller_mode =
         use_reduced_controller
@@ -4403,6 +4653,10 @@ DeltaSteppingCsrResult run_delta_stepping_impl(
         use_reduced_controller ? controller_batch_size : 1U;
     telemetry->controller_fallback =
         reduced_controller_requested && !use_reduced_controller;
+    telemetry->controller_fallback_reason = controller_fallback_reason;
+    telemetry->controller_cooperative_blocks = 0;
+    telemetry->controller_concurrent_workspace_hint =
+        controller_concurrent_workspace_hint;
   }
   std::vector<int> deduplicated_sources;
   std::unordered_set<int> source_set;
@@ -4677,8 +4931,8 @@ DeltaSteppingCsrResult run_delta_stepping_impl(
           hipMemcpyHostToDevice,
           stream));
       // Establish one real explicit-stream publication boundary before the
-      // first cooperative grid. All later intra-launch dependencies use
-      // release fences plus grid-wide barriers, and each relaunch follows the
+      // first cooperative grid. All later intra-launch dependencies use HIP's
+      // grid-wide synchronization guarantee, and each relaunch follows the
       // descriptor D2H completion boundary.
       synchronize_explicit_stream(stream);
       while (true) {
@@ -4735,6 +4989,11 @@ DeltaSteppingCsrResult run_delta_stepping_impl(
             RowOffset, UseCurrentGenerations, TrackParents,
             UseEdgeParent, CollectTelemetry>(
                 args, cooperative_blocks, stream);
+        if constexpr (CollectTelemetry) {
+          telemetry->controller_cooperative_blocks =
+              static_cast<std::uint32_t>(cooperative_blocks);
+          ++telemetry->controller_launches;
+        }
         const DeltaSteppingCsrControllerDescriptor descriptor =
             copy_controller_descriptor_to_host(scratch, stream);
         ++controller_round_trips;
@@ -5205,6 +5464,7 @@ DeltaSteppingCsrResult dispatch_delta_stepping_impl(
     DeltaSteppingCsrControllerMode controller_mode,
     std::uint32_t controller_batch_size,
     std::uint32_t controller_generation_seed_for_testing,
+    std::uint32_t controller_concurrent_workspace_hint,
     DeltaSteppingCsrTelemetry* telemetry) {
   if (current_membership_mode ==
       DeltaSteppingCsrCurrentMembershipMode::kGeneration) {
@@ -5216,6 +5476,7 @@ DeltaSteppingCsrResult dispatch_delta_stepping_impl(
           exclusive_distance_limit, stream,
           progress_callback, progress_user_data, controller_mode,
           controller_batch_size, controller_generation_seed_for_testing,
+          controller_concurrent_workspace_hint,
           telemetry);
     }
     return run_delta_stepping_impl<RowOffset, true, TrackParents,
@@ -5225,6 +5486,7 @@ DeltaSteppingCsrResult dispatch_delta_stepping_impl(
         exclusive_distance_limit, stream,
         progress_callback, progress_user_data, controller_mode,
         controller_batch_size, controller_generation_seed_for_testing,
+        controller_concurrent_workspace_hint,
         nullptr);
   }
   if (current_membership_mode !=
@@ -5240,6 +5502,7 @@ DeltaSteppingCsrResult dispatch_delta_stepping_impl(
         exclusive_distance_limit, stream,
         progress_callback, progress_user_data, controller_mode,
         controller_batch_size, controller_generation_seed_for_testing,
+        controller_concurrent_workspace_hint,
         telemetry);
   }
   return run_delta_stepping_impl<RowOffset, false, TrackParents,
@@ -5249,6 +5512,7 @@ DeltaSteppingCsrResult dispatch_delta_stepping_impl(
       exclusive_distance_limit, stream,
       progress_callback, progress_user_data, controller_mode,
       controller_batch_size, controller_generation_seed_for_testing,
+      controller_concurrent_workspace_hint,
       nullptr);
 }
 
@@ -5261,7 +5525,8 @@ void begin_telemetry_record(DeltaSteppingCsrTelemetry* telemetry,
                             bool all_edges_light,
                             bool compact_parent_fallback,
                             DeltaSteppingCsrControllerMode controller_mode,
-                            std::uint32_t controller_batch_size) {
+                            std::uint32_t controller_batch_size,
+                            std::uint32_t controller_concurrent_workspace_hint) {
   if (telemetry == nullptr) return;
   telemetry->collected = true;
   telemetry->execution_path = path;
@@ -5279,9 +5544,23 @@ void begin_telemetry_record(DeltaSteppingCsrTelemetry* telemetry,
   telemetry->requested_controller_batch_size = controller_batch_size;
   telemetry->effective_controller_batch_size = 1;
   telemetry->controller_fallback = false;
+  telemetry->controller_fallback_reason =
+      DeltaSteppingCsrControllerFallbackReason::kNone;
+  telemetry->controller_cooperative_blocks = 0;
+  telemetry->controller_concurrent_workspace_hint =
+      controller_concurrent_workspace_hint;
+  telemetry->controller_launches = 0;
 }
 
 }  // namespace ds_delta_detail
+
+const char* delta_stepping_uninstrumented_distance_atomic_name() noexcept {
+#if DS_DELTA_USE_UINT_ATOMIC_MIN
+  return "uint_atomic_min";
+#else
+  return "cas";
+#endif
+}
 
 const char* delta_stepping_execution_path_name(
     DeltaSteppingCsrExecutionPath path) noexcept {
@@ -5528,6 +5807,13 @@ DeltaSteppingCsrWorkspace::DeltaSteppingCsrWorkspace(
   controller_batch_size_ = options.controller_batch_size;
   controller_generation_seed_for_testing_ =
       options.controller_generation_seed_for_testing;
+  if (options.controller_concurrent_workspace_hint == 0) {
+    throw std::invalid_argument(
+        "Delta-Stepping controller concurrent-workspace hint must be "
+        "positive");
+  }
+  controller_concurrent_workspace_hint_ =
+      options.controller_concurrent_workspace_hint;
   impl_->scratch.reserve_query_capacity(options.capacity_hints,
                                         impl_->path_capable);
 }
@@ -5551,6 +5837,13 @@ DeltaSteppingCsrWorkspace::DeltaSteppingCsrWorkspace(
   controller_batch_size_ = options.controller_batch_size;
   controller_generation_seed_for_testing_ =
       options.controller_generation_seed_for_testing;
+  if (options.controller_concurrent_workspace_hint == 0) {
+    throw std::invalid_argument(
+        "Delta-Stepping controller concurrent-workspace hint must be "
+        "positive");
+  }
+  controller_concurrent_workspace_hint_ =
+      options.controller_concurrent_workspace_hint;
   impl_->scratch.reserve_query_capacity(options.capacity_hints,
                                         impl_->path_capable);
 }
@@ -5690,7 +5983,8 @@ DeltaSteppingCsrResult DeltaSteppingCsrWorkspace::run_distances(
       skip_heavy_edges,
       false,
       controller_mode_,
-      controller_batch_size_);
+      controller_batch_size_,
+      controller_concurrent_workspace_hint_);
   const auto run_typed = [&](const auto& graph) {
     using RowOffset = typename std::remove_cv<typename std::remove_pointer<
         decltype(graph.rowptr)>::type>::type;
@@ -5701,7 +5995,8 @@ DeltaSteppingCsrResult DeltaSteppingCsrWorkspace::run_distances(
         skip_heavy_edges, delta, max_iters, active_distance_limit_, stream,
         progress_callback, progress_user_data, current_membership_mode_,
         controller_mode_, controller_batch_size_,
-        controller_generation_seed_for_testing_, active_telemetry_);
+        controller_generation_seed_for_testing_,
+        controller_concurrent_workspace_hint_, active_telemetry_);
   };
   if (adjacency.uses_32_bit_offsets) {
     return run_typed(adjacency.view<CompactRowOffset>());
@@ -5736,7 +6031,8 @@ DeltaSteppingCsrResult DeltaSteppingCsrWorkspace::run(
       execution_mode_ == DeltaSteppingCsrExecutionMode::kForceGeneric,
       parent_mode_ == DeltaSteppingCsrParentMode::kForceLegacy,
       impl_->has_vertex_costs, skip_heavy_edges, false,
-      controller_mode_, controller_batch_size_);
+      controller_mode_, controller_batch_size_,
+      controller_concurrent_workspace_hint_);
   const auto run_typed = [&](const auto& graph) {
     using RowOffset = typename std::remove_cv<typename std::remove_pointer<
         decltype(graph.rowptr)>::type>::type;
@@ -5747,7 +6043,8 @@ DeltaSteppingCsrResult DeltaSteppingCsrWorkspace::run(
         skip_heavy_edges, delta, max_iters, active_distance_limit_, stream,
         progress_callback, progress_user_data, current_membership_mode_,
         controller_mode_, controller_batch_size_,
-        controller_generation_seed_for_testing_, active_telemetry_);
+        controller_generation_seed_for_testing_,
+        controller_concurrent_workspace_hint_, active_telemetry_);
   };
   if (adjacency.uses_32_bit_offsets) {
     return run_typed(adjacency.view<CompactRowOffset>());
@@ -5789,13 +6086,17 @@ DeltaSteppingCsrResult DeltaSteppingCsrWorkspace::run(
           active_telemetry_, DeltaSteppingCsrExecutionPath::kExactUnit,
           delta, false, false, false,
           impl_->max_edge_value <= delta, false,
-          controller_mode_, controller_batch_size_);
+          controller_mode_, controller_batch_size_,
+          controller_concurrent_workspace_hint_);
       if (active_telemetry_ != nullptr &&
           controller_mode_ ==
               DeltaSteppingCsrControllerMode::kReducedRoundTrip) {
         // The reduced controller is defined only for classic generic Delta.
         // Exact-unit specialization bypasses it and reports that explicitly.
         active_telemetry_->controller_fallback = true;
+        active_telemetry_->controller_fallback_reason =
+            DeltaSteppingCsrControllerFallbackReason::
+                kExecutionPathUnsupported;
       }
       if (active_telemetry_ != nullptr) {
         return run_unit_weight_specialization<RowOffset, true>(
@@ -5818,13 +6119,15 @@ DeltaSteppingCsrResult DeltaSteppingCsrWorkspace::run(
           delta,
           execution_mode_ == DeltaSteppingCsrExecutionMode::kForceGeneric,
           false, impl_->has_vertex_costs, skip_heavy_edges, false,
-          controller_mode_, controller_batch_size_);
+          controller_mode_, controller_batch_size_,
+          controller_concurrent_workspace_hint_);
       return dispatch_delta_stepping_impl<RowOffset, true, true>(
           graph, adjacency.edge_source.get(), impl_->scratch, sources,
           -1, &targets, vertex_costs, skip_heavy_edges, delta, max_iters,
           active_distance_limit_, stream, progress_callback,
           progress_user_data, current_membership_mode_, controller_mode_,
           controller_batch_size_, controller_generation_seed_for_testing_,
+          controller_concurrent_workspace_hint_,
           active_telemetry_);
     }
     const bool compact_parent_fallback =
@@ -5836,13 +6139,15 @@ DeltaSteppingCsrResult DeltaSteppingCsrWorkspace::run(
         execution_mode_ == DeltaSteppingCsrExecutionMode::kForceGeneric,
         parent_mode_ == DeltaSteppingCsrParentMode::kForceLegacy,
         impl_->has_vertex_costs, skip_heavy_edges, compact_parent_fallback,
-        controller_mode_, controller_batch_size_);
+        controller_mode_, controller_batch_size_,
+        controller_concurrent_workspace_hint_);
     return dispatch_delta_stepping_impl<RowOffset, true, false>(
         graph, nullptr, impl_->scratch, sources, -1, &targets,
         vertex_costs, skip_heavy_edges, delta, max_iters,
         active_distance_limit_, stream, progress_callback,
         progress_user_data, current_membership_mode_, controller_mode_,
         controller_batch_size_, controller_generation_seed_for_testing_,
+        controller_concurrent_workspace_hint_,
         active_telemetry_);
   };
   if (adjacency.uses_32_bit_offsets) {
@@ -5889,7 +6194,7 @@ DeltaSteppingCsrResult delta_stepping_minplus_hip_csr(
       progress_callback, progress_user_data,
       DeltaSteppingCsrCurrentMembershipMode::kBoolean,
       DeltaSteppingCsrControllerMode::kHostChecked,
-      kDeltaSteppingCsrRecommendedControllerBatchSize, 0, nullptr);
+      kDeltaSteppingCsrRecommendedControllerBatchSize, 0, 1, nullptr);
 }
 
 DeltaSteppingCsrResult delta_stepping_minplus_hip_csr(
@@ -5954,7 +6259,7 @@ DeltaSteppingCsrResult delta_stepping_minplus_hip_csr(
         std::numeric_limits<float>::infinity(), stream, progress_callback,
         progress_user_data, DeltaSteppingCsrCurrentMembershipMode::kBoolean,
         DeltaSteppingCsrControllerMode::kHostChecked,
-        kDeltaSteppingCsrRecommendedControllerBatchSize, 0, nullptr);
+        kDeltaSteppingCsrRecommendedControllerBatchSize, 0, 1, nullptr);
   }
   return dispatch_delta_stepping_impl<Offset, true, false>(
       d_adjacency.view<Offset>(), nullptr, scratch, sources, target, nullptr,
@@ -5962,7 +6267,7 @@ DeltaSteppingCsrResult delta_stepping_minplus_hip_csr(
       std::numeric_limits<float>::infinity(), stream, progress_callback,
       progress_user_data, DeltaSteppingCsrCurrentMembershipMode::kBoolean,
       DeltaSteppingCsrControllerMode::kHostChecked,
-      kDeltaSteppingCsrRecommendedControllerBatchSize, 0, nullptr);
+      kDeltaSteppingCsrRecommendedControllerBatchSize, 0, 1, nullptr);
 }
 
 DeltaSteppingCsrResult delta_stepping_minplus_hip_csr(
@@ -5987,7 +6292,7 @@ DeltaSteppingCsrResult delta_stepping_minplus_hip_csr(
         std::numeric_limits<float>::infinity(), stream, progress_callback,
         progress_user_data, DeltaSteppingCsrCurrentMembershipMode::kBoolean,
         DeltaSteppingCsrControllerMode::kHostChecked,
-        kDeltaSteppingCsrRecommendedControllerBatchSize, 0, nullptr);
+        kDeltaSteppingCsrRecommendedControllerBatchSize, 0, 1, nullptr);
   }
   return dispatch_delta_stepping_impl<Offset, true, false>(
       d_adjacency.view<Offset>(), nullptr, scratch, sources, target, nullptr,
@@ -5995,7 +6300,7 @@ DeltaSteppingCsrResult delta_stepping_minplus_hip_csr(
       std::numeric_limits<float>::infinity(), stream, progress_callback,
       progress_user_data, DeltaSteppingCsrCurrentMembershipMode::kBoolean,
       DeltaSteppingCsrControllerMode::kHostChecked,
-      kDeltaSteppingCsrRecommendedControllerBatchSize, 0, nullptr);
+      kDeltaSteppingCsrRecommendedControllerBatchSize, 0, 1, nullptr);
 }
 
 DeltaSteppingCsrResult delta_stepping_minplus_hip_csr(

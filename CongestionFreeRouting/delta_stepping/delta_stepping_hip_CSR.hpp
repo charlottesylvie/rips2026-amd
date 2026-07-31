@@ -7,13 +7,31 @@
 
 #include <hip/hip_runtime.h>
 
+#include <array>
 #include <cmath>
+#include <cstddef>
 #include <cstdint>
 #include <limits>
 #include <memory>
 #include <stdexcept>
 #include <utility>
 #include <vector>
+
+#ifndef DS_DELTA_USE_UINT_ATOMIC_MIN
+#define DS_DELTA_USE_UINT_ATOMIC_MIN 0
+#endif
+
+#if DS_DELTA_USE_UINT_ATOMIC_MIN != 0 && DS_DELTA_USE_UINT_ATOMIC_MIN != 1
+#error "DS_DELTA_USE_UINT_ATOMIC_MIN must be 0 or 1"
+#endif
+
+inline constexpr bool kDeltaSteppingCsrUsesUintAtomicMin =
+    DS_DELTA_USE_UINT_ATOMIC_MIN != 0;
+
+// Defined by the implementation translation unit so diagnostic labels cannot
+// silently disagree with the primitive selected there if a build applies the
+// compile-time switch inconsistently across translation units.
+const char* delta_stepping_uninstrumented_distance_atomic_name() noexcept;
 
 // Delta-Stepping SSSP for nonnegative edge weights over outgoing-edge CSR:
 //   adjacency row u, column v = weight of directed edge u -> v.
@@ -65,6 +83,11 @@ struct DeltaSteppingCsrTelemetry {
   std::uint64_t pending_entry_examinations = 0;
   std::uint64_t stale_pending_entry_examinations = 0;
   std::uint64_t reached_vertices = 0;
+  // Active light-frontier rows in bins: 0, 1, 2, 3-4, 5-8, 9-16,
+  // 17-32, 33-64, and >64 outgoing edges.
+  std::array<std::uint64_t, kDeltaSteppingCsrRowDegreeBinCount>
+      active_row_degree_histogram{};
+  std::uint64_t touched_queue_insertions = 0;
   std::uint64_t current_queue_high_water = 0;
   std::uint64_t pending_queue_high_water = 0;
   std::uint64_t heavy_queue_high_water = 0;
@@ -78,6 +101,13 @@ struct DeltaSteppingCsrTelemetry {
       kDeltaSteppingCsrRecommendedControllerBatchSize;
   std::uint32_t effective_controller_batch_size = 1;
   bool controller_fallback = false;
+  DeltaSteppingCsrControllerFallbackReason controller_fallback_reason =
+      DeltaSteppingCsrControllerFallbackReason::kNone;
+  // The cooperative grid used by an accepted launch. Zero means no
+  // cooperative launch was accepted, including trivial early-stop queries.
+  std::uint32_t controller_cooperative_blocks = 0;
+  std::uint32_t controller_concurrent_workspace_hint = 1;
+  std::uint64_t controller_launches = 0;
 };
 
 struct DeltaSteppingCsrRunOptions {
@@ -155,6 +185,11 @@ struct DeltaSteppingCsrWorkspaceOptions {
   // seeds the next generic generation advance. It has no effect in Boolean
   // membership mode.
   std::uint32_t controller_generation_seed_for_testing = 0;
+  // Expected simultaneous workspaces on the same device. The reduced
+  // controller divides its one-block-per-CU fairness budget by this value so
+  // one query does not reserve every CU while other PathFinder streams wait.
+  // Append-only for positional aggregate compatibility.
+  std::uint32_t controller_concurrent_workspace_hint = 1;
 };
 
 struct DeltaSteppingCsrGraphOptions {
@@ -439,6 +474,7 @@ class DeltaSteppingCsrWorkspace {
   std::uint32_t controller_batch_size_ =
       kDeltaSteppingCsrRecommendedControllerBatchSize;
   std::uint32_t controller_generation_seed_for_testing_ = 0;
+  std::uint32_t controller_concurrent_workspace_hint_ = 1;
   DeltaSteppingCsrTelemetry* active_telemetry_ = nullptr;
   float active_distance_limit_ = std::numeric_limits<float>::infinity();
   std::unique_ptr<Impl> impl_;

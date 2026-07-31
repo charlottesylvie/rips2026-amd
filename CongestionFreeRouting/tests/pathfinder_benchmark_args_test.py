@@ -82,6 +82,10 @@ def main() -> None:
         "controller controls must remain unset by default",
     )
     require(
+        defaults.delta_current_membership is None,
+        "current-membership selection must remain unset by default",
+    )
+    require(
         benchmark.pathfinder_args(defaults) == [],
         "default wrapper arguments must not select or tune delta-stepping",
     )
@@ -132,6 +136,22 @@ def main() -> None:
         "benchmark wrapper must preserve an explicit numeric delta",
     )
 
+    explicit_boolean_membership = benchmark.parse_args(
+        [
+            "input.phys",
+            "output.phys",
+            "--sssp-engine",
+            "delta-step",
+            "--delta-current-membership",
+            "boolean",
+        ]
+    )
+    require(
+        benchmark.pathfinder_args(explicit_boolean_membership)[-2:]
+        == ["--delta-current-membership", "boolean"],
+        "benchmark wrapper must forward explicit Boolean membership",
+    )
+
     forced = benchmark.parse_args(
         [
             "input.phys",
@@ -143,6 +163,8 @@ def main() -> None:
             "--delta-telemetry",
             "--delta-telemetry",
             "--delta-force-legacy-parent",
+            "--delta-current-membership",
+            "generation",
             "--delta-controller",
             "reduced-round-trip",
             "--delta-controller-batch-size",
@@ -162,6 +184,8 @@ def main() -> None:
             "--delta-force-legacy-parent",
             "--delta",
             "0.75",
+            "--delta-current-membership",
+            "generation",
             "--delta-controller",
             "reduced-round-trip",
             "--delta-controller-batch-size",
@@ -220,6 +244,8 @@ def main() -> None:
         ["--delta-force-generic"],
         ["--delta-telemetry"],
         ["--delta-force-legacy-parent"],
+        ["--delta-current-membership", "boolean"],
+        ["--delta-current-membership", "generation"],
         ["--delta-controller", "host-checked"],
         ["--delta-controller", "reduced-round-trip"],
         [
@@ -252,9 +278,27 @@ def main() -> None:
             ["--sssp-engine", non_delta_engine, "--delta-telemetry"],
             f"delta telemetry was accepted with {non_delta_engine!r}",
         )
+        require_parse_rejected(
+            [
+                "--sssp-engine",
+                non_delta_engine,
+                "--delta-current-membership",
+                "generation",
+            ],
+            f"Delta membership was accepted with {non_delta_engine!r}",
+        )
     require_parse_rejected(
         ["--sssp-engine", "delta-step", "--delta-multiplier", "2"],
         "delta multiplier was accepted without --delta auto",
+    )
+    require_parse_rejected(
+        [
+            "--sssp-engine",
+            "delta-step",
+            "--delta-current-membership",
+            "tags",
+        ],
+        "unknown current-membership mode was accepted",
     )
     require_parse_rejected(
         [

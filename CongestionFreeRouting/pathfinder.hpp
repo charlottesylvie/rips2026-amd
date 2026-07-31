@@ -142,6 +142,9 @@ struct PathfinderOptions {
   int delta_controller_batch_size =
       static_cast<int>(kDeltaSteppingCsrRecommendedControllerBatchSize);
   bool delta_controller_controls_explicit = false;
+  DeltaSteppingCsrCurrentMembershipMode delta_current_membership_mode =
+      DeltaSteppingCsrCurrentMembershipMode::kBoolean;
+  bool delta_current_membership_controls_explicit = false;
 };
 
 struct PathfinderResult {

@@ -57,6 +57,8 @@ int main() {
          "--delta-telemetry",
          "--delta-telemetry",
          "--delta-force-legacy-parent",
+         "--delta-current-membership",
+         "generation",
          "--delta-controller",
          "reduced-round-trip",
          "--delta-controller-batch-size",
@@ -73,6 +75,8 @@ int main() {
                                           "--delta-force-generic",
                                           "--delta-telemetry",
                                           "--delta-force-legacy-parent",
+                                          "--delta-current-membership",
+                                          "generation",
                                           "--delta-controller",
                                           "reduced-round-trip",
                                           "--delta-controller-batch-size",
@@ -92,11 +96,16 @@ int main() {
          "design_unrouted.phys",
          "design_routed.phys",
          "--use-delta-step",
-         "--delta-force-generic"});
+         "--delta-force-generic",
+         "--delta-current-membership",
+         "boolean"});
     require(shorthand.pathfinder_args ==
-                std::vector<std::string>({"--use-delta-step",
-                                          "--delta-force-generic"}),
-            "router did not forward the delta shorthand and force-generic flag");
+                 std::vector<std::string>({"--use-delta-step",
+                                          "--delta-force-generic",
+                                          "--delta-current-membership",
+                                          "boolean"}),
+            "router did not forward the delta shorthand, force-generic flag, "
+            "and explicit Boolean membership");
 
     bool missing_seed_rejected = false;
     try {
@@ -121,6 +130,18 @@ int main() {
     }
     require(missing_controller_batch_rejected,
             "router accepted a controller batch option without its value");
+
+    bool missing_membership_rejected = false;
+    try {
+      (void)parse({"PathFinderFile",
+                   "design_unrouted.phys",
+                   "design_routed.phys",
+                   "--delta-current-membership"});
+    } catch (const std::runtime_error&) {
+      missing_membership_rejected = true;
+    }
+    require(missing_membership_rejected,
+            "router accepted a membership option without its value");
 
     for (const std::string& weight_family :
          std::vector<std::string>({"unit", "all-light", "all-heavy"})) {

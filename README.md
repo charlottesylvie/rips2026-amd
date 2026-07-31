@@ -132,6 +132,17 @@ and unsupported cooperative kernels use the complete host-checked fallback;
 use Delta telemetry to confirm the effective controller before interpreting a
 profile or timing run.
 
+Current-frontier membership has a separate Boolean/generation A/B control.
+Boolean remains the default; generation tags remove the per-round clear while
+retaining a full rollover reset:
+
+```bash
+make ROUTER=PathFinderFile BENCHMARKS="boom_med_pb" VERBOSE=1 \
+  PATHFINDER_SSSP_ENGINE=delta-step \
+  PATHFINDER_ARGS="--delta 1 --delta-force-generic \
+    --delta-current-membership generation"
+```
+
 Synthetic weighted runs are reproducible without rebuilding the CSR. This
 example uses a fixed mixed-family seed and emits one aggregate telemetry JSON
 line after all net workers join:
@@ -416,6 +427,7 @@ Tuning options:
 | `--delta-multiplier <float>` | `1` | Positive multiplier for sweeping around `--delta auto`; rejected with an explicit numeric width. |
 | `--delta-force-generic` | unset | Bypass only the exact-unit Delta dispatch while preserving weights, delta, destination costs, and automatic compact-parent selection. |
 | `--delta-force-legacy-parent` | unset | Select legacy predecessor recovery for generic vector-target Delta runs; combine with force-generic for a parent-policy A/B test. |
+| `--delta-current-membership <boolean\|generation>` | `boolean` | Select cleared Boolean or rollover-safe generation-tagged current-frontier membership for generic Delta. |
 | `--delta-controller <host-checked\|reduced-round-trip>` | `host-checked` | Select the established generic host controller or the capability-gated bounded device controller. |
 | `--delta-controller-batch-size <int>` | `4` in reduced mode | Positive device-control budget; valid only with an explicitly selected reduced-round-trip controller. |
 | `--delta-telemetry` | unset | Emit one aggregate Delta-Stepping telemetry JSON record after all net workers join. |
@@ -436,7 +448,9 @@ works with numeric or automatic delta. The multiplier requires automatic
 delta, benchmark weight families require an explicit numeric delta, and the
 seed is valid only with `mixed`. A controller batch size requires an explicit
 `--delta-controller reduced-round-trip`; host-checked mode preserves the
-existing null-stream and explicit-stream behavior exactly. Force-generic and
+existing null-stream and explicit-stream behavior exactly. Membership and
+controller controls are independent, so use their four-cell Boolean/generation
+by host/reduced matrix to attribute an A/B result. Force-generic and
 force-legacy-parent may be
 combined: the first chooses generic execution and the second chooses its
 parent representation. Force-legacy-parent by itself also makes the fixed
@@ -482,7 +496,7 @@ uninstrumented kernel instantiations and does not allocate, reset, or copy the
 device counter buffer. `--delta-telemetry` selects instrumented kernels and is
 intended for diagnosis, not clean wall-time measurement. After a successful
 worker join, PathFinder writes one JSON line to standard output with
-`type="delta_stepping_telemetry"` and `schema_version=2`; filter mixed logs on
+`type="delta_stepping_telemetry"` and `schema_version=4`; filter mixed logs on
 that type. `queries` counts actual collected net searches, counter fields are
 sums across searches, and queue fields under `maxima` are per-search maxima
 combined with `max`, not sums. Execution-path counts distinguish exact-unit,
@@ -494,8 +508,14 @@ from being mistaken for a reduced-controller measurement.
 The counters measure bucket/light/heavy rounds, frontier and edge visits,
 distance atomic attempts/successes/CAS retries, logical queue insertions and
 peaks, repeated pending-token examinations, unique reached vertices,
-controller status round trips, and compact-parent fallbacks. In particular,
-pending examinations may count one retained token in multiple scheduler scans,
+controller status round trips, and compact-parent fallbacks. Schema version 4
+also records the configured membership mode, accepted cooperative block and
+launch counts, controller fallback reasons, touched-queue insertions, the
+nine-bin active-row degree histogram, and safe derived ratios. The
+`distance_atomic_primitives` object separately labels generic uninstrumented,
+generic instrumented, and exact-unit claim primitives; the generic
+instrumented path retains the CAS reference. In particular, pending
+examinations may count one retained token in multiple scheduler scans,
 edge visits are phase examinations rather than unique light/heavy edges, queue
 peaks are entries rather than bytes, and controller round trips are counted
 algorithmic status reads rather than all HIP calls. The precise field-by-field
@@ -577,7 +597,7 @@ Useful wrapper options:
 | `--interchange-to-csr <path>` | Override converter executable. Env: `INTERCHANGE_TO_CSR`. |
 | `--pathfinder <path>` | Override PathFinder executable. Env: `PATHFINDER_BIN`. |
 | `--routes-to-phys <path>` | Override route reconstructor. Env: `ROUTES_TO_PHYS`. |
-| `--sssp-engine`, `--use-delta-step`, `--delta`, `--delta-multiplier`, `--delta-force-generic`, `--delta-force-legacy-parent`, `--delta-controller`, `--delta-controller-batch-size`, `--delta-telemetry`, `--delta-benchmark-weights`, `--delta-benchmark-weight-seed`, `--max-sssp-iters`, `--net-limit`, `--parallel-net-workers`, `--capacity` | Forwarded to `pathfinder`. |
+| `--sssp-engine`, `--use-delta-step`, `--delta`, `--delta-multiplier`, `--delta-force-generic`, `--delta-force-legacy-parent`, `--delta-current-membership`, `--delta-controller`, `--delta-controller-batch-size`, `--delta-telemetry`, `--delta-benchmark-weights`, `--delta-benchmark-weight-seed`, `--max-sssp-iters`, `--net-limit`, `--parallel-net-workers`, `--capacity` | Forwarded to `pathfinder`. |
 | `--max-pathfinder-iters`, `--present-factor`, `--present-multiplier`, `--history-factor`, `--route-batch-size` | Compatibility-only; forwarded to `pathfinder` and ignored. |
 
 ## File Formats And Artifacts
