@@ -5012,7 +5012,7 @@ DeltaSteppingCsrResult run_delta_stepping_impl(
     next_count_device = scratch.next_count.get();
     reset_int_zero_async(scratch.current_count.get(), stream);
     reset_int_zero_async(scratch.new_pending_count.get(), stream);
-    // Same-stream ordering: both counter resets complete before compaction.
+    synchronize_explicit_stream(stream);
     const std::uint32_t compacted_current_generation =
         acquire_current_generation<UseCurrentGenerations>(scratch, stream);
 
