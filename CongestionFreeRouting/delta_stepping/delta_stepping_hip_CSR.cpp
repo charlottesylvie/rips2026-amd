@@ -4323,7 +4323,7 @@ int find_min_pending_bucket(const int* d_pending_queue,
                                     sizeof(int),
                                     hipMemcpyHostToDevice,
                                     stream));
-  // Same-stream ordering publishes the sentinel before reduction begins.
+  synchronize_explicit_stream(stream);
   reduce_min_pending_bucket_kernel<CollectTelemetry>
       <<<launch_blocks, kBlockSize, 0, stream>>>(
       d_pending_queue, d_pending_count, current_bucket, delta, d_dist,
