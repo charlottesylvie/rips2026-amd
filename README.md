@@ -18,6 +18,9 @@ are reported as diagnostics; they do not make the one-shot router fail.
   `CongestionFreeRouting/unit_bfs`; Delta Stepping remains available for
   comparison and nonnegative weighted graphs. UnitBFS validates the full CSR
   at graph construction and rejects any edge weight not exactly `1.0f`.
+- Weighted bounded prototype: BF11 performs true multi-source active-frontier
+  Bellman--Ford with inclusive endpoint boxes, device-resident target checks,
+  and workspace-local full or sparse dynamic vertex-cost updates.
 - Main interchange flow: `device_to_routing_graph` once per device/bounds
   policy, then `interchange_to_csr -> pathfinder -> routes_to_phys` per test
   case.
@@ -88,6 +91,17 @@ The current measured classic Delta-Stepping benchmark control is
 results remain comparable. It is an empirical control for the tested workload,
 not a portable algorithm default; automatic selection and low-level workspace
 behavior remain unchanged.
+
+Run the bounded BF11 challenger against a newly generated CSR v3 artifact with:
+
+```bash
+make ROUTER=PathFinderFile BENCHMARKS="boom_med_pb" VERBOSE=1 \
+  PATHFINDER_SSSP_ENGINE=bf11 \
+  PATHFINDER_ARGS="--bf11-bbox-margin-x 3 --bf11-bbox-margin-y 15"
+```
+
+BF11 defaults to one worker because each workspace owns graph-sized search
+state. Use `--bf11-unbounded` for a legacy CSR or as the unrestricted A/B arm.
 
 The delta backend also accepts a graph-aware bucket-width seed and a sweep
 multiplier while retaining numeric widths as an explicit override:
@@ -194,6 +208,7 @@ the generated `.csrbin`, metadata, and routes files for debugging.
 | --- | --- |
 | `CongestionFreeRouting/device_to_routing_graph.cpp` | Preprocesses invariant `DeviceResources` data into a reusable `.devicegraph` artifact. |
 | `CongestionFreeRouting/interchange/device_routing_graph.cpp` / `.hpp` | Shared device-graph serialization, validation, lookup, and per-design filtering support. |
+| `CongestionFreeRouting/interchange/routing_csr_sidecars.hpp` | Route-end coordinates, immutable base vertex costs, and destination-tile spatial edge shards shared by conversion and BF11. |
 | `CongestionFreeRouting/interchange_to_csr.cpp` | Combines a preprocessed `.devicegraph` with one benchmark's `.phys` and `.netlist` inputs to produce the router CSR graph and metadata sidecar. |
 | `CongestionFreeRouting/pathfinder.cpp` / `CongestionFreeRouting/pathfinder.hpp` | Implements the current one-shot source-to-sink shortest-path router over CSR input. |
 | `CongestionFreeRouting/routes_to_phys.cpp` | Reconstructs a routed FPGA Interchange `PhysicalNetlist` from route JSONL output. |
@@ -206,6 +221,7 @@ the generated `.csrbin`, metadata, and routes files for debugging.
 | Path | Purpose |
 | --- | --- |
 | `CongestionFreeRouting/delta_stepping` | Production outgoing-CSR Delta-Stepping implementation used by PathFinder. |
+| `CongestionFreeRouting/bellman_ford/bf11.cpp` / `.hpp` | Bounded, dynamically weighted, true-multi-source outgoing-CSR Bellman--Ford backend. |
 | `HIP_kernel/delta_stepping` | Legacy incoming-CSR Delta-Stepping experiment; it is not used by PathFinder. |
 | `HIP_kernel/bellman_ford` | Bellman-Ford experiments and correctness tests. Result metadata has target fields, but Bellman-Ford does not currently target-early-stop like Delta Stepping. |
 | `HIP_kernel/minplus_mm` | Dense and sparse min-plus matrix multiplication experiments. |
@@ -257,13 +273,14 @@ g++ -std=c++17 -O3 -I"$SCHEMA_DIR" \
   "$SCHEMA_DIR"/References.capnp.c++ \
   -lcapnp -lkj -lz -o interchange_to_csr
 
-hipcc -std=c++17 -O3 -x hip -DBF10_NO_MAIN \
+hipcc -std=c++17 -O3 -x hip -DBF10_NO_MAIN -DBF11_NO_MAIN \
   -I HIP_kernel/bellman_ford/src \
   -I CongestionFreeRouting/bellman_ford \
   -I CongestionFreeRouting/delta_stepping \
   -I CongestionFreeRouting/unit_bfs \
   CongestionFreeRouting/pathfinder.cpp \
   CongestionFreeRouting/bellman_ford/bf10.cpp \
+  CongestionFreeRouting/bellman_ford/bf11.cpp \
   CongestionFreeRouting/delta_stepping/delta_stepping_hip_CSR.cpp \
   CongestionFreeRouting/unit_bfs/unit_bfs_hip_CSR.cpp \
   -pthread -o pathfinder
@@ -353,7 +370,8 @@ graph and metadata sidecar:
 The expensive parsing, coordinate extraction, PIP construction, and base-CSR
 formatting have already happened in `device_to_routing_graph`. This stage
 loads the two design netlists, extracts route requests and blockages, filters
-the shared graph, and writes design-specific CSR and metadata outputs. Its
+the shared graph, builds destination-coordinate edge shards, and writes
+design-specific CSR and metadata outputs. Its
 summary distinguishes eligible route requests, source-less OOC exclusions,
 already-preserved nets, and unsupported preserved work. Unsupported partial
 or structurally incompatible signal work fails conversion by default; the
@@ -380,7 +398,7 @@ machine.
 
 The two outputs are staged before publication. Separate adjacent `.publishing`
 guards are acquired for the CSR and metadata paths, so converters that share
-either output cannot race. CSR version 2 and metadata version 6 embed the same
+either output cannot race. CSR version 3 and metadata version 6 embed the same
 nonzero 128-bit pair ID; the `.generation` sidecar publishes its canonical hex
 form, and PathFinder propagates it into every route JSON record. Metadata v6
 keeps the declared node count but omits seven unused per-node columns that
@@ -410,7 +428,7 @@ Tuning options:
 
 | Option | Default | Meaning |
 | --- | --- | --- |
-| `--sssp-engine <unit-bfs\|delta-step\|bellman-ford\|bf10>` | `unit-bfs` | Shortest-path backend; `bf8`, `bf9`, and `bf10` are Bellman-Ford compatibility aliases. |
+| `--sssp-engine <unit-bfs\|delta-step\|bellman-ford\|bf10\|bf11>` | `unit-bfs` | Shortest-path backend; `bf8`, `bf9`, and `bf10` select reference BF10, while `bf11` selects bounded dynamic-cost BF11. |
 | `--use-delta-step` | unset | Shorthand for `--sssp-engine delta-step`. |
 | `--delta <float\|auto>` | `1` | Explicit Delta-Stepping bucket width. Automatic mode uses `1` for exact-unit effective weights and otherwise uses a graph-aware seed based on runtime wavefront size, average effective weight, and average out-degree. |
 | `--delta-multiplier <float>` | `1` | Positive multiplier for sweeping around `--delta auto`; rejected with an explicit numeric width. |
@@ -422,6 +440,11 @@ Tuning options:
 | `--delta-benchmark-weights <unit\|all-light\|all-heavy\|mixed>` | unset | Deterministically replace in-memory CSR weights for a benchmark; requires an explicit numeric delta. |
 | `--delta-benchmark-weight-seed <uint>` | `0` | Seed the `mixed` family; rejected for every other family. |
 | `--max-sssp-iters <int>` | `-1` | Delta buckets, unit-BFS depth, or Bellman-Ford rounds; `-1` uses the default. |
+| `--bf11-unbounded` | unset | Disable automatic source/target bounding for BF11. This is also the explicit compatibility path for CSR v1/v2. |
+| `--bf11-bbox-margin-x <int>` | `3` | Nonnegative horizontal expansion applied to BF11's inclusive endpoint box. |
+| `--bf11-bbox-margin-y <int>` | `15` | Nonnegative vertical expansion applied to BF11's inclusive endpoint box. |
+| `--bf11-target-check-interval <int>` | `1` | Check BF11's exact nonnegative-distance target certificate every N relaxation rounds. |
+| `--bf11-no-unbounded-fallback` | unset | Keep an unreachable auto-bounded query inside its initial box instead of retrying once unbounded. |
 | `--capacity <int>` | `1` | Capacity used only for overuse diagnostics. |
 | `--net-limit <count>` | unset | Route only the first `count` requests. |
 | `--parallel-net-workers <count>` | `0` | Independent net workers; `0` enables engine-dependent auto-selection. Workers share one immutable CSR across worker-private search state. |
@@ -442,6 +465,13 @@ combined: the first chooses generic execution and the second chooses its
 parent representation. Force-legacy-parent by itself also makes the fixed
 exact-unit parent path ineligible, so use force-generic with automatic parents
 for a clean execution-path A/B comparison.
+
+Every BF11-specific control requires `--sssp-engine bf11`. One cost epoch is
+frozen for each query. The low-level `BellmanFord11CsrWorkspace` API can replace
+all dynamic destination multipliers or update a sparse node list between
+queries; compact results carry effective per-edge costs so PathFinder preserves
+the weighted route distance. The one-shot PathFinder controller currently
+leaves dynamic multipliers at `1`.
 
 The converter emits exact unit weights. An automatic vector-target Delta
 workspace uses its append-only exact-unit specialization only when the graph
@@ -577,7 +607,7 @@ Useful wrapper options:
 | `--interchange-to-csr <path>` | Override converter executable. Env: `INTERCHANGE_TO_CSR`. |
 | `--pathfinder <path>` | Override PathFinder executable. Env: `PATHFINDER_BIN`. |
 | `--routes-to-phys <path>` | Override route reconstructor. Env: `ROUTES_TO_PHYS`. |
-| `--sssp-engine`, `--use-delta-step`, `--delta`, `--delta-multiplier`, `--delta-force-generic`, `--delta-force-legacy-parent`, `--delta-controller`, `--delta-controller-batch-size`, `--delta-telemetry`, `--delta-benchmark-weights`, `--delta-benchmark-weight-seed`, `--max-sssp-iters`, `--net-limit`, `--parallel-net-workers`, `--capacity` | Forwarded to `pathfinder`. |
+| `--sssp-engine`, `--use-delta-step`, `--delta`, `--delta-multiplier`, `--delta-force-generic`, `--delta-force-legacy-parent`, `--delta-controller`, `--delta-controller-batch-size`, `--delta-telemetry`, `--delta-benchmark-weights`, `--delta-benchmark-weight-seed`, `--bf11-unbounded`, `--bf11-bbox-margin-x`, `--bf11-bbox-margin-y`, `--bf11-target-check-interval`, `--bf11-no-unbounded-fallback`, `--max-sssp-iters`, `--net-limit`, `--parallel-net-workers`, `--capacity` | Forwarded to `pathfinder`. |
 | `--max-pathfinder-iters`, `--present-factor`, `--present-multiplier`, `--history-factor`, `--route-batch-size` | Compatibility-only; forwarded to `pathfinder` and ignored. |
 
 ## File Formats And Artifacts
@@ -587,8 +617,8 @@ Useful wrapper options:
 | `<benchmark>_unrouted.phys` | Contest setup | Unrouted FPGA Interchange physical netlist. |
 | `<benchmark>.netlist` | Contest setup | Matching logical netlist. |
 | `xcvu3p.device` | RapidWright | FPGA Interchange device resources for the target part. |
-| `.devicegraph` | `device_to_routing_graph` | Persistent device-wide CSR, node/PIP metadata, and lookup tables for one device/bounds policy. |
-| `.csrbin` | `interchange_to_csr` | Internal outgoing CSR routing graph; new version-2 files embed an artifact-pair ID. |
+| `.devicegraph` | `device_to_routing_graph` | Version-4 persistent device-wide CSR, node/PIP metadata, lookup tables, representative route-end coordinates, and base vertex costs. Version 3 remains readable with synthesized midpoint coordinates and unit costs. |
+| `.csrbin` | `interchange_to_csr` | Internal outgoing CSR routing graph. Version 3 embeds the pair ID plus route-end X/Y, base vertex costs, and a `uint32` post-filter edge permutation grouped by destination tile with a missing-coordinate spill shard. |
 | `.csrbin.ifmeta.bin` | `interchange_to_csr` | Version-6 metadata sidecar with the matching pair ID, declared node/edge counts, string table, PIP data, site pins, logical summaries, and route requests. Redundant device-wide node columns remain available in `.devicegraph` and are no longer copied into each design sidecar. |
 | `.csrbin.ifmeta.bin.generation` | `interchange_to_csr` | Canonical pair ID sampled around reads; must match both binary headers. |
 | `.routes.jsonl` | `pathfinder` | One pair-ID-bound JSON object per net containing sources, sinks, and selected PIP edges. |
@@ -598,15 +628,16 @@ Useful wrapper options:
 
 CSR orientation is outgoing-edge: row `u`, column `v` represents directed edge
 `u -> v`. Edge weights are stored as a separate `float` array aligned with
-`colind`; node coordinate ranges and tile/wire type metadata stay in the
-reusable `.devicegraph` instead of being duplicated in every v6 sidecar.
+`colind`; compact route-end coordinates and base costs are copied into CSR v3
+for BF11, while full coordinate ranges and tile/wire type metadata stay in the
+reusable `.devicegraph` instead of being duplicated in metadata v6.
 
-Device-graph format version 3 excludes pseudo-PIPs whose site occupancy cannot
-be represented, retains typed primary/alternate site-pin aliases, records the
-device name for PhysicalNetlist part validation, and rejects ambiguous
-tile/wire mappings. Regenerate every version-1 or version-2 `.devicegraph`
-with the current `device_to_routing_graph`; old caches are rejected
-deliberately.
+Device-graph format version 4 retains version 3's pseudo-PIP, typed alias,
+device-name, and ambiguity rules while adding route-end/base-cost columns.
+Version 3 remains readable; regenerate version-1 or version-2 artifacts, which
+are rejected deliberately. BF11's active-frontier path reads only CSR v3's
+node sidecars; the spatial edge permutation is persisted for a shard-driven
+full-edge implementation and is skipped at BF11 load time today.
 
 ## Testing
 
@@ -656,6 +687,16 @@ g++ -std=c++17 -O2 -pthread \
   -o /tmp/pathfinder_bf10_cpu_stub_test
 
 /tmp/pathfinder_bf10_cpu_stub_test
+```
+
+Host-only BF11 sidecar and spatial-shard policy test:
+
+```bash
+g++ -std=c++17 -O2 -Wall -Wextra -Wpedantic -Werror \
+  CongestionFreeRouting/tests/bf11_sidecar_policy_test.cpp \
+  -o /tmp/bf11_sidecar_policy_test
+
+/tmp/bf11_sidecar_policy_test
 ```
 
 Targeted UnitBFS path diagnostic (requires the normal AMD HIP `pathfinder`
@@ -729,6 +770,19 @@ hipcc -std=c++17 -O2 -pthread -x hip \
   -o /tmp/delta_stepping_hip_test
 
 /tmp/delta_stepping_hip_test
+```
+
+Bounded/dynamic BF11 regression test (requires an AMD HIP system):
+
+```bash
+hipcc -std=c++17 -O2 -pthread -x hip -DBF11_NO_MAIN \
+  -I HIP_kernel/bellman_ford/src \
+  -I CongestionFreeRouting/bellman_ford \
+  CongestionFreeRouting/tests/bf11_bounded_dynamic_hip_test.cpp \
+  CongestionFreeRouting/bellman_ford/bf11.cpp \
+  -o /tmp/bf11_bounded_dynamic_hip_test
+
+/tmp/bf11_bounded_dynamic_hip_test
 ```
 
 Python route-writer regression test:
@@ -849,13 +903,15 @@ output, and computes the benchmark score.
 - A cached `.devicegraph` records a semantic format version, content
   fingerprint, bounds policy, and device name; conversion rejects a
   PhysicalNetlist for a different part. CSR/metadata publication is guarded
-  against concurrent converters and process interruption. New CSR v2,
+  against concurrent converters and process interruption. New CSR v3,
   metadata v6, generation, and route records carry one pair ID and supported
-  readers require equality. Coherent CSR v1/metadata v4 pairs without a
-  generation remain readable as explicitly legacy/unverified input; mixed
-  legacy/current files fail. Pair IDs are provenance tokens rather than content
-  checksums, and this remains a fail-closed protocol rather than a durable
-  multi-file filesystem transaction across power loss.
+  readers require equality. CSR v2 remains readable with its pair ID, and
+  coherent CSR v1/metadata v4 pairs without a generation remain readable as
+  explicitly legacy/unverified input; bounded BF11 specifically requires v3
+  sidecars unless `--bf11-unbounded` is selected. Mixed legacy/current files
+  fail. Pair IDs are provenance tokens rather than content checksums, and this
+  remains a fail-closed protocol rather than a durable multi-file filesystem
+  transaction across power loss.
 - C++ reconstruction compares its route pair ID and ordered source/sink/node
   identities with the metadata. The current benchmark Python wrapper also
   checks the metadata/generation/route ID chain. Both C++ and Python

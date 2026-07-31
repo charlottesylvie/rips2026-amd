@@ -127,6 +127,20 @@ def positive_int_arg(value: str) -> int:
     return numeric
 
 
+def nonnegative_i32_arg(value: str) -> int:
+    try:
+        numeric = int(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(
+            "value must be a nonnegative 32-bit integer"
+        ) from exc
+    if numeric < 0 or numeric > (1 << 31) - 1:
+        raise argparse.ArgumentTypeError(
+            "value must be a nonnegative 32-bit integer"
+        )
+    return numeric
+
+
 def default_schema_dir() -> Path | None:
     env_schema = os.environ.get("FPGA_INTERCHANGE_SCHEMA_DIR")
     if env_schema:
@@ -182,7 +196,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     engine = parser.add_mutually_exclusive_group()
     engine.add_argument(
         "--sssp-engine",
-        choices=("unit-bfs", "delta-step", "bellman-ford"),
+        choices=("unit-bfs", "delta-step", "bellman-ford", "bf11"),
         help="shortest-path backend forwarded to PathFinder",
     )
     engine.add_argument(
@@ -241,7 +255,32 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument(
         "--max-sssp-iters",
         type=int,
-        help="delta-step rounds or unit-BFS depth cap",
+        help="SSSP round/depth cap",
+    )
+    parser.add_argument(
+        "--bf11-unbounded",
+        action="store_true",
+        help="disable BF11 automatic endpoint bounding",
+    )
+    parser.add_argument(
+        "--bf11-bbox-margin-x",
+        type=nonnegative_i32_arg,
+        help="nonnegative BF11 horizontal bounding margin",
+    )
+    parser.add_argument(
+        "--bf11-bbox-margin-y",
+        type=nonnegative_i32_arg,
+        help="nonnegative BF11 vertical bounding margin",
+    )
+    parser.add_argument(
+        "--bf11-target-check-interval",
+        type=positive_int_arg,
+        help="positive BF11 device target-check interval",
+    )
+    parser.add_argument(
+        "--bf11-no-unbounded-fallback",
+        action="store_true",
+        help="do not retry an unreachable bounded BF11 query unbounded",
     )
     parser.add_argument(
         "--capacity",
@@ -299,6 +338,16 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
             "delta-specific options require --sssp-engine delta-step or "
             "--use-delta-step"
         )
+    bf11_selected = args.sssp_engine == "bf11"
+    bf11_specific_controls = (
+        args.bf11_unbounded
+        or args.bf11_bbox_margin_x is not None
+        or args.bf11_bbox_margin_y is not None
+        or args.bf11_target_check_interval is not None
+        or args.bf11_no_unbounded_fallback
+    )
+    if bf11_specific_controls and not bf11_selected:
+        parser.error("BF11-specific options require --sssp-engine bf11")
     if args.delta_multiplier is not None and args.delta != "auto":
         parser.error("--delta-multiplier requires --delta auto")
     if args.delta_controller_batch_size is not None and (
@@ -335,6 +384,10 @@ def pathfinder_args(args: argparse.Namespace) -> list[str]:
         forwarded.append("--delta-telemetry")
     if args.delta_force_legacy_parent:
         forwarded.append("--delta-force-legacy-parent")
+    if args.bf11_unbounded:
+        forwarded.append("--bf11-unbounded")
+    if args.bf11_no_unbounded_fallback:
+        forwarded.append("--bf11-no-unbounded-fallback")
     for attr, option in (
         ("sssp_engine", "--sssp-engine"),
         ("delta", "--delta"),
@@ -343,6 +396,9 @@ def pathfinder_args(args: argparse.Namespace) -> list[str]:
         ("delta_controller_batch_size", "--delta-controller-batch-size"),
         ("delta_benchmark_weights", "--delta-benchmark-weights"),
         ("delta_benchmark_weight_seed", "--delta-benchmark-weight-seed"),
+        ("bf11_bbox_margin_x", "--bf11-bbox-margin-x"),
+        ("bf11_bbox_margin_y", "--bf11-bbox-margin-y"),
+        ("bf11_target_check_interval", "--bf11-target-check-interval"),
         ("max_pathfinder_iters", "--max-pathfinder-iters"),
         ("max_sssp_iters", "--max-sssp-iters"),
         ("capacity", "--capacity"),

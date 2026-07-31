@@ -488,7 +488,7 @@ void write_minimal_csr_fixture(
   out.write(magic, sizeof(magic));
   write_fixture_u64(out, version);
   write_fixture_u64(out, 2);
-  if (version == 2) {
+  if (version >= 2) {
     const auto value = id.value_or(
         routing::interchange::InterchangeArtifactPairId{});
     write_fixture_u64(out, value.high);
@@ -502,8 +502,29 @@ void write_minimal_csr_fixture(
   write_fixture_u64(out, 2);  // rowptr count
   write_fixture_u64(out, 0);  // colind count
   write_fixture_u64(out, 0);  // values count
+  if (version >= 3) {
+    write_fixture_u64(out, 1);  // route-end x count
+    write_fixture_u64(out, 1);  // route-end y count
+    write_fixture_u64(out, 1);  // base vertex cost count
+    write_fixture_u64(out, 0);  // signed spatial minimum x
+    write_fixture_u64(out, 0);  // signed spatial minimum y
+    write_fixture_u64(out, 1);  // spatial width
+    write_fixture_u64(out, 1);  // spatial height
+    write_fixture_u64(out, 3);  // regular + spill + terminal offset
+    write_fixture_u64(out, 0);  // spatial edge-id count
+  }
   const std::int64_t rowptr[2] = {0, 0};
   out.write(reinterpret_cast<const char*>(rowptr), sizeof(rowptr));
+  if (version >= 3) {
+    const std::int32_t route_end = 0;
+    const float base_cost = 1.0f;
+    const std::uint64_t shard_offsets[3] = {0, 0, 0};
+    out.write(reinterpret_cast<const char*>(&route_end), sizeof(route_end));
+    out.write(reinterpret_cast<const char*>(&route_end), sizeof(route_end));
+    out.write(reinterpret_cast<const char*>(&base_cost), sizeof(base_cost));
+    out.write(reinterpret_cast<const char*>(shard_offsets),
+              sizeof(shard_offsets));
+  }
 }
 
 void write_minimal_metadata_fixture(
@@ -561,6 +582,36 @@ void test_interchange_artifact_pair_loaders() {
   routing::interchange::require_matching_interchange_pair_ids(
       csr_id, loaded_metadata.artifact_pair_id, pair);
 
+  write_minimal_csr_fixture(csr, 3, pair);
+  routing::interchange::RoutingCsrSidecars csr_sidecars;
+  csr_id.reset();
+  const HostCsrF32 graph_v3 =
+      routing::load_csrbin(csr, &csr_id, &csr_sidecars);
+  require(graph_v3.rows == 1 && graph_v3.nnz == 0 && csr_id == pair &&
+              csr_sidecars.route_end_x == std::vector<std::int32_t>({0}) &&
+              csr_sidecars.route_end_y == std::vector<std::int32_t>({0}) &&
+              csr_sidecars.base_vertex_cost == std::vector<float>({1.0f}) &&
+              csr_sidecars.spatial_edges.width == 1 &&
+              csr_sidecars.spatial_edges.height == 1 &&
+              csr_sidecars.spatial_edges.offsets ==
+                  std::vector<std::uint64_t>({0, 0, 0}) &&
+              csr_sidecars.spatial_edges.edge_ids.empty(),
+          "CSR v3 routing sidecars did not load exactly");
+  routing::interchange::RoutingCsrSidecars node_sidecars_only;
+  (void)routing::load_csrbin(csr, &csr_id, &node_sidecars_only, false);
+  require(node_sidecars_only.route_end_x ==
+              std::vector<std::int32_t>({0}) &&
+              node_sidecars_only.route_end_y ==
+                  std::vector<std::int32_t>({0}) &&
+              node_sidecars_only.base_vertex_cost ==
+                  std::vector<float>({1.0f}) &&
+              node_sidecars_only.spatial_edges.offsets.empty() &&
+              node_sidecars_only.spatial_edges.edge_ids.empty(),
+          "CSR v3 node-only loading unexpectedly materialized spatial shards");
+  // A graph-only caller may skip the optional payload without materializing
+  // graph-sized geometry or shard arrays.
+  (void)routing::load_csrbin(csr, &csr_id);
+
   write_minimal_csr_fixture(csr, 1, std::nullopt);
   write_minimal_metadata_fixture(metadata, 4, std::nullopt);
   csr_id = pair;
@@ -595,6 +646,18 @@ void test_interchange_artifact_pair_loaders() {
             pair, std::nullopt, pair);
       },
       "mixed legacy/current artifact pair was accepted");
+
+  write_minimal_csr_fixture(csr, 3, pair);
+  std::filesystem::resize_file(csr, std::filesystem::file_size(csr) - 1);
+  require_failure(
+      [&] { (void)routing::load_csrbin(csr); },
+      "graph-only CSR loading accepted a truncated v3 spatial payload");
+  require_failure(
+      [&] {
+        routing::interchange::RoutingCsrSidecars node_sidecars;
+        (void)routing::load_csrbin(csr, nullptr, &node_sidecars, false);
+      },
+      "node-only CSR loading accepted a truncated v3 spatial payload");
 
   write_minimal_csr_fixture(csr, 2, std::nullopt);
   require_failure(
@@ -1412,6 +1475,8 @@ BellmanFordCsrResult BellmanFord10CsrWorkspace::run(
              progress_callback,
              progress_user_data);
 }
+
+#include "bf11_pathfinder_cpu_stub.inc"
 
 struct DeltaSteppingCsrGraph::Impl {
   explicit Impl(const HostCsrF32& adjacency) : graph(adjacency) {}

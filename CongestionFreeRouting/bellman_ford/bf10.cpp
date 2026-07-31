@@ -1615,8 +1615,9 @@ using DeviceOffset = rips_sssp_bf10::DeviceOffset;
 constexpr char CSR_MAGIC[8] = {'R', 'I', 'P', 'S', 'C', 'S', 'R', '1'};
 constexpr char METADATA_MAGIC[8] = {'R', 'I', 'P', 'S', 'I', 'F', 'M', '1'};
 constexpr std::uint64_t MIN_CSR_VERSION = 1;
-constexpr std::uint64_t CURRENT_CSR_VERSION = 2;
+constexpr std::uint64_t CURRENT_CSR_VERSION = 3;
 constexpr std::uint64_t ARTIFACT_PAIR_CSR_VERSION = 2;
+constexpr std::uint64_t ROUTING_SIDECAR_CSR_VERSION = 3;
 constexpr std::uint64_t MIN_METADATA_VERSION = 3;
 constexpr std::uint64_t CURRENT_METADATA_VERSION = 6;
 constexpr std::uint64_t NODE_PHYSICAL_METADATA_VERSION = 4;
@@ -1758,7 +1759,7 @@ std::uint64_t checked_byte_count(std::uint64_t count,
 }
 
 // CPU helper. Inputs: binary stream, byte count, field name. Output: stream advanced.
-// Purpose: skip metadata sections bf10 does not need.
+// Purpose: skip binary sections this standalone driver does not need.
 void skip_bytes(std::ifstream& in, std::uint64_t count, const char* name) {
   if (count == 0) return;
   if (count > static_cast<std::uint64_t>(std::numeric_limits<std::streamoff>::max())) {
@@ -1922,7 +1923,7 @@ HostOutgoingCsrF32 load_outgoing_csrbin(const std::filesystem::path& path) {
   const std::uint64_t orientation = read_u64(in, "outgoing CSR orientation");
   if (version < MIN_CSR_VERSION || version > CURRENT_CSR_VERSION) {
     throw std::runtime_error(
-        "unsupported RIPSCSR1 format version (expected version 1 or 2)");
+        "unsupported RIPSCSR1 format version (expected version 1, 2, or 3)");
   }
   if (orientation != EXPECTED_OUTGOING_EDGE_ORIENTATION) {
     throw std::runtime_error(
@@ -1954,6 +1955,28 @@ HostOutgoingCsrF32 load_outgoing_csrbin(const std::filesystem::path& path) {
       read_u64(in, "outgoing CSR colind count");
   const std::uint64_t values_count = read_u64(in, "outgoing CSR values count");
 
+  std::uint64_t route_end_x_count = 0;
+  std::uint64_t route_end_y_count = 0;
+  std::uint64_t base_vertex_cost_count = 0;
+  std::uint64_t spatial_width = 0;
+  std::uint64_t spatial_height = 0;
+  std::uint64_t spatial_offset_count = 0;
+  std::uint64_t spatial_edge_id_count = 0;
+  if (version >= ROUTING_SIDECAR_CSR_VERSION) {
+    route_end_x_count = read_u64(in, "outgoing CSR route-end X count");
+    route_end_y_count = read_u64(in, "outgoing CSR route-end Y count");
+    base_vertex_cost_count =
+        read_u64(in, "outgoing CSR base vertex cost count");
+    (void)read_u64(in, "outgoing CSR spatial shard minimum X");
+    (void)read_u64(in, "outgoing CSR spatial shard minimum Y");
+    spatial_width = read_u64(in, "outgoing CSR spatial shard width");
+    spatial_height = read_u64(in, "outgoing CSR spatial shard height");
+    spatial_offset_count =
+        read_u64(in, "outgoing CSR spatial shard offset count");
+    spatial_edge_id_count =
+        read_u64(in, "outgoing CSR spatial shard edge ID count");
+  }
+
   if (rows == 0 || rows != cols) {
     throw std::runtime_error("outgoing CSR graph must be nonempty and square");
   }
@@ -1975,6 +1998,26 @@ HostOutgoingCsrF32 load_outgoing_csrbin(const std::filesystem::path& path) {
     throw std::runtime_error(
         "outgoing CSR rowptr/colind/values counts are inconsistent");
   }
+  if (version >= ROUTING_SIDECAR_CSR_VERSION) {
+    if (route_end_x_count != rows || route_end_y_count != rows ||
+        base_vertex_cost_count != rows || spatial_edge_id_count != nnz) {
+      throw std::runtime_error(
+          "outgoing CSR routing sidecar counts are inconsistent");
+    }
+    if ((spatial_width == 0) != (spatial_height == 0) ||
+        (spatial_width != 0 &&
+         spatial_height >
+             std::numeric_limits<std::uint64_t>::max() / spatial_width)) {
+      throw std::runtime_error(
+          "outgoing CSR spatial shard dimensions are invalid");
+    }
+    const std::uint64_t regular_shards = spatial_width * spatial_height;
+    if (regular_shards > std::numeric_limits<std::uint64_t>::max() - 2 ||
+        spatial_offset_count != regular_shards + 2) {
+      throw std::runtime_error(
+          "outgoing CSR spatial shard offset count is inconsistent");
+    }
+  }
 
   HostOutgoingCsrF32 graph;
   graph.rows = static_cast<Offset>(rows);
@@ -1984,6 +2027,30 @@ HostOutgoingCsrF32 load_outgoing_csrbin(const std::filesystem::path& path) {
   read_array(in, graph.rowptr, rowptr_count, "outgoing CSR rowptr");
   read_array(in, graph.to, colind_count, "outgoing CSR colind destinations");
   read_array(in, graph.values, values_count, "outgoing CSR values");
+
+  if (version >= ROUTING_SIDECAR_CSR_VERSION) {
+    skip_bytes(in,
+               checked_byte_count(route_end_x_count, sizeof(std::int32_t),
+                                  "outgoing CSR route-end X values"),
+               "outgoing CSR route-end X values");
+    skip_bytes(in,
+               checked_byte_count(route_end_y_count, sizeof(std::int32_t),
+                                  "outgoing CSR route-end Y values"),
+               "outgoing CSR route-end Y values");
+    skip_bytes(in,
+               checked_byte_count(base_vertex_cost_count, sizeof(float),
+                                  "outgoing CSR base vertex costs"),
+               "outgoing CSR base vertex costs");
+    skip_bytes(in,
+               checked_byte_count(spatial_offset_count, sizeof(std::uint64_t),
+                                  "outgoing CSR spatial shard offsets"),
+               "outgoing CSR spatial shard offsets");
+    skip_bytes(in,
+               checked_byte_count(spatial_edge_id_count,
+                                  sizeof(std::uint32_t),
+                                  "outgoing CSR spatial shard edge IDs"),
+               "outgoing CSR spatial shard edge IDs");
+  }
 
   if (graph.rowptr.front() != 0 || graph.rowptr.back() != graph.nnz) {
     throw std::runtime_error(

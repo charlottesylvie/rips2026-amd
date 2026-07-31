@@ -200,6 +200,40 @@ HostCsrF32 make_three_net_overlap_graph() {
   return graph;
 }
 
+routing::interchange::RoutingCsrSidecars make_routing_sidecars(
+    const HostCsrF32& graph) {
+  routing::interchange::RoutingCsrSidecars sidecars;
+  const std::size_t vertex_count = static_cast<std::size_t>(graph.rows);
+  sidecars.route_end_x.resize(vertex_count);
+  sidecars.route_end_y.assign(vertex_count, 0);
+  sidecars.base_vertex_cost.assign(vertex_count, 1.0f);
+  for (std::size_t node = 0; node < vertex_count; ++node) {
+    sidecars.route_end_x[node] = static_cast<std::int32_t>(node);
+  }
+
+  auto& shards = sidecars.spatial_edges;
+  shards.width = vertex_count;
+  shards.height = vertex_count == 0 ? 0 : 1;
+  std::vector<std::uint64_t> counts(vertex_count + 1, 0);
+  for (const int destination : graph.colind) {
+    ++counts[static_cast<std::size_t>(destination)];
+  }
+  shards.offsets.resize(counts.size() + 1, 0);
+  for (std::size_t shard = 0; shard < counts.size(); ++shard) {
+    shards.offsets[shard + 1] = shards.offsets[shard] + counts[shard];
+  }
+  shards.edge_ids.resize(static_cast<std::size_t>(graph.nnz));
+  std::vector<std::uint64_t> cursors(shards.offsets.begin(),
+                                     shards.offsets.end() - 1);
+  for (std::size_t edge = 0; edge < graph.colind.size(); ++edge) {
+    const std::size_t shard =
+        static_cast<std::size_t>(graph.colind[edge]);
+    shards.edge_ids[static_cast<std::size_t>(cursors[shard]++)] =
+        static_cast<std::uint32_t>(edge);
+  }
+  return sidecars;
+}
+
 routing::RoutingMetadata make_metadata() {
   routing::RoutingMetadata metadata;
   metadata.strings = {"net0",      "SRC_SITE", "SRC_PIN", "SINK_SITE_0",
@@ -402,6 +436,8 @@ BellmanFordCsrResult BellmanFord10CsrWorkspace::run(
              progress_callback,
              progress_user_data);
 }
+
+#include "bf11_pathfinder_cpu_stub.inc"
 
 struct DeltaSteppingCsrGraph::Impl {
   explicit Impl(const HostCsrF32& adjacency) : graph(adjacency) {}
@@ -926,6 +962,68 @@ int main() {
   require(g_unit_bfs_calls == 0,
           "explicit Bellman-Ford routing should not call unit BFS");
 
+  const routing::interchange::RoutingCsrSidecars bf11_sidecars =
+      make_routing_sidecars(congestion_graph);
+  routing::PathfinderOptions bf11_options = parallel_options;
+  bf11_options.sssp_engine = routing::SsspEngine::kBellmanFord11;
+  const routing::PathfinderResult bf11_result = routing::run_pathfinder(
+      congestion_graph,
+      congestion_metadata,
+      bf11_options,
+      nullptr,
+      nullptr,
+      &bf11_sidecars);
+  require(bf11_result.routed,
+          "bounded BF11 should route with CSR v3 sidecars");
+  require(bf11_result.nets[0].sinks[0].nodes ==
+              std::vector<int>({0, 2, 4}) &&
+              bf11_result.nets[1].sinks[0].nodes ==
+                  std::vector<int>({1, 2, 5}),
+          "bounded BF11 should preserve compact route paths");
+
+  routing::interchange::RoutingCsrSidecars weighted_bf11_sidecars =
+      bf11_sidecars;
+  weighted_bf11_sidecars.base_vertex_cost =
+      {1.0f, 1.0f, 2.0f, 100.0f, 3.0f, 4.0f};
+  const routing::PathfinderResult weighted_bf11_result =
+      routing::run_pathfinder(congestion_graph,
+                              congestion_metadata,
+                              bf11_options,
+                              nullptr,
+                              nullptr,
+                              &weighted_bf11_sidecars);
+  require(weighted_bf11_result.routed &&
+              weighted_bf11_result.nets[0].sinks[0].distance == 5.0f &&
+              weighted_bf11_result.nets[0].sinks[0].edges.size() == 2 &&
+              weighted_bf11_result.nets[0].sinks[0].edges[0].cost == 2.0f &&
+              weighted_bf11_result.nets[0].sinks[0].edges[1].cost == 3.0f &&
+              weighted_bf11_result.nets[1].sinks[0].distance == 6.0f &&
+              weighted_bf11_result.nets[1].sinks[0].edges.size() == 2 &&
+              weighted_bf11_result.nets[1].sinks[0].edges[0].cost == 2.0f &&
+              weighted_bf11_result.nets[1].sinks[0].edges[1].cost == 4.0f,
+          "PathFinder must retain BF11 effective destination costs");
+
+  bool bounded_legacy_bf11_rejected = false;
+  try {
+    (void)routing::run_pathfinder(congestion_graph,
+                                  congestion_metadata,
+                                  bf11_options,
+                                  nullptr);
+  } catch (const std::runtime_error&) {
+    bounded_legacy_bf11_rejected = true;
+  }
+  require(bounded_legacy_bf11_rejected,
+          "bounded BF11 should reject a legacy CSR without route sidecars");
+
+  bf11_options.bf11_bounds_enabled = false;
+  const routing::PathfinderResult legacy_bf11_result =
+      routing::run_pathfinder(congestion_graph,
+                              congestion_metadata,
+                              bf11_options,
+                              nullptr);
+  require(legacy_bf11_result.routed,
+          "explicit unbounded BF11 should remain usable with a legacy CSR");
+
   const std::filesystem::path bellman_ford_routes_path =
       "/tmp/congestion_free_bellman_ford_routes.jsonl";
   routing::write_routes_jsonl(bellman_ford_routes_path,
@@ -962,6 +1060,11 @@ int main() {
   require(std::string(routing::sssp_engine_name(
               routing::SsspEngine::kBellmanFord)) == "bellman-ford",
           "Bellman-Ford engine should have a stable display name");
+  require(routing::parse_sssp_engine_arg("bf11") ==
+              routing::SsspEngine::kBellmanFord11 &&
+              std::string(routing::sssp_engine_name(
+                  routing::SsspEngine::kBellmanFord11)) == "bf11",
+          "BF11 engine selection should parse and display canonically");
 
   routing::PathfinderOptions auto_worker_options = parallel_options;
   auto_worker_options.parallel_net_workers = 0;

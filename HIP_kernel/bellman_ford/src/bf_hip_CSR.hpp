@@ -37,6 +37,10 @@ struct BellmanFordCsrResult {
   std::vector<int> target_edge_offsets;
   std::vector<int> target_path_nodes;
   std::vector<minplus_sparse::Offset> target_path_edges;
+  // Optional effective costs aligned one-for-one with target_path_edges.
+  // Engines whose traversal weights differ from the immutable CSR values
+  // populate this so routing adapters do not silently report raw-edge costs.
+  std::vector<float> target_path_edge_costs;
 };
 
 struct HostCsrF32 {

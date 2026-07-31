@@ -1,6 +1,7 @@
 #include "pathfinder.hpp"
 
 #include "bellman_ford/bf10.hpp"
+#include "bellman_ford/bf11.hpp"
 #include "delta_stepping/delta_stepping_hip_CSR.hpp"
 #include "interchange/import_policy.hpp"
 #include "profiling/roctx_ranges.hpp"
@@ -11,17 +12,18 @@
 // This keeps the same benchmark-facing and route JSON APIs, but the routing
 // pass intentionally ignores present/historical congestion.  The default
 // engine uses a unit-weight GPU BFS specialized for the converter's unit
-// routing graph. GPU delta-stepping and Bellman-Ford bf10 remain selectable for
-// comparison.
+// routing graph. GPU delta-stepping, reference BF10, and bounded dynamic-cost
+// BF11 remain selectable for weighted routing and comparison.
 //
 // Example GPU build from the repository root:
-//   hipcc -std=c++17 -O3 -x hip -DBF10_NO_MAIN \
+//   hipcc -std=c++17 -O3 -x hip -DBF10_NO_MAIN -DBF11_NO_MAIN \
 //     -I HIP_kernel/bellman_ford/src \
 //     -I CongestionFreeRouting/bellman_ford \
 //     -I CongestionFreeRouting/delta_stepping \
 //     -I CongestionFreeRouting/unit_bfs \
 //     CongestionFreeRouting/pathfinder.cpp \
 //     CongestionFreeRouting/bellman_ford/bf10.cpp \
+//     CongestionFreeRouting/bellman_ford/bf11.cpp \
 //     CongestionFreeRouting/delta_stepping/delta_stepping_hip_CSR.cpp \
 //     CongestionFreeRouting/unit_bfs/unit_bfs_hip_CSR.cpp \
 //     -pthread \
@@ -57,7 +59,8 @@ namespace {
 constexpr char CSR_MAGIC[8] = {'R', 'I', 'P', 'S', 'C', 'S', 'R', '1'};
 constexpr char METADATA_MAGIC[8] = {'R', 'I', 'P', 'S', 'I', 'F', 'M', '1'};
 constexpr std::uint64_t LEGACY_CSR_VERSION = 1;
-constexpr std::uint64_t CURRENT_CSR_VERSION = 2;
+constexpr std::uint64_t PAIRED_CSR_VERSION = 2;
+constexpr std::uint64_t CURRENT_CSR_VERSION = 3;
 constexpr std::uint64_t LEGACY_METADATA_VERSION = 4;
 constexpr std::uint64_t FIRST_PAIRED_METADATA_VERSION = 5;
 constexpr std::uint64_t CURRENT_METADATA_VERSION = 6;
@@ -90,6 +93,15 @@ static_assert(std::is_trivially_copyable<SitePinNodeDisk>::value,
 
 std::uint64_t read_u64(std::ifstream& in, const char* name) {
   std::uint64_t value = 0;
+  in.read(reinterpret_cast<char*>(&value), sizeof(value));
+  if (!in) {
+    throw std::runtime_error(std::string("failed while reading ") + name);
+  }
+  return value;
+}
+
+std::int64_t read_i64(std::ifstream& in, const char* name) {
+  std::int64_t value = 0;
   in.read(reinterpret_cast<char*>(&value), sizeof(value));
   if (!in) {
     throw std::runtime_error(std::string("failed while reading ") + name);
@@ -348,6 +360,19 @@ void validate_options(const PathfinderOptions& options) {
   }
   if (options.capacity <= 0) {
     throw std::invalid_argument("capacity must be positive");
+  }
+
+  if (options.bf11_bbox_margin_x < 0 || options.bf11_bbox_margin_y < 0) {
+    throw std::invalid_argument("BF11 bounding-box margins must be nonnegative");
+  }
+  if (options.bf11_target_check_interval <= 0) {
+    throw std::invalid_argument(
+        "BF11 target-check interval must be positive");
+  }
+  if (options.sssp_engine != SsspEngine::kBellmanFord11 &&
+      options.bf11_controls_explicit) {
+    throw std::invalid_argument(
+        "BF11 controls require --sssp-engine bf11");
   }
 }
 
@@ -865,11 +890,17 @@ bool extract_routed_sink_candidate(
       !sssp.target_distances.empty() || !sssp.target_sources.empty() ||
       !sssp.target_path_offsets.empty() ||
       !sssp.target_edge_offsets.empty() ||
-      !sssp.target_path_nodes.empty() || !sssp.target_path_edges.empty();
+      !sssp.target_path_nodes.empty() || !sssp.target_path_edges.empty() ||
+      !sssp.target_path_edge_costs.empty();
 
   if (has_compact_target_paths) {
     if (target_pos >= target_count) {
       throw std::out_of_range("route target position is outside SSSP result");
+    }
+    if (!sssp.target_path_edge_costs.empty() &&
+        sssp.target_path_edge_costs.size() != sssp.target_path_edges.size()) {
+      throw std::runtime_error(
+          "SSSP returned compact edge costs with inconsistent size");
     }
     const float distance = sssp.target_distances[target_pos];
     if (!std::isfinite(distance)) {
@@ -941,8 +972,15 @@ bool extract_routed_sink_candidate(
           graph.colind[static_cast<std::size_t>(csr_edge)] != to) {
         throw std::runtime_error("SSSP compact path contains an invalid CSR edge");
       }
-      candidate->edges.push_back(
-          {from, to, csr_edge, graph.values[static_cast<std::size_t>(csr_edge)]});
+      const float path_cost = sssp.target_path_edge_costs.empty()
+                                  ? graph.values[static_cast<std::size_t>(csr_edge)]
+                                  : sssp.target_path_edge_costs[
+                                        static_cast<std::size_t>(edge_index)];
+      if (!std::isfinite(path_cost) || path_cost < 0.0f) {
+        throw std::runtime_error(
+            "SSSP compact path contains an invalid effective edge cost");
+      }
+      candidate->edges.push_back({from, to, csr_edge, path_cost});
     }
     candidate->distance = routed_path_cost(*candidate);
     trim_routed_sink_to_tree(*candidate, tree_seen, tree_stamp);
@@ -1077,7 +1115,8 @@ RoutedNet route_net(const HostCsrF32& graph,
       delta_telemetry->push_back(std::move(initial_telemetry));
     }
     const bool initial_paths_certified =
-        options.sssp_engine != SsspEngine::kBellmanFord ||
+        (options.sssp_engine != SsspEngine::kBellmanFord &&
+         options.sssp_engine != SsspEngine::kBellmanFord11) ||
         initial_sssp.stopped_on_target || initial_sssp.converged;
 
     for (std::size_t target_pos = 0;
@@ -2060,6 +2099,10 @@ SsspEngine parse_sssp_engine_arg(const char* text) {
       value == "bf9" || value == "bf10") {
     return SsspEngine::kBellmanFord;
   }
+  if (value == "bf11" || value == "bellman-ford-11" ||
+      value == "bellman_ford_11") {
+    return SsspEngine::kBellmanFord11;
+  }
   throw std::runtime_error("invalid sssp-engine: " + value);
 }
 
@@ -2071,6 +2114,8 @@ const char* sssp_engine_name(SsspEngine engine) {
       return "delta-step";
     case SsspEngine::kBellmanFord:
       return "bellman-ford";
+    case SsspEngine::kBellmanFord11:
+      return "bf11";
   }
   return "unknown";
 }
@@ -2080,13 +2125,20 @@ void print_usage(const char* program) {
       << "Usage:\n"
       << "  " << program << " <graph.csrbin> [metadata.ifmeta.bin] [options]\n\n"
       << "Options:\n"
-      << "  --sssp-engine <unit-bfs|delta-step|bellman-ford|bf10>\n"
+      << "  --sssp-engine <unit-bfs|delta-step|bellman-ford|bf10|bf11>\n"
       << "                                  Shortest-path backend. bellman-ford and bf10 select BF10;\n"
-      << "                                  bf8 and bf9 are compatibility aliases. Default: unit-bfs\n"
+      << "                                  bf11 selects bounded dynamic-cost BF11; bf8/bf9 are compatibility aliases.\n"
+      << "                                  Default: unit-bfs\n"
       << "  --use-delta-step                Use delta-step backend for comparison.\n"
       << "  --delta <float|auto>            Delta-stepping bucket width. Default: 1\n"
       << "  --delta-multiplier <float>      Positive sweep multiplier for --delta auto. Default: 1\n"
       << "  --max-sssp-iters <int>          Delta rounds, BFS depth, or Bellman-Ford rounds; -1 for default.\n"
+      << "  --bf11-unbounded                Disable BF11 automatic endpoint bounding.\n"
+      << "  --bf11-bbox-margin-x <int>      Nonnegative BF11 horizontal margin. Default: 3\n"
+      << "  --bf11-bbox-margin-y <int>      Nonnegative BF11 vertical margin. Default: 15\n"
+      << "  --bf11-target-check-interval <int>\n"
+      << "                                  Positive device-side target-check interval. Default: 1\n"
+      << "  --bf11-no-unbounded-fallback    Do not retry an unreachable bounded query unbounded.\n"
       << "  --delta-force-generic           Bypass exact-unit specialization; retain weights and delta.\n"
       << "  --delta-force-legacy-parent     Force generic Delta predecessor recovery for A/B comparison.\n"
       << "  --delta-controller <host-checked|reduced-round-trip>\n"
@@ -2115,7 +2167,9 @@ void print_usage(const char* program) {
 
 HostCsrF32 load_csrbin(
     const std::filesystem::path& path,
-    std::optional<interchange::InterchangeArtifactPairId>* artifact_pair_id) {
+    std::optional<interchange::InterchangeArtifactPairId>* artifact_pair_id,
+    interchange::RoutingCsrSidecars* routing_sidecars,
+    bool load_spatial_edge_shards) {
   std::ifstream in(path, std::ios::binary);
   if (!in) {
     throw std::runtime_error("could not open CSR file: " + path.string());
@@ -2129,7 +2183,7 @@ HostCsrF32 load_csrbin(
 
   const std::uint64_t version = read_u64(in, "CSR format version");
   const std::uint64_t orientation = read_u64(in, "CSR orientation");
-  if (version != LEGACY_CSR_VERSION && version != CURRENT_CSR_VERSION) {
+  if (version < LEGACY_CSR_VERSION || version > CURRENT_CSR_VERSION) {
     throw std::runtime_error("unsupported CSR format version");
   }
   if (orientation != EXPECTED_OUTGOING_EDGE_ORIENTATION) {
@@ -2137,7 +2191,7 @@ HostCsrF32 load_csrbin(
   }
 
   std::optional<interchange::InterchangeArtifactPairId> parsed_pair_id;
-  if (version == CURRENT_CSR_VERSION) {
+  if (version >= PAIRED_CSR_VERSION) {
     interchange::InterchangeArtifactPairId id;
     id.high = read_u64(in, "CSR artifact pair id high");
     id.low = read_u64(in, "CSR artifact pair id low");
@@ -2156,6 +2210,27 @@ HostCsrF32 load_csrbin(
   const std::uint64_t colind_count = read_u64(in, "CSR colind count");
   const std::uint64_t values_count = read_u64(in, "CSR values count");
 
+  std::uint64_t route_x_count = 0;
+  std::uint64_t route_y_count = 0;
+  std::uint64_t base_cost_count = 0;
+  std::int64_t spatial_min_x = 0;
+  std::int64_t spatial_min_y = 0;
+  std::uint64_t spatial_width = 0;
+  std::uint64_t spatial_height = 0;
+  std::uint64_t spatial_offset_count = 0;
+  std::uint64_t spatial_edge_id_count = 0;
+  if (version >= CURRENT_CSR_VERSION) {
+    route_x_count = read_u64(in, "CSR route-end x count");
+    route_y_count = read_u64(in, "CSR route-end y count");
+    base_cost_count = read_u64(in, "CSR base vertex cost count");
+    spatial_min_x = read_i64(in, "CSR spatial shard minimum x");
+    spatial_min_y = read_i64(in, "CSR spatial shard minimum y");
+    spatial_width = read_u64(in, "CSR spatial shard width");
+    spatial_height = read_u64(in, "CSR spatial shard height");
+    spatial_offset_count = read_u64(in, "CSR spatial shard offset count");
+    spatial_edge_id_count = read_u64(in, "CSR spatial shard edge-id count");
+  }
+
   if (rows == 0 || rows != cols) {
     throw std::runtime_error("CSR graph must be nonempty and square");
   }
@@ -2167,6 +2242,32 @@ HostCsrF32 load_csrbin(
   if (rowptr_count != rows + 1 || colind_count != nnz || values_count != nnz) {
     throw std::runtime_error("CSR header counts are inconsistent");
   }
+  if (version >= CURRENT_CSR_VERSION) {
+    if (route_x_count != rows || route_y_count != rows ||
+        base_cost_count != rows || spatial_edge_id_count != nnz) {
+      throw std::runtime_error("CSR routing sidecar counts are inconsistent");
+    }
+    if (spatial_min_x < std::numeric_limits<std::int32_t>::min() ||
+        spatial_min_x > std::numeric_limits<std::int32_t>::max() ||
+        spatial_min_y < std::numeric_limits<std::int32_t>::min() ||
+        spatial_min_y > std::numeric_limits<std::int32_t>::max()) {
+      throw std::runtime_error("CSR spatial shard origin exceeds int32 range");
+    }
+    if ((spatial_width == 0) != (spatial_height == 0) ||
+        (spatial_width != 0 &&
+         spatial_height >
+             std::numeric_limits<std::uint64_t>::max() / spatial_width)) {
+      throw std::runtime_error("CSR spatial shard grid dimensions are invalid");
+    }
+    const std::uint64_t regular_shards = spatial_width * spatial_height;
+    if (regular_shards >
+            interchange::maximum_dense_spatial_cells(
+                static_cast<std::size_t>(rows)) ||
+        regular_shards > std::numeric_limits<std::uint64_t>::max() - 2 ||
+        spatial_offset_count != regular_shards + 2) {
+      throw std::runtime_error("CSR spatial shard offset count is inconsistent");
+    }
+  }
 
   HostCsrF32 graph;
   graph.rows = static_cast<minplus_sparse::Offset>(rows);
@@ -2175,9 +2276,62 @@ HostCsrF32 load_csrbin(
   read_array(in, graph.rowptr, rowptr_count, "CSR rowptr");
   read_array(in, graph.colind, colind_count, "CSR colind");
   read_array(in, graph.values, values_count, "CSR values");
+
+  interchange::RoutingCsrSidecars parsed_sidecars;
+  if (version >= CURRENT_CSR_VERSION) {
+    if (routing_sidecars != nullptr) {
+      read_array(in, parsed_sidecars.route_end_x, route_x_count,
+                 "CSR route-end x coordinates");
+      read_array(in, parsed_sidecars.route_end_y, route_y_count,
+                 "CSR route-end y coordinates");
+      read_array(in, parsed_sidecars.base_vertex_cost, base_cost_count,
+                 "CSR base vertex costs");
+      if (load_spatial_edge_shards) {
+        parsed_sidecars.spatial_edges.min_x =
+            static_cast<std::int32_t>(spatial_min_x);
+        parsed_sidecars.spatial_edges.min_y =
+            static_cast<std::int32_t>(spatial_min_y);
+        parsed_sidecars.spatial_edges.width = spatial_width;
+        parsed_sidecars.spatial_edges.height = spatial_height;
+        read_array(in, parsed_sidecars.spatial_edges.offsets,
+                   spatial_offset_count, "CSR spatial shard offsets");
+        read_array(in, parsed_sidecars.spatial_edges.edge_ids,
+                   spatial_edge_id_count, "CSR spatial shard edge IDs");
+      } else {
+        skip_array<std::uint64_t>(in, spatial_offset_count,
+                                  "CSR spatial shard offsets");
+        skip_array<std::uint32_t>(in, spatial_edge_id_count,
+                                  "CSR spatial shard edge IDs");
+      }
+      if (load_spatial_edge_shards) {
+        interchange::validate_destination_spatial_edge_shards(
+            parsed_sidecars, static_cast<std::size_t>(rows), graph.colind);
+      } else {
+        interchange::validate_routing_csr_sidecars(
+            parsed_sidecars,
+            static_cast<std::size_t>(rows),
+            static_cast<std::size_t>(nnz),
+            false);
+      }
+    } else {
+      skip_array<std::int32_t>(in, route_x_count,
+                               "CSR route-end x coordinates");
+      skip_array<std::int32_t>(in, route_y_count,
+                               "CSR route-end y coordinates");
+      skip_array<float>(in, base_cost_count, "CSR base vertex costs");
+      skip_array<std::uint64_t>(in, spatial_offset_count,
+                                "CSR spatial shard offsets");
+      skip_array<std::uint32_t>(in, spatial_edge_id_count,
+                                "CSR spatial shard edge IDs");
+    }
+  }
+  require_position_within_file(in, "CSR payload");
   validate_csr(graph);
   if (artifact_pair_id != nullptr) {
     *artifact_pair_id = parsed_pair_id;
+  }
+  if (routing_sidecars != nullptr) {
+    *routing_sidecars = std::move(parsed_sidecars);
   }
   return graph;
 }
@@ -2466,7 +2620,9 @@ PathfinderResult run_pathfinder(const HostCsrF32& base_graph,
                                 const RoutingMetadata& metadata,
                                 const PathfinderOptions& options,
                                 hipStream_t stream,
-                                UnitBfsPathDiagnostic* unit_bfs_diagnostic) {
+                                UnitBfsPathDiagnostic* unit_bfs_diagnostic,
+                                const interchange::RoutingCsrSidecars*
+                                    routing_sidecars) {
   PATHFINDER_PROFILE_RANGE("pathfinder.run");
   validate_options(options);
   int automatic_delta_wavefront_size = 0;
@@ -2487,6 +2643,19 @@ PathfinderResult run_pathfinder(const HostCsrF32& base_graph,
         options.delta_multiplier);
   } else {
     validate_csr_shape(base_graph);
+  }
+  if (options.sssp_engine == SsspEngine::kBellmanFord11 &&
+      routing_sidecars != nullptr &&
+      (!routing_sidecars->route_end_x.empty() ||
+       !routing_sidecars->route_end_y.empty() ||
+       !routing_sidecars->base_vertex_cost.empty() ||
+       !routing_sidecars->spatial_edges.offsets.empty() ||
+       !routing_sidecars->spatial_edges.edge_ids.empty())) {
+    interchange::validate_routing_csr_sidecars(
+        *routing_sidecars,
+        static_cast<std::size_t>(base_graph.rows),
+        static_cast<std::size_t>(base_graph.nnz),
+        !routing_sidecars->spatial_edges.offsets.empty());
   }
   const std::size_t metadata_node_count =
       metadata.declared_node_count != 0
@@ -2735,6 +2904,67 @@ PathfinderResult run_pathfinder(const HostCsrF32& base_graph,
           result.nets,
           [shared_graph](hipStream_t worker_stream) {
             return BellmanFord10CsrWorkspace(shared_graph, worker_stream);
+          });
+      break;
+    }
+    case SsspEngine::kBellmanFord11: {
+      std::cout << "[pathfinder] selected bounded dynamic-cost BF11 backend\n";
+      const bool has_routing_sidecars =
+          routing_sidecars != nullptr &&
+          !routing_sidecars->route_end_x.empty();
+      if (!has_routing_sidecars && options.bf11_bounds_enabled) {
+        throw std::runtime_error(
+            "bounded BF11 requires CSR v3 route-end sidecars; regenerate the "
+            "CSR or pass --bf11-unbounded for a legacy artifact");
+      }
+
+      std::shared_ptr<BellmanFord11CsrGraph> shared_graph;
+      if (has_routing_sidecars) {
+        shared_graph = std::make_shared<BellmanFord11CsrGraph>(
+            base_graph, *routing_sidecars, stream);
+      } else {
+        BellmanFord11NodeSidecars legacy_sidecars;
+        legacy_sidecars.route_end_x.assign(
+            static_cast<std::size_t>(base_graph.rows),
+            interchange::kMissingRouteCoordinate);
+        legacy_sidecars.route_end_y.assign(
+            static_cast<std::size_t>(base_graph.rows),
+            interchange::kMissingRouteCoordinate);
+        legacy_sidecars.base_vertex_costs.assign(
+            static_cast<std::size_t>(base_graph.rows), 1.0f);
+        shared_graph = std::make_shared<BellmanFord11CsrGraph>(
+            base_graph, legacy_sidecars, stream);
+      }
+
+      PathfinderOptions bf11_options = options;
+      if (bf11_options.parallel_net_workers == 0) {
+        // BF11 keeps one graph-sized distance/frontier/cost epoch per worker.
+        // Preserve GPU memory for the persistent controller by default.
+        bf11_options.parallel_net_workers = 1;
+        std::cout << "[pathfinder] auto-selected 1 BF11 worker(s)\n";
+      }
+      BellmanFord11WorkspaceOptions workspace_options;
+      workspace_options.auto_bounds = bf11_options.bf11_bounds_enabled;
+      workspace_options.auto_margin_x =
+          static_cast<std::int32_t>(bf11_options.bf11_bbox_margin_x);
+      workspace_options.auto_margin_y =
+          static_cast<std::int32_t>(bf11_options.bf11_bbox_margin_y);
+      workspace_options.unbounded_fallback =
+          bf11_options.bf11_bounds_enabled &&
+          bf11_options.bf11_unbounded_fallback;
+      workspace_options.target_check_interval =
+          bf11_options.bf11_target_check_interval;
+      route_all_nets_with_workspace(
+          base_graph,
+          metadata,
+          bf11_options,
+          stream,
+          route_request_count,
+          progress_interval,
+          result.nets,
+          [shared_graph, workspace_options](hipStream_t worker_stream) {
+            return BellmanFord11CsrWorkspace(
+                shared_graph, worker_stream, workspace_options);
           });
       break;
     }
@@ -3067,6 +3297,25 @@ int main(int argc, char** argv) {
       } else if (option == "--max-sssp-iters") {
         options.max_sssp_iterations =
             routing::parse_int_arg(require_value("--max-sssp-iters"), "max-sssp-iters");
+      } else if (option == "--bf11-unbounded") {
+        options.bf11_bounds_enabled = false;
+        options.bf11_controls_explicit = true;
+      } else if (option == "--bf11-bbox-margin-x") {
+        options.bf11_bbox_margin_x = routing::parse_int_arg(
+            require_value("--bf11-bbox-margin-x"), "bf11-bbox-margin-x");
+        options.bf11_controls_explicit = true;
+      } else if (option == "--bf11-bbox-margin-y") {
+        options.bf11_bbox_margin_y = routing::parse_int_arg(
+            require_value("--bf11-bbox-margin-y"), "bf11-bbox-margin-y");
+        options.bf11_controls_explicit = true;
+      } else if (option == "--bf11-target-check-interval") {
+        options.bf11_target_check_interval = routing::parse_int_arg(
+            require_value("--bf11-target-check-interval"),
+            "bf11-target-check-interval");
+        options.bf11_controls_explicit = true;
+      } else if (option == "--bf11-no-unbounded-fallback") {
+        options.bf11_unbounded_fallback = false;
+        options.bf11_controls_explicit = true;
       } else if (option == "--delta-force-legacy-parent") {
         options.delta_force_legacy_parent = true;
       } else if (option == "--delta-force-generic") {
@@ -3195,11 +3444,19 @@ int main(int argc, char** argv) {
 
     std::optional<routing::interchange::InterchangeArtifactPairId>
         csr_artifact_pair_id;
+    routing::interchange::RoutingCsrSidecars routing_sidecars;
+    routing::interchange::RoutingCsrSidecars* routing_sidecars_output =
+        options.sssp_engine == routing::SsspEngine::kBellmanFord11
+            ? &routing_sidecars
+            : nullptr;
     std::cout << "[pathfinder] loading CSR..." << std::flush;
     const auto csr_load_started = std::chrono::steady_clock::now();
     HostCsrF32 graph = [&]() {
       PATHFINDER_PROFILE_RANGE("pathfinder.load_csr");
-      return routing::load_csrbin(csr_path, &csr_artifact_pair_id);
+      return routing::load_csrbin(csr_path,
+                                  &csr_artifact_pair_id,
+                                  routing_sidecars_output,
+                                  false);
     }();
     std::cout << " done ("
               << std::chrono::duration<double>(
@@ -3275,7 +3532,8 @@ int main(int argc, char** argv) {
             metadata,
             options,
             nullptr,
-            diagnose_unit_bfs ? &unit_bfs_diagnostic : nullptr);
+            diagnose_unit_bfs ? &unit_bfs_diagnostic : nullptr,
+            routing_sidecars_output);
 
     if (diagnose_unit_bfs) {
       std::cout << routing::unit_bfs_path_diagnostic_json(

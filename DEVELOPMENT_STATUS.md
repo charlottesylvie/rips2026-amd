@@ -1,8 +1,8 @@
 # GPU SSSP Development Status
 
-Updated 2026-07-27 for the bounded UnitBFS/classic-Delta optimization pass,
-the optional reduced-round-trip Delta controller, and the FPGA Interchange
-import correctness audit.
+Updated 2026-07-31 for bounded dynamic-cost BF11, CSR v3 spatial sidecars,
+devicegraph v4, the bounded UnitBFS/classic-Delta optimization pass, and the
+FPGA Interchange import correctness audit.
 All GPU changes below are implemented but HIP-unvalidated.
 
 This file is the concise source of truth for landed work, confidence, and the
@@ -18,7 +18,10 @@ telemetry definitions belong in
 The production graph has exact unit weights, so UnitBFS is the default and the
 most relevant routing backend. Classic Delta-Stepping is the retained backend
 for arbitrary nonnegative weights and for controlled comparisons on the same
-CSR. Bellman--Ford/BF10 remains a reference and fallback.
+CSR. Bellman--Ford/BF10 remains a reference and fallback. BF11 is the new
+weighted-routing prototype: one true multi-source active-frontier traversal,
+inclusive endpoint bounding, frozen factorized destination costs, and
+device-controlled target certification.
 
 The optimization scope is UnitBFS and classic Delta-Stepping. A separate
 Near/Far scheduler is not planned. Reusable ideas such as degree-aware edge
@@ -44,7 +47,7 @@ throughput, so the real multi-sink result remains provisional.
 | Area | Current implementation |
 | --- | --- |
 | Routing adapter | One batched original-source search per net, compact source-rooted paths, last-tree-intersection trimming, deterministic parent-conflict rejection, and a critical-path-inflation regression. |
-| Interchange import | Truly source-less OOC signals are preserved but excluded from route completion. RapidWright's exact `GLOBAL_USEDNET` sentinel and GND/VCC physical nets are supported preservation-only state: their represented resources are blocked and their original physical-net records remain structurally unchanged, without creating UnitBFS/Delta work. Unsupported partial/shape signal work is preserved and reported, then rejected by default unless diagnostic-only opt-in is explicit. Fixed routes reserve pins, stub nodes, both PIP endpoints, and xcvu3p's paired static SLICEL/SLICEM outputs. Device-graph v3 uses active typed alternate-site mappings, validates the physical part, rejects ambiguous lookups, duplicate physical names, and cross-net endpoint ownership, excludes unserializable pseudo-PIPs, makes non-source sinks terminal, and removes incoming edges to exclusive sources while retaining their outgoing rows. Source/stub analysis retains scratch high-water capacity, and the blocked/exclusive destination union restores one destination-mask read per filtered edge. The one-time preprocessor avoids duplicate device-string/wire lookup storage and compacts row offsets in place. Logical name-only links are emitted only when globally unambiguous. New CSR v2/metadata v6 outputs embed one 128-bit pair ID, publish it in the generation sidecar, and propagate it to routes; guarded readers reject mixed or stale artifacts. Metadata v6 retains declared counts while omitting seven unused device-wide node arrays (40 bytes per node); v4/v5 remain readable. |
+| Interchange import | Truly source-less OOC signals are preserved but excluded from route completion. RapidWright's exact `GLOBAL_USEDNET` sentinel and GND/VCC physical nets are supported preservation-only state: their represented resources are blocked and their original physical-net records remain structurally unchanged, without creating UnitBFS/Delta work. Unsupported partial/shape signal work is preserved and reported, then rejected by default unless diagnostic-only opt-in is explicit. Fixed routes reserve pins, stub nodes, both PIP endpoints, and xcvu3p's paired static SLICEL/SLICEM outputs. Device-graph v4 retains v3's active typed alternate-site mappings, part/ambiguity/ownership validation, pseudo-PIP exclusion, terminal sinks, and exclusive sources while adding route-end coordinates and base vertex costs; v3 readers synthesize midpoint/unit-cost columns. CSR v3 carries those node sidecars plus a compact `uint32` filtered-edge permutation grouped by destination tile and a missing-coordinate spill shard. Source/stub analysis retains scratch high-water capacity, and the blocked/exclusive destination union restores one destination-mask read per filtered edge. The one-time preprocessor avoids duplicate device-string/wire lookup storage and compacts row offsets in place. Logical name-only links are emitted only when globally unambiguous. CSR v3/metadata v6 outputs embed one 128-bit pair ID, publish it in the generation sidecar, and propagate it to routes; CSR v1/v2 remain readable. Metadata v6 retains declared counts while omitting seven unused device-wide node arrays (40 bytes per node); v4/v5 remain readable. |
 | UnitBFS graph | Shared immutable outgoing CSR. Graph construction validates every edge weight as exactly `1.0f`; normal dispatch therefore already rejects non-unit input. |
 | Shared query capacity | PathFinder derives optional source/target high-water hints from exactly the routed metadata prefix, retaining duplicate endpoint counts. Checked count/byte arithmetic rejects overflow; low-level callers may omit hints. Compact paths are never reserved from graph size. |
 | UnitBFS state | Private stream-affine workspaces, automatic 32-bit row/predecessor-edge offsets when `nnz <= INT32_MAX`, a forced-64-bit test mode, one append-only frontier/visited queue, geometrically retained source/target/metadata/offset/path buffers, and compact validated target paths. Sparse reset remains the default; packed generation-stamped visitation is opt-in and performs a safe full reset on rollover. |
@@ -55,7 +58,7 @@ throughput, so the real multi-sink result remains provisional.
 | Delta parents | Automatic vector-target runs use a compact 64-bit `{distance_bits, original_edge_id}` key and a shared 32-bit edge-to-source map when eligible. Legacy predecessor arrays are lazy fallback state. |
 | Delta modes | Exact-unit specialization for eligible small graphs, compile-time no-parent `run_distances()`, strict distances-only graph storage, exclusive distance bounds, exact-unit automatic width `1 * multiplier`, weighted graph-aware seeding, deterministic weight families, force/controller controls, and opt-in telemetry are implemented. Boolean `in_current` plus its guarded clear remains the default; generation-tagged membership is opt-in and rollover-safe. |
 | Delta capacity | Source/target hints pre-reserve only applicable state. Query and compact-path buffers retain geometric high-water capacity; compact-parent runs avoid legacy predecessor arrays, and strict distances-only storage ignores target/path hints. |
-| Bellman--Ford | BF10 is wired as the Bellman--Ford engine and retained as a reference/fallback, not a current optimization target. |
+| Bellman--Ford | BF10 remains the reference `bellman-ford` engine. BF11 is separately selectable as `bf11`; it protects all roots in one multi-source traversal, gates known destination coordinates inside an inclusive box while admitting spill resources, applies `edge * base[dst] * dynamic[dst]`, serializes cost epochs, checks an exact nonnegative-distance certificate every N rounds, and retries an auto-bounded miss unbounded when enabled. Its cooperative controller has a complete host fallback and emits compact original-edge paths with aligned effective edge costs. |
 
 ## Verification completed in this audit
 
@@ -70,6 +73,7 @@ The following CPU/fake-HIP checks pass on the current macOS checkout with
 - `unit_bfs_policy_test`;
 - `delta_stepping_policy_test`;
 - `device_routing_graph_test`; and
+- `bf11_sidecar_policy_test`; and
 - `interchange_import_policy_test`; and
 - `gzip_io_test`; and
 - `pathfinder_benchmark_writer_test.py`.
@@ -99,7 +103,7 @@ equivalence, callback-style abort/reuse, membership reuse, and rollover.
 `hipcc`, ROCm, and an AMD GPU are unavailable on this host. Consequently the
 production `unit_bfs_hip_CSR.cpp`, `delta_stepping_hip_CSR.cpp`, the linked
 HIP `pathfinder` executable, the standalone `bf8.cpp`, `bf9.cpp`, and
-`bf10.cpp` HIP programs, and every HIP regression translation unit that uses
+`bf10.cpp`/`bf11.cpp` HIP programs, and every HIP regression translation unit that uses
 those implementations remain uncompiled and unexecuted. The Bellman--Ford
 files received fake-HIP preprocessing only. No production speedup or
 GPU-memory reduction has been measured. The exact later-hardware
@@ -164,6 +168,14 @@ Python reconstruction coverage, not a substitute compile claim.
 - Automatic Delta is resolved once by PathFinder. Mutable low-level callers
   must recompute a numeric width after `update_values()` or
   `update_vertex_costs()`.
+- BF11 still clears all V query-state entries. Its active-frontier path does
+  not yet consume CSR v3's spatial edge permutation; PathFinder therefore skips
+  that section at BF11 load time. Cooperative launch support and real speedup
+  remain AMD-validation gates, and the one-shot controller leaves BF11's
+  dynamic multipliers at one even though the low-level full/sparse update API
+  is implemented. Automatic bounds currently cover each batched net request;
+  persistent per-connection box growth across negotiated-congestion iterations
+  remains controller work rather than a claim of this one-shot integration.
 - Interchange reconstruction limitations remain under
   [README caveats](README.md#known-interchange-limitations).
 

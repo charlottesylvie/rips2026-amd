@@ -2,10 +2,12 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cstring>
 #include <cstdint>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <iterator>
 #include <optional>
 #include <stdexcept>
 #include <string>
@@ -121,6 +123,9 @@ ri::DeviceRoutingGraph make_graph() {
   graph.node_max_y = graph.node_min_y;
   graph.node_tile_type_strings.assign(4, tile_type);
   graph.node_wire_type_strings.assign(4, wire_type);
+  graph.node_route_end_x = {0, 4, 1, ri::kMissingRouteCoordinate};
+  graph.node_route_end_y = {0, 6, 2, ri::kMissingRouteCoordinate};
+  graph.node_base_vertex_cost = {1.0f, 1.25f, 2.5f, 4.0f};
 
   graph.pip_data = {
       {wire0, wire1, true},
@@ -153,7 +158,8 @@ ri::DeviceRoutingGraph make_graph() {
 
 void compare_graphs(const ri::DeviceRoutingGraph& expected,
                     const ri::DeviceRoutingGraph& actual,
-                    bool expect_physical_node_arrays = true) {
+                    bool expect_physical_node_arrays = true,
+                    bool expect_routing_sidecars = true) {
   require(actual.device_fingerprint == expected.device_fingerprint,
           "fingerprint changed across roundtrip");
   require(actual.device_path_string == expected.device_path_string,
@@ -192,6 +198,18 @@ void compare_graphs(const ri::DeviceRoutingGraph& expected,
                 actual.node_tile_type_strings.empty() &&
                 actual.node_wire_type_strings.empty(),
             "filtering projection retained physical node arrays");
+  }
+  if (expect_routing_sidecars) {
+    require(actual.node_route_end_x == expected.node_route_end_x &&
+                actual.node_route_end_y == expected.node_route_end_y &&
+                actual.node_base_vertex_cost ==
+                    expected.node_base_vertex_cost,
+            "BF11 node sidecars changed across roundtrip");
+  } else {
+    require(actual.node_route_end_x.empty() &&
+                actual.node_route_end_y.empty() &&
+                actual.node_base_vertex_cost.empty(),
+            "filtering projection retained BF11 node sidecars");
   }
   require(actual.declared_edges == expected.declared_edges &&
               actual.loaded_edges == expected.loaded_edges,
@@ -260,6 +278,71 @@ void compare_graphs(const ri::DeviceRoutingGraph& expected,
           "site-pin lookup changed across roundtrip");
 }
 
+void write_legacy_v3_fixture(const std::filesystem::path& v4_path,
+                             const std::filesystem::path& v3_path,
+                             const ri::DeviceRoutingGraph& graph) {
+  std::ifstream input(v4_path, std::ios::binary);
+  std::vector<char> bytes((std::istreambuf_iterator<char>(input)),
+                          std::istreambuf_iterator<char>());
+  require(static_cast<bool>(input) || input.eof(),
+          "could not read the version-4 device-graph fixture");
+
+  constexpr std::size_t kMagicBytes = 8;
+  constexpr std::size_t kFixedHeaderBytes =
+      kMagicBytes + 17 * sizeof(std::uint64_t);
+  require(bytes.size() >= kFixedHeaderBytes,
+          "version-4 fixture is shorter than its fixed header");
+  const std::uint64_t legacy_version = 3;
+  std::memcpy(bytes.data() + kMagicBytes,
+              &legacy_version,
+              sizeof(legacy_version));
+
+  std::size_t node_arrays_begin = kFixedHeaderBytes;
+  for (const std::string& text : graph.string_table.strings) {
+    node_arrays_begin += sizeof(std::uint64_t) + text.size();
+  }
+  const std::size_t node_count = graph.node_device_ids.size();
+  constexpr std::size_t kLegacyNodeBytes =
+      3 * sizeof(std::uint64_t) + 4 * sizeof(std::int32_t);
+  constexpr std::size_t kRoutingSidecarBytes =
+      2 * sizeof(std::int32_t) + sizeof(float);
+  const std::size_t sidecars_begin =
+      node_arrays_begin + node_count * kLegacyNodeBytes;
+  const std::size_t sidecars_end =
+      sidecars_begin + node_count * kRoutingSidecarBytes;
+  require(sidecars_end <= bytes.size(),
+          "version-4 fixture does not contain complete BF11 sidecars");
+  bytes.erase(bytes.begin() + static_cast<std::ptrdiff_t>(sidecars_begin),
+              bytes.begin() + static_cast<std::ptrdiff_t>(sidecars_end));
+
+  std::ofstream output(v3_path, std::ios::binary | std::ios::trunc);
+  output.write(bytes.data(), static_cast<std::streamsize>(bytes.size()));
+  require(static_cast<bool>(output),
+          "could not write the legacy version-3 fixture");
+}
+
+ri::DeviceRoutingGraph legacy_v3_expectation(
+    const ri::DeviceRoutingGraph& current) {
+  ri::DeviceRoutingGraph expected = current;
+  const auto midpoint = [](std::int32_t minimum, std::int32_t maximum) {
+    if (minimum == ri::kMissingRouteCoordinate &&
+        maximum == ri::kMissingRouteCoordinate) {
+      return ri::kMissingRouteCoordinate;
+    }
+    return static_cast<std::int32_t>(
+        static_cast<std::int64_t>(minimum) +
+        (static_cast<std::int64_t>(maximum) - minimum) / 2);
+  };
+  for (std::size_t node = 0; node < expected.node_device_ids.size(); ++node) {
+    expected.node_route_end_x[node] =
+        midpoint(expected.node_min_x[node], expected.node_max_x[node]);
+    expected.node_route_end_y[node] =
+        midpoint(expected.node_min_y[node], expected.node_max_y[node]);
+  }
+  expected.node_base_vertex_cost.assign(expected.node_device_ids.size(), 1.0f);
+  return expected;
+}
+
 }  // namespace
 
 int main() {
@@ -273,12 +356,21 @@ int main() {
         ("rips-device-graph-test-" + std::to_string(nonce));
     const std::filesystem::path split_path = base.string() + ".split";
     const std::filesystem::path streamed_path = base.string() + ".streamed";
+    const std::filesystem::path version_three_path =
+        base.string() + ".version-three";
     const std::filesystem::path legacy_path = base.string() + ".legacy";
     const std::filesystem::path trailing_path = base.string() + ".trailing";
     const std::filesystem::path projected_truncated_path =
         base.string() + ".projected-truncated";
-    cleanup = {split_path, streamed_path, legacy_path, trailing_path,
-               projected_truncated_path};
+    const std::filesystem::path sidecar_truncated_path =
+        base.string() + ".sidecar-truncated";
+    cleanup = {split_path,
+               streamed_path,
+               version_three_path,
+               legacy_path,
+               trailing_path,
+               projected_truncated_path,
+               sidecar_truncated_path};
 
     const std::filesystem::path staged_one =
         ri::create_unique_staging_path(base.string() + ".output");
@@ -410,13 +502,62 @@ int main() {
     require(rejected_invalid_graph,
             "validation accepted an empty cached device name");
 
+    rejected_invalid_graph = false;
+    try {
+      ri::DeviceRoutingGraph invalid = make_graph();
+      invalid.node_route_end_x.pop_back();
+      ri::validate_device_routing_graph(invalid);
+    } catch (const std::runtime_error&) {
+      rejected_invalid_graph = true;
+    }
+    require(rejected_invalid_graph,
+            "validation accepted a short route-end coordinate column");
+
+    rejected_invalid_graph = false;
+    try {
+      ri::DeviceRoutingGraph invalid = make_graph();
+      invalid.node_route_end_x[0] = ri::kMissingRouteCoordinate;
+      ri::validate_device_routing_graph(invalid);
+    } catch (const std::runtime_error&) {
+      rejected_invalid_graph = true;
+    }
+    require(rejected_invalid_graph,
+            "validation accepted a half-missing route-end coordinate");
+
+    rejected_invalid_graph = false;
+    try {
+      ri::DeviceRoutingGraph invalid = make_graph();
+      invalid.node_base_vertex_cost[0] = 0.0f;
+      ri::validate_device_routing_graph(invalid);
+    } catch (const std::runtime_error&) {
+      rejected_invalid_graph = true;
+    }
+    require(rejected_invalid_graph,
+            "validation accepted a nonpositive base vertex cost");
+
     ri::write_device_routing_graph(expected, split_path);
     const ri::DeviceRoutingGraph split =
         ri::read_device_routing_graph(split_path);
     compare_graphs(expected, split);
     const ri::DeviceRoutingGraph deferred =
         ri::read_device_routing_graph_for_filtering(split_path);
-    compare_graphs(expected, deferred, false);
+    compare_graphs(expected, deferred, false, false);
+    const ri::DeviceRoutingGraph routing_projection =
+        ri::read_device_routing_graph_for_routing(split_path);
+    compare_graphs(expected, routing_projection, false, true);
+
+    write_legacy_v3_fixture(split_path, version_three_path, expected);
+    const ri::DeviceRoutingGraph expected_v3 =
+        legacy_v3_expectation(expected);
+    const ri::DeviceRoutingGraph version_three =
+        ri::read_device_routing_graph(version_three_path);
+    compare_graphs(expected_v3, version_three);
+    const ri::DeviceRoutingGraph version_three_filtering =
+        ri::read_device_routing_graph_for_filtering(version_three_path);
+    compare_graphs(expected_v3, version_three_filtering, false, false);
+    const ri::DeviceRoutingGraph version_three_routing =
+        ri::read_device_routing_graph_for_routing(version_three_path);
+    compare_graphs(expected_v3, version_three_routing, false, true);
 
     // Truncate one byte before the end of the skipped 40-byte/node block.
     // The projection must check the available file extent instead of letting
@@ -446,6 +587,29 @@ int main() {
     }
     require(rejected_projected_truncation,
             "filtering projection accepted a truncated node block");
+
+    std::filesystem::copy_file(
+        split_path, sidecar_truncated_path,
+        std::filesystem::copy_options::overwrite_existing);
+    constexpr std::uintmax_t kLegacyNodeBytes =
+        3 * sizeof(std::uint64_t) + 4 * sizeof(std::int32_t);
+    constexpr std::uintmax_t kRoutingSidecarBytes =
+        2 * sizeof(std::int32_t) + sizeof(float);
+    std::filesystem::resize_file(
+        sidecar_truncated_path,
+        node_arrays_begin +
+            expected.node_device_ids.size() *
+                (kLegacyNodeBytes + kRoutingSidecarBytes) -
+            1);
+    bool rejected_sidecar_truncation = false;
+    try {
+      (void)ri::read_device_routing_graph_for_routing(
+          sidecar_truncated_path);
+    } catch (const std::runtime_error&) {
+      rejected_sidecar_truncation = true;
+    }
+    require(rejected_sidecar_truncation,
+            "routing projection accepted a truncated BF11 sidecar block");
 
     std::filesystem::copy_file(
         split_path, legacy_path,

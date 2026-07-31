@@ -1,5 +1,7 @@
 #pragma once
 
+#include "routing_csr_sidecars.hpp"
+
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
@@ -146,6 +148,15 @@ struct DeviceRoutingGraph {
   std::vector<std::uint64_t> node_tile_type_strings;
   std::vector<std::uint64_t> node_wire_type_strings;
 
+  // BF11-facing static sidecars.  route_end_{x,y} is the representative tile
+  // of the node wire selected for routing metadata, or
+  // kMissingRouteCoordinate for special resources without a physical tile.
+  // base_vertex_cost is factored from mutable negotiated-congestion cost so a
+  // routing epoch can update the latter without rewriting immutable CSR data.
+  std::vector<std::int32_t> node_route_end_x;
+  std::vector<std::int32_t> node_route_end_y;
+  std::vector<float> node_base_vertex_cost;
+
   std::vector<std::int64_t> rowptr;
   std::vector<std::int32_t> colind;
   std::vector<EdgeAttr> edge_attrs;
@@ -173,6 +184,7 @@ struct CsrGraph {
   std::vector<std::int32_t> colind;
   std::vector<float> values;
   std::vector<EdgeAttr> edge_attrs;
+  RoutingCsrSidecars routing_sidecars;
 };
 
 std::uint32_t checked_lookup_string_id(std::uint64_t id);
@@ -214,6 +226,13 @@ DeviceRoutingGraph read_device_routing_graph(
 // filter_device_routing_graph(), avoiding both 40 bytes/node of input and a
 // second scan of every large edge record in the per-design pipeline.
 DeviceRoutingGraph read_device_routing_graph_for_filtering(
+    const std::filesystem::path& path);
+
+// Per-design filtering needs the immutable CSR/lookups plus BF11's compact
+// route-end/cost columns, but not the legacy 40-byte physical-node columns.
+// Version-3 artifacts synthesize representative coordinates from node extents
+// and unit base costs; version 4 reads the authored sidecars directly.
+DeviceRoutingGraph read_device_routing_graph_for_routing(
     const std::filesystem::path& path);
 
 // Standard writer used by tests and tools that already own split arrays.

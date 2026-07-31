@@ -3,6 +3,7 @@
 #include "../HIP_kernel/bellman_ford/src/bf_hip_CSR.hpp"
 #include "delta_stepping/delta_stepping_policy.hpp"
 #include "interchange/import_policy.hpp"
+#include "interchange/routing_csr_sidecars.hpp"
 #include "sssp_query_capacity.hpp"
 
 #include <hip/hip_runtime.h>
@@ -113,6 +114,7 @@ enum class SsspEngine {
   kUnitBfs,
   kDeltaStep,
   kBellmanFord,
+  kBellmanFord11,
 };
 
 struct PathfinderOptions {
@@ -142,6 +144,16 @@ struct PathfinderOptions {
   int delta_controller_batch_size =
       static_cast<int>(kDeltaSteppingCsrRecommendedControllerBatchSize);
   bool delta_controller_controls_explicit = false;
+  // BF11 derives one inclusive query window from the route-end coordinates of
+  // every source/target in the request, then expands it by these nonnegative
+  // margins. The explicit unbounded mode keeps BF11 usable with legacy CSR
+  // artifacts that do not carry spatial sidecars.
+  bool bf11_bounds_enabled = true;
+  int bf11_bbox_margin_x = 3;
+  int bf11_bbox_margin_y = 15;
+  int bf11_target_check_interval = 1;
+  bool bf11_unbounded_fallback = true;
+  bool bf11_controls_explicit = false;
 };
 
 struct PathfinderResult {
@@ -194,7 +206,9 @@ struct UnitBfsPathDiagnostic {
 HostCsrF32 load_csrbin(
     const std::filesystem::path& path,
     std::optional<interchange::InterchangeArtifactPairId>* artifact_pair_id =
-        nullptr);
+        nullptr,
+    interchange::RoutingCsrSidecars* routing_sidecars = nullptr,
+    bool load_spatial_edge_shards = true);
 RoutingMetadata load_interchange_metadata(
     const std::filesystem::path& path,
     InterchangeMetadataLoadMode mode = InterchangeMetadataLoadMode::kFull);
@@ -216,7 +230,9 @@ PathfinderResult run_pathfinder(const HostCsrF32& base_graph,
                                 const RoutingMetadata& metadata,
                                 const PathfinderOptions& options,
                                 hipStream_t stream = nullptr,
-                                UnitBfsPathDiagnostic* unit_bfs_diagnostic = nullptr);
+                                UnitBfsPathDiagnostic* unit_bfs_diagnostic = nullptr,
+                                const interchange::RoutingCsrSidecars*
+                                    routing_sidecars = nullptr);
 
 std::string unit_bfs_path_diagnostic_json(
     const UnitBfsPathDiagnostic& diagnostic);

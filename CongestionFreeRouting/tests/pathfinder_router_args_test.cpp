@@ -98,6 +98,33 @@ int main() {
                                           "--delta-force-generic"}),
             "router did not forward the delta shorthand and force-generic flag");
 
+    const Options bf11 = parse(
+        {"PathFinderFile",
+         "design_unrouted.phys",
+         "design_routed.phys",
+         "--sssp-engine",
+         "bf11",
+         "--bf11-unbounded",
+         "--bf11-bbox-margin-x",
+         "4",
+         "--bf11-bbox-margin-y",
+         "18",
+         "--bf11-target-check-interval",
+         "3",
+         "--bf11-no-unbounded-fallback"});
+    require(bf11.pathfinder_args ==
+                std::vector<std::string>({"--sssp-engine",
+                                          "bf11",
+                                          "--bf11-unbounded",
+                                          "--bf11-bbox-margin-x",
+                                          "4",
+                                          "--bf11-bbox-margin-y",
+                                          "18",
+                                          "--bf11-target-check-interval",
+                                          "3",
+                                          "--bf11-no-unbounded-fallback"}),
+            "router did not preserve BF11 option forwarding");
+
     bool missing_seed_rejected = false;
     try {
       (void)parse({"PathFinderFile",

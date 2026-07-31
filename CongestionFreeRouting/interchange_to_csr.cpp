@@ -90,7 +90,7 @@ static_assert(sizeof(PipDataDisk) == 3 * sizeof(std::uint64_t),
 
 constexpr char CSR_MAGIC[8] = {'R', 'I', 'P', 'S', 'C', 'S', 'R', '1'};
 constexpr char METADATA_MAGIC[8] = {'R', 'I', 'P', 'S', 'I', 'F', 'M', '1'};
-constexpr std::uint64_t CSR_FORMAT_VERSION = 2;
+constexpr std::uint64_t CSR_FORMAT_VERSION = 3;
 // Version 6 keeps the node count but omits the seven 40-byte-per-node physical
 // metadata arrays. No production consumer used their contents, and retaining
 // them made every full-device conversion write more than a GiB of dead data.
@@ -102,6 +102,8 @@ using routing::interchange::EdgeAttr;
 using routing::interchange::InterchangeArtifactPairId;
 using routing::interchange::NodeId;
 using routing::interchange::PipData;
+using routing::interchange::RoutingCsrSidecars;
+using routing::interchange::SpatialEdgeShards;
 using routing::interchange::StringTable;
 using routing::interchange::device_routing_graph_node_count;
 using routing::interchange::filter_device_routing_graph;
@@ -113,8 +115,10 @@ using routing::interchange::kNoIndex;
 using routing::interchange::kNoLogicalNetIndex;
 using routing::interchange::kNoStringIndex;
 using routing::interchange::node_bounds_mode_name;
-using routing::interchange::read_device_routing_graph_for_filtering;
+using routing::interchange::read_device_routing_graph_for_routing;
 using routing::interchange::read_gzip_or_plain_chunks;
+using routing::interchange::validate_destination_spatial_edge_shards;
+using routing::interchange::validate_routing_csr_sidecars;
 
 // FPGAIF stores most names as integer indexes into strList. This cache turns
 // those indexes into std::string once, avoiding repeated Cap'n Proto text copies
@@ -396,6 +400,13 @@ std::uint64_t as_u64(std::int64_t value, const char* name) {
 }
 
 void write_u64(std::ofstream& out, std::uint64_t value, const char* name) {
+  out.write(reinterpret_cast<const char*>(&value), sizeof(value));
+  if (!out) {
+    throw std::runtime_error(std::string("failed while writing ") + name);
+  }
+}
+
+void write_i64(std::ofstream& out, std::int64_t value, const char* name) {
   out.write(reinterpret_cast<const char*>(&value), sizeof(value));
   if (!out) {
     throw std::runtime_error(std::string("failed while writing ") + name);
@@ -1245,17 +1256,37 @@ CsrGraph make_outgoing_csr(RoutingGraph& graph) {
         graph.unavailable_destination_nodes[node] |
         graph.blocked_node[node]);
   }
-  return filter_device_routing_graph(graph, graph.blocked_node,
-                                     graph.sink_node_stops,
-                                     graph.unavailable_destination_nodes);
+  CsrGraph csr = filter_device_routing_graph(
+      graph, graph.blocked_node, graph.sink_node_stops,
+      graph.unavailable_destination_nodes);
+
+  // The routing projection owns only these compact node columns. Move them
+  // into the design-specific CSR artifact after edge filtering rather than
+  // carrying a second graph-sized copy through conversion.
+  csr.routing_sidecars.route_end_x = std::move(graph.node_route_end_x);
+  csr.routing_sidecars.route_end_y = std::move(graph.node_route_end_y);
+  csr.routing_sidecars.base_vertex_cost =
+      std::move(graph.node_base_vertex_cost);
+
+  const std::size_t node_count = static_cast<std::size_t>(csr.rows);
+  const std::size_t edge_count = csr.colind.size();
+  validate_routing_csr_sidecars(csr.routing_sidecars, node_count, edge_count,
+                                false);
+  csr.routing_sidecars.spatial_edges =
+      routing::interchange::build_destination_spatial_edge_shards(
+          csr.routing_sidecars.route_end_x,
+          csr.routing_sidecars.route_end_y,
+          csr.colind);
+  return csr;
 }
 
 void write_csr_graph(const CsrGraph& graph,
                      const InterchangeArtifactPairId& artifact_pair_id,
                      const std::filesystem::path& output_path) {
-  // This binary file intentionally contains only the generic graph structure:
-  // rowptr, colind, and unit weights. FPGA routing names and PIP details live
-  // in the RIPSIFM1 metadata sidecar.
+  // Version 3 keeps the generic outgoing CSR first, then appends immutable
+  // GPU-routing sidecars: representative route-end coordinates, static vertex
+  // costs, and a destination-coordinate spatial edge permutation. FPGA routing
+  // names and PIP details remain in the RIPSIFM1 metadata sidecar.
   if (artifact_pair_id.is_zero()) {
     throw std::runtime_error("cannot write CSR with a zero artifact pair id");
   }
@@ -1275,6 +1306,13 @@ void write_csr_graph(const CsrGraph& graph,
   }
 
   const std::uint64_t nnz = static_cast<std::uint64_t>(graph.values.size());
+  if (graph.rows < 0 || graph.cols < 0) {
+    throw std::runtime_error("cannot write a CSR with negative dimensions");
+  }
+  validate_destination_spatial_edge_shards(
+      graph.routing_sidecars, static_cast<std::size_t>(graph.rows),
+      graph.colind);
+  const SpatialEdgeShards& shards = graph.routing_sidecars.spatial_edges;
   write_u64(out, CSR_FORMAT_VERSION, "format version");
   write_u64(out, OUTGOING_EDGE_ORIENTATION, "orientation");
   write_u64(out, artifact_pair_id.high, "artifact pair id high");
@@ -1290,10 +1328,36 @@ void write_csr_graph(const CsrGraph& graph,
             "colind count");
   write_u64(out, static_cast<std::uint64_t>(graph.values.size()),
             "values count");
+  write_u64(out,
+            static_cast<std::uint64_t>(
+                graph.routing_sidecars.route_end_x.size()),
+            "route-end X count");
+  write_u64(out,
+            static_cast<std::uint64_t>(
+                graph.routing_sidecars.route_end_y.size()),
+            "route-end Y count");
+  write_u64(out,
+            static_cast<std::uint64_t>(
+                graph.routing_sidecars.base_vertex_cost.size()),
+            "base vertex cost count");
+  write_i64(out, shards.min_x, "spatial shard minimum X");
+  write_i64(out, shards.min_y, "spatial shard minimum Y");
+  write_u64(out, shards.width, "spatial shard width");
+  write_u64(out, shards.height, "spatial shard height");
+  write_u64(out, static_cast<std::uint64_t>(shards.offsets.size()),
+            "spatial shard offset count");
+  write_u64(out, static_cast<std::uint64_t>(shards.edge_ids.size()),
+            "spatial shard edge ID count");
 
   write_array(out, graph.rowptr, "rowptr");
   write_array(out, graph.colind, "colind");
   write_array(out, graph.values, "values");
+  write_array(out, graph.routing_sidecars.route_end_x, "route-end X values");
+  write_array(out, graph.routing_sidecars.route_end_y, "route-end Y values");
+  write_array(out, graph.routing_sidecars.base_vertex_cost,
+              "base vertex costs");
+  write_array(out, shards.offsets, "spatial shard offsets");
+  write_array(out, shards.edge_ids, "spatial shard edge IDs");
   finish_output(out, output_path);
 }
 
@@ -1581,7 +1645,7 @@ int main(int argc, char** argv) {
     std::cout << "physical_netlist: " << options.phys_path << "\n";
     std::cout << "logical_netlist: " << options.logical_path << "\n";
     RoutingGraph graph(
-        read_device_routing_graph_for_filtering(options.device_graph_path));
+        read_device_routing_graph_for_routing(options.device_graph_path));
     std::cout << "device_fingerprint: " << graph.device_fingerprint << "\n";
     std::cout << "bounds: X" << graph.bounds.min_x << "..X"
               << graph.bounds.max_x << ", Y" << graph.bounds.min_y << "..Y"
@@ -1678,12 +1742,36 @@ int main(int argc, char** argv) {
                                           "CSR destinations"));
     const std::uint64_t values_bytes = static_cast<std::uint64_t>(
         checked_array_bytes<float>(csr.values.size(), "CSR values"));
+    const std::uint64_t route_x_bytes = static_cast<std::uint64_t>(
+        checked_array_bytes<std::int32_t>(
+            csr.routing_sidecars.route_end_x.size(), "route-end X values"));
+    const std::uint64_t route_y_bytes = static_cast<std::uint64_t>(
+        checked_array_bytes<std::int32_t>(
+            csr.routing_sidecars.route_end_y.size(), "route-end Y values"));
+    const std::uint64_t base_cost_bytes = static_cast<std::uint64_t>(
+        checked_array_bytes<float>(
+            csr.routing_sidecars.base_vertex_cost.size(),
+            "base vertex costs"));
+    const std::uint64_t shard_offset_bytes = static_cast<std::uint64_t>(
+        checked_array_bytes<std::uint64_t>(
+            csr.routing_sidecars.spatial_edges.offsets.size(),
+            "spatial shard offsets"));
+    const std::uint64_t shard_edge_bytes = static_cast<std::uint64_t>(
+        checked_array_bytes<std::uint32_t>(
+            csr.routing_sidecars.spatial_edges.edge_ids.size(),
+            "spatial shard edge IDs"));
     const std::uint64_t attr_bytes = static_cast<std::uint64_t>(
         checked_array_bytes<EdgeAttr>(csr.edge_attrs.size(),
                                       "metadata edge attributes"));
-    const std::uint64_t csr_bytes = checked_add_u64(
+    std::uint64_t csr_bytes = checked_add_u64(
         checked_add_u64(rowptr_bytes, colind_bytes, "CSR byte count"),
         values_bytes, "CSR byte count");
+    for (const std::uint64_t sidecar_bytes :
+         {route_x_bytes, route_y_bytes, base_cost_bytes, shard_offset_bytes,
+          shard_edge_bytes}) {
+      csr_bytes =
+          checked_add_u64(csr_bytes, sidecar_bytes, "CSR byte count");
+    }
     const std::int64_t csr_rows = csr.rows;
     const std::size_t csr_nnz = csr.values.size();
 
@@ -1708,6 +1796,11 @@ int main(int argc, char** argv) {
       release_storage(csr.rowptr);
       release_storage(csr.colind);
       release_storage(csr.values);
+      release_storage(csr.routing_sidecars.route_end_x);
+      release_storage(csr.routing_sidecars.route_end_y);
+      release_storage(csr.routing_sidecars.base_vertex_cost);
+      release_storage(csr.routing_sidecars.spatial_edges.offsets);
+      release_storage(csr.routing_sidecars.spatial_edges.edge_ids);
       write_metadata(graph, csr, artifact_pair_id, staged_metadata_path);
       std::ofstream generation(staged_generation_path,
                                std::ios::binary | std::ios::trunc);

@@ -175,31 +175,37 @@ PATHFINDER_SCHEMA_DIR ?=
 PATHFINDER_SSSP_ENGINE ?= unit-bfs
 PATHFINDER_ARGS ?=
 PATHFINDER_DEVICE_GRAPH ?= xcvu3p.full-poc-base-wire.devicegraph
+PATHFINDER_COMPONENT_BINS := $(PATHFINDER_ROUTER_BIN) $(INTERCHANGE_TO_CSR) $(PATHFINDER_BIN) $(ROUTES_TO_PHYS)
 export INTERCHANGE_TO_CSR PATHFINDER_BIN ROUTES_TO_PHYS
 
 PATHFINDER_GPU_SOURCES := \
 	CongestionFreeRouting/pathfinder.cpp \
 	CongestionFreeRouting/bellman_ford/bf10.cpp \
+	CongestionFreeRouting/bellman_ford/bf11.cpp \
 	CongestionFreeRouting/delta_stepping/delta_stepping_hip_CSR.cpp \
 	CongestionFreeRouting/unit_bfs/unit_bfs_hip_CSR.cpp
 PATHFINDER_GPU_HEADERS := \
 	CongestionFreeRouting/pathfinder.hpp \
+	CongestionFreeRouting/interchange/import_policy.hpp \
+	CongestionFreeRouting/interchange/routing_csr_sidecars.hpp \
 	CongestionFreeRouting/profiling/roctx_ranges.hpp \
+	CongestionFreeRouting/sssp_query_capacity.hpp \
 	$(wildcard CongestionFreeRouting/bellman_ford/*.hpp) \
 	$(wildcard CongestionFreeRouting/delta_stepping/*.hpp) \
 	$(wildcard CongestionFreeRouting/unit_bfs/*.hpp) \
-	HIP_kernel/bellman_ford/src/bf_hip_CSR.hpp
+	HIP_kernel/bellman_ford/src/bf_hip_CSR.hpp \
+	HIP_kernel/minplus_mm/src/minplus_sparse_hip.hpp
 
-# Explicit local binary build recipes. Benchmark output targets deliberately
-# treat the configured executables as caller-managed rather than file
-# prerequisites. Generated FPGA Interchange schemas are not present in every
-# checkout, so converter/reconstructor recipes are available only when their
-# schema directory is supplied explicitly.
+# Rebuild in-tree binaries changed by this repository before timing them.
+# Generated FPGA Interchange schemas are not present in every checkout, so the
+# default converter/reconstructor targets become Make-managed only when their
+# schema directory is supplied explicitly. Helpers at non-default paths remain
+# caller-managed, but all configured executables must exist before routing.
 ./PathFinderFile: CongestionFreeRouting/pathfinder_router.cpp
 	$(PATHFINDER_HOST_CXX) $(PATHFINDER_HOST_FLAGS) $< -o $@
 
 ./pathfinder: $(PATHFINDER_GPU_SOURCES) $(PATHFINDER_GPU_HEADERS)
-	$(PATHFINDER_HIPCC) $(PATHFINDER_HIP_FLAGS) -DBF10_NO_MAIN \
+	$(PATHFINDER_HIPCC) $(PATHFINDER_HIP_FLAGS) -DBF10_NO_MAIN -DBF11_NO_MAIN \
 		-I HIP_kernel/bellman_ford/src \
 		-I CongestionFreeRouting/bellman_ford \
 		-I CongestionFreeRouting/delta_stepping \
@@ -210,7 +216,8 @@ ifneq ($(strip $(PATHFINDER_SCHEMA_DIR)),)
 PATHFINDER_INTERCHANGE_HEADERS := \
 	CongestionFreeRouting/interchange/device_routing_graph.hpp \
 	CongestionFreeRouting/interchange/gzip_io.hpp \
-	CongestionFreeRouting/interchange/import_policy.hpp
+	CongestionFreeRouting/interchange/import_policy.hpp \
+	CongestionFreeRouting/interchange/routing_csr_sidecars.hpp
 PATHFINDER_PHYSICAL_SCHEMA_FILES := \
 	$(PATHFINDER_SCHEMA_DIR)/PhysicalNetlist.capnp.h \
 	$(PATHFINDER_SCHEMA_DIR)/PhysicalNetlist.capnp.c++
@@ -289,7 +296,7 @@ endif
 .PHONY: pathfinder-profile-force
 pathfinder-profile-force:
 
-%_PathFinderFile.phys: %_unrouted.phys %.netlist $(PATHFINDER_DEVICE_GRAPH) $(if $(filter-out none,$(PATHFINDER_PROFILE)),pathfinder-profile-force)
+%_PathFinderFile.phys: %_unrouted.phys %.netlist $(PATHFINDER_DEVICE_GRAPH) $(PATHFINDER_COMPONENT_BINS) $(if $(filter-out none,$(PATHFINDER_PROFILE)),pathfinder-profile-force)
 	(time env PATHFINDER_PROFILE_COMMAND='$(PATHFINDER_PROFILE_COMMAND)' $(PATHFINDER_ROUTER_BIN) $< $@ --logical-netlist $*.netlist --device-graph $(PATHFINDER_DEVICE_GRAPH) --sssp-engine $(PATHFINDER_SSSP_ENGINE) $(PATHFINDER_ARGS)) $(call log_and_or_display,$@.log)
 
 #### END ROUTER RECIPES

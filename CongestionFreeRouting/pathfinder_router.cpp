@@ -191,7 +191,7 @@ void print_usage(const char* program) {
       << "  --routes-to-phys <path>        Route reconstructor. Env: ROUTES_TO_PHYS\n"
       << "  Env PATHFINDER_PROFILE_COMMAND Shell prefix applied only to the inner pathfinder command.\n"
       << "  --strict-routing               Fail instead of writing partial routes.\n"
-      << "  --sssp-engine <unit-bfs|delta-step|bellman-ford>\n"
+      << "  --sssp-engine <unit-bfs|delta-step|bellman-ford|bf11>\n"
       << "                                 Forwarded to pathfinder. Default: unit-bfs\n"
       << "  --use-delta-step               Forwarded to pathfinder for comparison.\n"
       << "  --delta-force-generic          Force generic Delta-Stepping even for exact-unit weights.\n"
@@ -208,6 +208,12 @@ void print_usage(const char* program) {
       << "  --delta-benchmark-weight-seed <nonnegative-int>\n"
       << "                                 Forward a seed; valid only with mixed weights.\n"
       << "  --max-sssp-iters <int>         Forwarded to pathfinder.\n"
+      << "  --bf11-unbounded               Disable automatic BF11 endpoint bounding.\n"
+      << "  --bf11-bbox-margin-x <int>     Forward BF11 horizontal bounding margin.\n"
+      << "  --bf11-bbox-margin-y <int>     Forward BF11 vertical bounding margin.\n"
+      << "  --bf11-target-check-interval <int>\n"
+      << "                                 Forward BF11 device target-check interval.\n"
+      << "  --bf11-no-unbounded-fallback   Keep an unreachable BF11 query bounded.\n"
       << "  --net-limit <count>            Forwarded to pathfinder.\n"
       << "  --parallel-net-workers <count> Forwarded to pathfinder; 0 enables engine-dependent auto-selection.\n"
       << "  --capacity <int>               Forwarded for overuse diagnostics.\n"
@@ -271,7 +277,9 @@ Options parse_args(int argc, char** argv) {
       options.allow_unrouted = false;
     } else if (option == "--use-delta-step" ||
                option == "--delta-force-generic" ||
-               option == "--delta-force-legacy-parent") {
+               option == "--delta-force-legacy-parent" ||
+               option == "--bf11-unbounded" ||
+               option == "--bf11-no-unbounded-fallback") {
       options.pathfinder_args.push_back(option);
     } else if (option == "--delta-telemetry") {
       if (!delta_telemetry) {
@@ -293,6 +301,9 @@ Options parse_args(int argc, char** argv) {
                option == "--delta-multiplier" ||
                option == "--delta-controller" ||
                option == "--delta-controller-batch-size" ||
+               option == "--bf11-bbox-margin-x" ||
+               option == "--bf11-bbox-margin-y" ||
+               option == "--bf11-target-check-interval" ||
                option == "--max-pathfinder-iters" ||
                option == "--max-sssp-iters" ||
                option == "--net-limit" ||

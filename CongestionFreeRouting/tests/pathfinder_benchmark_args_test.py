@@ -82,6 +82,14 @@ def main() -> None:
         "controller controls must remain unset by default",
     )
     require(
+        not defaults.bf11_unbounded
+        and defaults.bf11_bbox_margin_x is None
+        and defaults.bf11_bbox_margin_y is None
+        and defaults.bf11_target_check_interval is None
+        and not defaults.bf11_no_unbounded_fallback,
+        "BF11 controls must remain unset by default",
+    )
+    require(
         benchmark.pathfinder_args(defaults) == [],
         "default wrapper arguments must not select or tune delta-stepping",
     )
@@ -213,6 +221,61 @@ def main() -> None:
     )
     for invalid in ("0", "-1", "1.5", "batch", "2147483648"):
         require_arg_rejected(benchmark.positive_int_arg, invalid)
+    require(
+        benchmark.nonnegative_i32_arg("2147483647") == (1 << 31) - 1,
+        "BF11 margin parser rejected the maximum 32-bit int",
+    )
+    for invalid in ("-1", "1.5", "margin", "2147483648"):
+        require_arg_rejected(benchmark.nonnegative_i32_arg, invalid)
+
+    bf11 = benchmark.parse_args(
+        [
+            "input.phys",
+            "output.phys",
+            "--sssp-engine",
+            "bf11",
+            "--bf11-unbounded",
+            "--bf11-bbox-margin-x",
+            "4",
+            "--bf11-bbox-margin-y",
+            "18",
+            "--bf11-target-check-interval",
+            "3",
+            "--bf11-no-unbounded-fallback",
+        ]
+    )
+    require(
+        benchmark.pathfinder_args(bf11)
+        == [
+            "--bf11-unbounded",
+            "--bf11-no-unbounded-fallback",
+            "--sssp-engine",
+            "bf11",
+            "--bf11-bbox-margin-x",
+            "4",
+            "--bf11-bbox-margin-y",
+            "18",
+            "--bf11-target-check-interval",
+            "3",
+        ],
+        "BF11 controls were not forwarded canonically",
+    )
+
+    for bf11_controls in (
+        ["--bf11-unbounded"],
+        ["--bf11-bbox-margin-x", "4"],
+        ["--bf11-bbox-margin-y", "18"],
+        ["--bf11-target-check-interval", "3"],
+        ["--bf11-no-unbounded-fallback"],
+    ):
+        require_parse_rejected(
+            bf11_controls,
+            "BF11-specific controls were accepted without explicit BF11 selection",
+        )
+        require_parse_rejected(
+            ["--sssp-engine", "unit-bfs", *bf11_controls],
+            "BF11-specific controls were accepted with unit-BFS",
+        )
 
     for delta_controls in (
         ["--delta", "1"],
@@ -247,7 +310,7 @@ def main() -> None:
         ["--sssp-engine", "unit-bfs", "--delta-force-generic"],
         "force-generic was accepted with the unit-BFS engine",
     )
-    for non_delta_engine in ("unit-bfs", "bellman-ford"):
+    for non_delta_engine in ("unit-bfs", "bellman-ford", "bf11"):
         require_parse_rejected(
             ["--sssp-engine", non_delta_engine, "--delta-telemetry"],
             f"delta telemetry was accepted with {non_delta_engine!r}",

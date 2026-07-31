@@ -53,6 +53,7 @@ using routing::interchange::StaticCsrEntry;
 using routing::interchange::checked_lookup_string_id;
 using routing::interchange::create_unique_staging_path;
 using routing::interchange::kInvalidRouteNode;
+using routing::interchange::kMissingRouteCoordinate;
 using routing::interchange::kNoIndex;
 using routing::interchange::kNoStringIndex;
 using routing::interchange::node_bounds_mode_name;
@@ -484,6 +485,9 @@ BuildResult build_device_routing_graph(const Options& options) {
   graph.node_max_y.reserve(node_capacity);
   graph.node_tile_type_strings.reserve(node_capacity);
   graph.node_wire_type_strings.reserve(node_capacity);
+  graph.node_route_end_x.reserve(node_capacity);
+  graph.node_route_end_y.reserve(node_capacity);
+  graph.node_base_vertex_cost.reserve(node_capacity);
 
   // Build the final compact lookup records directly. A separate numeric
   // staging vector held the same key/node triples and briefly doubled this
@@ -567,6 +571,21 @@ BuildResult build_device_routing_graph(const Options& options) {
     graph.node_max_y.push_back(max_y);
 
     const auto metadata_wire = wires[metadata_wire_index];
+    std::int32_t route_end_x = kMissingRouteCoordinate;
+    std::int32_t route_end_y = kMissingRouteCoordinate;
+    if (metadata_wire.getTile() < tile_info.size()) {
+      const TileInfo& route_tile = tile_info[metadata_wire.getTile()];
+      if (route_tile.has_xy) {
+        route_end_x = route_tile.x;
+        route_end_y = route_tile.y;
+      }
+    }
+    graph.node_route_end_x.push_back(route_end_x);
+    graph.node_route_end_y.push_back(route_end_y);
+    // Static cost is deliberately factorized from mutable negotiated
+    // congestion.  Unit cost preserves the current routing objective until a
+    // characterized wire/type cost model replaces it.
+    graph.node_base_vertex_cost.push_back(1.0f);
     std::uint64_t tile_type_string = kNoStringIndex;
     if (metadata_wire.getTile() < tile_info.size()) {
       const std::uint32_t tile_index =
