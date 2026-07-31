@@ -172,12 +172,14 @@ PATHFINDER_HOST_FLAGS ?= -std=c++17 -O2
 PATHFINDER_INTERCHANGE_FLAGS ?= -std=c++17 -O3
 PATHFINDER_INTERCHANGE_LIBS ?= -lcapnp -lkj -lz
 PATHFINDER_SCHEMA_DIR ?=
+PATHFINDER_BUILD_COMPONENTS ?= 0
 PATHFINDER_SSSP_ENGINE ?= unit-bfs
 PATHFINDER_ARGS ?=
 PATHFINDER_DEVICE_GRAPH ?= xcvu3p.full-poc-base-wire.devicegraph
 PATHFINDER_COMPONENT_BINS := $(PATHFINDER_ROUTER_BIN) $(INTERCHANGE_TO_CSR) $(PATHFINDER_BIN) $(ROUTES_TO_PHYS)
 export INTERCHANGE_TO_CSR PATHFINDER_BIN ROUTES_TO_PHYS
 
+ifeq ($(PATHFINDER_BUILD_COMPONENTS),1)
 PATHFINDER_GPU_SOURCES := \
 	CongestionFreeRouting/pathfinder.cpp \
 	CongestionFreeRouting/bellman_ford/bf10.cpp \
@@ -196,14 +198,10 @@ PATHFINDER_GPU_HEADERS := \
 	HIP_kernel/bellman_ford/src/bf_hip_CSR.hpp \
 	HIP_kernel/minplus_mm/src/minplus_sparse_hip.hpp
 
-# Rebuild in-tree binaries changed by this repository before timing them.
-# Generated FPGA Interchange schemas are not present in every checkout, so the
-# default converter/reconstructor targets become Make-managed only when their
-# schema directory is supplied explicitly. Helpers at non-default paths remain
-# caller-managed, but all configured executables must exist before routing.
-./PathFinderFile: CongestionFreeRouting/pathfinder_router.cpp
-	$(PATHFINDER_HOST_CXX) $(PATHFINDER_HOST_FLAGS) $< -o $@
-
+# Source-based rebuilding of the GPU/helper components is opt-in. The
+# contest/setup flow supplies every compiled binary explicitly and leaves
+# PATHFINDER_BUILD_COMPONENTS=0. PathFinderFile is always caller-supplied and
+# never acquires a C++ source dependency from this Makefile.
 ./pathfinder: $(PATHFINDER_GPU_SOURCES) $(PATHFINDER_GPU_HEADERS)
 	$(PATHFINDER_HIPCC) $(PATHFINDER_HIP_FLAGS) -DBF10_NO_MAIN -DBF11_NO_MAIN \
 		-I HIP_kernel/bellman_ford/src \
@@ -255,6 +253,7 @@ PATHFINDER_REFERENCES_SCHEMA_FILES := \
 		CongestionFreeRouting/routes_to_phys.cpp \
 		$(PATHFINDER_SCHEMA_DIR)/PhysicalNetlist.capnp.c++ \
 		$(PATHFINDER_INTERCHANGE_LIBS) -o $@
+endif
 endif
 
 # DeviceResources preprocessing is deliberately outside Make and benchmark

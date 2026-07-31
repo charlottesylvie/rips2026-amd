@@ -29,16 +29,54 @@ def main() -> None:
         fixture_root = Path(directory)
         shutil.copy2(makefile, fixture_root / "Makefile")
 
-        # Materialize only the files Make needs to resolve the benchmark and
-        # in-tree PathFinder rules. The dry run must not need ROCm, generated
-        # schemas, benchmark downloads, or executable fixture contents.
+        # The default copied-Makefile flow owns precompiled binaries only. It
+        # must not resolve repository source paths, ROCm, or generated schemas.
         old = 1_700_000_000
         current = old + 20
         for relative_path in (
             "logicnets_jscl_unrouted.phys",
             "logicnets_jscl.netlist",
             "xcvu3p.full-poc-base-wire.devicegraph",
-            "CongestionFreeRouting/pathfinder_router.cpp",
+        ):
+            write_fixture_file(fixture_root, relative_path, old)
+
+        for relative_path in (
+            "PathFinderFile",
+            "interchange_to_csr",
+            "pathfinder",
+            "routes_to_phys",
+        ):
+            write_fixture_file(fixture_root, relative_path, current)
+
+        precompiled = subprocess.run(
+            [
+                "make",
+                "--dry-run",
+                "PATHFINDER_HIPCC=unexpected-pathfinder-compiler",
+                "logicnets_jscl_PathFinderFile.phys",
+            ],
+            cwd=fixture_root,
+            check=False,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+        )
+        require(
+            precompiled.returncode == 0,
+            "precompiled PathFinder make dry run failed:\n" +
+            precompiled.stdout,
+        )
+        require(
+            "unexpected-pathfinder-compiler" not in precompiled.stdout and
+            "./PathFinderFile logicnets_jscl_unrouted.phys" in
+            precompiled.stdout,
+            "default PathFinder Make flow did not treat binaries as precompiled",
+        )
+
+        # Source-based rebuilds remain available as an explicit in-repository
+        # mode for the GPU/helper components. PathFinderFile itself remains a
+        # caller-supplied binary and must never resolve its C++ source.
+        for relative_path in (
             "CongestionFreeRouting/pathfinder.cpp",
             "CongestionFreeRouting/bellman_ford/bf10.cpp",
             "CongestionFreeRouting/bellman_ford/bf11.cpp",
@@ -54,14 +92,6 @@ def main() -> None:
             "HIP_kernel/minplus_mm/src/minplus_sparse_hip.hpp",
         ):
             write_fixture_file(fixture_root, relative_path, old)
-
-        for relative_path in (
-            "PathFinderFile",
-            "interchange_to_csr",
-            "pathfinder",
-            "routes_to_phys",
-        ):
-            write_fixture_file(fixture_root, relative_path, current)
 
         # Exercise both implementation and cross-directory transitive headers.
         # Each case independently makes only that input newer than ./pathfinder.
@@ -84,6 +114,7 @@ def main() -> None:
                 [
                     "make",
                     "--dry-run",
+                    "PATHFINDER_BUILD_COMPONENTS=1",
                     "PATHFINDER_HIPCC=pathfinder-hipcc-fixture",
                     "logicnets_jscl_PathFinderFile.phys",
                 ],
@@ -123,6 +154,11 @@ def main() -> None:
                 "interchange_to_csr.cpp" not in completed.stdout
                 and "routes_to_phys.cpp" not in completed.stdout,
                 "the dependency check unexpectedly required schema-backed rebuilds"
+                + context,
+            )
+            require(
+                "pathfinder_router.cpp" not in completed.stdout,
+                "PathFinderFile unexpectedly acquired a C++ source dependency"
                 + context,
             )
 
