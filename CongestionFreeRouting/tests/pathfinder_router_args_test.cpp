@@ -111,7 +111,9 @@ int main() {
          "18",
          "--bf11-target-check-interval",
          "3",
-         "--bf11-no-unbounded-fallback"});
+         "--bf11-no-unbounded-fallback",
+         "--bf11-telemetry",
+         "--bf11-telemetry"});
     require(bf11.pathfinder_args ==
                 std::vector<std::string>({"--sssp-engine",
                                           "bf11",
@@ -122,8 +124,13 @@ int main() {
                                           "18",
                                           "--bf11-target-check-interval",
                                           "3",
-                                          "--bf11-no-unbounded-fallback"}),
+                                          "--bf11-no-unbounded-fallback",
+                                          "--bf11-telemetry"}),
             "router did not preserve BF11 option forwarding");
+    require(std::count(bf11.pathfinder_args.begin(),
+                       bf11.pathfinder_args.end(),
+                       "--bf11-telemetry") == 1,
+            "router did not forward BF11 telemetry exactly once");
 
     bool missing_seed_rejected = false;
     try {

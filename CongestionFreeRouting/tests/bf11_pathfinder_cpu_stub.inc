@@ -2,10 +2,53 @@
 // production implementation is HIP-only; CPU PathFinder tests include this
 // after defining their deterministic Dijkstra helpers.
 
-void reset_bellman_ford11_runtime_stats() {}
+std::atomic<std::uint64_t> g_bf11_stub_requested_workers{0};
+std::atomic<std::uint64_t> g_bf11_stub_effective_workers{0};
+std::atomic<std::uint64_t> g_bf11_stub_free_before_workers{0};
+std::atomic<std::uint64_t> g_bf11_stub_workspace_constructions{0};
+std::atomic<std::uint64_t> g_bf11_stub_telemetry_workspaces{0};
+std::atomic<bool> g_bf11_stub_telemetry_enabled{false};
+// Test-only failure injection. Deliberately not cleared by PathFinder's stats
+// reset so a test can arm it before run_pathfinder constructs worker state.
+std::atomic<std::uint64_t> g_bf11_stub_throw_on_workspace_construction{0};
+
+void record_bf11_stub_workspace_construction(bool telemetry) {
+  const std::uint64_t ordinal = ++g_bf11_stub_workspace_constructions;
+  if (ordinal == g_bf11_stub_throw_on_workspace_construction.load()) {
+    throw std::runtime_error("injected BF11 workspace construction failure");
+  }
+  if (telemetry) ++g_bf11_stub_telemetry_workspaces;
+}
+
+void reset_bellman_ford11_runtime_stats() {
+  g_bf11_stub_requested_workers = 0;
+  g_bf11_stub_effective_workers = 0;
+  g_bf11_stub_free_before_workers = 0;
+  g_bf11_stub_workspace_constructions = 0;
+  g_bf11_stub_telemetry_workspaces = 0;
+  g_bf11_stub_telemetry_enabled = false;
+}
+
+void configure_bellman_ford11_runtime_stats(
+    bool telemetry_enabled,
+    std::uint64_t requested_workers,
+    std::uint64_t effective_workers,
+    std::uint64_t gpu_free_before_workers) {
+  g_bf11_stub_telemetry_enabled = telemetry_enabled;
+  g_bf11_stub_requested_workers = requested_workers;
+  g_bf11_stub_effective_workers = effective_workers;
+  g_bf11_stub_free_before_workers = gpu_free_before_workers;
+}
 
 BellmanFord11RuntimeStats bellman_ford11_runtime_stats() {
-  return {};
+  BellmanFord11RuntimeStats stats;
+  stats.telemetry_enabled = g_bf11_stub_telemetry_enabled;
+  stats.requested_workers = g_bf11_stub_requested_workers;
+  stats.effective_workers = g_bf11_stub_effective_workers;
+  stats.workspace_state_initializations =
+      g_bf11_stub_workspace_constructions;
+  stats.gpu_free_before_workers = g_bf11_stub_free_before_workers;
+  return stats;
 }
 
 struct BellmanFord11CsrGraph::Impl {
@@ -58,6 +101,7 @@ BellmanFord11CsrWorkspace::BellmanFord11CsrWorkspace(
   impl_->options = options;
   impl_->dynamic_vertex_cost.assign(static_cast<std::size_t>(adjacency.rows),
                                     1.0f);
+  record_bf11_stub_workspace_construction(options.telemetry);
 }
 
 BellmanFord11CsrWorkspace::BellmanFord11CsrWorkspace(
@@ -72,6 +116,7 @@ BellmanFord11CsrWorkspace::BellmanFord11CsrWorkspace(
   impl_->options = options;
   impl_->dynamic_vertex_cost.assign(static_cast<std::size_t>(adjacency.rows),
                                     1.0f);
+  record_bf11_stub_workspace_construction(options.telemetry);
 }
 
 BellmanFord11CsrWorkspace::BellmanFord11CsrWorkspace(
@@ -87,6 +132,7 @@ BellmanFord11CsrWorkspace::BellmanFord11CsrWorkspace(
   impl_->options = options;
   impl_->dynamic_vertex_cost.assign(
       static_cast<std::size_t>(impl_->graph->graph.rows), 1.0f);
+  record_bf11_stub_workspace_construction(options.telemetry);
 }
 
 BellmanFord11CsrWorkspace::~BellmanFord11CsrWorkspace() = default;

@@ -2,6 +2,7 @@
 
 #include "bellman_ford/bf10.hpp"
 #include "bellman_ford/bf11.hpp"
+#include "bellman_ford/bf11_worker_policy.hpp"
 #include "delta_stepping/delta_stepping_hip_CSR.hpp"
 #include "interchange/import_policy.hpp"
 #include "profiling/roctx_ranges.hpp"
@@ -40,6 +41,7 @@
 #include <chrono>
 #include <cmath>
 #include <cstddef>
+#include <condition_variable>
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
@@ -370,7 +372,7 @@ void validate_options(const PathfinderOptions& options) {
         "BF11 target-check interval must be positive");
   }
   if (options.sssp_engine != SsspEngine::kBellmanFord11 &&
-      options.bf11_controls_explicit) {
+      (options.bf11_controls_explicit || options.bf11_telemetry)) {
     throw std::invalid_argument(
         "BF11 controls require --sssp-engine bf11");
   }
@@ -1533,6 +1535,61 @@ std::size_t recommend_delta_worker_count(minplus_sparse::Offset rows,
 #endif
 }
 
+struct Bf11WorkerRecommendation {
+  bf11_worker_policy::Recommendation policy;
+  std::size_t peak_workspace_device_bytes_estimate = 0;
+  std::size_t free_device_bytes = 0;
+  std::string device_architecture;
+  int compute_unit_count = 0;
+};
+
+Bf11WorkerRecommendation recommend_bf11_worker_count(
+    minplus_sparse::Offset rows,
+    const SsspQueryCapacityHints& capacity_hints,
+    std::size_t route_request_count,
+    hipStream_t stream,
+    bool telemetry_enabled) {
+  Bf11WorkerRecommendation result;
+  if (rows <= 0) return result;
+  result.peak_workspace_device_bytes_estimate =
+      bf11_worker_policy::automatic_worker_device_bytes_estimate(
+          static_cast<std::size_t>(rows), capacity_hints.max_sources,
+          capacity_hints.max_targets, telemetry_enabled);
+
+#if defined(__HIPCC__) || defined(__HIP_PLATFORM_AMD__)
+  std::size_t total_device_bytes = 0;
+  if (hipMemGetInfo(&result.free_device_bytes, &total_device_bytes) !=
+      hipSuccess) {
+    result.free_device_bytes = 0;
+  }
+  (void)total_device_bytes;
+#endif
+
+#if defined(__HIPCC__)
+  int device = 0;
+  hipDeviceProp_t properties{};
+  if (hipGetDevice(&device) == hipSuccess &&
+      hipGetDeviceProperties(&properties, device) == hipSuccess) {
+    result.device_architecture = properties.gcnArchName;
+    result.compute_unit_count = properties.multiProcessorCount;
+  } else {
+    (void)hipGetLastError();
+  }
+#endif
+
+  const std::size_t cpu_threads =
+      std::max<unsigned int>(1, std::thread::hardware_concurrency());
+  result.policy = bf11_worker_policy::recommend(
+      {route_request_count,
+       cpu_threads,
+       result.free_device_bytes,
+       result.peak_workspace_device_bytes_estimate,
+       result.device_architecture,
+       result.compute_unit_count});
+  if (stream != nullptr) result.policy.worker_count = 1;
+  return result;
+}
+
 template <typename WorkspaceFactory>
 void route_all_nets_with_workspace(const HostCsrF32& base_graph,
                                    const RoutingMetadata& metadata,
@@ -1607,8 +1664,24 @@ void route_all_nets_with_workspace(const HostCsrF32& base_graph,
   std::exception_ptr first_exception;
   std::mutex exception_mutex;
   std::mutex progress_mutex;
+  std::mutex workspace_barrier_mutex;
+  std::condition_variable workspace_barrier_cv;
+  std::size_t workspaces_ready = 0;
+  bool workspace_barrier_failed = false;
   std::size_t last_reported = 0;
   const int worker_device = current_worker_device();
+
+  auto signal_worker_failure = [&]() {
+    // Publish the barrier predicate while holding the same mutex used by
+    // wait(). Otherwise a constructor failure can notify between a waiter's
+    // predicate check and unlock, losing the only wakeup.
+    {
+      std::lock_guard<std::mutex> lock(workspace_barrier_mutex);
+      workspace_barrier_failed = true;
+      failed.store(true, std::memory_order_relaxed);
+    }
+    workspace_barrier_cv.notify_all();
+  };
 
   auto report_progress = [&](std::size_t completed) {
     std::lock_guard<std::mutex> lock(progress_mutex);
@@ -1631,6 +1704,23 @@ void route_all_nets_with_workspace(const HostCsrF32& base_graph,
       WorkerStream worker_stream(stream == nullptr);
       hipStream_t local_stream = worker_stream.get(stream);
       auto sssp_workspace = workspace_factory(local_stream);
+      if (options.bf11_telemetry) {
+        // Keep every telemetry-enabled BF11 worker idle until all persistent
+        // workspaces exist. The last constructor can then sample free memory
+        // without earlier workers' demand-grown query buffers muddying the
+        // post-construction measurement. Disabled runs never enter this path.
+        std::unique_lock<std::mutex> lock(workspace_barrier_mutex);
+        ++workspaces_ready;
+        if (workspaces_ready == worker_count) {
+          workspace_barrier_cv.notify_all();
+        } else {
+          workspace_barrier_cv.wait(lock, [&]() {
+            return workspaces_ready == worker_count ||
+                   workspace_barrier_failed;
+          });
+        }
+        if (workspace_barrier_failed) return;
+      }
       std::vector<std::uint32_t> route_tree_seen(
           static_cast<std::size_t>(base_graph.rows), 0);
       std::vector<int> route_parent_by_child(
@@ -1678,7 +1768,7 @@ void route_all_nets_with_workspace(const HostCsrF32& base_graph,
         report_progress(completed);
       }
     } catch (...) {
-      failed.store(true, std::memory_order_relaxed);
+      signal_worker_failure();
       std::lock_guard<std::mutex> lock(exception_mutex);
       if (!first_exception) {
         first_exception = std::current_exception();
@@ -1704,7 +1794,7 @@ void route_all_nets_with_workspace(const HostCsrF32& base_graph,
     // started, those joinable threads must be stopped and joined before the
     // vector is destroyed. Otherwise std::thread::~thread calls terminate()
     // instead of allowing the construction error to reach the caller.
-    failed.store(true, std::memory_order_relaxed);
+    signal_worker_failure();
     join_workers();
     throw;
   }
@@ -2139,6 +2229,7 @@ void print_usage(const char* program) {
       << "  --bf11-target-check-interval <int>\n"
       << "                                  Positive device-side target-check interval. Default: 1\n"
       << "  --bf11-no-unbounded-fallback    Do not retry an unreachable bounded query unbounded.\n"
+      << "  --bf11-telemetry                Emit one aggregate BF11 phase/work/memory telemetry record.\n"
       << "  --delta-force-generic           Bypass exact-unit specialization; retain weights and delta.\n"
       << "  --delta-force-legacy-parent     Force generic Delta predecessor recovery for A/B comparison.\n"
       << "  --delta-controller <host-checked|reduced-round-trip>\n"
@@ -2908,6 +2999,7 @@ PathfinderResult run_pathfinder(const HostCsrF32& base_graph,
       break;
     }
     case SsspEngine::kBellmanFord11: {
+      const auto bf11_backend_started = std::chrono::steady_clock::now();
       std::cout << "[pathfinder] selected bounded dynamic-cost BF11 backend\n";
       reset_bellman_ford11_runtime_stats();
       const bool has_routing_sidecars =
@@ -2938,11 +3030,15 @@ PathfinderResult run_pathfinder(const HostCsrF32& base_graph,
       }
 
       PathfinderOptions bf11_options = options;
+      const std::size_t bf11_requested_worker_count =
+          bf11_options.parallel_net_workers;
+      const Bf11WorkerRecommendation bf11_recommendation =
+          recommend_bf11_worker_count(base_graph.rows, query_capacity_hints,
+                                      route_request_count, stream,
+                                      bf11_options.bf11_telemetry);
       if (bf11_options.parallel_net_workers == 0) {
-        // BF11 keeps one graph-sized distance/frontier/cost epoch per worker.
-        // Preserve GPU memory for the persistent controller by default.
-        bf11_options.parallel_net_workers = 1;
-        std::cout << "[pathfinder] auto-selected 1 BF11 worker(s)\n";
+        bf11_options.parallel_net_workers =
+            bf11_recommendation.policy.worker_count;
       }
       const std::size_t bf11_worker_count =
           stream != nullptr
@@ -2950,6 +3046,30 @@ PathfinderResult run_pathfinder(const HostCsrF32& base_graph,
               : std::min<std::size_t>(
                     bf11_options.parallel_net_workers,
                     std::max<std::size_t>(1, route_request_count));
+      std::cout << "[pathfinder] BF11 workers requested=";
+      if (bf11_requested_worker_count == 0) {
+        std::cout << "auto";
+      } else {
+        std::cout << bf11_requested_worker_count;
+      }
+      std::cout << " selected=" << bf11_worker_count
+                << " peak_workspace_device_bytes_estimate="
+                << bf11_recommendation.peak_workspace_device_bytes_estimate
+                << " free_device_bytes_before_workers="
+                << bf11_recommendation.free_device_bytes;
+      if (!bf11_recommendation.device_architecture.empty()) {
+        std::cout << " architecture="
+                  << bf11_recommendation.device_architecture
+                  << " compute_units="
+                  << bf11_recommendation.compute_unit_count;
+      }
+      std::cout << '\n';
+      configure_bellman_ford11_runtime_stats(
+          bf11_options.bf11_telemetry,
+          static_cast<std::uint64_t>(bf11_requested_worker_count),
+          static_cast<std::uint64_t>(bf11_worker_count),
+          static_cast<std::uint64_t>(
+              bf11_recommendation.free_device_bytes));
       if (bf11_worker_count > 1) {
         std::cout
             << "[pathfinder] BF11 parallel workers use independent explicit "
@@ -2967,6 +3087,7 @@ PathfinderResult run_pathfinder(const HostCsrF32& base_graph,
           bf11_options.bf11_unbounded_fallback;
       workspace_options.target_check_interval =
           bf11_options.bf11_target_check_interval;
+      workspace_options.telemetry = bf11_options.bf11_telemetry;
       route_all_nets_with_workspace(
           base_graph,
           metadata,
@@ -2981,9 +3102,17 @@ PathfinderResult run_pathfinder(const HostCsrF32& base_graph,
           });
       const BellmanFord11RuntimeStats bf11_stats =
           bellman_ford11_runtime_stats();
+      const double bf11_backend_seconds =
+          std::chrono::duration<double>(std::chrono::steady_clock::now() -
+                                        bf11_backend_started)
+              .count();
       std::cout << "{\"type\":\"bf11_runtime_stats\""
-                << ",\"schema_version\":1"
+                << ",\"schema_version\":2"
                 << ",\"workers\":" << bf11_worker_count
+                << ",\"requested_workers\":"
+                << bf11_requested_worker_count
+                << ",\"effective_workers\":" << bf11_worker_count
+                << ",\"routing_seconds\":" << bf11_backend_seconds
                 << ",\"persistent_controller_runs\":"
                 << bf11_stats.persistent_controller_runs
                 << ",\"host_controller_runs\":"
@@ -2997,6 +3126,56 @@ PathfinderResult run_pathfinder(const HostCsrF32& base_graph,
                 << bf11_stats.workspace_state_initializations
                 << ",\"defensive_dense_state_resets\":"
                 << bf11_stats.defensive_dense_state_resets << "}\n";
+      if (bf11_options.bf11_telemetry) {
+        std::cout
+            << "{\"type\":\"bf11_telemetry\",\"schema_version\":1"
+            << ",\"requested_workers\":" << bf11_stats.requested_workers
+            << ",\"effective_workers\":" << bf11_stats.effective_workers
+            << ",\"queries\":" << bf11_stats.telemetry_queries
+            << ",\"completed_queries\":"
+            << bf11_stats.telemetry_completed_queries
+            << ",\"timing_nanoseconds\":{"
+            << "\"total_query_cpu\":"
+            << bf11_stats.total_query_nanoseconds
+            << ",\"reset_seed_gpu\":"
+            << bf11_stats.reset_seed_gpu_nanoseconds
+            << ",\"relaxation_gpu\":"
+            << bf11_stats.relaxation_gpu_nanoseconds
+            << ",\"target_check_gpu\":"
+            << bf11_stats.target_check_gpu_nanoseconds
+            << ",\"iteration_status_copy_gpu\":"
+            << bf11_stats.iteration_status_copy_gpu_nanoseconds
+            << ",\"stream_synchronize_cpu\":"
+            << bf11_stats.stream_synchronize_cpu_nanoseconds
+            << ",\"target_summary_gpu\":"
+            << bf11_stats.target_summary_gpu_nanoseconds
+            << ",\"path_reconstruction_gpu\":"
+            << bf11_stats.path_reconstruction_gpu_nanoseconds
+            << "},\"work\":{"
+            << "\"iterations\":" << bf11_stats.iterations
+            << ",\"frontier_vertices_processed\":"
+            << bf11_stats.frontier_vertices_processed
+            << ",\"edges_examined\":" << bf11_stats.edges_examined
+            << ",\"successful_relaxations\":"
+            << bf11_stats.successful_relaxations
+            << ",\"touched_vertices\":" << bf11_stats.touched_vertices
+            << ",\"maximum_touched_vertices\":"
+            << bf11_stats.maximum_touched_vertices
+            << ",\"maximum_touched_fraction\":"
+            << bf11_stats.maximum_touched_fraction
+            << "},\"memory\":{"
+            << "\"peak_workspace_device_bytes_estimate\":"
+            << bf11_recommendation.peak_workspace_device_bytes_estimate
+            << ","
+            << "\"workspace_device_bytes_total\":"
+            << bf11_stats.workspace_device_bytes_total
+            << ",\"workspace_device_bytes_per_worker_max\":"
+            << bf11_stats.workspace_device_bytes_per_worker_max
+            << ",\"gpu_free_before_workers\":"
+            << bf11_stats.gpu_free_before_workers
+            << ",\"gpu_free_after_workers\":"
+            << bf11_stats.gpu_free_after_workers << "}}\n";
+      }
       break;
     }
   }
@@ -3347,6 +3526,9 @@ int main(int argc, char** argv) {
       } else if (option == "--bf11-no-unbounded-fallback") {
         options.bf11_unbounded_fallback = false;
         options.bf11_controls_explicit = true;
+      } else if (option == "--bf11-telemetry") {
+        options.bf11_telemetry = true;
+        options.bf11_controls_explicit = true;
       } else if (option == "--delta-force-legacy-parent") {
         options.delta_force_legacy_parent = true;
       } else if (option == "--delta-force-generic") {
@@ -3557,6 +3739,7 @@ int main(int argc, char** argv) {
                 << std::flush;
     }
 
+    const auto routing_started = std::chrono::steady_clock::now();
     routing::PathfinderResult result =
         routing::run_pathfinder(
             graph,
@@ -3565,6 +3748,15 @@ int main(int argc, char** argv) {
             nullptr,
             diagnose_unit_bfs ? &unit_bfs_diagnostic : nullptr,
             routing_sidecars_output);
+    if (options.sssp_engine == routing::SsspEngine::kBellmanFord11 &&
+        options.bf11_telemetry) {
+      std::cout << "{\"type\":\"bf11_routing_time\",\"schema_version\":1"
+                << ",\"routing_seconds\":"
+                << std::chrono::duration<double>(
+                       std::chrono::steady_clock::now() - routing_started)
+                       .count()
+                << "}\n";
+    }
 
     if (diagnose_unit_bfs) {
       std::cout << routing::unit_bfs_path_diagnostic_json(

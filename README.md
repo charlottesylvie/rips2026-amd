@@ -100,13 +100,20 @@ make ROUTER=PathFinderFile BENCHMARKS="boom_med_pb" VERBOSE=1 \
   PATHFINDER_ARGS="--bf11-bbox-margin-x 3 --bf11-bbox-margin-y 15"
 ```
 
-BF11 defaults to one worker because each workspace owns graph-sized search
-state. With `--parallel-net-workers 2` or higher, each worker uses the complete
-host-checked controller on its independent nonblocking stream; BF11 never
-launches overlapping full-residency cooperative grids. The single-worker
-default retains the persistent device controller when it uses the default/null
-stream on a cooperative-launch-capable device. Use `--bf11-unbounded` for a
-legacy CSR or as the unrestricted A/B arm.
+BF11 automatically chooses workers from route count, CPU concurrency, free GPU
+memory, its exact graph/state bytes, conservative rounded query/compact-path
+capacity ceilings (including replacement-allocation overlap), architecture,
+and CU count. It leaves 25% as HIP runtime/allocator headroom. On the measured
+`gfx1151` target it chooses the smallest observed throughput plateau, three
+workers, when resources permit; unmeasured architectures remain at one until
+target evidence supports more. Automatic selection is capped at four and never
+infers that eight should be faster. An explicit
+`--parallel-net-workers N` remains an override. With two or more workers, each
+uses the complete host-checked controller on an independent nonblocking stream;
+BF11 never launches overlapping full-residency cooperative grids. A
+single-worker null stream retains the persistent device controller on a
+cooperative-launch-capable device. Use `--bf11-unbounded` for a legacy CSR or as
+the unrestricted A/B arm.
 
 BF11 initializes graph-sized search state once per workspace, then resets only
 the nodes touched by the preceding query. It emits one `bf11_runtime_stats`
@@ -114,7 +121,12 @@ JSON record after routing; `persistent_controller_runs` versus
 `host_controller_runs` confirms the selected path, while
 `workspace_state_initializations`, `sparse_state_resets`, and
 `defensive_dense_state_resets` distinguish one-time initialization, normal
-reuse, and rare recovery full resets.
+reuse, and rare recovery full resets. `--bf11-telemetry` adds one aggregate
+phase/work/memory record; it is disabled by default because event timing and
+device work counters intentionally add measurement overhead. See
+[the BF11 saturation benchmark protocol](CongestionFreeRouting/BF11_OPTIMIZATION.md)
+for the CAS control, five-repetition medians, phase interpretation, and memory
+checks.
 
 The delta backend also accepts a graph-aware bucket-width seed and a sweep
 multiplier while retaining numeric widths as an explicit override:
@@ -458,6 +470,7 @@ Tuning options:
 | `--bf11-bbox-margin-y <int>` | `15` | Nonnegative vertical expansion applied to BF11's inclusive endpoint box. |
 | `--bf11-target-check-interval <int>` | `1` | Check BF11's exact nonnegative-distance target certificate every N relaxation rounds. |
 | `--bf11-no-unbounded-fallback` | unset | Keep an unreachable auto-bounded query inside its initial box instead of retrying once unbounded. |
+| `--bf11-telemetry` | unset | Emit aggregate BF11 GPU phase times, blocking synchronization time, work counts, touched density, worker workspace bytes, and free-memory snapshots. |
 | `--capacity <int>` | `1` | Capacity used only for overuse diagnostics. |
 | `--net-limit <count>` | unset | Route only the first `count` requests. |
 | `--parallel-net-workers <count>` | `0` | Independent net workers; `0` enables engine-dependent auto-selection. Workers share one immutable CSR across worker-private search state. |
@@ -620,7 +633,7 @@ Useful wrapper options:
 | `--interchange-to-csr <path>` | Override converter executable. Env: `INTERCHANGE_TO_CSR`. |
 | `--pathfinder <path>` | Override PathFinder executable. Env: `PATHFINDER_BIN`. |
 | `--routes-to-phys <path>` | Override route reconstructor. Env: `ROUTES_TO_PHYS`. |
-| `--sssp-engine`, `--use-delta-step`, `--delta`, `--delta-multiplier`, `--delta-force-generic`, `--delta-force-legacy-parent`, `--delta-controller`, `--delta-controller-batch-size`, `--delta-telemetry`, `--delta-benchmark-weights`, `--delta-benchmark-weight-seed`, `--bf11-unbounded`, `--bf11-bbox-margin-x`, `--bf11-bbox-margin-y`, `--bf11-target-check-interval`, `--bf11-no-unbounded-fallback`, `--max-sssp-iters`, `--net-limit`, `--parallel-net-workers`, `--capacity` | Forwarded to `pathfinder`. |
+| `--sssp-engine`, `--use-delta-step`, `--delta`, `--delta-multiplier`, `--delta-force-generic`, `--delta-force-legacy-parent`, `--delta-controller`, `--delta-controller-batch-size`, `--delta-telemetry`, `--delta-benchmark-weights`, `--delta-benchmark-weight-seed`, `--bf11-unbounded`, `--bf11-bbox-margin-x`, `--bf11-bbox-margin-y`, `--bf11-target-check-interval`, `--bf11-no-unbounded-fallback`, `--bf11-telemetry`, `--max-sssp-iters`, `--net-limit`, `--parallel-net-workers`, `--capacity` | Forwarded to `pathfinder`. |
 | `--max-pathfinder-iters`, `--present-factor`, `--present-multiplier`, `--history-factor`, `--route-batch-size` | Compatibility-only; forwarded to `pathfinder` and ignored. |
 
 ## File Formats And Artifacts
@@ -796,6 +809,21 @@ hipcc -std=c++17 -O2 -pthread -x hip -DBF11_NO_MAIN \
   -o /tmp/bf11_bounded_dynamic_hip_test
 
 /tmp/bf11_bounded_dynamic_hip_test
+```
+
+Repeat that build with `-DBF11_FORCE_CAS_ATOMIC_LOAD` to compile and execute
+the compatibility control that uses the proven coherent CAS load instead of
+the relaxed agent-scope HIP atomic-load intrinsic.
+
+Host-only BF11 automatic-worker policy, exact retained-layout accounting, and
+conservative allocation-peak estimator test:
+
+```bash
+g++ -std=c++17 -O2 -Wall -Wextra -Wpedantic -Werror \
+  CongestionFreeRouting/tests/bf11_worker_policy_test.cpp \
+  -o /tmp/bf11_worker_policy_test
+
+/tmp/bf11_worker_policy_test
 ```
 
 Host-side BF11 sparse-reset and explicit-stream controller policy guard:

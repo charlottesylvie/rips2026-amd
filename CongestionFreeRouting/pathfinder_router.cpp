@@ -214,6 +214,7 @@ void print_usage(const char* program) {
       << "  --bf11-target-check-interval <int>\n"
       << "                                 Forward BF11 device target-check interval.\n"
       << "  --bf11-no-unbounded-fallback   Keep an unreachable BF11 query bounded.\n"
+      << "  --bf11-telemetry               Forward opt-in aggregate BF11 telemetry.\n"
       << "  --net-limit <count>            Forwarded to pathfinder.\n"
       << "  --parallel-net-workers <count> Forwarded to pathfinder; 0 enables engine-dependent auto-selection.\n"
       << "  --capacity <int>               Forwarded for overuse diagnostics.\n"
@@ -248,6 +249,7 @@ Options parse_args(int argc, char** argv) {
   std::string delta_benchmark_weights;
   bool delta_benchmark_weight_seed_provided = false;
   bool delta_telemetry = false;
+  bool bf11_telemetry = false;
 
   for (int i = 3; i < argc; ++i) {
     const std::string option = argv[i];
@@ -285,6 +287,11 @@ Options parse_args(int argc, char** argv) {
       if (!delta_telemetry) {
         options.pathfinder_args.push_back(option);
         delta_telemetry = true;
+      }
+    } else if (option == "--bf11-telemetry") {
+      if (!bf11_telemetry) {
+        options.pathfinder_args.push_back(option);
+        bf11_telemetry = true;
       }
     } else if (option == "--delta-benchmark-weights") {
       delta_benchmark_weights = require_value("--delta-benchmark-weights");

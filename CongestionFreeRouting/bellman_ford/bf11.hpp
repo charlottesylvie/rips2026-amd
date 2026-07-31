@@ -50,6 +50,9 @@ struct BellmanFord11WorkspaceOptions {
   // miss retries once.
   bool unbounded_fallback = false;
   int target_check_interval = 1;
+  // Collect aggregate phase/work telemetry. Disabled workspaces do not create
+  // HIP events or execute telemetry counter operations.
+  bool telemetry = false;
 };
 
 // Process-wide aggregate for one benchmark/run interval. PathFinder resets it
@@ -64,9 +67,38 @@ struct BellmanFord11RuntimeStats {
   std::uint64_t sparse_state_resets = 0;
   std::uint64_t workspace_state_initializations = 0;
   std::uint64_t defensive_dense_state_resets = 0;
+  bool telemetry_enabled = false;
+  std::uint64_t requested_workers = 0;
+  std::uint64_t effective_workers = 0;
+  std::uint64_t telemetry_queries = 0;
+  std::uint64_t telemetry_completed_queries = 0;
+  std::uint64_t total_query_nanoseconds = 0;
+  std::uint64_t reset_seed_gpu_nanoseconds = 0;
+  std::uint64_t relaxation_gpu_nanoseconds = 0;
+  std::uint64_t target_check_gpu_nanoseconds = 0;
+  std::uint64_t iteration_status_copy_gpu_nanoseconds = 0;
+  std::uint64_t stream_synchronize_cpu_nanoseconds = 0;
+  std::uint64_t target_summary_gpu_nanoseconds = 0;
+  std::uint64_t path_reconstruction_gpu_nanoseconds = 0;
+  std::uint64_t iterations = 0;
+  std::uint64_t frontier_vertices_processed = 0;
+  std::uint64_t edges_examined = 0;
+  std::uint64_t successful_relaxations = 0;
+  std::uint64_t touched_vertices = 0;
+  std::uint64_t maximum_touched_vertices = 0;
+  double maximum_touched_fraction = 0.0;
+  std::uint64_t workspace_device_bytes_total = 0;
+  std::uint64_t workspace_device_bytes_per_worker_max = 0;
+  std::uint64_t gpu_free_before_workers = 0;
+  std::uint64_t gpu_free_after_workers = 0;
 };
 
 void reset_bellman_ford11_runtime_stats();
+void configure_bellman_ford11_runtime_stats(
+    bool telemetry_enabled,
+    std::uint64_t requested_workers,
+    std::uint64_t effective_workers,
+    std::uint64_t gpu_free_before_workers);
 BellmanFord11RuntimeStats bellman_ford11_runtime_stats();
 
 class BellmanFord11CsrGraph {

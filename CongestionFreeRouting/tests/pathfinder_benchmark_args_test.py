@@ -86,7 +86,8 @@ def main() -> None:
         and defaults.bf11_bbox_margin_x is None
         and defaults.bf11_bbox_margin_y is None
         and defaults.bf11_target_check_interval is None
-        and not defaults.bf11_no_unbounded_fallback,
+        and not defaults.bf11_no_unbounded_fallback
+        and not defaults.bf11_telemetry,
         "BF11 controls must remain unset by default",
     )
     require(
@@ -242,6 +243,8 @@ def main() -> None:
             "--bf11-target-check-interval",
             "3",
             "--bf11-no-unbounded-fallback",
+            "--bf11-telemetry",
+            "--bf11-telemetry",
         ]
     )
     require(
@@ -249,6 +252,7 @@ def main() -> None:
         == [
             "--bf11-unbounded",
             "--bf11-no-unbounded-fallback",
+            "--bf11-telemetry",
             "--sssp-engine",
             "bf11",
             "--bf11-bbox-margin-x",
@@ -267,6 +271,7 @@ def main() -> None:
         ["--bf11-bbox-margin-y", "18"],
         ["--bf11-target-check-interval", "3"],
         ["--bf11-no-unbounded-fallback"],
+        ["--bf11-telemetry"],
     ):
         require_parse_rejected(
             bf11_controls,

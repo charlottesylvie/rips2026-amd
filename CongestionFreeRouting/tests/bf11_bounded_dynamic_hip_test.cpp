@@ -796,6 +796,168 @@ void test_target_check_interval_and_settlement() {
           "BF11 failed to certify a target first reached on round V-1");
 }
 
+void test_opt_in_telemetry() {
+  const HostCsrF32 graph = make_graph(
+      6, {{0, 1, 1.0f}, {0, 2, 4.0f}, {1, 3, 1.0f},
+          {2, 3, 1.0f}, {3, 4, 0.0f}, {4, 5, 2.0f}});
+  const ri::RoutingCsrSidecars sidecars =
+      make_sidecars({0, 1, 1, 2, 3, 4}, {0, 0, 1, 0, 0, 0});
+  const std::vector<float> dynamic(graph.rows, 1.0f);
+  auto shared_graph =
+      std::make_shared<BellmanFord11CsrGraph>(graph, sidecars, nullptr);
+  HipStream stream;
+
+  reset_bellman_ford11_runtime_stats();
+  configure_bellman_ford11_runtime_stats(false, 1, 1, 0);
+  {
+    BellmanFord11CsrWorkspace disabled(shared_graph, stream.get());
+    const BellmanFordCsrResult result = disabled.run(
+        std::vector<int>{0}, std::vector<int>{5}, 1.0f, -1, stream.get(),
+        nullptr, nullptr);
+    validate_paths("BF11 telemetry-disabled smoke", graph, sidecars, dynamic,
+                   {0}, {5}, result);
+  }
+  const BellmanFord11RuntimeStats disabled_stats =
+      bellman_ford11_runtime_stats();
+  require(!disabled_stats.telemetry_enabled &&
+              disabled_stats.telemetry_queries == 0 &&
+              disabled_stats.telemetry_completed_queries == 0 &&
+              disabled_stats.total_query_nanoseconds == 0 &&
+              disabled_stats.reset_seed_gpu_nanoseconds == 0 &&
+              disabled_stats.relaxation_gpu_nanoseconds == 0 &&
+              disabled_stats.target_check_gpu_nanoseconds == 0 &&
+              disabled_stats.iteration_status_copy_gpu_nanoseconds == 0 &&
+              disabled_stats.stream_synchronize_cpu_nanoseconds == 0 &&
+              disabled_stats.target_summary_gpu_nanoseconds == 0 &&
+              disabled_stats.path_reconstruction_gpu_nanoseconds == 0 &&
+              disabled_stats.frontier_vertices_processed == 0 &&
+              disabled_stats.edges_examined == 0 &&
+              disabled_stats.successful_relaxations == 0 &&
+              disabled_stats.touched_vertices == 0 &&
+              disabled_stats.workspace_device_bytes_total == 0 &&
+              disabled_stats.workspace_device_bytes_per_worker_max == 0 &&
+              disabled_stats.gpu_free_after_workers == 0,
+          "disabled BF11 telemetry performed or reported instrumentation");
+
+  std::size_t free_before = 0;
+  std::size_t total_before = 0;
+  check_hip(hipMemGetInfo(&free_before, &total_before),
+            "sample test GPU memory before BF11 telemetry workspace");
+  (void)total_before;
+  reset_bellman_ford11_runtime_stats();
+  configure_bellman_ford11_runtime_stats(
+      true, 1, 1, static_cast<std::uint64_t>(free_before));
+  {
+    BellmanFord11WorkspaceOptions options;
+    options.telemetry = true;
+    BellmanFord11CsrWorkspace enabled(
+        shared_graph, stream.get(), options);
+    const BellmanFordCsrResult result = enabled.run(
+        std::vector<int>{0}, std::vector<int>{4, 5}, 1.0f, -1,
+        stream.get(), nullptr, nullptr);
+    validate_paths("BF11 telemetry-enabled smoke", graph, sidecars, dynamic,
+                   {0}, {4, 5}, result);
+  }
+  const BellmanFord11RuntimeStats enabled_stats =
+      bellman_ford11_runtime_stats();
+  const std::uint64_t measured_gpu_phase_nanoseconds =
+      enabled_stats.reset_seed_gpu_nanoseconds +
+      enabled_stats.relaxation_gpu_nanoseconds +
+      enabled_stats.target_check_gpu_nanoseconds +
+      enabled_stats.iteration_status_copy_gpu_nanoseconds +
+      enabled_stats.target_summary_gpu_nanoseconds +
+      enabled_stats.path_reconstruction_gpu_nanoseconds;
+  require(enabled_stats.telemetry_enabled &&
+              enabled_stats.requested_workers == 1 &&
+              enabled_stats.effective_workers == 1 &&
+              enabled_stats.persistent_controller_runs == 0 &&
+              enabled_stats.host_controller_runs == 1 &&
+              enabled_stats.telemetry_queries == 1 &&
+              enabled_stats.telemetry_completed_queries == 1 &&
+              enabled_stats.total_query_nanoseconds > 0 &&
+              measured_gpu_phase_nanoseconds > 0 &&
+              enabled_stats.stream_synchronize_cpu_nanoseconds > 0 &&
+              enabled_stats.iterations > 0 &&
+              enabled_stats.frontier_vertices_processed > 0 &&
+              enabled_stats.edges_examined > 0 &&
+              enabled_stats.successful_relaxations > 0 &&
+              enabled_stats.touched_vertices > 0 &&
+              enabled_stats.maximum_touched_vertices > 0 &&
+              enabled_stats.maximum_touched_fraction > 0.0 &&
+              enabled_stats.maximum_touched_fraction <= 1.0 &&
+              enabled_stats.workspace_device_bytes_total > 0 &&
+              enabled_stats.workspace_device_bytes_per_worker_max > 0 &&
+              enabled_stats.workspace_device_bytes_total >=
+                  enabled_stats.workspace_device_bytes_per_worker_max &&
+              enabled_stats.gpu_free_before_workers == free_before &&
+              enabled_stats.gpu_free_after_workers > 0,
+          "explicit-stream BF11 telemetry omitted its host-controller, "
+          "timing, work, or memory records");
+
+  std::size_t null_stream_free_before = 0;
+  std::size_t null_stream_total_before = 0;
+  check_hip(hipMemGetInfo(&null_stream_free_before,
+                          &null_stream_total_before),
+            "sample test GPU memory before null-stream telemetry workspace");
+  (void)null_stream_total_before;
+  reset_bellman_ford11_runtime_stats();
+  configure_bellman_ford11_runtime_stats(
+      true, 1, 1, static_cast<std::uint64_t>(null_stream_free_before));
+  {
+    BellmanFord11WorkspaceOptions options;
+    options.telemetry = true;
+    BellmanFord11CsrWorkspace enabled_null_stream(
+        shared_graph, nullptr, options);
+    const BellmanFordCsrResult result = enabled_null_stream.run(
+        std::vector<int>{0}, std::vector<int>{4, 5}, 1.0f, -1, nullptr,
+        nullptr, nullptr);
+    validate_paths("BF11 null-stream telemetry smoke", graph, sidecars,
+                   dynamic, {0}, {4, 5}, result);
+  }
+  const BellmanFord11RuntimeStats null_stream_stats =
+      bellman_ford11_runtime_stats();
+  const std::uint64_t null_stream_controller_runs =
+      null_stream_stats.persistent_controller_runs +
+      null_stream_stats.host_controller_runs;
+  const std::uint64_t null_stream_controller_phase_nanoseconds =
+      null_stream_stats.reset_seed_gpu_nanoseconds +
+      null_stream_stats.relaxation_gpu_nanoseconds +
+      null_stream_stats.target_check_gpu_nanoseconds;
+  require(null_stream_stats.telemetry_enabled &&
+              null_stream_stats.requested_workers == 1 &&
+              null_stream_stats.effective_workers == 1 &&
+              null_stream_controller_runs == 1 &&
+              null_stream_stats.telemetry_queries == 1 &&
+              null_stream_stats.telemetry_completed_queries == 1 &&
+              null_stream_stats.total_query_nanoseconds > 0 &&
+              null_stream_controller_phase_nanoseconds > 0 &&
+              null_stream_stats.stream_synchronize_cpu_nanoseconds > 0 &&
+              null_stream_stats.iterations > 0 &&
+              null_stream_stats.frontier_vertices_processed > 0 &&
+              null_stream_stats.edges_examined > 0 &&
+              null_stream_stats.successful_relaxations > 0 &&
+              null_stream_stats.touched_vertices > 0 &&
+              null_stream_stats.workspace_device_bytes_total > 0 &&
+              null_stream_stats.workspace_device_bytes_per_worker_max > 0 &&
+              null_stream_stats.gpu_free_before_workers ==
+                  null_stream_free_before &&
+              null_stream_stats.gpu_free_after_workers > 0,
+          "null-stream BF11 telemetry omitted its controller, timing, work, "
+          "or memory records");
+  // A null-stream workspace selects the cooperative controller when the
+  // runtime and occupancy query permit it, and otherwise keeps the complete
+  // host fallback. Validate whichever capability path the target exposes.
+  if (null_stream_stats.persistent_controller_runs != 0) {
+    require(null_stream_stats.persistent_controller_runs == 1 &&
+                null_stream_stats.host_controller_runs == 0,
+            "cooperative-capable null-stream telemetry mixed controller paths");
+  } else {
+    require(null_stream_stats.host_controller_runs == 1,
+            "cooperative-unavailable null-stream telemetry lost the complete "
+            "host-controller fallback");
+  }
+}
+
 void test_parallel_explicit_stream_host_controller() {
   const HostCsrF32 graph = make_graph(
       8, {{0, 2, 1.0f}, {2, 4, 1.0f}, {0, 6, 10.0f}, {6, 4, 1.0f},
@@ -891,6 +1053,203 @@ void test_parallel_explicit_stream_host_controller() {
           "parallel BF11 did not use only independent host-controlled sparse resets");
 }
 
+struct WorkerCountQuery {
+  std::string label;
+  std::vector<int> sources;
+  std::vector<int> targets;
+  int max_iters = -1;
+};
+
+void require_same_result(const std::string& label,
+                         const BellmanFordCsrResult& expected,
+                         const BellmanFordCsrResult& actual) {
+  require(actual.dist == expected.dist &&
+              actual.pred_node == expected.pred_node &&
+              actual.pred_edge == expected.pred_edge &&
+              actual.iterations_used == expected.iterations_used &&
+              actual.converged == expected.converged &&
+              actual.target == expected.target &&
+              actual.target_distance == expected.target_distance &&
+              actual.target_reached == expected.target_reached &&
+              actual.stopped_on_target == expected.stopped_on_target &&
+              actual.stopped_on_distance_limit ==
+                  expected.stopped_on_distance_limit &&
+              actual.target_distances == expected.target_distances &&
+              actual.target_sources == expected.target_sources &&
+              actual.target_path_offsets == expected.target_path_offsets &&
+              actual.target_edge_offsets == expected.target_edge_offsets &&
+              actual.target_path_nodes == expected.target_path_nodes &&
+              actual.target_path_edges == expected.target_path_edges &&
+              actual.target_path_edge_costs ==
+                  expected.target_path_edge_costs,
+          label + ": worker count changed the complete BF11 result");
+}
+
+std::vector<BellmanFordCsrResult> run_explicit_stream_workers(
+    const std::shared_ptr<BellmanFord11CsrGraph>& shared_graph,
+    const std::vector<float>& dynamic_cost,
+    const std::vector<WorkerCountQuery>& queries,
+    std::size_t worker_count) {
+  require(worker_count > 0 && worker_count <= queries.size(),
+          "invalid BF11 worker-count test configuration");
+
+  std::vector<std::unique_ptr<HipStream>> streams;
+  std::vector<std::unique_ptr<BellmanFord11CsrWorkspace>> workspaces;
+  streams.reserve(worker_count);
+  workspaces.reserve(worker_count);
+  for (std::size_t worker = 0; worker < worker_count; ++worker) {
+    streams.push_back(std::make_unique<HipStream>());
+    workspaces.push_back(std::make_unique<BellmanFord11CsrWorkspace>(
+        shared_graph, streams.back()->get()));
+    workspaces.back()->update_vertex_costs(dynamic_cost,
+                                           streams.back()->get());
+  }
+
+  int device = 0;
+  check_hip(hipGetDevice(&device), "get worker-count HIP device");
+  std::vector<BellmanFordCsrResult> results(queries.size());
+  std::vector<std::exception_ptr> errors(worker_count);
+  std::mutex start_mutex;
+  std::condition_variable start_condition;
+  std::size_t ready_workers = 0;
+  bool start_workers = false;
+
+  auto worker = [&](std::size_t worker_index) {
+    try {
+      {
+        std::unique_lock<std::mutex> lock(start_mutex);
+        ++ready_workers;
+        start_condition.notify_all();
+        start_condition.wait(lock, [&] { return start_workers; });
+      }
+      check_hip(hipSetDevice(device), "select worker-count HIP device");
+      BellmanFord11RunOptions run_options;
+      for (std::size_t query_index = worker_index;
+           query_index < queries.size(); query_index += worker_count) {
+        const WorkerCountQuery& query = queries[query_index];
+        results[query_index] = workspaces[worker_index]->run(
+            query.sources, query.targets, 1.0f, query.max_iters, run_options,
+            streams[worker_index]->get(), nullptr, nullptr);
+      }
+    } catch (...) {
+      errors[worker_index] = std::current_exception();
+    }
+  };
+
+  bf11_internal_reset_counters();
+  std::vector<std::thread> threads;
+  threads.reserve(worker_count);
+  for (std::size_t worker_index = 0; worker_index < worker_count;
+       ++worker_index) {
+    threads.emplace_back(worker, worker_index);
+  }
+  {
+    std::unique_lock<std::mutex> lock(start_mutex);
+    start_condition.wait(lock,
+                         [&] { return ready_workers == worker_count; });
+    start_workers = true;
+  }
+  start_condition.notify_all();
+  for (std::thread& thread : threads) thread.join();
+  for (const std::exception_ptr& error : errors) {
+    if (error) std::rethrow_exception(error);
+  }
+
+  require(bf11_internal_gpu_controller_launch_count() == 0 &&
+              bf11_internal_controller_fallback_count() == queries.size() &&
+              bf11_internal_sparse_state_reset_count() == queries.size() &&
+              bf11_internal_dense_state_reset_count() == 0,
+          "BF11 worker-count stress left the explicit-stream controller policy");
+  return results;
+}
+
+void test_explicit_stream_worker_count_invariance() {
+  constexpr int kVertices = 80;
+  std::vector<EdgeSpec> edges = {
+      // A dynamically weighted diamond with a unique cheaper lower arm.
+      {0, 1, 1.0f},
+      {0, 2, 1.0f},
+      {1, 3, 1.0f},
+      {2, 3, 1.0f},
+  };
+  // A substantially longer, narrow frontier.
+  for (int node = 4; node < 36; ++node) {
+    edges.push_back({node, node + 1,
+                     0.25f * static_cast<float>(1 + node % 4)});
+  }
+  // A shallow, wide frontier. The final arm is uniquely cheapest and has a
+  // zero-cost second edge, so the stress also preserves exact zero weights.
+  for (int node = 38; node <= 69; ++node) {
+    edges.push_back(
+        {37, node, 1.0f + 0.125f * static_cast<float>(node - 38)});
+    edges.push_back({node, 70, node == 69 ? 0.0f : 4.0f});
+  }
+  // True multi-source/multi-target component with a missing-coordinate spill
+  // node, zero-weight path, a separate branch, and isolated node 79.
+  edges.insert(edges.end(), {{71, 73, 2.0f},
+                             {72, 73, 0.0f},
+                             {73, 74, 0.0f},
+                             {71, 75, 1.0f},
+                             {75, 76, 1.0f},
+                             {72, 77, 3.0f}});
+
+  const HostCsrF32 graph = make_graph(kVertices, edges);
+  std::vector<std::int32_t> x(kVertices);
+  std::vector<std::int32_t> y(kVertices, 0);
+  for (int node = 0; node < kVertices; ++node) x[node] = node;
+  x[73] = ri::kMissingRouteCoordinate;
+  y[73] = ri::kMissingRouteCoordinate;
+  std::vector<float> base_cost(kVertices, 1.0f);
+  base_cost[2] = 2.0f;
+  const ri::RoutingCsrSidecars sidecars =
+      make_sidecars(std::move(x), std::move(y), std::move(base_cost));
+  std::vector<float> dynamic_cost(kVertices, 1.0f);
+  dynamic_cost[1] = 4.0f;
+  dynamic_cost[2] = 0.25f;
+
+  const std::vector<WorkerCountQuery> queries = {
+      {"weighted diamond", {0}, {3}, -1},
+      {"long chain", {4}, {36}, -1},
+      {"wide frontier", {37}, {70}, -1},
+      {"multi-source targets", {71, 72}, {74, 72, 79}, -1},
+      {"zero-round identity", {71}, {71}, 0},
+      {"diamond multi-target", {0}, {1, 3}, -1},
+      {"chain multi-target", {4}, {20, 36}, -1},
+      {"wide multi-target", {37}, {38, 69, 70}, -1},
+      {"unreachable from diamond", {0}, {79}, -1},
+      {"missing-coordinate zero path", {72}, {74}, -1},
+      {"chain suffix", {10}, {36}, -1},
+      {"wide reuse", {37}, {55, 70}, -1},
+      {"multi-source separate branches", {71, 72}, {76, 77}, -1},
+      {"weighted diamond reuse", {0}, {2, 3}, -1},
+      {"wide zero-round identity", {37}, {37}, 0},
+      {"isolated-source unreachable", {79}, {0}, -1},
+  };
+
+  auto shared_graph =
+      std::make_shared<BellmanFord11CsrGraph>(graph, sidecars, nullptr);
+  std::vector<BellmanFordCsrResult> sequential_results;
+  for (const std::size_t worker_count : {1u, 3u, 4u, 8u}) {
+    std::vector<BellmanFordCsrResult> results = run_explicit_stream_workers(
+        shared_graph, dynamic_cost, queries, worker_count);
+    for (std::size_t query_index = 0; query_index < queries.size();
+         ++query_index) {
+      const WorkerCountQuery& query = queries[query_index];
+      const std::string label = "BF11 " + std::to_string(worker_count) +
+                                "-worker " + query.label;
+      validate_paths(label, graph, sidecars, dynamic_cost, query.sources,
+                     query.targets, results[query_index]);
+      if (!sequential_results.empty()) {
+        require_same_result(label, sequential_results[query_index],
+                            results[query_index]);
+      }
+    }
+    if (sequential_results.empty()) {
+      sequential_results = std::move(results);
+    }
+  }
+}
+
 }  // namespace
 
 int main() {
@@ -901,7 +1260,9 @@ int main() {
     test_explicit_bounds_and_missing_spill();
     test_auto_bounds_and_fallback();
     test_target_check_interval_and_settlement();
+    test_opt_in_telemetry();
     test_parallel_explicit_stream_host_controller();
+    test_explicit_stream_worker_count_invariance();
     std::cout << "BF11 bounded dynamic HIP tests passed\n";
     return 0;
   } catch (const std::exception& error) {

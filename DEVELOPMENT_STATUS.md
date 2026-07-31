@@ -168,12 +168,17 @@ Python reconstruction coverage, not a substitute compile claim.
 - Automatic Delta is resolved once by PathFinder. Mutable low-level callers
   must recompute a numeric width after `update_values()` or
   `update_vertex_costs()`.
-- BF11 still clears all V query-state entries. Its active-frontier path does
-  not yet consume CSR v3's spatial edge permutation; PathFinder therefore skips
-  that section at BF11 load time. Cooperative launch support and real speedup
-  remain AMD-validation gates, and the one-shot controller leaves BF11's
-  dynamic multipliers at one even though the low-level full/sparse update API
-  is implemented. Automatic bounds currently cover each batched net request;
+- BF11 initializes all V query-state entries once per workspace and normally
+  clears only the prior query's exact touched list; an exceptional query forces
+  one defensive dense reset. Its relaxation state observation uses a relaxed
+  agent-scope HIP atomic load with a compile-time CAS compatibility control.
+  Opt-in phase/work/memory telemetry and a `gfx1151` three-worker plateau policy
+  are implemented, but target acceptance medians remain an AMD-validation gate.
+  The active-frontier path does not yet consume CSR v3's spatial edge
+  permutation, so PathFinder skips that section at BF11 load time. The one-shot
+  controller leaves BF11's dynamic multipliers at one even though the low-level
+  full/sparse update API is implemented. Automatic bounds currently cover each
+  batched net request;
   persistent per-connection box growth across negotiated-congestion iterations
   remains controller work rather than a claim of this one-shot integration.
 - Interchange reconstruction limitations remain under

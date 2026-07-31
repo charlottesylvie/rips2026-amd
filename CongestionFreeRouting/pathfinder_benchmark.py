@@ -283,6 +283,11 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         help="do not retry an unreachable bounded BF11 query unbounded",
     )
     parser.add_argument(
+        "--bf11-telemetry",
+        action="store_true",
+        help="emit opt-in aggregate BF11 phase, work, and memory telemetry",
+    )
+    parser.add_argument(
         "--capacity",
         type=int,
         help="capacity used only for overuse diagnostics",
@@ -345,6 +350,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         or args.bf11_bbox_margin_y is not None
         or args.bf11_target_check_interval is not None
         or args.bf11_no_unbounded_fallback
+        or args.bf11_telemetry
     )
     if bf11_specific_controls and not bf11_selected:
         parser.error("BF11-specific options require --sssp-engine bf11")
@@ -388,6 +394,8 @@ def pathfinder_args(args: argparse.Namespace) -> list[str]:
         forwarded.append("--bf11-unbounded")
     if args.bf11_no_unbounded_fallback:
         forwarded.append("--bf11-no-unbounded-fallback")
+    if args.bf11_telemetry:
+        forwarded.append("--bf11-telemetry")
     for attr, option in (
         ("sssp_engine", "--sssp-engine"),
         ("delta", "--delta"),

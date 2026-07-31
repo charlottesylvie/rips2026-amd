@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Source-level guardrails for BF11's HIP-only reset/controller policy."""
 
+import re
 from pathlib import Path
 
 
@@ -38,9 +39,76 @@ def main() -> None:
         and "touched_nodes[touched_slot] = dst" in source,
         "first finite BF11 labels are no longer recorded for sparse reset",
     )
+    atomic_relax = function_body(
+        source,
+        "__device__ __forceinline__ AtomicRelaxResult atomic_relax_strict(",
+        "__device__ __forceinline__ float effective_edge_weight(",
+    )
     require(
-        "old_state = atomicCAS(address, 0ULL, 0ULL)" in source,
-        "BF11 first-discovery checks lost their coherent reused-state load",
+        "unsigned long long old_state = coherent_atomic_load(address);"
+        in atomic_relax,
+        "BF11 first-discovery checks bypass the coherent atomic-load helper",
+    )
+    require(
+        "BF11_FORCE_CAS_ATOMIC_LOAD" in source,
+        "BF11 lost the compile-time CAS compatibility override",
+    )
+    require(
+        re.search(
+            r"__hip_atomic_load\s*\(\s*address\s*,\s*__ATOMIC_RELAXED\s*,"
+            r"\s*__HIP_MEMORY_SCOPE_AGENT\s*\)",
+            source,
+        )
+        is not None,
+        "BF11 primary state observation is not a relaxed agent-scope HIP atomic load",
+    )
+    require(
+        "atomicCAS(address, 0ULL, 0ULL)" in source,
+        "BF11 lost the proven CAS compatibility load",
+    )
+    coherent_load = function_body(
+        source,
+        "__device__ __forceinline__ unsigned long long coherent_atomic_load(",
+        "__device__ __forceinline__ AtomicRelaxResult atomic_relax_strict(",
+    )
+    require(
+        "BF11_FORCE_CAS_ATOMIC_LOAD" in coherent_load
+        and "__hip_atomic_load" in coherent_load
+        and "atomicCAS(address, 0ULL, 0ULL)" in coherent_load
+        and "#else" in coherent_load,
+        "BF11 coherent load does not keep guarded HIP-load and CAS paths",
+    )
+    require(
+        re.search(r"(?:return\s+|=\s*)\*\s*address\b", coherent_load) is None
+        and re.search(r"\baddress\s*\[\s*0\s*\]", coherent_load) is None,
+        "BF11 coherent state observation regressed to an ordinary cached load",
+    )
+
+    telemetry_initialization = function_body(
+        source,
+        "void initialize_workspace_telemetry(",
+        "void begin_telemetry_event(",
+    )
+    require(
+        "hipDeviceAttributeWallClockRate" in telemetry_initialization,
+        "BF11 cooperative telemetry does not query the fixed wall-clock rate",
+    )
+    cooperative_controller = function_body(
+        source,
+        "__global__ void frontier_controller_kernel(",
+        "__global__ void summarize_target_paths_kernel(",
+    )
+    require(
+        "wall_clock64()" in cooperative_controller,
+        "BF11 cooperative telemetry does not use the GFX11-safe wall clock",
+    )
+    require(
+        re.search(r"(?<!wall_)clock64\s*\(", source) is None,
+        "BF11 telemetry uses bare clock64, which is unreliable on GFX11",
+    )
+    require(
+        re.search(r"\b\w+\s*\.\s*clockRate\b", source) is None,
+        "BF11 telemetry converts timer ticks with multiprocessor clockRate",
     )
 
     host_controller = function_body(

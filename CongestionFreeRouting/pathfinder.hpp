@@ -154,6 +154,9 @@ struct PathfinderOptions {
   int bf11_target_check_interval = 1;
   bool bf11_unbounded_fallback = true;
   bool bf11_controls_explicit = false;
+  // Collect aggregate BF11 phase/work/memory telemetry. Disabled by default;
+  // enabling it adds HIP events and device-side work counters.
+  bool bf11_telemetry = false;
 };
 
 struct PathfinderResult {

@@ -2695,6 +2695,120 @@ int main() {
                           }),
           "every parallel UnitBFS workspace must receive identical hints");
 
+  routing::interchange::RoutingCsrSidecars bf11_sidecars;
+  bf11_sidecars.route_end_x.resize(
+      static_cast<std::size_t>(congestion_graph.rows));
+  bf11_sidecars.route_end_y.assign(
+      static_cast<std::size_t>(congestion_graph.rows), 0);
+  bf11_sidecars.base_vertex_cost.assign(
+      static_cast<std::size_t>(congestion_graph.rows), 1.0f);
+  for (int node = 0; node < congestion_graph.rows; ++node) {
+    bf11_sidecars.route_end_x[static_cast<std::size_t>(node)] = node;
+  }
+
+  routing::PathfinderOptions explicit_bf11_options = parallel_options;
+  explicit_bf11_options.sssp_engine = routing::SsspEngine::kBellmanFord11;
+  explicit_bf11_options.parallel_net_workers = 8;
+  explicit_bf11_options.bf11_telemetry = true;
+  explicit_bf11_options.bf11_controls_explicit = true;
+  routing::PathfinderResult explicit_bf11_result;
+  std::string explicit_bf11_stdout;
+  {
+    ScopedCoutCapture capture;
+    explicit_bf11_result = routing::run_pathfinder(
+        congestion_graph, congestion_metadata, explicit_bf11_options, nullptr,
+        nullptr, &bf11_sidecars);
+    explicit_bf11_stdout = capture.str();
+  }
+  require(explicit_bf11_result.routed &&
+              explicit_bf11_result.nets[0].sinks[0].nodes ==
+                  parallel_result.nets[0].sinks[0].nodes &&
+              explicit_bf11_result.nets[1].sinks[0].nodes ==
+                  parallel_result.nets[1].sinks[0].nodes,
+          "explicit BF11 workers changed PathFinder route results");
+  require(g_bf11_stub_requested_workers == 8 &&
+              g_bf11_stub_effective_workers == 2 &&
+              g_bf11_stub_workspace_constructions == 2 &&
+              g_bf11_stub_telemetry_workspaces == 2 &&
+              g_bf11_stub_telemetry_enabled,
+          "PathFinder lost requested/effective BF11 workers or telemetry options");
+  require(explicit_bf11_stdout.find(
+              "BF11 workers requested=8 selected=2") != std::string::npos &&
+              explicit_bf11_stdout.find("\"type\":\"bf11_telemetry\"") !=
+                  std::string::npos &&
+              explicit_bf11_stdout.find("\"requested_workers\":8") !=
+                  std::string::npos &&
+              explicit_bf11_stdout.find("\"effective_workers\":2") !=
+                  std::string::npos &&
+              explicit_bf11_stdout.find(
+                  "\"peak_workspace_device_bytes_estimate\":") !=
+                  std::string::npos,
+          "BF11 worker selection/telemetry logging is incomplete");
+
+  // A telemetry worker can wait for all persistent workspaces while another
+  // worker's constructor fails. The failure publication and barrier wakeup
+  // must be indivisible with respect to the waiter; a watchdog makes a lost
+  // wakeup a bounded test failure instead of hanging the host suite forever.
+  g_bf11_stub_throw_on_workspace_construction = 2;
+  std::mutex bf11_failure_watchdog_mutex;
+  std::condition_variable bf11_failure_watchdog_cv;
+  bool bf11_failure_test_finished = false;
+  std::thread bf11_failure_watchdog([&]() {
+    std::unique_lock<std::mutex> lock(bf11_failure_watchdog_mutex);
+    if (!bf11_failure_watchdog_cv.wait_for(
+            lock, std::chrono::seconds(5),
+            [&]() { return bf11_failure_test_finished; })) {
+      std::_Exit(124);
+    }
+  });
+  bool bf11_construction_failure_observed = false;
+  try {
+    (void)routing::run_pathfinder(
+        congestion_graph, congestion_metadata, explicit_bf11_options, nullptr,
+        nullptr, &bf11_sidecars);
+  } catch (const std::runtime_error& error) {
+    bf11_construction_failure_observed =
+        std::string(error.what()).find(
+            "injected BF11 workspace construction failure") !=
+        std::string::npos;
+  }
+  g_bf11_stub_throw_on_workspace_construction = 0;
+  {
+    std::lock_guard<std::mutex> lock(bf11_failure_watchdog_mutex);
+    bf11_failure_test_finished = true;
+  }
+  bf11_failure_watchdog_cv.notify_one();
+  bf11_failure_watchdog.join();
+  require(bf11_construction_failure_observed,
+          "BF11 telemetry workspace failure did not escape without deadlock");
+
+  routing::PathfinderOptions automatic_bf11_options = explicit_bf11_options;
+  automatic_bf11_options.parallel_net_workers = 0;
+  automatic_bf11_options.bf11_telemetry = false;
+  automatic_bf11_options.bf11_controls_explicit = false;
+  std::string automatic_bf11_stdout;
+  {
+    ScopedCoutCapture capture;
+    const routing::PathfinderResult automatic_bf11_result =
+        routing::run_pathfinder(congestion_graph, congestion_metadata,
+                                automatic_bf11_options, nullptr, nullptr,
+                                &bf11_sidecars);
+    require(automatic_bf11_result.routed,
+            "automatic BF11 worker selection changed routed status");
+    automatic_bf11_stdout = capture.str();
+  }
+  require(g_bf11_stub_requested_workers == 0 &&
+              g_bf11_stub_effective_workers == 1 &&
+              g_bf11_stub_workspace_constructions == 1 &&
+              g_bf11_stub_telemetry_workspaces == 0 &&
+              !g_bf11_stub_telemetry_enabled &&
+              automatic_bf11_stdout.find(
+                  "BF11 workers requested=auto selected=1") !=
+                  std::string::npos &&
+              automatic_bf11_stdout.find(
+                  "\"type\":\"bf11_telemetry\"") == std::string::npos,
+          "unmeasured-device BF11 auto policy or disabled telemetry regressed");
+
   routing::PathfinderOptions parallel_delta_options = parallel_options;
   parallel_delta_options.sssp_engine = routing::SsspEngine::kDeltaStep;
   parallel_delta_options.delta = 2.5f;
