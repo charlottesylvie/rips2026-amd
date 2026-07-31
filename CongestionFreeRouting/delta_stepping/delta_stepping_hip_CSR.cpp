@@ -5040,8 +5040,8 @@ DeltaSteppingCsrResult run_delta_stepping_impl(
                                       sizeof(int),
                                       hipMemcpyDeviceToDevice,
                                       stream));
-    // The next bucket appends to this count and consumes the compacted queue.
-    synchronize_explicit_stream(stream);
+    // Same-stream ordering publishes the count before the swapped queue is
+    // consumed.
     std::swap(pending_queue, pending_scratch);
     }
   }
