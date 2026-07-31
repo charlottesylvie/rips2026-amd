@@ -101,7 +101,20 @@ make ROUTER=PathFinderFile BENCHMARKS="boom_med_pb" VERBOSE=1 \
 ```
 
 BF11 defaults to one worker because each workspace owns graph-sized search
-state. Use `--bf11-unbounded` for a legacy CSR or as the unrestricted A/B arm.
+state. With `--parallel-net-workers 2` or higher, each worker uses the complete
+host-checked controller on its independent nonblocking stream; BF11 never
+launches overlapping full-residency cooperative grids. The single-worker
+default retains the persistent device controller when it uses the default/null
+stream on a cooperative-launch-capable device. Use `--bf11-unbounded` for a
+legacy CSR or as the unrestricted A/B arm.
+
+BF11 initializes graph-sized search state once per workspace, then resets only
+the nodes touched by the preceding query. It emits one `bf11_runtime_stats`
+JSON record after routing; `persistent_controller_runs` versus
+`host_controller_runs` confirms the selected path, while
+`workspace_state_initializations`, `sparse_state_resets`, and
+`defensive_dense_state_resets` distinguish one-time initialization, normal
+reuse, and rare recovery full resets.
 
 The delta backend also accepts a graph-aware bucket-width seed and a sweep
 multiplier while retaining numeric widths as an explicit override:
@@ -783,6 +796,12 @@ hipcc -std=c++17 -O2 -pthread -x hip -DBF11_NO_MAIN \
   -o /tmp/bf11_bounded_dynamic_hip_test
 
 /tmp/bf11_bounded_dynamic_hip_test
+```
+
+Host-side BF11 sparse-reset and explicit-stream controller policy guard:
+
+```bash
+python3 CongestionFreeRouting/tests/bf11_sparse_reset_source_test.py
 ```
 
 Python route-writer regression test:

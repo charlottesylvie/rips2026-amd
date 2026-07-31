@@ -12,14 +12,19 @@
 #include "../bellman_ford/bf11.hpp"
 
 #include <algorithm>
+#include <condition_variable>
 #include <cmath>
 #include <cstdint>
+#include <exception>
+#include <functional>
 #include <iostream>
 #include <limits>
 #include <memory>
+#include <mutex>
 #include <queue>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -28,6 +33,8 @@ extern "C" std::uint64_t bf11_internal_gpu_controller_launch_count();
 extern "C" std::uint64_t bf11_internal_controller_fallback_count();
 extern "C" std::uint64_t bf11_internal_target_check_count();
 extern "C" std::uint64_t bf11_internal_auto_unbounded_retry_count();
+extern "C" std::uint64_t bf11_internal_sparse_state_reset_count();
+extern "C" std::uint64_t bf11_internal_dense_state_reset_count();
 
 namespace ri = routing::interchange;
 using Offset = minplus_sparse::Offset;
@@ -41,6 +48,30 @@ void require(bool condition, const std::string& message) {
     throw std::runtime_error(message);
   }
 }
+
+void check_hip(hipError_t status, const char* operation) {
+  if (status != hipSuccess) {
+    throw std::runtime_error(std::string(operation) + ": " +
+                             hipGetErrorString(status));
+  }
+}
+
+class HipStream {
+ public:
+  HipStream() {
+    check_hip(hipStreamCreateWithFlags(&stream_, hipStreamNonBlocking),
+              "create test stream");
+  }
+  ~HipStream() {
+    if (stream_ != nullptr) (void)hipStreamDestroy(stream_);
+  }
+  HipStream(const HipStream&) = delete;
+  HipStream& operator=(const HipStream&) = delete;
+  hipStream_t get() const { return stream_; }
+
+ private:
+  hipStream_t stream_ = nullptr;
+};
 
 template <typename Exception = std::exception, typename Function>
 void require_throws(const std::string& label, Function&& function) {
@@ -400,6 +431,35 @@ void test_validation_and_dynamic_updates() {
           "BF11 retained dangling or caller-mutable graph sidecars");
 }
 
+void test_defensive_reset_after_controller_error() {
+  const float largest = std::numeric_limits<float>::max();
+  // Row 0 is processed in CSR order: node 1 receives a finite label before
+  // the node-2 edge/base-cost product overflows and raises controller error 3.
+  // The next query must therefore discard partially written search state.
+  const HostCsrF32 graph =
+      make_graph(3, {{0, 1, 1.0f}, {0, 2, largest}});
+  const ri::RoutingCsrSidecars sidecars =
+      make_sidecars({0, 1, 2}, {0, 0, 0}, {1.0f, 1.0f, largest});
+  HipStream stream;
+  BellmanFord11CsrWorkspace workspace(graph, sidecars, stream.get());
+
+  bf11_internal_reset_counters();
+  require_throws<std::runtime_error>("nonfinite BF11 effective edge weight",
+                                     [&] {
+    (void)workspace.run(std::vector<int>{0}, std::vector<int>{1}, 1.0f, -1,
+                        stream.get(), nullptr, nullptr);
+  });
+
+  const BellmanFordCsrResult recovered = workspace.run(
+      std::vector<int>{2}, std::vector<int>{1}, 1.0f, -1, stream.get(),
+      nullptr, nullptr);
+  validate_paths("BF11 defensive reset after controller error", graph,
+                 sidecars, std::vector<float>(3, 1.0f), {2}, {1}, recovered);
+  require(!recovered.target_reached && recovered.target_path_nodes.empty() &&
+              bf11_internal_dense_state_reset_count() == 1,
+          "BF11 reused partial state instead of taking one defensive reset");
+}
+
 void test_true_multi_source() {
   const HostCsrF32 graph = make_graph(
       5, {{0, 3, 4.0f}, {1, 3, 1.0f}, {2, 1, 0.0f}, {3, 4, 1.0f}});
@@ -445,6 +505,14 @@ void test_true_multi_source() {
               !zero_round_identity.converged &&
               zero_round_identity.target_path_nodes == std::vector<int>({1}),
           "BF11 lost a source-equals-target path at max_iters=0");
+
+  const BellmanFordCsrResult after_zero_round = workspace.run(
+      std::vector<int>{0}, std::vector<int>{4}, 1.0f, -1,
+      nullptr, nullptr, nullptr);
+  validate_paths("BF11 reuse after zero-round source state", graph, sidecars,
+                 dynamic, {0}, {4}, after_zero_round);
+  require(after_zero_round.target_path_nodes == std::vector<int>({0, 3, 4}),
+          "zero-round source state leaked into the next sparse-reset query");
 }
 
 void test_explicit_bounds_and_missing_spill() {
@@ -457,6 +525,8 @@ void test_explicit_bounds_and_missing_spill() {
   const std::vector<float> dynamic(5, 1.0f);
   BellmanFord11RunOptions bounded_options;
   bounded_options.bounds = {true, 0, 3, 0, 0};
+
+  bf11_internal_reset_counters();
 
   const BellmanFordCsrResult bounded = workspace.run(
       std::vector<int>{0}, std::vector<int>{3}, 1.0f, -1,
@@ -481,6 +551,22 @@ void test_explicit_bounds_and_missing_spill() {
       bounded_options, nullptr, nullptr, nullptr);
   require(bounded_again.target_path_nodes == bounded.target_path_nodes,
           "an unbounded run leaked into later explicit bound state");
+
+  for (int repetition = 0; repetition < 8; ++repetition) {
+    const BellmanFordCsrResult repeated_unbounded = workspace.run(
+        std::vector<int>{0}, std::vector<int>{3}, 1.0f, -1,
+        nullptr, nullptr, nullptr);
+    const BellmanFordCsrResult repeated_bounded = workspace.run(
+        std::vector<int>{0}, std::vector<int>{3}, 1.0f, -1,
+        bounded_options, nullptr, nullptr, nullptr);
+    require(repeated_unbounded.target_path_nodes ==
+                    std::vector<int>({0, 4, 3}) &&
+                repeated_bounded.target_path_nodes == bounded.target_path_nodes,
+            "alternating bounded queries retained stale touched state");
+  }
+  require(bf11_internal_sparse_state_reset_count() == 19 &&
+              bf11_internal_dense_state_reset_count() == 0,
+          "successful BF11 reuse did not remain on the sparse reset path");
 
   BellmanFord11RunOptions inverted = bounded_options;
   inverted.bounds.min_x = 4;
@@ -710,15 +796,112 @@ void test_target_check_interval_and_settlement() {
           "BF11 failed to certify a target first reached on round V-1");
 }
 
+void test_parallel_explicit_stream_host_controller() {
+  const HostCsrF32 graph = make_graph(
+      8, {{0, 2, 1.0f}, {2, 4, 1.0f}, {0, 6, 10.0f}, {6, 4, 1.0f},
+          {1, 3, 1.0f}, {3, 5, 1.0f}, {1, 7, 10.0f}, {7, 5, 1.0f}});
+  const ri::RoutingCsrSidecars sidecars =
+      make_sidecars({0, 0, 1, 1, 2, 2, 1, 1},
+                    {0, 1, 0, 1, 0, 1, 2, 3});
+  auto shared_graph =
+      std::make_shared<BellmanFord11CsrGraph>(graph, sidecars, nullptr);
+  HipStream stream_a;
+  HipStream stream_b;
+  BellmanFord11CsrWorkspace workspace_a(shared_graph, stream_a.get());
+  BellmanFord11CsrWorkspace workspace_b(shared_graph, stream_b.get());
+
+  int device = 0;
+  check_hip(hipGetDevice(&device), "get test HIP device");
+  std::mutex start_mutex;
+  std::condition_variable start_condition;
+  int ready_threads = 0;
+  bool start_threads = false;
+  std::exception_ptr error_a;
+  std::exception_ptr error_b;
+  BellmanFordCsrResult result_a;
+  BellmanFordCsrResult result_b;
+  const std::vector<float> dynamic(8, 1.0f);
+
+  auto wait_for_start = [&] {
+    std::unique_lock<std::mutex> lock(start_mutex);
+    ++ready_threads;
+    start_condition.notify_all();
+    start_condition.wait(lock, [&] { return start_threads; });
+  };
+  auto run_repeated = [&](BellmanFord11CsrWorkspace& workspace,
+                          hipStream_t stream,
+                          int primary_source,
+                          int alternate_source,
+                          int target,
+                          int primary_middle,
+                          BellmanFordCsrResult* output,
+                          std::exception_ptr* error) {
+    try {
+      wait_for_start();
+      check_hip(hipSetDevice(device), "select test HIP device");
+      for (int repetition = 0; repetition < 8; ++repetition) {
+        const bool use_primary = repetition % 2 == 0;
+        const int source = use_primary ? primary_source : alternate_source;
+        BellmanFordCsrResult current = workspace.run(
+            std::vector<int>{source}, std::vector<int>{target}, 1.0f, -1,
+            stream, nullptr, nullptr);
+        validate_paths("BF11 parallel explicit stream repetition " +
+                           std::to_string(repetition),
+                       graph, sidecars, dynamic, {source}, {target}, current);
+        const std::vector<int> expected_path =
+            use_primary ? std::vector<int>{primary_source, primary_middle,
+                                           target}
+                        : std::vector<int>{alternate_source, target};
+        require(current.target_path_nodes == expected_path,
+                "parallel explicit-stream BF11 leaked state between queries");
+        *output = std::move(current);
+      }
+    } catch (...) {
+      *error = std::current_exception();
+    }
+  };
+
+  bf11_internal_reset_counters();
+  std::thread thread_a(run_repeated, std::ref(workspace_a), stream_a.get(),
+                       0, 6, 4, 2, &result_a, &error_a);
+  std::thread thread_b(run_repeated, std::ref(workspace_b), stream_b.get(),
+                       1, 7, 5, 3, &result_b, &error_b);
+  {
+    std::unique_lock<std::mutex> lock(start_mutex);
+    start_condition.wait(lock, [&] { return ready_threads == 2; });
+    start_threads = true;
+  }
+  start_condition.notify_all();
+  thread_a.join();
+  thread_b.join();
+  if (error_a) std::rethrow_exception(error_a);
+  if (error_b) std::rethrow_exception(error_b);
+
+  validate_paths("BF11 first parallel explicit stream", graph, sidecars,
+                 dynamic, {6}, {4}, result_a);
+  validate_paths("BF11 second parallel explicit stream", graph, sidecars,
+                 dynamic, {7}, {5}, result_b);
+  require(result_a.target_path_nodes == std::vector<int>({6, 4}) &&
+              result_b.target_path_nodes == std::vector<int>({7, 5}),
+          "parallel explicit-stream BF11 returned an incorrect route");
+  require(bf11_internal_gpu_controller_launch_count() == 0 &&
+              bf11_internal_controller_fallback_count() == 16 &&
+              bf11_internal_sparse_state_reset_count() == 16 &&
+              bf11_internal_dense_state_reset_count() == 0,
+          "parallel BF11 did not use only independent host-controlled sparse resets");
+}
+
 }  // namespace
 
 int main() {
   try {
     test_validation_and_dynamic_updates();
+    test_defensive_reset_after_controller_error();
     test_true_multi_source();
     test_explicit_bounds_and_missing_spill();
     test_auto_bounds_and_fallback();
     test_target_check_interval_and_settlement();
+    test_parallel_explicit_stream_host_controller();
     std::cout << "BF11 bounded dynamic HIP tests passed\n";
     return 0;
   } catch (const std::exception& error) {

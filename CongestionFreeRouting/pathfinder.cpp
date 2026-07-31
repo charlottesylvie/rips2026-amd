@@ -2909,6 +2909,7 @@ PathfinderResult run_pathfinder(const HostCsrF32& base_graph,
     }
     case SsspEngine::kBellmanFord11: {
       std::cout << "[pathfinder] selected bounded dynamic-cost BF11 backend\n";
+      reset_bellman_ford11_runtime_stats();
       const bool has_routing_sidecars =
           routing_sidecars != nullptr &&
           !routing_sidecars->route_end_x.empty();
@@ -2943,6 +2944,18 @@ PathfinderResult run_pathfinder(const HostCsrF32& base_graph,
         bf11_options.parallel_net_workers = 1;
         std::cout << "[pathfinder] auto-selected 1 BF11 worker(s)\n";
       }
+      const std::size_t bf11_worker_count =
+          stream != nullptr
+              ? 1
+              : std::min<std::size_t>(
+                    bf11_options.parallel_net_workers,
+                    std::max<std::size_t>(1, route_request_count));
+      if (bf11_worker_count > 1) {
+        std::cout
+            << "[pathfinder] BF11 parallel workers use independent explicit "
+               "streams with the host-checked controller; the persistent "
+               "cooperative controller remains single-worker only\n";
+      }
       BellmanFord11WorkspaceOptions workspace_options;
       workspace_options.auto_bounds = bf11_options.bf11_bounds_enabled;
       workspace_options.auto_margin_x =
@@ -2966,6 +2979,24 @@ PathfinderResult run_pathfinder(const HostCsrF32& base_graph,
             return BellmanFord11CsrWorkspace(
                 shared_graph, worker_stream, workspace_options);
           });
+      const BellmanFord11RuntimeStats bf11_stats =
+          bellman_ford11_runtime_stats();
+      std::cout << "{\"type\":\"bf11_runtime_stats\""
+                << ",\"schema_version\":1"
+                << ",\"workers\":" << bf11_worker_count
+                << ",\"persistent_controller_runs\":"
+                << bf11_stats.persistent_controller_runs
+                << ",\"host_controller_runs\":"
+                << bf11_stats.host_controller_runs
+                << ",\"target_checks\":" << bf11_stats.target_checks
+                << ",\"auto_unbounded_retries\":"
+                << bf11_stats.auto_unbounded_retries
+                << ",\"sparse_state_resets\":"
+                << bf11_stats.sparse_state_resets
+                << ",\"workspace_state_initializations\":"
+                << bf11_stats.workspace_state_initializations
+                << ",\"defensive_dense_state_resets\":"
+                << bf11_stats.defensive_dense_state_resets << "}\n";
       break;
     }
   }

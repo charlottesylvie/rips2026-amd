@@ -2,6 +2,12 @@
 // production implementation is HIP-only; CPU PathFinder tests include this
 // after defining their deterministic Dijkstra helpers.
 
+void reset_bellman_ford11_runtime_stats() {}
+
+BellmanFord11RuntimeStats bellman_ford11_runtime_stats() {
+  return {};
+}
+
 struct BellmanFord11CsrGraph::Impl {
   Impl(const HostCsrF32& adjacency, const std::vector<float>& base_costs)
       : graph(adjacency), base_vertex_cost(base_costs) {}

@@ -52,6 +52,23 @@ struct BellmanFord11WorkspaceOptions {
   int target_check_interval = 1;
 };
 
+// Process-wide aggregate for one benchmark/run interval. PathFinder resets it
+// immediately before constructing BF11 workspaces and emits one JSON snapshot
+// after all nets finish. The counters are atomic because net workers run on
+// independent CPU threads.
+struct BellmanFord11RuntimeStats {
+  std::uint64_t persistent_controller_runs = 0;
+  std::uint64_t host_controller_runs = 0;
+  std::uint64_t target_checks = 0;
+  std::uint64_t auto_unbounded_retries = 0;
+  std::uint64_t sparse_state_resets = 0;
+  std::uint64_t workspace_state_initializations = 0;
+  std::uint64_t defensive_dense_state_resets = 0;
+};
+
+void reset_bellman_ford11_runtime_stats();
+BellmanFord11RuntimeStats bellman_ford11_runtime_stats();
+
 class BellmanFord11CsrGraph {
  public:
   struct Impl;

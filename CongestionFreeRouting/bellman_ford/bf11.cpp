@@ -1,6 +1,8 @@
 // Bounded, dynamically weighted, true-multi-source active-frontier
-// Bellman-Ford for PathFinder. The cooperative controller keeps every
-// relaxation round and target certificate on the GPU.
+// Bellman-Ford for PathFinder. The default-stream cooperative controller keeps
+// every relaxation round and target certificate on the GPU; explicit worker
+// streams use the complete host-checked controller because a BF11 cooperative
+// grid consumes full device residency on the target gfx1151 runtime.
 
 #include "bf11.hpp"
 
@@ -34,14 +36,38 @@ std::atomic<std::uint64_t> g_bf11_gpu_controller_launches{0};
 std::atomic<std::uint64_t> g_bf11_controller_fallbacks{0};
 std::atomic<std::uint64_t> g_bf11_target_checks{0};
 std::atomic<std::uint64_t> g_bf11_auto_unbounded_retries{0};
+std::atomic<std::uint64_t> g_bf11_sparse_state_resets{0};
+std::atomic<std::uint64_t> g_bf11_workspace_state_initializations{0};
+std::atomic<std::uint64_t> g_bf11_defensive_dense_state_resets{0};
 
 }  // namespace
 
-extern "C" void bf11_internal_reset_counters() {
+void reset_bellman_ford11_runtime_stats() {
   g_bf11_gpu_controller_launches.store(0, std::memory_order_relaxed);
   g_bf11_controller_fallbacks.store(0, std::memory_order_relaxed);
   g_bf11_target_checks.store(0, std::memory_order_relaxed);
   g_bf11_auto_unbounded_retries.store(0, std::memory_order_relaxed);
+  g_bf11_sparse_state_resets.store(0, std::memory_order_relaxed);
+  g_bf11_workspace_state_initializations.store(0,
+                                                std::memory_order_relaxed);
+  g_bf11_defensive_dense_state_resets.store(0,
+                                             std::memory_order_relaxed);
+}
+
+BellmanFord11RuntimeStats bellman_ford11_runtime_stats() {
+  return {g_bf11_gpu_controller_launches.load(std::memory_order_relaxed),
+          g_bf11_controller_fallbacks.load(std::memory_order_relaxed),
+          g_bf11_target_checks.load(std::memory_order_relaxed),
+          g_bf11_auto_unbounded_retries.load(std::memory_order_relaxed),
+          g_bf11_sparse_state_resets.load(std::memory_order_relaxed),
+          g_bf11_workspace_state_initializations.load(
+              std::memory_order_relaxed),
+          g_bf11_defensive_dense_state_resets.load(
+              std::memory_order_relaxed)};
+}
+
+extern "C" void bf11_internal_reset_counters() {
+  reset_bellman_ford11_runtime_stats();
 }
 
 extern "C" std::uint64_t bf11_internal_gpu_controller_launch_count() {
@@ -58,6 +84,15 @@ extern "C" std::uint64_t bf11_internal_target_check_count() {
 
 extern "C" std::uint64_t bf11_internal_auto_unbounded_retry_count() {
   return g_bf11_auto_unbounded_retries.load(std::memory_order_relaxed);
+}
+
+extern "C" std::uint64_t bf11_internal_sparse_state_reset_count() {
+  return g_bf11_sparse_state_resets.load(std::memory_order_relaxed);
+}
+
+extern "C" std::uint64_t bf11_internal_dense_state_reset_count() {
+  return g_bf11_defensive_dense_state_resets.load(
+      std::memory_order_relaxed);
 }
 
 namespace rips_sssp_bf11 {
@@ -142,6 +177,14 @@ struct DeviceWorkspace {
   Index* next_frontier = nullptr;
   int* next_marks = nullptr;
   unsigned char* source_mask = nullptr;
+  // Query reset is sparse after construction. Every node whose packed state,
+  // frontier mark, or source bit can differ from the default state appears
+  // exactly once in touched_nodes[0:touched_count]. Sources publish themselves
+  // while seeding; a non-source is published by the unique relaxation that
+  // replaces its infinity label. Any future writer of those arrays must
+  // preserve this completeness invariant.
+  Index* touched_nodes = nullptr;
+  int* touched_count = nullptr;
   float* dynamic_vertex_cost = nullptr;
   IterationStatus* iteration_status = nullptr;
   IterationStatus* host_iteration_status = nullptr;
@@ -165,6 +208,9 @@ struct DeviceWorkspace {
   std::size_t compact_node_capacity = 0;
   std::size_t compact_edge_capacity = 0;
   int cooperative_blocks = -1;
+  // A failed asynchronous operation can leave the sparse-reset invariant
+  // uncertain. Reuse then takes the defensive dense reset path once.
+  bool needs_full_state_reset = false;
 };
 
 struct SsspStatus {
@@ -243,6 +289,14 @@ dim3 grid_for_items(Offset items) {
   const unsigned gy = static_cast<unsigned>(
       (blocks + static_cast<Offset>(gx) - 1) / static_cast<Offset>(gx));
   return dim3(gx, gy);
+}
+
+dim3 sparse_reset_grid(Offset rows) {
+  constexpr Offset kMaxSparseResetBlocks = 256;
+  const Offset required =
+      std::max<Offset>(1, (rows + kBlockSize - 1) / kBlockSize);
+  return dim3(static_cast<unsigned>(
+      std::min(required, kMaxSparseResetBlocks)));
 }
 
 template <typename T>
@@ -343,19 +397,29 @@ __device__ __forceinline__ bool node_admitted(
 // Distance-only comparison is deliberate. Equal-distance predecessor rewrites
 // can create cycles around zero-cost edges and are irrelevant to SSSP distance
 // correctness. The first strict label improvement therefore owns its parent.
-__device__ __forceinline__ bool atomic_relax_strict(
+struct AtomicRelaxResult {
+  bool improved = false;
+  bool first_discovery = false;
+};
+
+__device__ __forceinline__ AtomicRelaxResult atomic_relax_strict(
     unsigned long long* address,
     float candidate,
     DeviceOffset predecessor) {
   const unsigned int candidate_bits = __float_as_uint(candidate);
-  unsigned long long old_state = *address;
+  // Reused workspaces are reset by an earlier dispatch. Observe that reset
+  // through the coherent atomic path so a cached finite label from the prior
+  // query cannot suppress the first claim (and its touched-list publication).
+  unsigned long long old_state = atomicCAS(address, 0ULL, 0ULL);
   while (candidate_bits < state_distance_bits(old_state)) {
     const unsigned long long desired = pack_state(candidate_bits, predecessor);
     const unsigned long long assumed = old_state;
     old_state = atomicCAS(address, assumed, desired);
-    if (old_state == assumed) return true;
+    if (old_state == assumed) {
+      return {true, state_distance_bits(assumed) == kInfinityBits};
+    }
   }
-  return false;
+  return {};
 }
 
 __device__ __forceinline__ float effective_edge_weight(
@@ -380,6 +444,8 @@ __device__ __forceinline__ unsigned int relax_edge(
     Index* __restrict__ next_frontier,
     int* __restrict__ next_marks,
     const unsigned char* __restrict__ source_mask,
+    Index* __restrict__ touched_nodes,
+    int* __restrict__ touched_count,
     IterationStatus* __restrict__ status) {
   const Index dst = graph.to[edge];
   if (dst < 0 || static_cast<Offset>(dst) >= graph.rows) {
@@ -402,9 +468,20 @@ __device__ __forceinline__ unsigned int relax_edge(
   const float candidate = from_distance + effective_weight;
   if (!finite_device(candidate)) return kInfinityBits;
 
-  if (!atomic_relax_strict(&best_state[dst], candidate,
-                           static_cast<DeviceOffset>(edge))) {
+  const AtomicRelaxResult relaxation =
+      atomic_relax_strict(&best_state[dst], candidate,
+                          static_cast<DeviceOffset>(edge));
+  if (!relaxation.improved) {
     return kInfinityBits;
+  }
+  if (relaxation.first_discovery) {
+    const int touched_slot = atomicAdd(touched_count, 1);
+    if (touched_slot < 0 ||
+        static_cast<Offset>(touched_slot) >= graph.rows) {
+      atomicExch(&status->error_status, 5);
+      return kInfinityBits;
+    }
+    touched_nodes[touched_slot] = dst;
   }
   const int old_mark = atomicExch(&next_marks[dst], mark_token);
   if (old_mark != mark_token) {
@@ -429,17 +506,53 @@ __global__ void clear_state_kernel(Offset rows,
   source_mask[row] = 0;
 }
 
+__global__ void clear_touched_state_kernel(
+    Offset rows,
+    const Index* touched_nodes,
+    const int* touched_count,
+    unsigned long long* best_state,
+    int* next_marks,
+    unsigned char* source_mask) {
+  __shared__ int shared_count;
+  if (threadIdx.x == 0) {
+    // The list is immutable for this kernel and the preceding work is ordered
+    // on the same stream, so an atomic read-modify-write only adds contention.
+    shared_count = *touched_count;
+  }
+  __syncthreads();
+  const Offset thread = logical_thread_id();
+  const Offset thread_count =
+      static_cast<Offset>(gridDim.x) * static_cast<Offset>(gridDim.y) *
+      static_cast<Offset>(blockDim.x);
+  const int observed_count = shared_count;
+  Offset count = observed_count <= 0 ? 0 : static_cast<Offset>(observed_count);
+  if (count > rows) count = rows;
+  for (Offset item = thread; item < count; item += thread_count) {
+    const Index node = touched_nodes[item];
+    if (node < 0 || static_cast<Offset>(node) >= rows) continue;
+    best_state[node] = pack_state(kInfinityBits, kNoPredecessor);
+    next_marks[node] = 0;
+    source_mask[node] = 0;
+  }
+}
+
 __global__ void seed_sources_kernel(const Index* source_nodes,
                                     Offset source_count,
                                     unsigned long long* best_state,
                                     Index* frontier,
-                                    unsigned char* source_mask) {
+                                    unsigned char* source_mask,
+                                    Index* touched_nodes,
+                                    int* touched_count) {
   const Offset item = logical_thread_id();
   if (item >= source_count) return;
   const Index source = source_nodes[item];
   best_state[source] = pack_state(0u, kNoPredecessor);
+  // Sources are stable-deduplicated before upload, so this prefix contains no
+  // duplicate touched entries and needs no queue-tail atomic.
+  touched_nodes[item] = source;
   source_mask[source] = 1;
   frontier[item] = source;
+  if (item == 0) *touched_count = static_cast<int>(source_count);
 }
 
 __global__ void reset_iteration_status_kernel(IterationStatus* status) {
@@ -462,6 +575,8 @@ __global__ void frontier_relax_kernel(
     Index* next_frontier,
     int* next_marks,
     const unsigned char* source_mask,
+    Index* touched_nodes,
+    int* touched_count,
     IterationStatus* status) {
   const Offset item = logical_thread_id();
   if (item >= static_cast<Offset>(frontier_count)) return;
@@ -482,7 +597,8 @@ __global__ void frontier_relax_kernel(
   for (Offset edge = begin; edge < end; ++edge) {
     const unsigned int candidate = relax_edge(
         graph, edge, from_dist, dynamic_vertex_cost, bounds, mark_token,
-        best_state, next_frontier, next_marks, source_mask, status);
+        best_state, next_frontier, next_marks, source_mask, touched_nodes,
+        touched_count, status);
     local_min = candidate < local_min ? candidate : local_min;
   }
   if (local_min != kInfinityBits) {
@@ -531,16 +647,33 @@ __global__ void frontier_controller_kernel(
     Index* next_frontier,
     int* next_marks,
     unsigned char* source_mask,
+    Index* touched_nodes,
+    int* touched_count,
     IterationStatus* iteration_status,
     ControllerResult* controller_result) {
   cooperative_groups::grid_group grid = cooperative_groups::this_grid();
   const Offset thread = static_cast<Offset>(grid.thread_rank());
   const Offset thread_count = static_cast<Offset>(grid.size());
 
-  for (Offset row = thread; row < graph.rows; row += thread_count) {
-    best_state[row] = pack_state(kInfinityBits, kNoPredecessor);
-    next_marks[row] = 0;
-    source_mask[row] = 0;
+  // Snapshot before clearing: touched_count must remain stable until every
+  // block has consumed the prior query's list. Reusing the iteration status as
+  // initialization scratch is safe because the first round resets it below.
+  if (thread == 0) {
+    const int observed = *touched_count;
+    Offset prior_count = observed <= 0 ? 0 : static_cast<Offset>(observed);
+    if (prior_count > graph.rows) prior_count = graph.rows;
+    iteration_status->next_count = static_cast<int>(prior_count);
+  }
+  grid.sync();
+  const int prior_touched_count = iteration_status->next_count;
+  for (Offset item = thread;
+       item < static_cast<Offset>(prior_touched_count);
+       item += thread_count) {
+    const Index node = touched_nodes[item];
+    if (node < 0 || static_cast<Offset>(node) >= graph.rows) continue;
+    best_state[node] = pack_state(kInfinityBits, kNoPredecessor);
+    next_marks[node] = 0;
+    source_mask[node] = 0;
   }
   grid.sync();
   for (Offset item = thread; item < source_count; item += thread_count) {
@@ -548,8 +681,10 @@ __global__ void frontier_controller_kernel(
     best_state[source] = pack_state(0u, kNoPredecessor);
     source_mask[source] = 1;
     frontier[item] = source;
+    touched_nodes[item] = source;
   }
   if (thread == 0) {
+    *touched_count = static_cast<int>(source_count);
     controller_result->iterations_used = 0;
     controller_result->error_status = 0;
     controller_result->frontier_count = static_cast<int>(source_count);
@@ -598,7 +733,8 @@ __global__ void frontier_controller_kernel(
       for (Offset edge = begin; edge < end; ++edge) {
         const unsigned int candidate = relax_edge(
             graph, edge, from_dist, dynamic_vertex_cost, bounds, mark_token,
-            best_state, next, next_marks, source_mask, iteration_status);
+            best_state, next, next_marks, source_mask, touched_nodes,
+            touched_count, iteration_status);
         local_min = candidate < local_min ? candidate : local_min;
       }
       if (local_min != kInfinityBits) {
@@ -947,6 +1083,10 @@ DeviceWorkspace make_workspace(Offset rows, hipStream_t stream) {
         device_allocate<int>(count, "hipMalloc BF11 frontier marks");
     workspace.source_mask = device_allocate<unsigned char>(
         count, "hipMalloc BF11 source mask");
+    workspace.touched_nodes =
+        device_allocate<Index>(count, "hipMalloc BF11 touched nodes");
+    workspace.touched_count =
+        device_allocate<int>(1, "hipMalloc BF11 touched count");
     workspace.dynamic_vertex_cost = device_allocate<float>(
         count, "hipMalloc BF11 dynamic vertex costs");
     workspace.iteration_status = device_allocate<IterationStatus>(
@@ -957,11 +1097,22 @@ DeviceWorkspace make_workspace(Offset rows, hipStream_t stream) {
         1, "hipMalloc BF11 controller result");
     workspace.host_controller_result = pinned_allocate<ControllerResult>(
         1, "hipHostMalloc BF11 controller result");
+    // Pay the dense state initialization once per workspace. Successful query
+    // reuse clears only the nodes recorded in touched_nodes.
+    hipLaunchKernelGGL(clear_state_kernel, grid_for_items(rows),
+                       dim3(kBlockSize), 0, stream, rows,
+                       workspace.best_state, workspace.next_marks,
+                       workspace.source_mask);
+    check_hip(hipGetLastError(), "initialize BF11 search state");
+    check_hip(hipMemsetAsync(workspace.touched_count, 0, sizeof(int), stream),
+              "initialize BF11 touched count");
     hipLaunchKernelGGL(fill_cost_kernel, grid_for_items(rows), dim3(kBlockSize),
                        0, stream, rows, workspace.dynamic_vertex_cost, 1.0f);
     check_hip(hipGetLastError(), "initialize BF11 dynamic vertex costs");
     check_hip(hipStreamSynchronize(stream),
               "synchronize BF11 workspace initialization");
+    g_bf11_workspace_state_initializations.fetch_add(
+        1, std::memory_order_relaxed);
     return workspace;
   } catch (...) {
     // The initialization kernel uses the caller's stream. If an asynchronous
@@ -973,6 +1124,8 @@ DeviceWorkspace make_workspace(Offset rows, hipStream_t stream) {
     if (workspace.next_frontier) (void)hipFree(workspace.next_frontier);
     if (workspace.next_marks) (void)hipFree(workspace.next_marks);
     if (workspace.source_mask) (void)hipFree(workspace.source_mask);
+    if (workspace.touched_nodes) (void)hipFree(workspace.touched_nodes);
+    if (workspace.touched_count) (void)hipFree(workspace.touched_count);
     if (workspace.dynamic_vertex_cost)
       (void)hipFree(workspace.dynamic_vertex_cost);
     if (workspace.iteration_status) (void)hipFree(workspace.iteration_status);
@@ -993,6 +1146,8 @@ void free_workspace(DeviceWorkspace* workspace) noexcept {
   if (workspace->next_frontier) (void)hipFree(workspace->next_frontier);
   if (workspace->next_marks) (void)hipFree(workspace->next_marks);
   if (workspace->source_mask) (void)hipFree(workspace->source_mask);
+  if (workspace->touched_nodes) (void)hipFree(workspace->touched_nodes);
+  if (workspace->touched_count) (void)hipFree(workspace->touched_count);
   if (workspace->dynamic_vertex_cost)
     (void)hipFree(workspace->dynamic_vertex_cost);
   if (workspace->iteration_status) (void)hipFree(workspace->iteration_status);
@@ -1017,6 +1172,22 @@ void free_workspace(DeviceWorkspace* workspace) noexcept {
   if (workspace->compact_edge_costs)
     (void)hipFree(workspace->compact_edge_costs);
   *workspace = {};
+}
+
+void fully_reset_workspace_state(DeviceWorkspace& workspace) {
+  hipLaunchKernelGGL(clear_state_kernel, grid_for_items(workspace.rows),
+                     dim3(kBlockSize), 0, workspace.stream, workspace.rows,
+                     workspace.best_state, workspace.next_marks,
+                     workspace.source_mask);
+  check_hip(hipGetLastError(), "defensively reset BF11 search state");
+  check_hip(hipMemsetAsync(workspace.touched_count, 0, sizeof(int),
+                           workspace.stream),
+            "defensively reset BF11 touched count");
+  check_hip(hipStreamSynchronize(workspace.stream),
+            "synchronize defensive BF11 state reset");
+  g_bf11_defensive_dense_state_resets.fetch_add(
+      1, std::memory_order_relaxed);
+  workspace.needs_full_state_reset = false;
 }
 
 Offset geometric_capacity(Offset current, Offset required, Offset limit) {
@@ -1175,6 +1346,8 @@ void throw_controller_error(int status) {
           "BF11 effective edge weight is nonfinite or negative");
     case 4:
       throw std::runtime_error("BF11 next-frontier capacity overflowed");
+    case 5:
+      throw std::runtime_error("BF11 touched-state capacity overflowed");
     default:
       throw std::runtime_error("BF11 controller returned an unknown error");
   }
@@ -1224,6 +1397,7 @@ SsspStatus run_gpu_controller(const DeviceGraph& graph,
                               const BellmanFord11RunOptions& options,
                               int blocks) {
   PATHFINDER_PROFILE_RANGE("bf11.gpu_controller");
+  g_bf11_sparse_state_resets.fetch_add(1, std::memory_order_relaxed);
   DeviceGraph graph_arg = graph;
   const Index* sources_arg = workspace.source_nodes;
   Offset source_count_arg = source_count;
@@ -1238,6 +1412,8 @@ SsspStatus run_gpu_controller(const DeviceGraph& graph,
   Index* next_arg = workspace.next_frontier;
   int* marks_arg = workspace.next_marks;
   unsigned char* source_mask_arg = workspace.source_mask;
+  Index* touched_nodes_arg = workspace.touched_nodes;
+  int* touched_count_arg = workspace.touched_count;
   IterationStatus* iteration_arg = workspace.iteration_status;
   ControllerResult* result_arg = workspace.controller_result;
   void* args[] = {&graph_arg,
@@ -1254,6 +1430,8 @@ SsspStatus run_gpu_controller(const DeviceGraph& graph,
                   &next_arg,
                   &marks_arg,
                   &source_mask_arg,
+                  &touched_nodes_arg,
+                  &touched_count_arg,
                   &iteration_arg,
                   &result_arg};
   check_hip(hipLaunchCooperativeKernel(
@@ -1295,17 +1473,26 @@ SsspStatus run_host_controller(const DeviceGraph& graph,
                                const BellmanFord11RunOptions& options) {
   PATHFINDER_PROFILE_RANGE("bf11.controller_fallback");
   g_bf11_controller_fallbacks.fetch_add(1, std::memory_order_relaxed);
-  hipLaunchKernelGGL(clear_state_kernel, grid_for_items(graph.rows),
-                     dim3(kBlockSize), 0, workspace.stream, graph.rows,
-                     workspace.best_state, workspace.next_marks,
-                     workspace.source_mask);
-  check_hip(hipGetLastError(), "clear BF11 state");
+  g_bf11_sparse_state_resets.fetch_add(1, std::memory_order_relaxed);
+  hipLaunchKernelGGL(clear_touched_state_kernel,
+                     sparse_reset_grid(graph.rows), dim3(kBlockSize), 0,
+                     workspace.stream, graph.rows, workspace.touched_nodes,
+                     workspace.touched_count, workspace.best_state,
+                     workspace.next_marks, workspace.source_mask);
+  check_hip(hipGetLastError(), "clear BF11 touched state");
+  check_hip(hipMemsetAsync(workspace.touched_count, 0, sizeof(int),
+                           workspace.stream),
+            "reset BF11 touched count");
   hipLaunchKernelGGL(seed_sources_kernel, grid_for_items(source_count),
                      dim3(kBlockSize), 0, workspace.stream,
                      workspace.source_nodes, source_count,
                      workspace.best_state, workspace.frontier,
-                     workspace.source_mask);
+                     workspace.source_mask, workspace.touched_nodes,
+                     workspace.touched_count);
   check_hip(hipGetLastError(), "seed BF11 sources");
+  // Same-stream ordering publishes reset and seed work to the first round; a
+  // later controller-status or path-result transfer is the first required
+  // host synchronization point.
 
   int frontier_count = static_cast<int>(source_count);
   SsspStatus result;
@@ -1320,6 +1507,7 @@ SsspStatus run_host_controller(const DeviceGraph& graph,
                        workspace.dynamic_vertex_cost, options.bounds,
                        workspace.best_state, workspace.next_frontier,
                        workspace.next_marks, workspace.source_mask,
+                       workspace.touched_nodes, workspace.touched_count,
                        workspace.iteration_status);
     check_hip(hipGetLastError(), "launch BF11 frontier relaxation");
     const bool check_targets =
@@ -1367,7 +1555,13 @@ SsspStatus run_sssp(const DeviceGraph& graph,
                     int max_iters,
                     const BellmanFord11RunOptions& options) {
   if (max_iters < 0) max_iters = static_cast<int>(graph.rows) - 1;
-  const int blocks = cooperative_block_count(workspace);
+  // PathFinder's parallel workers use independent nonblocking streams. A BF11
+  // cooperative grid consumes the device's full legal residency, so launching
+  // one on each worker stream can corrupt the HIP runtime on gfx1151. Preserve
+  // the one-round-trip persistent controller for the default stream and use
+  // the complete host controller for explicit streams.
+  const int blocks =
+      workspace.stream == nullptr ? cooperative_block_count(workspace) : 0;
   return blocks > 0
              ? run_gpu_controller(graph, workspace, source_count, target_count,
                                   max_iters, options, blocks)
@@ -1638,6 +1832,13 @@ struct BellmanFord11CsrWorkspace::Impl {
     ensure_source_capacity(workspace, source_count);
     ensure_target_capacity(workspace, target_count);
     ensure_reconstruction_capacity(workspace, target_count);
+    if (workspace.needs_full_state_reset) {
+      fully_reset_workspace_state(workspace);
+    }
+    // Leave this set across every asynchronous phase. Only a completely
+    // materialized host result proves that the touched-list invariant is safe
+    // for sparse reuse; any exception forces one dense reset next time.
+    workspace.needs_full_state_reset = true;
     DrainStreamOnException drain(stream);
     check_hip(hipMemcpyAsync(workspace.source_nodes, unique_sources.data(),
                              unique_sources.size() * sizeof(Index),
@@ -1824,6 +2025,7 @@ struct BellmanFord11CsrWorkspace::Impl {
       result.target_edge_offsets.push_back(
           static_cast<int>(result.target_path_edges.size()));
     }
+    workspace.needs_full_state_reset = false;
     return result;
   }
 };
