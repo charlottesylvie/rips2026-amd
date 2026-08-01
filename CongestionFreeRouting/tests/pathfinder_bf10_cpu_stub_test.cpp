@@ -2008,6 +2008,13 @@ int main() {
   }
 
   const routing::PathfinderOptions default_pathfinder_options;
+  const BellmanFord11WorkspaceOptions default_bf11_workspace_options;
+  require(default_pathfinder_options.bf11_bbox_margin_x == 2 &&
+              default_pathfinder_options.bf11_bbox_margin_y == 14 &&
+              default_bf11_workspace_options.auto_margin_x == 2 &&
+              default_bf11_workspace_options.auto_margin_y == 14,
+          "BF11 inclusive automatic margins must match RWRoute's strict "
+          "3/15 bounding-box admission");
   require(default_pathfinder_options.delta == 1.0f,
           "default delta-stepping bucket width must be one");
   require(!default_pathfinder_options.delta_auto,

@@ -97,7 +97,7 @@ Run the bounded BF11 challenger against a newly generated CSR v3 artifact with:
 ```bash
 make ROUTER=PathFinderFile BENCHMARKS="boom_med_pb" VERBOSE=1 \
   PATHFINDER_SSSP_ENGINE=bf11 \
-  PATHFINDER_ARGS="--bf11-bbox-margin-x 3 --bf11-bbox-margin-y 15"
+  PATHFINDER_ARGS="--bf11-bbox-margin-x 2 --bf11-bbox-margin-y 14"
 ```
 
 BF11 automatically chooses workers from route count, CPU concurrency, free GPU
@@ -466,8 +466,8 @@ Tuning options:
 | `--delta-benchmark-weight-seed <uint>` | `0` | Seed the `mixed` family; rejected for every other family. |
 | `--max-sssp-iters <int>` | `-1` | Delta buckets, unit-BFS depth, or Bellman-Ford rounds; `-1` uses the default. |
 | `--bf11-unbounded` | unset | Disable automatic source/target bounding for BF11. This is also the explicit compatibility path for CSR v1/v2. |
-| `--bf11-bbox-margin-x <int>` | `3` | Nonnegative horizontal expansion applied to BF11's inclusive endpoint box. |
-| `--bf11-bbox-margin-y <int>` | `15` | Nonnegative vertical expansion applied to BF11's inclusive endpoint box. |
+| `--bf11-bbox-margin-x <int>` | `2` | Nonnegative horizontal expansion applied to BF11's inclusive endpoint box, matching the integer layers admitted by RWRoute's strict X extension of 3. |
+| `--bf11-bbox-margin-y <int>` | `14` | Nonnegative vertical expansion applied to BF11's inclusive endpoint box, matching the integer layers admitted by RWRoute's strict Y extension of 15. |
 | `--bf11-target-check-interval <int>` | `1` | Check BF11's exact nonnegative-distance target certificate every N relaxation rounds. |
 | `--bf11-no-unbounded-fallback` | unset | Keep an unreachable auto-bounded query inside its initial box instead of retrying once unbounded. |
 | `--bf11-telemetry` | unset | Emit aggregate BF11 GPU phase times, blocking synchronization time, work counts, touched density, worker workspace bytes, and free-memory snapshots. |

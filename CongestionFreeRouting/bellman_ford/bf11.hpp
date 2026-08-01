@@ -42,8 +42,10 @@ struct BellmanFord11RunOptions {
 struct BellmanFord11WorkspaceOptions {
   // The legacy-shaped run() overload is unbounded unless this is enabled.
   bool auto_bounds = false;
-  std::int32_t auto_margin_x = 3;
-  std::int32_t auto_margin_y = 15;
+  // BF11 admits inclusive bounds, so 2/14 matches the integer coordinate
+  // layers admitted by RWRoute's strict 3/15 bounding-box test.
+  std::int32_t auto_margin_x = 2;
+  std::int32_t auto_margin_y = 14;
   // Applies only to auto-bounded legacy-shaped runs. Explicit run options never
   // widen silently. Missing-coordinate route-tree sources are still seeded,
   // but a target without coordinates selects an unbounded first run. A bounded

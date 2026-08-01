@@ -149,8 +149,9 @@ struct PathfinderOptions {
   // margins. The explicit unbounded mode keeps BF11 usable with legacy CSR
   // artifacts that do not carry spatial sidecars.
   bool bf11_bounds_enabled = true;
-  int bf11_bbox_margin_x = 3;
-  int bf11_bbox_margin_y = 15;
+  // BF11's inclusive 2/14 defaults match RWRoute's strict 3/15 admission.
+  int bf11_bbox_margin_x = 2;
+  int bf11_bbox_margin_y = 14;
   int bf11_target_check_interval = 1;
   bool bf11_unbounded_fallback = true;
   bool bf11_controls_explicit = false;
