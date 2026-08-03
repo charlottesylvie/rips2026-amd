@@ -98,6 +98,63 @@ int main() {
                                           "--delta-force-generic"}),
             "router did not forward the delta shorthand and force-generic flag");
 
+    const Options bounded_delta = parse(
+        {"PathFinderFile",
+         "design_unrouted.phys",
+         "design_routed.phys",
+         "--sssp-engine",
+         "delta-step",
+         "--delta-bbox",
+         "--delta-bbox-margin-x",
+         "4",
+         "--delta-bbox-margin-y",
+         "18",
+         "--delta-no-unbounded-fallback"});
+    require(bounded_delta.pathfinder_args ==
+                std::vector<std::string>({"--sssp-engine",
+                                          "delta-step",
+                                          "--delta-bbox",
+                                          "--delta-bbox-margin-x",
+                                          "4",
+                                          "--delta-bbox-margin-y",
+                                          "18",
+                                          "--delta-no-unbounded-fallback"}),
+            "router did not preserve bounded Delta option forwarding");
+
+    const Options bf11 = parse(
+        {"PathFinderFile",
+         "design_unrouted.phys",
+         "design_routed.phys",
+         "--sssp-engine",
+         "bf11",
+         "--bf11-unbounded",
+         "--bf11-bbox-margin-x",
+         "4",
+         "--bf11-bbox-margin-y",
+         "18",
+         "--bf11-target-check-interval",
+         "3",
+         "--bf11-no-unbounded-fallback",
+         "--bf11-telemetry",
+         "--bf11-telemetry"});
+    require(bf11.pathfinder_args ==
+                std::vector<std::string>({"--sssp-engine",
+                                          "bf11",
+                                          "--bf11-unbounded",
+                                          "--bf11-bbox-margin-x",
+                                          "4",
+                                          "--bf11-bbox-margin-y",
+                                          "18",
+                                          "--bf11-target-check-interval",
+                                          "3",
+                                          "--bf11-no-unbounded-fallback",
+                                          "--bf11-telemetry"}),
+            "router did not preserve BF11 option forwarding");
+    require(std::count(bf11.pathfinder_args.begin(),
+                       bf11.pathfinder_args.end(),
+                       "--bf11-telemetry") == 1,
+            "router did not forward BF11 telemetry exactly once");
+
     bool missing_seed_rejected = false;
     try {
       (void)parse({"PathFinderFile",
@@ -121,6 +178,18 @@ int main() {
     }
     require(missing_controller_batch_rejected,
             "router accepted a controller batch option without its value");
+
+    bool missing_delta_bbox_margin_rejected = false;
+    try {
+      (void)parse({"PathFinderFile",
+                   "design_unrouted.phys",
+                   "design_routed.phys",
+                   "--delta-bbox-margin-x"});
+    } catch (const std::runtime_error&) {
+      missing_delta_bbox_margin_rejected = true;
+    }
+    require(missing_delta_bbox_margin_rejected,
+            "router accepted a Delta bounding margin without its value");
 
     for (const std::string& weight_family :
          std::vector<std::string>({"unit", "all-light", "all-heavy"})) {

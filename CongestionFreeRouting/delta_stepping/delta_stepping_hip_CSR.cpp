@@ -43,6 +43,7 @@ enum DeviceTelemetryCounter : int {
   kTelemetryStaleFrontierEntries,
   kTelemetryLightEdgeVisits,
   kTelemetryHeavyEdgeVisits,
+  kTelemetryBoundsRejectedEdges,
   kTelemetryDistanceAtomicAttempts,
   kTelemetrySuccessfulRelaxations,
   kTelemetryDistanceCasRetries,
@@ -56,6 +57,26 @@ enum DeviceTelemetryCounter : int {
   kTelemetryHeavyQueueHighWater,
   kTelemetryCounterCount,
 };
+
+struct DeviceBoundsView {
+  const std::int32_t* route_end_x = nullptr;
+  const std::int32_t* route_end_y = nullptr;
+  DeltaSteppingCsrBoundingBox bounds{};
+};
+
+__host__ __device__ inline bool node_admitted(
+    const DeviceBoundsView& view,
+    int node) {
+  if (!view.bounds.enabled) return true;
+  const std::int32_t x = view.route_end_x[node];
+  const std::int32_t y = view.route_end_y[node];
+  if (x == routing::interchange::kMissingRouteCoordinate &&
+      y == routing::interchange::kMissingRouteCoordinate) {
+    return true;
+  }
+  return x >= view.bounds.min_x && x <= view.bounds.max_x &&
+         y >= view.bounds.min_y && y <= view.bounds.max_y;
+}
 
 enum UnitStatusIndex : int {
   kUnitStatusQueueTail = 0,
@@ -1120,6 +1141,7 @@ __device__ inline void expand_unit_frontier_range(
     int* queue_tail,
     int* found_count,
     const int* target_multiplicity,
+    DeviceBoundsView bounds,
     unsigned long long* telemetry_counters) {
   const float next_distance = static_cast<float>(next_depth);
   const unsigned int infinity_bits = __float_as_uint(INFINITY);
@@ -1140,6 +1162,12 @@ __device__ inline void expand_unit_frontier_range(
         ++telemetry[kTelemetryLightEdgeVisits];
       }
       const int v = static_cast<int>(out_colind[edge]);
+      if (!node_admitted(bounds, v)) {
+        if constexpr (CollectTelemetry) {
+          ++telemetry[kTelemetryBoundsRejectedEdges];
+        }
+        continue;
+      }
       auto* const distance_bits =
           reinterpret_cast<unsigned int*>(&dist[v]);
       const bool attempted = *distance_bits == infinity_bits;
@@ -1191,6 +1219,7 @@ __global__ void expand_unit_frontier_kernel(const RowOffset* out_rowptr,
                                             int* frontier_queue,
                                             int* status,
                                             const int* target_multiplicity,
+                                            DeviceBoundsView bounds,
                                             unsigned long long* telemetry_counters) {
   __shared__ int controller[4];
   if (threadIdx.x == 0) {
@@ -1210,7 +1239,7 @@ __global__ void expand_unit_frontier_kernel(const RowOffset* out_rowptr,
       controller[1], controller[2], controller[3] + 1, out_rowptr,
       out_colind, dist, pred_node, pred_edge, frontier_queue,
       status + kUnitStatusQueueTail, status + kUnitStatusFoundCount,
-      target_multiplicity, telemetry_counters);
+      target_multiplicity, bounds, telemetry_counters);
 }
 
 template <typename RowOffset, bool CollectTelemetry>
@@ -1227,11 +1256,12 @@ __global__ void expand_unit_frontier_host_controlled_kernel(
     int* queue_tail,
     int* found_count,
     const int* target_multiplicity,
+    DeviceBoundsView bounds,
     unsigned long long* telemetry_counters) {
   expand_unit_frontier_range<RowOffset, CollectTelemetry>(
       frontier_begin, frontier_end, next_depth, out_rowptr, out_colind, dist,
       pred_node, pred_edge, frontier_queue, queue_tail, found_count,
-      target_multiplicity, telemetry_counters);
+      target_multiplicity, bounds, telemetry_counters);
 }
 
 __global__ void advance_unit_frontier_kernel(int* status,
@@ -1681,6 +1711,7 @@ __global__ void relax_light_edges_kernel(const int* frontier,
                                          int* pending_count,
                                          int* heavy_queue,
                                          int* heavy_count,
+                                         DeviceBoundsView bounds,
                                          unsigned long long* telemetry_counters) {
   // FPGA routing graphs have short outgoing rows.  Assign one active vertex to
   // each thread so a 256-thread block can process up to 256 rows concurrently,
@@ -1734,8 +1765,14 @@ __global__ void relax_light_edges_kernel(const int* frontier,
         if constexpr (CollectTelemetry) {
           ++telemetry[kTelemetryLightEdgeVisits];
         }
-        const float w = out_values[e];
         const int v = static_cast<int>(out_colind[e]);
+        if (!node_admitted(bounds, v)) {
+          if constexpr (CollectTelemetry) {
+            ++telemetry[kTelemetryBoundsRejectedEdges];
+          }
+          continue;
+        }
+        const float w = out_values[e];
         const float effective_w =
             HasVertexCosts ? w * vertex_costs[v] : w;
         const float candidate = du + effective_w;
@@ -1861,6 +1898,7 @@ __global__ void relax_heavy_edges_kernel(const int* heavy_vertices,
                                          int* pending_queue,
                                          int* pending_count,
                                          int* in_heavy,
+                                         DeviceBoundsView bounds,
                                          unsigned long long* telemetry_counters) {
   __shared__ int heavy_count_value;
   if (threadIdx.x == 0) {
@@ -1884,8 +1922,14 @@ __global__ void relax_heavy_edges_kernel(const int* heavy_vertices,
         if constexpr (CollectTelemetry) {
           ++telemetry[kTelemetryHeavyEdgeVisits];
         }
-        const float w = out_values[e];
         const int v = static_cast<int>(out_colind[e]);
+        if (!node_admitted(bounds, v)) {
+          if constexpr (CollectTelemetry) {
+            ++telemetry[kTelemetryBoundsRejectedEdges];
+          }
+          continue;
+        }
+        const float w = out_values[e];
         const float effective_w =
             HasVertexCosts ? w * vertex_costs[v] : w;
         const float candidate = du + effective_w;
@@ -1965,6 +2009,7 @@ template <typename RowOffset,
           bool CollectTelemetry>
 void launch_relax_light_edges(
     const DeviceCsrView<RowOffset>& graph,
+    DeviceBoundsView bounds,
     DeltaSteppingScratch& scratch,
     const float* vertex_costs,
     const int* current_queue,
@@ -1992,6 +2037,7 @@ void launch_relax_light_edges(
           scratch.touched_count.get(), next_queue, next_count,
           pending_queue, scratch.pending_count.get(), scratch.heavy_queue.get(),
           scratch.heavy_count.get(),
+          bounds,
           CollectTelemetry ? scratch.telemetry_counters.get() : nullptr);
   DS_DELTA_HIP_CHECK(hipGetLastError());
 }
@@ -2003,6 +2049,7 @@ template <typename RowOffset,
           bool CollectTelemetry>
 void launch_relax_heavy_edges(
     const DeviceCsrView<RowOffset>& graph,
+    DeviceBoundsView bounds,
     DeltaSteppingScratch& scratch,
     const float* vertex_costs,
     int launch_blocks,
@@ -2020,6 +2067,7 @@ void launch_relax_heavy_edges(
           scratch.dist.get(), scratch.parent_key.get(), scratch.in_pending.get(),
           scratch.touched_queue.get(), scratch.touched_count.get(),
           pending_queue, scratch.pending_count.get(), scratch.in_heavy.get(),
+          bounds,
           CollectTelemetry ? scratch.telemetry_counters.get() : nullptr);
   DS_DELTA_HIP_CHECK(hipGetLastError());
 }
@@ -2274,6 +2322,7 @@ struct CooperativeDeltaControllerArgs {
   const RowOffset* rowptr;
   const Index* colind;
   const float* values;
+  DeviceBoundsView bounds;
   const float* vertex_costs;
   float delta;
   float exclusive_distance_limit;
@@ -2485,6 +2534,12 @@ __device__ void cooperative_relax_light_range(
             args.state, DeltaSteppingCsrControllerStatus::kInvalidState);
         continue;
       }
+      if (!node_admitted(args.bounds, v)) {
+        if constexpr (CollectTelemetry) {
+          ++telemetry[kTelemetryBoundsRejectedEdges];
+        }
+        continue;
+      }
       const float effective_w =
           use_vertex_costs ? args.values[e] * args.vertex_costs[v]
                            : args.values[e];
@@ -2619,6 +2674,12 @@ __device__ void cooperative_relax_heavy_range(
         if (v < 0 || v >= capacity) {
           controller_set_status(
               args.state, DeltaSteppingCsrControllerStatus::kInvalidState);
+          continue;
+        }
+        if (!node_admitted(args.bounds, v)) {
+          if constexpr (CollectTelemetry) {
+            ++telemetry[kTelemetryBoundsRejectedEdges];
+          }
           continue;
         }
         const float effective_w =
@@ -3486,6 +3547,8 @@ void copy_device_telemetry_to_host(DeltaSteppingScratch& scratch,
       counters[kTelemetryStaleFrontierEntries];
   telemetry.light_edge_visits = counters[kTelemetryLightEdgeVisits];
   telemetry.heavy_edge_visits = counters[kTelemetryHeavyEdgeVisits];
+  telemetry.bounds_rejected_edges =
+      counters[kTelemetryBoundsRejectedEdges];
   telemetry.distance_atomic_attempts =
       counters[kTelemetryDistanceAtomicAttempts];
   telemetry.successful_distance_relaxations =
@@ -3942,6 +4005,7 @@ void extract_target_paths_to_result(
 template <typename RowOffset, bool CollectTelemetry>
 DeltaSteppingCsrResult run_unit_weight_specialization(
     const DeviceCsrView<RowOffset>& graph,
+    DeviceBoundsView bounds,
     DeltaSteppingScratch& scratch,
     const std::vector<int>& sources,
     const std::vector<int>& targets,
@@ -4085,6 +4149,7 @@ DeltaSteppingCsrResult run_unit_weight_specialization(
               scratch.unit_status.get() + kUnitStatusQueueTail,
               scratch.unit_status.get() + kUnitStatusFoundCount,
               scratch.in_pending.get(),
+              bounds,
               CollectTelemetry ? scratch.telemetry_counters.get() : nullptr);
       DS_DELTA_HIP_CHECK(hipGetLastError());
       DS_DELTA_HIP_CHECK(hipMemcpyAsync(scratch.host_unit_status.get(),
@@ -4153,6 +4218,7 @@ DeltaSteppingCsrResult run_unit_weight_specialization(
                 scratch.pred_node.get(), scratch.pred_edge.get(),
                 scratch.current_queue.get(), scratch.unit_status.get(),
                 scratch.in_pending.get(),
+                bounds,
                 CollectTelemetry ? scratch.telemetry_counters.get() : nullptr);
         DS_DELTA_HIP_CHECK(hipGetLastError());
         advance_unit_frontier_kernel<<<1, 1, 0, stream>>>(
@@ -4354,6 +4420,7 @@ template <typename RowOffset,
           bool CollectTelemetry>
 DeltaSteppingCsrResult run_delta_stepping_impl(
     const DeviceCsrView<RowOffset>& d_adjacency,
+    DeviceBoundsView bounds,
     const std::uint32_t* edge_source,
     DeltaSteppingScratch& scratch,
     const std::vector<int>& sources,
@@ -4695,6 +4762,7 @@ DeltaSteppingCsrResult run_delta_stepping_impl(
         args.rowptr = d_adjacency.rowptr;
         args.colind = d_adjacency.colind;
         args.values = d_adjacency.values;
+        args.bounds = bounds;
         args.vertex_costs = vertex_costs;
         args.delta = delta;
         args.exclusive_distance_limit = exclusive_distance_limit;
@@ -4864,7 +4932,7 @@ DeltaSteppingCsrResult run_delta_stepping_impl(
           launch_relax_light_edges<RowOffset, UseCurrentGenerations,
                                    TrackParents, UseEdgeParent, true, false,
                                    true, CollectTelemetry>(
-              d_adjacency, scratch, vertex_costs, current_queue,
+              d_adjacency, bounds, scratch, vertex_costs, current_queue,
               current_count_device, launch_blocks, current_bucket, delta,
               exclusive_distance_limit, next_queue, next_count_device,
               next_current_generation, pending_queue, stream);
@@ -4872,7 +4940,7 @@ DeltaSteppingCsrResult run_delta_stepping_impl(
           launch_relax_light_edges<RowOffset, UseCurrentGenerations,
                                    TrackParents, UseEdgeParent, false, false,
                                    true, CollectTelemetry>(
-              d_adjacency, scratch, nullptr, current_queue,
+              d_adjacency, bounds, scratch, nullptr, current_queue,
               current_count_device, launch_blocks, current_bucket, delta,
               exclusive_distance_limit, next_queue, next_count_device,
               next_current_generation, pending_queue, stream);
@@ -4880,7 +4948,7 @@ DeltaSteppingCsrResult run_delta_stepping_impl(
           launch_relax_light_edges<RowOffset, UseCurrentGenerations,
                                    TrackParents, UseEdgeParent, true, true,
                                    false, CollectTelemetry>(
-              d_adjacency, scratch, vertex_costs, current_queue,
+              d_adjacency, bounds, scratch, vertex_costs, current_queue,
               current_count_device, launch_blocks, current_bucket, delta,
               exclusive_distance_limit, next_queue, next_count_device,
               next_current_generation, pending_queue, stream);
@@ -4888,7 +4956,7 @@ DeltaSteppingCsrResult run_delta_stepping_impl(
           launch_relax_light_edges<RowOffset, UseCurrentGenerations,
                                    TrackParents, UseEdgeParent, false, true,
                                    false, CollectTelemetry>(
-              d_adjacency, scratch, nullptr, current_queue,
+              d_adjacency, bounds, scratch, nullptr, current_queue,
               current_count_device, launch_blocks, current_bucket, delta,
               exclusive_distance_limit, next_queue, next_count_device,
               next_current_generation, pending_queue, stream);
@@ -4912,13 +4980,13 @@ DeltaSteppingCsrResult run_delta_stepping_impl(
       if (vertex_costs != nullptr) {
         launch_relax_heavy_edges<RowOffset, TrackParents, UseEdgeParent, true,
                                  CollectTelemetry>(
-            d_adjacency, scratch, vertex_costs, device_count_blocks,
+            d_adjacency, bounds, scratch, vertex_costs, device_count_blocks,
             current_bucket, delta, exclusive_distance_limit, pending_queue,
             stream);
       } else {
         launch_relax_heavy_edges<RowOffset, TrackParents, UseEdgeParent,
                                  false, CollectTelemetry>(
-            d_adjacency, scratch, nullptr, device_count_blocks,
+            d_adjacency, bounds, scratch, nullptr, device_count_blocks,
             current_bucket, delta, exclusive_distance_limit, pending_queue,
             stream);
       }
@@ -5188,6 +5256,7 @@ DeltaSteppingCsrResult run_delta_stepping_impl(
 template <typename RowOffset, bool TrackParents, bool UseEdgeParent>
 DeltaSteppingCsrResult dispatch_delta_stepping_impl(
     const DeviceCsrView<RowOffset>& d_adjacency,
+    DeviceBoundsView bounds,
     const std::uint32_t* edge_source,
     DeltaSteppingScratch& scratch,
     const std::vector<int>& sources,
@@ -5211,7 +5280,7 @@ DeltaSteppingCsrResult dispatch_delta_stepping_impl(
     if (telemetry != nullptr) {
       return run_delta_stepping_impl<RowOffset, true, TrackParents,
                                      UseEdgeParent, true>(
-          d_adjacency, edge_source, scratch, sources, target, targets,
+          d_adjacency, bounds, edge_source, scratch, sources, target, targets,
           vertex_costs, skip_heavy_edges, delta, max_iters,
           exclusive_distance_limit, stream,
           progress_callback, progress_user_data, controller_mode,
@@ -5220,7 +5289,7 @@ DeltaSteppingCsrResult dispatch_delta_stepping_impl(
     }
     return run_delta_stepping_impl<RowOffset, true, TrackParents,
                                    UseEdgeParent, false>(
-        d_adjacency, edge_source, scratch, sources, target, targets,
+        d_adjacency, bounds, edge_source, scratch, sources, target, targets,
         vertex_costs, skip_heavy_edges, delta, max_iters,
         exclusive_distance_limit, stream,
         progress_callback, progress_user_data, controller_mode,
@@ -5235,7 +5304,7 @@ DeltaSteppingCsrResult dispatch_delta_stepping_impl(
   if (telemetry != nullptr) {
     return run_delta_stepping_impl<RowOffset, false, TrackParents,
                                    UseEdgeParent, true>(
-        d_adjacency, edge_source, scratch, sources, target, targets,
+        d_adjacency, bounds, edge_source, scratch, sources, target, targets,
         vertex_costs, skip_heavy_edges, delta, max_iters,
         exclusive_distance_limit, stream,
         progress_callback, progress_user_data, controller_mode,
@@ -5244,7 +5313,7 @@ DeltaSteppingCsrResult dispatch_delta_stepping_impl(
   }
   return run_delta_stepping_impl<RowOffset, false, TrackParents,
                                  UseEdgeParent, false>(
-      d_adjacency, edge_source, scratch, sources, target, targets,
+      d_adjacency, bounds, edge_source, scratch, sources, target, targets,
       vertex_costs, skip_heavy_edges, delta, max_iters,
       exclusive_distance_limit, stream,
       progress_callback, progress_user_data, controller_mode,
@@ -5300,12 +5369,278 @@ const char* delta_stepping_execution_path_name(
   return "unknown";
 }
 
+namespace {
+
+struct DeltaSteppingCsrCoordinateStorage {
+  std::vector<std::int32_t> host_route_end_x;
+  std::vector<std::int32_t> host_route_end_y;
+  ds_delta_detail::DeviceBuffer<std::int32_t> route_end_x;
+  ds_delta_detail::DeviceBuffer<std::int32_t> route_end_y;
+  std::uint64_t unknown_coordinate_nodes = 0;
+
+  bool available() const noexcept { return !host_route_end_x.empty(); }
+
+  void initialize(
+      const HostCsrF32& adjacency,
+      const routing::interchange::RoutingCsrSidecars& sidecars,
+      hipStream_t stream) {
+    routing::interchange::validate_routing_csr_sidecars(
+        sidecars, static_cast<std::size_t>(adjacency.rows),
+        static_cast<std::size_t>(adjacency.nnz), false);
+    host_route_end_x = sidecars.route_end_x;
+    host_route_end_y = sidecars.route_end_y;
+    unknown_coordinate_nodes = 0;
+    for (std::size_t node = 0; node < host_route_end_x.size(); ++node) {
+      if (host_route_end_x[node] ==
+              routing::interchange::kMissingRouteCoordinate &&
+          host_route_end_y[node] ==
+              routing::interchange::kMissingRouteCoordinate) {
+        ++unknown_coordinate_nodes;
+      }
+    }
+
+    const std::size_t rows = host_route_end_x.size();
+    route_end_x.reset(rows);
+    route_end_y.reset(rows);
+    try {
+      DS_DELTA_HIP_CHECK(hipMemcpyAsync(
+          route_end_x.get(), host_route_end_x.data(),
+          sssp_capacity::checked_bytes<std::int32_t>(rows),
+          hipMemcpyHostToDevice, stream));
+      DS_DELTA_HIP_CHECK(hipMemcpyAsync(
+          route_end_y.get(), host_route_end_y.data(),
+          sssp_capacity::checked_bytes<std::int32_t>(rows),
+          hipMemcpyHostToDevice, stream));
+      DS_DELTA_HIP_CHECK(hipStreamSynchronize(stream));
+    } catch (...) {
+      // A failed second copy must not release the first destination while work
+      // targeting it can still be queued on an explicit worker stream.
+      (void)hipStreamSynchronize(stream);
+      throw;
+    }
+  }
+
+  ds_delta_detail::DeviceBoundsView device_view(
+      DeltaSteppingCsrBoundingBox bounds) const {
+    if (bounds.enabled && !available()) {
+      throw std::invalid_argument(
+          "bounded Delta-Stepping requires route-end coordinate sidecars");
+    }
+    return {route_end_x.get(), route_end_y.get(), bounds};
+  }
+};
+
+bool delta_bounds_known_coordinate(
+    const DeltaSteppingCsrCoordinateStorage& coordinates,
+    int node) {
+  return coordinates.host_route_end_x[static_cast<std::size_t>(node)] !=
+             routing::interchange::kMissingRouteCoordinate &&
+         coordinates.host_route_end_y[static_cast<std::size_t>(node)] !=
+             routing::interchange::kMissingRouteCoordinate;
+}
+
+bool delta_bounds_contains(
+    const DeltaSteppingCsrCoordinateStorage& coordinates,
+    int node,
+    const DeltaSteppingCsrBoundingBox& bounds) {
+  if (!bounds.enabled) return true;
+  if (!delta_bounds_known_coordinate(coordinates, node)) return false;
+  const std::size_t index = static_cast<std::size_t>(node);
+  const std::int32_t x = coordinates.host_route_end_x[index];
+  const std::int32_t y = coordinates.host_route_end_y[index];
+  return x >= bounds.min_x && x <= bounds.max_x && y >= bounds.min_y &&
+         y <= bounds.max_y;
+}
+
+void validate_delta_bounding_box(const DeltaSteppingCsrBoundingBox& bounds) {
+  if (bounds.enabled &&
+      (bounds.min_x > bounds.max_x || bounds.min_y > bounds.max_y)) {
+    throw std::invalid_argument("Delta-Stepping bounding box is inverted");
+  }
+}
+
+void validate_delta_bounded_terminals(
+    const DeltaSteppingCsrCoordinateStorage& coordinates,
+    const std::vector<int>& sources,
+    const std::vector<int>* targets,
+    int scalar_target,
+    const DeltaSteppingCsrBoundingBox& bounds,
+    bool allow_missing_sources) {
+  validate_delta_bounding_box(bounds);
+  if (!bounds.enabled) return;
+  if (!coordinates.available()) {
+    throw std::invalid_argument(
+        "bounded Delta-Stepping requires route-end coordinate sidecars");
+  }
+  for (const int source : sources) {
+    if (allow_missing_sources &&
+        !delta_bounds_known_coordinate(coordinates, source)) {
+      continue;
+    }
+    if (!delta_bounds_contains(coordinates, source, bounds)) {
+      throw std::invalid_argument(
+          "bounded Delta-Stepping source is missing coordinates or outside "
+          "the box");
+    }
+  }
+  auto validate_target = [&](int target) {
+    if (!delta_bounds_contains(coordinates, target, bounds)) {
+      throw std::invalid_argument(
+          "bounded Delta-Stepping target is missing coordinates or outside "
+          "the box");
+    }
+  };
+  if (targets != nullptr) {
+    for (const int target : *targets) validate_target(target);
+  } else if (scalar_target >= 0) {
+    validate_target(scalar_target);
+  }
+}
+
+std::int32_t delta_saturating_margin(std::int32_t value,
+                                     std::int32_t margin,
+                                     bool subtract) {
+  const std::int64_t widened =
+      subtract ? static_cast<std::int64_t>(value) - margin
+               : static_cast<std::int64_t>(value) + margin;
+  return static_cast<std::int32_t>(std::max<std::int64_t>(
+      std::numeric_limits<std::int32_t>::min(),
+      std::min<std::int64_t>(std::numeric_limits<std::int32_t>::max(),
+                             widened)));
+}
+
+bool make_delta_auto_bounds(
+    const DeltaSteppingCsrCoordinateStorage& coordinates,
+    const std::vector<int>& sources,
+    const std::vector<int>& targets,
+    std::int32_t margin_x,
+    std::int32_t margin_y,
+    DeltaSteppingCsrBoundingBox* output) {
+  std::int32_t min_x = std::numeric_limits<std::int32_t>::max();
+  std::int32_t max_x = std::numeric_limits<std::int32_t>::min();
+  std::int32_t min_y = std::numeric_limits<std::int32_t>::max();
+  std::int32_t max_y = std::numeric_limits<std::int32_t>::min();
+  auto include = [&](int node) {
+    if (!delta_bounds_known_coordinate(coordinates, node)) return false;
+    const std::size_t index = static_cast<std::size_t>(node);
+    const std::int32_t x = coordinates.host_route_end_x[index];
+    const std::int32_t y = coordinates.host_route_end_y[index];
+    min_x = std::min(min_x, x);
+    max_x = std::max(max_x, x);
+    min_y = std::min(min_y, y);
+    max_y = std::max(max_y, y);
+    return true;
+  };
+  for (const int source : sources) (void)include(source);
+  for (const int target : targets) {
+    if (!include(target)) return false;
+  }
+  *output = {true,
+             delta_saturating_margin(min_x, margin_x, true),
+             delta_saturating_margin(max_x, margin_x, false),
+             delta_saturating_margin(min_y, margin_y, true),
+             delta_saturating_margin(max_y, margin_y, false)};
+  return true;
+}
+
+int delta_saturated_add_iterations(int left, int right) {
+  if (right > 0 && left > std::numeric_limits<int>::max() - right) {
+    return std::numeric_limits<int>::max();
+  }
+  return left + right;
+}
+
+void prepare_delta_bounds_telemetry(
+    DeltaSteppingCsrTelemetry* telemetry,
+    const DeltaSteppingCsrCoordinateStorage& coordinates,
+    const DeltaSteppingCsrBoundingBox& bounds) {
+  if (telemetry == nullptr) return;
+  telemetry->bounds_enabled = bounds.enabled;
+  telemetry->bounds_min_x = bounds.enabled ? bounds.min_x : 0;
+  telemetry->bounds_max_x = bounds.enabled ? bounds.max_x : 0;
+  telemetry->bounds_min_y = bounds.enabled ? bounds.min_y : 0;
+  telemetry->bounds_max_y = bounds.enabled ? bounds.max_y : 0;
+  telemetry->bounds_unknown_coordinate_nodes =
+      coordinates.unknown_coordinate_nodes;
+}
+
+void accumulate_delta_fallback_telemetry(
+    DeltaSteppingCsrTelemetry* telemetry,
+    const DeltaSteppingCsrTelemetry& bounded,
+    const DeltaSteppingCsrBoundingBox& original_bounds) {
+  if (telemetry == nullptr) return;
+  telemetry->outer_buckets_processed += bounded.outer_buckets_processed;
+  telemetry->light_relaxation_rounds += bounded.light_relaxation_rounds;
+  telemetry->heavy_edge_phases += bounded.heavy_edge_phases;
+  telemetry->frontier_entries_processed += bounded.frontier_entries_processed;
+  telemetry->active_vertices_processed += bounded.active_vertices_processed;
+  telemetry->stale_frontier_entries += bounded.stale_frontier_entries;
+  telemetry->light_edge_visits += bounded.light_edge_visits;
+  telemetry->heavy_edge_visits += bounded.heavy_edge_visits;
+  telemetry->distance_atomic_attempts += bounded.distance_atomic_attempts;
+  telemetry->successful_distance_relaxations +=
+      bounded.successful_distance_relaxations;
+  telemetry->distance_cas_retries += bounded.distance_cas_retries;
+  telemetry->current_queue_insertions += bounded.current_queue_insertions;
+  telemetry->pending_queue_insertions += bounded.pending_queue_insertions;
+  telemetry->heavy_queue_insertions += bounded.heavy_queue_insertions;
+  telemetry->bucket_insertions += bounded.bucket_insertions;
+  telemetry->pending_entry_examinations +=
+      bounded.pending_entry_examinations;
+  telemetry->stale_pending_entry_examinations +=
+      bounded.stale_pending_entry_examinations;
+  telemetry->reached_vertices += bounded.reached_vertices;
+  telemetry->current_queue_high_water = std::max(
+      telemetry->current_queue_high_water, bounded.current_queue_high_water);
+  telemetry->pending_queue_high_water = std::max(
+      telemetry->pending_queue_high_water, bounded.pending_queue_high_water);
+  telemetry->heavy_queue_high_water = std::max(
+      telemetry->heavy_queue_high_water, bounded.heavy_queue_high_water);
+  telemetry->controller_round_trips += bounded.controller_round_trips;
+  telemetry->compact_parent_fallback_events +=
+      bounded.compact_parent_fallback_events;
+  telemetry->bounds_rejected_edges += bounded.bounds_rejected_edges;
+  telemetry->controller_fallback =
+      telemetry->controller_fallback || bounded.controller_fallback;
+  telemetry->bounds_enabled = true;
+  telemetry->bounds_min_x = original_bounds.min_x;
+  telemetry->bounds_max_x = original_bounds.max_x;
+  telemetry->bounds_min_y = original_bounds.min_y;
+  telemetry->bounds_max_y = original_bounds.max_y;
+  telemetry->unbounded_fallback_triggered = true;
+}
+
+void validate_delta_graph_construction(
+    const HostCsrF32& adjacency,
+    DeltaSteppingCsrOffsetMode offset_mode) {
+  using namespace ds_delta_detail;
+  validate_host_csr_arrays(adjacency);
+  if (adjacency.rows <= 0 || adjacency.rows != adjacency.cols) {
+    throw std::invalid_argument("CSR graph must be nonempty and square");
+  }
+  if (static_cast<unsigned long long>(adjacency.rows) >
+      static_cast<unsigned long long>(std::numeric_limits<int>::max())) {
+    throw std::overflow_error(
+        "frontier vertices are stored as int; rows must fit in int");
+  }
+  switch (offset_mode) {
+    case DeltaSteppingCsrOffsetMode::kAuto:
+    case DeltaSteppingCsrOffsetMode::kForce64Bit:
+      return;
+    default:
+      throw std::invalid_argument("unknown Delta-Stepping offset mode");
+  }
+}
+
+}  // namespace
+
 struct DeltaSteppingCsrGraph::Impl {
   int device = 0;
   ds_delta_detail::DeviceCsrOwner adjacency;
   float max_edge_value = 0.0f;
   bool has_exact_unit_edge_values = false;
   bool path_capable = true;
+  DeltaSteppingCsrCoordinateStorage coordinates;
 
   Impl(const HostCsrF32& host,
        hipStream_t stream,
@@ -5353,27 +5688,31 @@ DeltaSteppingCsrGraph::DeltaSteppingCsrGraph(
 
 DeltaSteppingCsrGraph::DeltaSteppingCsrGraph(
     const HostCsrF32& adjacency,
+    const routing::interchange::RoutingCsrSidecars& sidecars,
+    hipStream_t stream)
+    : DeltaSteppingCsrGraph(adjacency, sidecars, stream,
+                            DeltaSteppingCsrGraphOptions{}) {}
+
+DeltaSteppingCsrGraph::DeltaSteppingCsrGraph(
+    const HostCsrF32& adjacency,
+    const routing::interchange::RoutingCsrSidecars& sidecars,
+    hipStream_t stream,
+    DeltaSteppingCsrGraphOptions options) {
+  PATHFINDER_PROFILE_RANGE("delta_step.upload_graph");
+  validate_delta_graph_construction(adjacency, options.offset_mode);
+  auto mutable_impl = std::make_shared<Impl>(
+      adjacency, stream, options.storage_mode, options.offset_mode);
+  mutable_impl->coordinates.initialize(adjacency, sidecars, stream);
+  impl_ = std::move(mutable_impl);
+}
+
+DeltaSteppingCsrGraph::DeltaSteppingCsrGraph(
+    const HostCsrF32& adjacency,
     hipStream_t stream,
     DeltaSteppingCsrStorageMode storage_mode,
     DeltaSteppingCsrOffsetMode offset_mode) {
   PATHFINDER_PROFILE_RANGE("delta_step.upload_graph");
-  using namespace ds_delta_detail;
-  validate_host_csr_arrays(adjacency);
-  if (adjacency.rows <= 0 || adjacency.rows != adjacency.cols) {
-    throw std::invalid_argument("CSR graph must be nonempty and square");
-  }
-  if (static_cast<unsigned long long>(adjacency.rows) >
-      static_cast<unsigned long long>(std::numeric_limits<int>::max())) {
-    throw std::overflow_error(
-        "frontier vertices are stored as int; rows must fit in int");
-  }
-  switch (offset_mode) {
-    case DeltaSteppingCsrOffsetMode::kAuto:
-    case DeltaSteppingCsrOffsetMode::kForce64Bit:
-      break;
-    default:
-      throw std::invalid_argument("unknown Delta-Stepping offset mode");
-  }
+  validate_delta_graph_construction(adjacency, offset_mode);
   impl_ = std::make_shared<Impl>(adjacency, stream, storage_mode, offset_mode);
 }
 
@@ -5390,6 +5729,7 @@ bool DeltaSteppingCsrGraph::uses_32_bit_offsets() const noexcept {
 struct DeltaSteppingCsrWorkspace::Impl {
   std::shared_ptr<const DeltaSteppingCsrGraph::Impl> shared_graph;
   std::unique_ptr<ds_delta_detail::DeviceCsrOwner> owned_adjacency;
+  DeltaSteppingCsrCoordinateStorage owned_coordinates;
   ds_delta_detail::DeltaSteppingScratch scratch;
   ds_delta_detail::DeviceBuffer<float> vertex_costs;
   float max_edge_value = 0.0f;
@@ -5457,6 +5797,23 @@ struct DeltaSteppingCsrWorkspace::Impl {
     return *owned_adjacency;
   }
 
+  const DeltaSteppingCsrCoordinateStorage& coordinates() const {
+    return shared_graph ? shared_graph->coordinates : owned_coordinates;
+  }
+
+  DeltaSteppingCsrCoordinateStorage& mutable_coordinates() {
+    if (!owned_adjacency) {
+      throw std::logic_error(
+          "cannot replace coordinates on an immutable shared delta graph");
+    }
+    return owned_coordinates;
+  }
+
+  ds_delta_detail::DeviceBoundsView bounds_view(
+      DeltaSteppingCsrBoundingBox bounds) const {
+    return coordinates().device_view(bounds);
+  }
+
   void require_run_context(hipStream_t candidate) const {
     if (candidate != stream) {
       throw std::invalid_argument(
@@ -5519,6 +5876,37 @@ DeltaSteppingCsrWorkspace::DeltaSteppingCsrWorkspace(
     hipStream_t stream,
     DeltaSteppingCsrWorkspaceOptions options)
     : DeltaSteppingCsrWorkspace(adjacency, stream) {
+  apply_workspace_options(options);
+}
+
+DeltaSteppingCsrWorkspace::DeltaSteppingCsrWorkspace(
+    const HostCsrF32& adjacency,
+    const routing::interchange::RoutingCsrSidecars& sidecars,
+    hipStream_t stream)
+    : DeltaSteppingCsrWorkspace(adjacency, stream) {
+  impl_->mutable_coordinates().initialize(adjacency, sidecars, stream);
+}
+
+DeltaSteppingCsrWorkspace::DeltaSteppingCsrWorkspace(
+    const HostCsrF32& adjacency,
+    const routing::interchange::RoutingCsrSidecars& sidecars,
+    hipStream_t stream,
+    DeltaSteppingCsrWorkspaceOptions options)
+    : DeltaSteppingCsrWorkspace(adjacency, sidecars, stream) {
+  apply_workspace_options(options);
+}
+
+void DeltaSteppingCsrWorkspace::apply_workspace_options(
+    const DeltaSteppingCsrWorkspaceOptions& options) {
+  if (options.auto_margin_x < 0 || options.auto_margin_y < 0) {
+    throw std::invalid_argument(
+        "Delta-Stepping automatic bound margins must be nonnegative");
+  }
+  if (options.auto_bounds && !impl_->coordinates().available()) {
+    throw std::invalid_argument(
+        "automatic bounded Delta-Stepping requires route-end coordinate "
+        "sidecars");
+  }
   parent_mode_ = options.parent_mode;
   execution_mode_ = options.execution_mode;
   current_membership_mode_ = options.current_membership_mode;
@@ -5528,6 +5916,10 @@ DeltaSteppingCsrWorkspace::DeltaSteppingCsrWorkspace(
   controller_batch_size_ = options.controller_batch_size;
   controller_generation_seed_for_testing_ =
       options.controller_generation_seed_for_testing;
+  auto_bounds_ = options.auto_bounds;
+  auto_margin_x_ = options.auto_margin_x;
+  auto_margin_y_ = options.auto_margin_y;
+  unbounded_fallback_ = options.unbounded_fallback;
   impl_->scratch.reserve_query_capacity(options.capacity_hints,
                                         impl_->path_capable);
 }
@@ -5542,17 +5934,7 @@ DeltaSteppingCsrWorkspace::DeltaSteppingCsrWorkspace(
     hipStream_t stream,
     DeltaSteppingCsrWorkspaceOptions options)
     : DeltaSteppingCsrWorkspace(std::move(adjacency), stream) {
-  parent_mode_ = options.parent_mode;
-  execution_mode_ = options.execution_mode;
-  current_membership_mode_ = options.current_membership_mode;
-  delta_stepping_validate_controller_policy(
-      {options.controller_mode, options.controller_batch_size});
-  controller_mode_ = options.controller_mode;
-  controller_batch_size_ = options.controller_batch_size;
-  controller_generation_seed_for_testing_ =
-      options.controller_generation_seed_for_testing;
-  impl_->scratch.reserve_query_capacity(options.capacity_hints,
-                                        impl_->path_capable);
+  apply_workspace_options(options);
 }
 
 DeltaSteppingCsrWorkspace::~DeltaSteppingCsrWorkspace() = default;
@@ -5695,8 +6077,13 @@ DeltaSteppingCsrResult DeltaSteppingCsrWorkspace::run_distances(
     using RowOffset = typename std::remove_cv<typename std::remove_pointer<
         decltype(graph.rowptr)>::type>::type;
     validate_device_csr_shape(graph, sources, -1, delta);
+    validate_delta_bounded_terminals(
+        impl_->coordinates(), sources, nullptr, -1, active_bounds_, false);
+    const DeviceBoundsView device_bounds = impl_->bounds_view(active_bounds_);
+    prepare_delta_bounds_telemetry(
+        active_telemetry_, impl_->coordinates(), active_bounds_);
     return dispatch_delta_stepping_impl<RowOffset, false, false>(
-        graph, nullptr, impl_->scratch, sources, -1, nullptr,
+        graph, device_bounds, nullptr, impl_->scratch, sources, -1, nullptr,
         impl_->has_vertex_costs ? impl_->vertex_costs.get() : nullptr,
         skip_heavy_edges, delta, max_iters, active_distance_limit_, stream,
         progress_callback, progress_user_data, current_membership_mode_,
@@ -5741,8 +6128,13 @@ DeltaSteppingCsrResult DeltaSteppingCsrWorkspace::run(
     using RowOffset = typename std::remove_cv<typename std::remove_pointer<
         decltype(graph.rowptr)>::type>::type;
     validate_device_csr_shape(graph, sources, target, delta);
+    validate_delta_bounded_terminals(
+        impl_->coordinates(), sources, nullptr, target, active_bounds_, false);
+    const DeviceBoundsView device_bounds = impl_->bounds_view(active_bounds_);
+    prepare_delta_bounds_telemetry(
+        active_telemetry_, impl_->coordinates(), active_bounds_);
     return dispatch_delta_stepping_impl<RowOffset, true, false>(
-        graph, nullptr, impl_->scratch, sources, target, nullptr,
+        graph, device_bounds, nullptr, impl_->scratch, sources, target, nullptr,
         impl_->has_vertex_costs ? impl_->vertex_costs.get() : nullptr,
         skip_heavy_edges, delta, max_iters, active_distance_limit_, stream,
         progress_callback, progress_user_data, current_membership_mode_,
@@ -5774,81 +6166,138 @@ DeltaSteppingCsrResult DeltaSteppingCsrWorkspace::run(
   }
   const DeviceCsrOwner& adjacency = impl_->adjacency();
   validate_target_list_common_shape(adjacency.rows, targets);
-  const auto run_typed = [&](const auto& graph) {
-    using RowOffset = typename std::remove_cv<typename std::remove_pointer<
-        decltype(graph.rowptr)>::type>::type;
-    validate_device_csr_shape(graph, sources, -1, delta);
-    if (execution_mode_ == DeltaSteppingCsrExecutionMode::kAutomatic &&
-        parent_mode_ == DeltaSteppingCsrParentMode::kAutomatic &&
-        impl_->has_exact_unit_edge_values &&
-        !impl_->has_vertex_costs &&
-        graph.rows <= kMaxUnitSpecializationRows &&
-        max_iters < 0 && progress_callback == nullptr) {
-      PATHFINDER_PROFILE_RANGE("delta_step.unit_specialization");
-      begin_telemetry_record(
-          active_telemetry_, DeltaSteppingCsrExecutionPath::kExactUnit,
-          delta, false, false, false,
-          impl_->max_edge_value <= delta, false,
-          controller_mode_, controller_batch_size_);
-      if (active_telemetry_ != nullptr &&
-          controller_mode_ ==
-              DeltaSteppingCsrControllerMode::kReducedRoundTrip) {
-        // The reduced controller is defined only for classic generic Delta.
-        // Exact-unit specialization bypasses it and reports that explicitly.
-        active_telemetry_->controller_fallback = true;
+  validate_source_list_common_shape(
+      adjacency.rows, adjacency.rows, adjacency.nnz, sources, -1);
+
+  const auto run_once = [&](const DeltaSteppingCsrBoundingBox& attempt_bounds,
+                            bool allow_missing_sources) {
+    const auto run_typed = [&](const auto& graph) {
+      using RowOffset = typename std::remove_cv<typename std::remove_pointer<
+          decltype(graph.rowptr)>::type>::type;
+      validate_device_csr_shape(graph, sources, -1, delta);
+      validate_delta_bounded_terminals(
+          impl_->coordinates(), sources, &targets, -1, attempt_bounds,
+          allow_missing_sources);
+      const DeviceBoundsView device_bounds =
+          impl_->bounds_view(attempt_bounds);
+      prepare_delta_bounds_telemetry(
+          active_telemetry_, impl_->coordinates(), attempt_bounds);
+      if (execution_mode_ == DeltaSteppingCsrExecutionMode::kAutomatic &&
+          parent_mode_ == DeltaSteppingCsrParentMode::kAutomatic &&
+          impl_->has_exact_unit_edge_values &&
+          !impl_->has_vertex_costs &&
+          graph.rows <= kMaxUnitSpecializationRows &&
+          max_iters < 0 && progress_callback == nullptr) {
+        PATHFINDER_PROFILE_RANGE("delta_step.unit_specialization");
+        begin_telemetry_record(
+            active_telemetry_, DeltaSteppingCsrExecutionPath::kExactUnit,
+            delta, false, false, false,
+            impl_->max_edge_value <= delta, false,
+            controller_mode_, controller_batch_size_);
+        if (active_telemetry_ != nullptr &&
+            controller_mode_ ==
+                DeltaSteppingCsrControllerMode::kReducedRoundTrip) {
+          // The reduced controller is defined only for classic generic Delta.
+          // Exact-unit specialization bypasses it and reports that explicitly.
+          active_telemetry_->controller_fallback = true;
+        }
+        if (active_telemetry_ != nullptr) {
+          return run_unit_weight_specialization<RowOffset, true>(
+              graph, device_bounds, impl_->scratch, sources, targets, delta,
+              active_distance_limit_, stream, active_telemetry_);
+        }
+        return run_unit_weight_specialization<RowOffset, false>(
+            graph, device_bounds, impl_->scratch, sources, targets, delta,
+            active_distance_limit_, stream, nullptr);
       }
-      if (active_telemetry_ != nullptr) {
-        return run_unit_weight_specialization<RowOffset, true>(
-            graph, impl_->scratch, sources, targets, delta,
-            active_distance_limit_, stream, active_telemetry_);
+      PATHFINDER_PROFILE_RANGE("delta_step.generic");
+      const float* const vertex_costs =
+          impl_->has_vertex_costs ? impl_->vertex_costs.get() : nullptr;
+      const bool skip_heavy_edges =
+          !impl_->has_vertex_costs && impl_->max_edge_value <= delta;
+      if (parent_mode_ == DeltaSteppingCsrParentMode::kAutomatic &&
+          adjacency.edge_source_available) {
+        begin_telemetry_record(
+            active_telemetry_, DeltaSteppingCsrExecutionPath::kCompactGeneric,
+            delta,
+            execution_mode_ == DeltaSteppingCsrExecutionMode::kForceGeneric,
+            false, impl_->has_vertex_costs, skip_heavy_edges, false,
+            controller_mode_, controller_batch_size_);
+        return dispatch_delta_stepping_impl<RowOffset, true, true>(
+            graph, device_bounds, adjacency.edge_source.get(), impl_->scratch,
+            sources, -1, &targets, vertex_costs, skip_heavy_edges, delta,
+            max_iters, active_distance_limit_, stream, progress_callback,
+            progress_user_data, current_membership_mode_, controller_mode_,
+            controller_batch_size_, controller_generation_seed_for_testing_,
+            active_telemetry_);
       }
-      return run_unit_weight_specialization<RowOffset, false>(
-          graph, impl_->scratch, sources, targets, delta,
-          active_distance_limit_, stream, nullptr);
-    }
-    PATHFINDER_PROFILE_RANGE("delta_step.generic");
-    const float* const vertex_costs =
-        impl_->has_vertex_costs ? impl_->vertex_costs.get() : nullptr;
-    const bool skip_heavy_edges =
-        !impl_->has_vertex_costs && impl_->max_edge_value <= delta;
-    if (parent_mode_ == DeltaSteppingCsrParentMode::kAutomatic &&
-        adjacency.edge_source_available) {
+      const bool compact_parent_fallback =
+          parent_mode_ == DeltaSteppingCsrParentMode::kAutomatic &&
+          !adjacency.edge_source_available;
       begin_telemetry_record(
-          active_telemetry_, DeltaSteppingCsrExecutionPath::kCompactGeneric,
+          active_telemetry_, DeltaSteppingCsrExecutionPath::kLegacyGeneric,
           delta,
           execution_mode_ == DeltaSteppingCsrExecutionMode::kForceGeneric,
-          false, impl_->has_vertex_costs, skip_heavy_edges, false,
+          parent_mode_ == DeltaSteppingCsrParentMode::kForceLegacy,
+          impl_->has_vertex_costs, skip_heavy_edges, compact_parent_fallback,
           controller_mode_, controller_batch_size_);
-      return dispatch_delta_stepping_impl<RowOffset, true, true>(
-          graph, adjacency.edge_source.get(), impl_->scratch, sources,
-          -1, &targets, vertex_costs, skip_heavy_edges, delta, max_iters,
+      return dispatch_delta_stepping_impl<RowOffset, true, false>(
+          graph, device_bounds, nullptr, impl_->scratch, sources, -1,
+          &targets, vertex_costs, skip_heavy_edges, delta, max_iters,
           active_distance_limit_, stream, progress_callback,
           progress_user_data, current_membership_mode_, controller_mode_,
           controller_batch_size_, controller_generation_seed_for_testing_,
           active_telemetry_);
+    };
+    if (adjacency.uses_32_bit_offsets) {
+      return run_typed(adjacency.view<CompactRowOffset>());
     }
-    const bool compact_parent_fallback =
-        parent_mode_ == DeltaSteppingCsrParentMode::kAutomatic &&
-        !adjacency.edge_source_available;
-    begin_telemetry_record(
-        active_telemetry_, DeltaSteppingCsrExecutionPath::kLegacyGeneric,
-        delta,
-        execution_mode_ == DeltaSteppingCsrExecutionMode::kForceGeneric,
-        parent_mode_ == DeltaSteppingCsrParentMode::kForceLegacy,
-        impl_->has_vertex_costs, skip_heavy_edges, compact_parent_fallback,
-        controller_mode_, controller_batch_size_);
-    return dispatch_delta_stepping_impl<RowOffset, true, false>(
-        graph, nullptr, impl_->scratch, sources, -1, &targets,
-        vertex_costs, skip_heavy_edges, delta, max_iters,
-        active_distance_limit_, stream, progress_callback,
-        progress_user_data, current_membership_mode_, controller_mode_,
-        controller_batch_size_, controller_generation_seed_for_testing_,
-        active_telemetry_);
+    return run_typed(adjacency.view<Offset>());
   };
-  if (adjacency.uses_32_bit_offsets) {
-    return run_typed(adjacency.view<CompactRowOffset>());
+
+  // An explicit enabled box is a fixed-subgraph request and takes precedence
+  // over the workspace's automatic policy. It never widens or falls back.
+  if (active_bounds_.enabled || !auto_bounds_) {
+    return run_once(active_bounds_, false);
   }
-  return run_typed(adjacency.view<Offset>());
+
+  DeltaSteppingCsrBoundingBox automatic_bounds;
+  if (!make_delta_auto_bounds(
+          impl_->coordinates(), sources, targets, auto_margin_x_,
+          auto_margin_y_, &automatic_bounds)) {
+    if (!unbounded_fallback_) {
+      throw std::invalid_argument(
+          "automatic bounded Delta-Stepping cannot form a box around a "
+          "target with missing route-end coordinates");
+    }
+    // No reliable box exists, so fallback policy selects one unbounded first
+    // run rather than performing a meaningless bounded attempt.
+    DeltaSteppingCsrResult unbounded_result =
+        run_once(DeltaSteppingCsrBoundingBox{}, false);
+    if (active_telemetry_ != nullptr) {
+      active_telemetry_->unbounded_fallback_triggered = true;
+    }
+    return unbounded_result;
+  }
+
+  DeltaSteppingCsrResult bounded_result = run_once(automatic_bounds, true);
+  if (bounded_result.target_reached || !unbounded_fallback_) {
+    return bounded_result;
+  }
+
+  DeltaSteppingCsrTelemetry bounded_telemetry;
+  if (active_telemetry_ != nullptr) {
+    bounded_telemetry = *active_telemetry_;
+  }
+  // Every run_once invocation resets and reseeds the sparse Delta state. The
+  // retry therefore cannot retain rejected work from the bounded attempt.
+  DeltaSteppingCsrResult unbounded_result =
+      run_once(DeltaSteppingCsrBoundingBox{}, false);
+  unbounded_result.iterations_used = delta_saturated_add_iterations(
+      bounded_result.iterations_used, unbounded_result.iterations_used);
+  accumulate_delta_fallback_telemetry(
+      active_telemetry_, bounded_telemetry, automatic_bounds);
+  return unbounded_result;
 }
 
 DeltaSteppingCsrResult DeltaSteppingCsrWorkspace::run(
@@ -5884,7 +6333,7 @@ DeltaSteppingCsrResult delta_stepping_minplus_hip_csr(
   validate_device_csr_contents(graph, stream);
   DeltaSteppingScratch scratch(d_adjacency.rows);
   return dispatch_delta_stepping_impl<Offset, true, false>(
-      graph, nullptr, scratch, sources, target, nullptr, nullptr, false, delta,
+      graph, {}, nullptr, scratch, sources, target, nullptr, nullptr, false, delta,
       max_iters, std::numeric_limits<float>::infinity(), stream,
       progress_callback, progress_user_data,
       DeltaSteppingCsrCurrentMembershipMode::kBoolean,
@@ -5949,7 +6398,7 @@ DeltaSteppingCsrResult delta_stepping_minplus_hip_csr(
   const std::vector<int> sources{source};
   if (d_adjacency.uses_32_bit_offsets) {
     return dispatch_delta_stepping_impl<CompactRowOffset, true, false>(
-        d_adjacency.view<CompactRowOffset>(), nullptr, scratch, sources,
+        d_adjacency.view<CompactRowOffset>(), {}, nullptr, scratch, sources,
         target, nullptr, nullptr, false, delta, max_iters,
         std::numeric_limits<float>::infinity(), stream, progress_callback,
         progress_user_data, DeltaSteppingCsrCurrentMembershipMode::kBoolean,
@@ -5957,7 +6406,7 @@ DeltaSteppingCsrResult delta_stepping_minplus_hip_csr(
         kDeltaSteppingCsrRecommendedControllerBatchSize, 0, nullptr);
   }
   return dispatch_delta_stepping_impl<Offset, true, false>(
-      d_adjacency.view<Offset>(), nullptr, scratch, sources, target, nullptr,
+      d_adjacency.view<Offset>(), {}, nullptr, scratch, sources, target, nullptr,
       nullptr, false, delta, max_iters,
       std::numeric_limits<float>::infinity(), stream, progress_callback,
       progress_user_data, DeltaSteppingCsrCurrentMembershipMode::kBoolean,
@@ -5982,7 +6431,7 @@ DeltaSteppingCsrResult delta_stepping_minplus_hip_csr(
   DeltaSteppingScratch scratch(adjacency.rows);
   if (d_adjacency.uses_32_bit_offsets) {
     return dispatch_delta_stepping_impl<CompactRowOffset, true, false>(
-        d_adjacency.view<CompactRowOffset>(), nullptr, scratch, sources,
+        d_adjacency.view<CompactRowOffset>(), {}, nullptr, scratch, sources,
         target, nullptr, nullptr, false, delta, max_iters,
         std::numeric_limits<float>::infinity(), stream, progress_callback,
         progress_user_data, DeltaSteppingCsrCurrentMembershipMode::kBoolean,
@@ -5990,7 +6439,7 @@ DeltaSteppingCsrResult delta_stepping_minplus_hip_csr(
         kDeltaSteppingCsrRecommendedControllerBatchSize, 0, nullptr);
   }
   return dispatch_delta_stepping_impl<Offset, true, false>(
-      d_adjacency.view<Offset>(), nullptr, scratch, sources, target, nullptr,
+      d_adjacency.view<Offset>(), {}, nullptr, scratch, sources, target, nullptr,
       nullptr, false, delta, max_iters,
       std::numeric_limits<float>::infinity(), stream, progress_callback,
       progress_user_data, DeltaSteppingCsrCurrentMembershipMode::kBoolean,

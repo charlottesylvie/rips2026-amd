@@ -1,4 +1,5 @@
 #include "../delta_stepping/delta_stepping_hip_CSR.hpp"
+#include "../interchange/routing_csr_sidecars.hpp"
 
 // AMD build/run from the repository root:
 //   hipcc -std=c++17 -O2 -pthread -x hip \
@@ -31,6 +32,7 @@
 namespace {
 
 using Offset = minplus_sparse::Offset;
+namespace ri = routing::interchange;
 
 constexpr float kInf = std::numeric_limits<float>::infinity();
 constexpr float kAbsoluteTolerance = 2e-3f;
@@ -55,6 +57,17 @@ void require_invalid_argument(const std::string& label, Function&& function) {
     rejected = true;
   }
   require(rejected, label + ": expected std::invalid_argument");
+}
+
+template <typename Function>
+void require_exception(const std::string& label, Function&& function) {
+  bool rejected = false;
+  try {
+    function();
+  } catch (const std::exception&) {
+    rejected = true;
+  }
+  require(rejected, label + ": expected an exception");
 }
 
 void record_progress(const DeltaSteppingCsrProgress& progress,
@@ -312,6 +325,144 @@ std::vector<float> cpu_dijkstra_outgoing_multi_source(
     }
   }
   return distances;
+}
+
+ri::RoutingCsrSidecars make_delta_route_sidecars(
+    const std::vector<std::pair<std::int32_t, std::int32_t>>& coordinates) {
+  ri::RoutingCsrSidecars sidecars;
+  sidecars.route_end_x.reserve(coordinates.size());
+  sidecars.route_end_y.reserve(coordinates.size());
+  for (const auto [x, y] : coordinates) {
+    sidecars.route_end_x.push_back(x);
+    sidecars.route_end_y.push_back(y);
+  }
+  // Node-sidecar validation also covers the routing base-cost column. Delta's
+  // dynamic destination costs remain workspace-local and are installed with
+  // update_vertex_costs() in the tests that exercise them.
+  sidecars.base_vertex_cost.assign(coordinates.size(), 1.0f);
+  return sidecars;
+}
+
+DeltaSteppingCsrBoundingBox make_delta_bounds(std::int32_t min_x,
+                                               std::int32_t max_x,
+                                               std::int32_t min_y,
+                                               std::int32_t max_y) {
+  DeltaSteppingCsrBoundingBox bounds;
+  bounds.enabled = true;
+  bounds.min_x = min_x;
+  bounds.max_x = max_x;
+  bounds.min_y = min_y;
+  bounds.max_y = max_y;
+  return bounds;
+}
+
+bool cpu_delta_destination_admitted(
+    const ri::RoutingCsrSidecars& sidecars,
+    int destination,
+    const DeltaSteppingCsrBoundingBox& bounds) {
+  if (!bounds.enabled) {
+    return true;
+  }
+  require(destination >= 0 &&
+              static_cast<std::size_t>(destination) <
+                  sidecars.route_end_x.size() &&
+              sidecars.route_end_x.size() == sidecars.route_end_y.size(),
+          "bounded CPU reference destination is outside its sidecars");
+  const std::int32_t x =
+      sidecars.route_end_x[static_cast<std::size_t>(destination)];
+  const std::int32_t y =
+      sidecars.route_end_y[static_cast<std::size_t>(destination)];
+  if (x == ri::kMissingRouteCoordinate &&
+      y == ri::kMissingRouteCoordinate) {
+    return true;
+  }
+  return x >= bounds.min_x && x <= bounds.max_x &&
+         y >= bounds.min_y && y <= bounds.max_y;
+}
+
+std::vector<float> cpu_bounded_dijkstra_outgoing_multi_source(
+    const HostCsrF32& graph,
+    const ri::RoutingCsrSidecars& sidecars,
+    const std::vector<int>& sources,
+    const DeltaSteppingCsrBoundingBox& bounds,
+    const std::vector<float>* vertex_costs = nullptr) {
+  require(!sources.empty(), "bounded CPU reference requires a source");
+  require(sidecars.route_end_x.size() ==
+                  static_cast<std::size_t>(graph.rows) &&
+              sidecars.route_end_y.size() ==
+                  static_cast<std::size_t>(graph.rows),
+          "bounded CPU reference sidecar size mismatch");
+  if (vertex_costs != nullptr) {
+    require(vertex_costs->size() == static_cast<std::size_t>(graph.rows),
+            "bounded CPU reference vertex-cost size mismatch");
+  }
+
+  std::vector<float> distances(static_cast<std::size_t>(graph.rows), kInf);
+  using QueueItem = std::pair<float, int>;
+  std::priority_queue<QueueItem,
+                      std::vector<QueueItem>,
+                      std::greater<QueueItem>>
+      queue;
+  for (const int source : sources) {
+    require(source >= 0 && static_cast<Offset>(source) < graph.rows,
+            "bounded CPU reference source is outside the graph");
+    if (distances[static_cast<std::size_t>(source)] != 0.0f) {
+      distances[static_cast<std::size_t>(source)] = 0.0f;
+      queue.push({0.0f, source});
+    }
+  }
+
+  while (!queue.empty()) {
+    const auto [distance, u] = queue.top();
+    queue.pop();
+    if (distance != distances[static_cast<std::size_t>(u)]) {
+      continue;
+    }
+    for (Offset edge = graph.rowptr[static_cast<std::size_t>(u)];
+         edge < graph.rowptr[static_cast<std::size_t>(u + 1)];
+         ++edge) {
+      const int v = graph.colind[static_cast<std::size_t>(edge)];
+      if (!cpu_delta_destination_admitted(sidecars, v, bounds)) {
+        continue;
+      }
+      const float candidate =
+          distance + effective_edge_weight(graph, edge, vertex_costs);
+      float& current = distances[static_cast<std::size_t>(v)];
+      if (candidate < current) {
+        current = candidate;
+        queue.push({candidate, v});
+      }
+    }
+  }
+  return distances;
+}
+
+DeltaSteppingCsrRunOptions make_bounded_run_options(
+    const DeltaSteppingCsrBoundingBox& bounds,
+    DeltaSteppingCsrTelemetry* telemetry = nullptr) {
+  DeltaSteppingCsrRunOptions options;
+  options.telemetry = telemetry;
+  options.bounds = bounds;
+  return options;
+}
+
+void require_bounds_telemetry(
+    const std::string& label,
+    const DeltaSteppingCsrTelemetry& telemetry,
+    const DeltaSteppingCsrBoundingBox& bounds,
+    std::uint64_t unknown_coordinate_nodes) {
+  require(telemetry.collected && telemetry.completed,
+          label + ": bounded telemetry was not completed");
+  require(telemetry.bounds_enabled == bounds.enabled,
+          label + ": telemetry reported the wrong bounds-enabled state");
+  require(telemetry.bounds_min_x == bounds.min_x &&
+              telemetry.bounds_max_x == bounds.max_x &&
+              telemetry.bounds_min_y == bounds.min_y &&
+              telemetry.bounds_max_y == bounds.max_y,
+          label + ": telemetry reported the wrong inclusive rectangle");
+  require(telemetry.bounds_unknown_coordinate_nodes ==
+              unknown_coordinate_nodes,
+          label + ": telemetry reported the wrong spill-node count");
 }
 
 bool close_enough(float expected, float actual) {
@@ -3821,6 +3972,834 @@ void test_parallel_randomized_explicit_streams() {
   }
 }
 
+void test_bounded_delta_validation(hipStream_t stream) {
+  const HostCsrF32 graph = make_outgoing_csr(
+      3, {{0, 1, 1.0f}, {1, 2, 1.0f}, {0, 2, 4.0f}});
+  const ri::RoutingCsrSidecars valid_sidecars = make_delta_route_sidecars(
+      {{0, 0}, {1, 0}, {2, 0}});
+
+  require_exception("bounded Delta short route-end X sidecar", [&] {
+    ri::RoutingCsrSidecars broken = valid_sidecars;
+    broken.route_end_x.pop_back();
+    DeltaSteppingCsrGraph rejected(graph, broken, stream);
+  });
+  require_exception("bounded Delta short route-end Y sidecar", [&] {
+    ri::RoutingCsrSidecars broken = valid_sidecars;
+    broken.route_end_y.pop_back();
+    DeltaSteppingCsrGraph rejected(graph, broken, stream);
+  });
+  require_exception("bounded Delta half-missing coordinate", [&] {
+    ri::RoutingCsrSidecars broken = valid_sidecars;
+    broken.route_end_x[1] = ri::kMissingRouteCoordinate;
+    DeltaSteppingCsrGraph rejected(graph, broken, stream);
+  });
+  require_exception("bounded Delta negative known coordinate", [&] {
+    ri::RoutingCsrSidecars broken = valid_sidecars;
+    broken.route_end_x[1] = -2;
+    DeltaSteppingCsrGraph rejected(graph, broken, stream);
+  });
+
+  auto shared_graph = std::make_shared<DeltaSteppingCsrGraph>(
+      graph, valid_sidecars, stream);
+  DeltaSteppingCsrWorkspace workspace(shared_graph, stream);
+  const std::vector<int> source = {0};
+  const std::vector<int> target = {2};
+
+  require_exception("bounded Delta inverted X box", [&] {
+    const DeltaSteppingCsrBoundingBox inverted =
+        make_delta_bounds(2, 1, 0, 0);
+    (void)workspace.run(source,
+                        target,
+                        1.0f,
+                        -1,
+                        make_bounded_run_options(inverted),
+                        stream,
+                        nullptr,
+                        nullptr);
+  });
+  require_exception("bounded Delta inverted Y box", [&] {
+    const DeltaSteppingCsrBoundingBox inverted =
+        make_delta_bounds(0, 2, 1, 0);
+    (void)workspace.run(source,
+                        target,
+                        1.0f,
+                        -1,
+                        make_bounded_run_options(inverted),
+                        stream,
+                        nullptr,
+                        nullptr);
+  });
+  require_exception("bounded Delta source outside explicit box", [&] {
+    const DeltaSteppingCsrBoundingBox target_only =
+        make_delta_bounds(1, 2, 0, 0);
+    (void)workspace.run(source,
+                        target,
+                        1.0f,
+                        -1,
+                        make_bounded_run_options(target_only),
+                        stream,
+                        nullptr,
+                        nullptr);
+  });
+  require_exception("bounded Delta target outside explicit box", [&] {
+    const DeltaSteppingCsrBoundingBox source_only =
+        make_delta_bounds(0, 1, 0, 0);
+    (void)workspace.run(source,
+                        target,
+                        1.0f,
+                        -1,
+                        make_bounded_run_options(source_only),
+                        stream,
+                        nullptr,
+                        nullptr);
+  });
+
+  const DeltaSteppingCsrBoundingBox scalar_bounds =
+      make_delta_bounds(0, 2, 0, 0);
+  DeltaSteppingCsrTelemetry scalar_telemetry;
+  const DeltaSteppingCsrResult scalar_result = workspace.run(
+      source,
+      2,
+      1.0f,
+      -1,
+      make_bounded_run_options(scalar_bounds, &scalar_telemetry),
+      stream,
+      nullptr,
+      nullptr);
+  require(scalar_result.target_reached &&
+              close_enough(2.0f, scalar_result.target_distance),
+          "explicit scalar-target bounded Delta returned the wrong result");
+  require_bounds_telemetry(
+      "explicit scalar-target bounded Delta", scalar_telemetry,
+      scalar_bounds, 0);
+
+  const ri::RoutingCsrSidecars missing_terminal_sidecars =
+      make_delta_route_sidecars(
+          {{0, 0},
+           {ri::kMissingRouteCoordinate, ri::kMissingRouteCoordinate},
+           {2, 0}});
+  auto missing_terminal_graph = std::make_shared<DeltaSteppingCsrGraph>(
+      graph, missing_terminal_sidecars, stream);
+  DeltaSteppingCsrWorkspace missing_terminal_workspace(
+      missing_terminal_graph, stream);
+  const DeltaSteppingCsrBoundingBox full_box =
+      make_delta_bounds(0, 2, 0, 0);
+  require_exception("bounded Delta explicit missing source", [&] {
+    (void)missing_terminal_workspace.run(
+        std::vector<int>{1},
+        std::vector<int>{2},
+        1.0f,
+        -1,
+        make_bounded_run_options(full_box),
+        stream,
+        nullptr,
+        nullptr);
+  });
+  require_exception("bounded Delta explicit missing target", [&] {
+    (void)missing_terminal_workspace.run(
+        std::vector<int>{0},
+        std::vector<int>{1},
+        1.0f,
+        -1,
+        make_bounded_run_options(full_box),
+        stream,
+        nullptr,
+        nullptr);
+  });
+
+  DeltaSteppingCsrWorkspace no_sidecars(graph, stream);
+  require_exception("bounded Delta graph without coordinate sidecars", [&] {
+    (void)no_sidecars.run(source,
+                          target,
+                          1.0f,
+                          -1,
+                          make_bounded_run_options(full_box),
+                          stream,
+                          nullptr,
+                          nullptr);
+  });
+  const DeltaSteppingCsrResult legacy_unbounded = no_sidecars.run(
+      source, target, 1.0f, -1, stream, nullptr, nullptr);
+  require(legacy_unbounded.target_reached &&
+              close_enough(2.0f, legacy_unbounded.target_distances[0]),
+          "unbounded Delta graph without sidecars changed behavior");
+}
+
+void test_bounded_delta_inclusive_exact_unit(hipStream_t stream) {
+  const HostCsrF32 graph = make_outgoing_csr(
+      6,
+      {{0, 1, 1.0f},
+       {0, 2, 1.0f},
+       {0, 3, 1.0f},
+       {0, 4, 1.0f},
+       {0, 5, 1.0f}});
+  const ri::RoutingCsrSidecars sidecars = make_delta_route_sidecars(
+      {{5, 5}, {1, 5}, {9, 5}, {5, 2}, {5, 8}, {10, 5}});
+  const DeltaSteppingCsrBoundingBox bounds =
+      make_delta_bounds(1, 9, 2, 8);
+  const std::vector<int> sources = {0};
+  const std::vector<int> targets = {1, 2, 3, 4};
+  const std::vector<float> expected =
+      cpu_bounded_dijkstra_outgoing_multi_source(
+          graph, sidecars, sources, bounds);
+
+  auto shared_graph = std::make_shared<DeltaSteppingCsrGraph>(
+      graph, sidecars, stream);
+  DeltaSteppingCsrWorkspace workspace(shared_graph, stream);
+  DeltaSteppingCsrTelemetry telemetry;
+  const DeltaSteppingCsrResult result = workspace.run(
+      sources,
+      targets,
+      1.0f,
+      -1,
+      make_bounded_run_options(bounds, &telemetry),
+      stream,
+      nullptr,
+      nullptr);
+  validate_compact_target_paths(
+      "bounded Delta inclusive exact-unit", graph, sources, targets,
+      expected, result);
+  require_bounds_telemetry(
+      "bounded Delta inclusive exact-unit", telemetry, bounds, 0);
+  require(telemetry.execution_path ==
+              DeltaSteppingCsrExecutionPath::kExactUnit,
+          "bounded Delta bypassed the exact-unit specialization");
+  require(telemetry.bounds_rejected_edges == 1,
+          "exact-unit bounds did not admit four boundary vertices and reject "
+          "the outside vertex");
+  require(telemetry.distance_atomic_attempts == targets.size(),
+          "exact-unit rejected edge reached a distance atomic");
+}
+
+void test_bounded_delta_outside_detour_and_reuse(hipStream_t stream) {
+  const HostCsrF32 graph = make_outgoing_csr(
+      4,
+      {{0, 1, 3.0f}, {1, 2, 3.0f}, {0, 3, 1.0f}, {3, 2, 1.0f}});
+  const ri::RoutingCsrSidecars sidecars = make_delta_route_sidecars(
+      {{0, 0}, {1, 0}, {2, 0}, {50, 0}});
+  const DeltaSteppingCsrBoundingBox bounds =
+      make_delta_bounds(0, 2, 0, 0);
+  const std::vector<int> sources = {0};
+  const std::vector<int> targets = {2};
+  const std::vector<float> bounded_expected =
+      cpu_bounded_dijkstra_outgoing_multi_source(
+          graph, sidecars, sources, bounds);
+  const std::vector<float> unbounded_expected =
+      cpu_dijkstra_outgoing_multi_source(graph, sources);
+  require(close_enough(6.0f, bounded_expected[2]) &&
+              close_enough(2.0f, unbounded_expected[2]),
+          "outside-detour CPU fixture has the wrong path costs");
+
+  for (const DeltaSteppingCsrOffsetMode offset_mode : {
+           DeltaSteppingCsrOffsetMode::kAuto,
+           DeltaSteppingCsrOffsetMode::kForce64Bit}) {
+    DeltaSteppingCsrGraphOptions graph_options;
+    graph_options.offset_mode = offset_mode;
+    auto shared_graph = std::make_shared<DeltaSteppingCsrGraph>(
+        graph, sidecars, stream, graph_options);
+    require(shared_graph->uses_32_bit_offsets() ==
+                (offset_mode == DeltaSteppingCsrOffsetMode::kAuto),
+            "bounded Delta sidecar graph selected the wrong row-offset width");
+    for (const DeltaSteppingCsrParentMode parent_mode : {
+             DeltaSteppingCsrParentMode::kAutomatic,
+             DeltaSteppingCsrParentMode::kForceLegacy}) {
+      const std::string label =
+          std::string("bounded Delta outside detour ") +
+          (offset_mode == DeltaSteppingCsrOffsetMode::kAuto
+               ? "compact-offset "
+               : "wide-offset ") +
+          (parent_mode == DeltaSteppingCsrParentMode::kAutomatic
+               ? "compact-parent"
+               : "legacy-parent");
+      DeltaSteppingCsrWorkspaceOptions workspace_options;
+      workspace_options.parent_mode = parent_mode;
+      workspace_options.execution_mode =
+          DeltaSteppingCsrExecutionMode::kForceGeneric;
+      DeltaSteppingCsrWorkspace workspace(
+          shared_graph, stream, workspace_options);
+
+      DeltaSteppingCsrTelemetry first_bounded_telemetry;
+      const DeltaSteppingCsrResult first_bounded = workspace.run(
+          sources,
+          targets,
+          2.0f,
+          -1,
+          make_bounded_run_options(bounds, &first_bounded_telemetry),
+          stream,
+          nullptr,
+          nullptr);
+      validate_compact_target_paths(label + ": first bounded",
+                                    graph,
+                                    sources,
+                                    targets,
+                                    bounded_expected,
+                                    first_bounded);
+      require_bounds_telemetry(
+          label, first_bounded_telemetry, bounds, 0);
+      require(first_bounded_telemetry.bounds_rejected_edges > 0,
+              label + ": outside detour was not reported as rejected");
+
+      const DeltaSteppingCsrResult unbounded = workspace.run(
+          sources, targets, 2.0f, -1, stream, nullptr, nullptr);
+      validate_compact_target_paths(label + ": unbounded reuse",
+                                    graph,
+                                    sources,
+                                    targets,
+                                    unbounded_expected,
+                                    unbounded);
+      require(std::find(unbounded.target_path_nodes.begin(),
+                        unbounded.target_path_nodes.end(),
+                        3) != unbounded.target_path_nodes.end(),
+              label + ": unbounded path did not use the cheaper detour");
+
+      DeltaSteppingCsrTelemetry second_bounded_telemetry;
+      const DeltaSteppingCsrResult second_bounded = workspace.run(
+          sources,
+          targets,
+          2.0f,
+          -1,
+          make_bounded_run_options(bounds, &second_bounded_telemetry),
+          stream,
+          nullptr,
+          nullptr);
+      validate_compact_target_paths(label + ": second bounded",
+                                    graph,
+                                    sources,
+                                    targets,
+                                    bounded_expected,
+                                    second_bounded);
+      require(std::find(second_bounded.target_path_nodes.begin(),
+                        second_bounded.target_path_nodes.end(),
+                        3) == second_bounded.target_path_nodes.end(),
+              label + ": bounded reuse leaked the outside predecessor");
+    }
+  }
+}
+
+void test_bounded_delta_spill_light_heavy_controllers(
+    hipStream_t stream) {
+  const HostCsrF32 graph = make_outgoing_csr(
+      6,
+      {{0, 1, 1.0f},
+       {1, 2, 9.0f},
+       {0, 3, 0.5f},
+       {3, 2, 0.5f},
+       {0, 4, 4.0f},
+       {4, 2, 0.5f},
+       // Keep source zero in the heavy queue even after the outside heavy
+       // destination is rejected during light classification. This makes a
+       // missing predicate in the duplicated heavy loop observable.
+       {0, 5, 6.0f}});
+  const ri::RoutingCsrSidecars sidecars = make_delta_route_sidecars(
+      {{0, 0},
+       {ri::kMissingRouteCoordinate, ri::kMissingRouteCoordinate},
+       {2, 0},
+       {50, 0},
+       {60, 0},
+       {1, 0}});
+  const DeltaSteppingCsrBoundingBox bounds =
+      make_delta_bounds(0, 2, 0, 0);
+  const std::vector<int> sources = {0};
+  const std::vector<int> targets = {2};
+  const std::vector<float> expected =
+      cpu_bounded_dijkstra_outgoing_multi_source(
+          graph, sidecars, sources, bounds);
+  require(close_enough(10.0f, expected[2]),
+          "missing-coordinate spill fixture has the wrong CPU distance");
+
+  auto shared_graph = std::make_shared<DeltaSteppingCsrGraph>(
+      graph, sidecars, stream);
+  for (const ControllerTestCase& controller : {
+           kHostCheckedControllerTestCase,
+           kReducedBatchFourControllerTestCase}) {
+    const DeltaSteppingCsrCurrentMembershipMode membership_mode =
+        controller.mode == DeltaSteppingCsrControllerMode::kReducedRoundTrip
+            ? DeltaSteppingCsrCurrentMembershipMode::kGeneration
+            : DeltaSteppingCsrCurrentMembershipMode::kBoolean;
+    const std::string label =
+        std::string("bounded Delta spill light/heavy ") + controller.label +
+        (membership_mode ==
+                 DeltaSteppingCsrCurrentMembershipMode::kGeneration
+             ? " generation-membership"
+             : " Boolean-membership");
+    DeltaSteppingCsrWorkspaceOptions options;
+    options.execution_mode = DeltaSteppingCsrExecutionMode::kForceGeneric;
+    options.current_membership_mode = membership_mode;
+    options.controller_mode = controller.mode;
+    options.controller_batch_size = controller.batch_size;
+    DeltaSteppingCsrWorkspace workspace(shared_graph, stream, options);
+    DeltaSteppingCsrTelemetry telemetry;
+    const DeltaSteppingCsrResult result = workspace.run(
+        sources,
+        targets,
+        1.0f,
+        -1,
+        make_bounded_run_options(bounds, &telemetry),
+        stream,
+        nullptr,
+        nullptr);
+    validate_compact_target_paths(
+        label, graph, sources, targets, expected, result);
+    require_bounds_telemetry(label, telemetry, bounds, 1);
+    require(telemetry.execution_path ==
+                DeltaSteppingCsrExecutionPath::kCompactGeneric,
+            label + ": did not use generic compact-parent relaxation");
+    require(telemetry.light_edge_visits > 0 &&
+                telemetry.heavy_edge_visits > 0,
+            label + ": did not exercise both light and heavy phases");
+    require(telemetry.bounds_rejected_edges >= 2,
+            label + ": did not reject both outside candidates");
+    require(std::find(result.target_path_nodes.begin(),
+                      result.target_path_nodes.end(),
+                      1) != result.target_path_nodes.end(),
+            label + ": missing-coordinate spill vertex was not admitted");
+    require_controller_telemetry(label, telemetry, controller);
+  }
+}
+
+void test_bounded_delta_vertex_costs(hipStream_t stream) {
+  const HostCsrF32 graph = make_outgoing_csr(
+      4,
+      {{0, 1, 0.5f}, {1, 2, 2.0f}, {0, 3, 0.1f}, {3, 2, 0.1f}});
+  const ri::RoutingCsrSidecars sidecars = make_delta_route_sidecars(
+      {{0, 0}, {1, 0}, {2, 0}, {50, 0}});
+  const std::vector<float> vertex_costs = {1.0f, 2.0f, 2.0f, 0.5f};
+  const DeltaSteppingCsrBoundingBox bounds =
+      make_delta_bounds(0, 2, 0, 0);
+  const std::vector<int> sources = {0};
+  const std::vector<int> targets = {2};
+  const std::vector<float> bounded_expected =
+      cpu_bounded_dijkstra_outgoing_multi_source(
+          graph, sidecars, sources, bounds, &vertex_costs);
+  const std::vector<float> unbounded_expected =
+      cpu_dijkstra_outgoing_multi_source(graph, sources, &vertex_costs);
+  require(close_enough(5.0f, bounded_expected[2]) &&
+              close_enough(0.25f, unbounded_expected[2]),
+          "bounded vertex-cost fixture has the wrong CPU path costs");
+
+  auto shared_graph = std::make_shared<DeltaSteppingCsrGraph>(
+      graph, sidecars, stream);
+  DeltaSteppingCsrWorkspaceOptions options;
+  options.execution_mode = DeltaSteppingCsrExecutionMode::kForceGeneric;
+  DeltaSteppingCsrWorkspace workspace(shared_graph, stream, options);
+  workspace.update_vertex_costs(vertex_costs, stream);
+
+  DeltaSteppingCsrTelemetry telemetry;
+  const DeltaSteppingCsrResult bounded = workspace.run(
+      sources,
+      targets,
+      1.0f,
+      -1,
+      make_bounded_run_options(bounds, &telemetry),
+      stream,
+      nullptr,
+      nullptr);
+  validate_compact_target_paths("bounded Delta vertex costs",
+                                graph,
+                                sources,
+                                targets,
+                                bounded_expected,
+                                bounded,
+                                &vertex_costs);
+  require_bounds_telemetry(
+      "bounded Delta vertex costs", telemetry, bounds, 0);
+  require(telemetry.has_vertex_costs && telemetry.light_edge_visits > 0 &&
+              telemetry.heavy_edge_visits > 0 &&
+              telemetry.bounds_rejected_edges > 0,
+          "bounded Delta vertex-cost path did not cover filtering and both "
+          "weight classes");
+
+  const DeltaSteppingCsrResult unbounded = workspace.run(
+      sources, targets, 1.0f, -1, stream, nullptr, nullptr);
+  validate_compact_target_paths("unbounded Delta vertex-cost reuse",
+                                graph,
+                                sources,
+                                targets,
+                                unbounded_expected,
+                                unbounded,
+                                &vertex_costs);
+}
+
+void test_bounded_delta_automatic_policy(hipStream_t stream) {
+  const HostCsrF32 union_graph = make_outgoing_csr(
+      5,
+      {{0, 1, 7.0f},
+       {0, 2, 1.0f},
+       {1, 3, 1.0f},
+       {0, 4, 0.25f},
+       {4, 3, 0.25f}});
+  const ri::RoutingCsrSidecars union_sidecars = make_delta_route_sidecars(
+      {{10, 10},
+       {ri::kMissingRouteCoordinate, ri::kMissingRouteCoordinate},
+       {12, 11},
+       {9, 20},
+       {100, 100}});
+  auto union_shared_graph = std::make_shared<DeltaSteppingCsrGraph>(
+      union_graph, union_sidecars, stream);
+
+  DeltaSteppingCsrWorkspaceOptions auto_options;
+  auto_options.execution_mode = DeltaSteppingCsrExecutionMode::kForceGeneric;
+  auto_options.auto_bounds = true;
+  auto_options.auto_margin_x = 2;
+  auto_options.auto_margin_y = 14;
+  DeltaSteppingCsrWorkspace auto_workspace(
+      union_shared_graph, stream, auto_options);
+  const std::vector<int> sources = {0, 1, 0};
+  const std::vector<int> targets = {2, 3};
+  const DeltaSteppingCsrBoundingBox expected_auto_bounds =
+      make_delta_bounds(7, 14, -4, 34);
+  const std::vector<float> expected =
+      cpu_bounded_dijkstra_outgoing_multi_source(
+          union_graph,
+          union_sidecars,
+          sources,
+          expected_auto_bounds);
+  DeltaSteppingCsrTelemetry auto_telemetry;
+  DeltaSteppingCsrRunOptions telemetry_only;
+  telemetry_only.telemetry = &auto_telemetry;
+  const DeltaSteppingCsrResult auto_result = auto_workspace.run(
+      sources,
+      targets,
+      1.0f,
+      -1,
+      telemetry_only,
+      stream,
+      nullptr,
+      nullptr);
+  validate_compact_target_paths("automatic bounded Delta union box",
+                                union_graph,
+                                sources,
+                                targets,
+                                expected,
+                                auto_result);
+  require_bounds_telemetry("automatic bounded Delta union box",
+                           auto_telemetry,
+                           expected_auto_bounds,
+                           1);
+  require(!auto_telemetry.unbounded_fallback_triggered,
+          "reachable automatic bounded query unexpectedly fell back");
+  require(close_enough(1.0f, auto_result.target_distances[0]) &&
+              close_enough(1.0f, auto_result.target_distances[1]),
+          "automatic box did not seed both known and missing sources");
+
+  constexpr std::int32_t kMaxCoordinate =
+      std::numeric_limits<std::int32_t>::max();
+  const HostCsrF32 saturation_graph =
+      make_outgoing_csr(2, {{0, 1, 1.0f}});
+  const ri::RoutingCsrSidecars saturation_sidecars =
+      make_delta_route_sidecars(
+          {{kMaxCoordinate - 1, kMaxCoordinate - 2},
+           {kMaxCoordinate, kMaxCoordinate}});
+  auto saturation_shared_graph = std::make_shared<DeltaSteppingCsrGraph>(
+      saturation_graph, saturation_sidecars, stream);
+  DeltaSteppingCsrWorkspaceOptions saturation_options;
+  saturation_options.auto_bounds = true;
+  saturation_options.auto_margin_x = 10;
+  saturation_options.auto_margin_y = 20;
+  DeltaSteppingCsrWorkspace saturation_workspace(
+      saturation_shared_graph, stream, saturation_options);
+  DeltaSteppingCsrTelemetry saturation_telemetry;
+  DeltaSteppingCsrRunOptions saturation_run_options;
+  saturation_run_options.telemetry = &saturation_telemetry;
+  const DeltaSteppingCsrResult saturation_result = saturation_workspace.run(
+      std::vector<int>{0},
+      std::vector<int>{1},
+      1.0f,
+      -1,
+      saturation_run_options,
+      stream,
+      nullptr,
+      nullptr);
+  require(saturation_result.target_reached &&
+              close_enough(1.0f, saturation_result.target_distances[0]),
+          "saturating automatic Delta box lost its target");
+  require_bounds_telemetry(
+      "saturating automatic Delta box",
+      saturation_telemetry,
+      make_delta_bounds(kMaxCoordinate - 11,
+                        kMaxCoordinate,
+                        kMaxCoordinate - 22,
+                        kMaxCoordinate),
+      0);
+
+  require_exception("negative automatic Delta margin", [&] {
+    DeltaSteppingCsrWorkspaceOptions invalid_options = auto_options;
+    invalid_options.auto_margin_x = -1;
+    DeltaSteppingCsrWorkspace invalid(
+        union_shared_graph, stream, invalid_options);
+    (void)invalid.run(sources,
+                      targets,
+                      1.0f,
+                      -1,
+                      stream,
+                      nullptr,
+                      nullptr);
+  });
+
+  DeltaSteppingCsrTelemetry missing_target_error_telemetry;
+  DeltaSteppingCsrRunOptions missing_target_error_options;
+  missing_target_error_options.telemetry =
+      &missing_target_error_telemetry;
+  require_exception("automatic Delta missing-coordinate target", [&] {
+    (void)auto_workspace.run(std::vector<int>{0},
+                             std::vector<int>{1},
+                             1.0f,
+                             -1,
+                             missing_target_error_options,
+                             stream,
+                             nullptr,
+                             nullptr);
+  });
+  require(!missing_target_error_telemetry.completed,
+          "failed automatic missing-target query reported completion");
+
+  DeltaSteppingCsrWorkspaceOptions missing_target_fallback_options =
+      auto_options;
+  missing_target_fallback_options.unbounded_fallback = true;
+  DeltaSteppingCsrWorkspace missing_target_fallback(
+      union_shared_graph, stream, missing_target_fallback_options);
+  DeltaSteppingCsrTelemetry missing_target_fallback_telemetry;
+  DeltaSteppingCsrRunOptions missing_target_run_options;
+  missing_target_run_options.telemetry =
+      &missing_target_fallback_telemetry;
+  const DeltaSteppingCsrResult missing_target_result =
+      missing_target_fallback.run(std::vector<int>{0},
+                                  std::vector<int>{1},
+                                  1.0f,
+                                  -1,
+                                  missing_target_run_options,
+                                  stream,
+                                  nullptr,
+                                  nullptr);
+  require(missing_target_result.target_reached &&
+              close_enough(7.0f,
+                           missing_target_result.target_distances[0]),
+          "missing-coordinate automatic target did not select an unbounded "
+          "run");
+  require(missing_target_fallback_telemetry.collected &&
+              missing_target_fallback_telemetry.completed &&
+              !missing_target_fallback_telemetry.bounds_enabled &&
+              missing_target_fallback_telemetry
+                  .unbounded_fallback_triggered,
+          "missing-coordinate target fallback telemetry is inconsistent");
+
+  const HostCsrF32 fallback_graph = make_outgoing_csr(
+      3, {{0, 1, 1.0f}, {1, 2, 1.0f}});
+  const ri::RoutingCsrSidecars fallback_sidecars =
+      make_delta_route_sidecars({{0, 0}, {50, 0}, {2, 0}});
+  auto fallback_shared_graph = std::make_shared<DeltaSteppingCsrGraph>(
+      fallback_graph, fallback_sidecars, stream);
+  DeltaSteppingCsrWorkspaceOptions no_fallback_options;
+  no_fallback_options.auto_bounds = true;
+  no_fallback_options.auto_margin_x = 0;
+  no_fallback_options.auto_margin_y = 0;
+  DeltaSteppingCsrWorkspace bounded_only(
+      fallback_shared_graph, stream, no_fallback_options);
+  DeltaSteppingCsrTelemetry bounded_only_telemetry;
+  DeltaSteppingCsrRunOptions bounded_only_run_options;
+  bounded_only_run_options.telemetry = &bounded_only_telemetry;
+  const DeltaSteppingCsrResult bounded_only_result = bounded_only.run(
+      std::vector<int>{0},
+      std::vector<int>{2},
+      1.0f,
+      -1,
+      bounded_only_run_options,
+      stream,
+      nullptr,
+      nullptr);
+  require(!bounded_only_result.target_reached &&
+              std::isinf(bounded_only_result.target_distances[0]),
+          "automatic zero-margin box unexpectedly reached outside detour");
+  require_bounds_telemetry("automatic bounded Delta without fallback",
+                           bounded_only_telemetry,
+                           make_delta_bounds(0, 2, 0, 0),
+                           0);
+
+  DeltaSteppingCsrWorkspace unbounded_reference(
+      fallback_shared_graph, stream);
+  const DeltaSteppingCsrResult unbounded_reference_result =
+      unbounded_reference.run(std::vector<int>{0},
+                              std::vector<int>{2},
+                              1.0f,
+                              -1,
+                              stream,
+                              nullptr,
+                              nullptr);
+  require(unbounded_reference_result.target_reached &&
+              close_enough(2.0f,
+                           unbounded_reference_result.target_distances[0]),
+          "unbounded fallback reference did not reach its target");
+
+  DeltaSteppingCsrWorkspaceOptions fallback_options = no_fallback_options;
+  fallback_options.unbounded_fallback = true;
+  DeltaSteppingCsrWorkspace fallback_workspace(
+      fallback_shared_graph, stream, fallback_options);
+  DeltaSteppingCsrTelemetry fallback_telemetry;
+  DeltaSteppingCsrRunOptions fallback_run_options;
+  fallback_run_options.telemetry = &fallback_telemetry;
+  const DeltaSteppingCsrResult fallback_result = fallback_workspace.run(
+      std::vector<int>{0},
+      std::vector<int>{2},
+      1.0f,
+      -1,
+      fallback_run_options,
+      stream,
+      nullptr,
+      nullptr);
+  require(fallback_result.target_reached &&
+              close_enough(2.0f, fallback_result.target_distances[0]),
+          "automatic bounded Delta did not restart with an unbounded search");
+  require(fallback_result.iterations_used ==
+              bounded_only_result.iterations_used +
+                  unbounded_reference_result.iterations_used,
+          "automatic fallback did not aggregate bounded and fresh unbounded "
+          "iteration counts");
+  require(fallback_telemetry.collected && fallback_telemetry.completed &&
+              fallback_telemetry.unbounded_fallback_triggered &&
+              fallback_telemetry.bounds_rejected_edges > 0,
+          "fresh unbounded fallback was not reported");
+  require_bounds_telemetry("automatic bounded Delta fallback aggregate",
+                           fallback_telemetry,
+                           make_delta_bounds(0, 2, 0, 0),
+                           0);
+
+  DeltaSteppingCsrTelemetry explicit_telemetry;
+  const DeltaSteppingCsrBoundingBox explicit_bounds =
+      make_delta_bounds(0, 2, 0, 0);
+  const DeltaSteppingCsrResult explicit_result = fallback_workspace.run(
+      std::vector<int>{0},
+      std::vector<int>{2},
+      1.0f,
+      -1,
+      make_bounded_run_options(explicit_bounds, &explicit_telemetry),
+      stream,
+      nullptr,
+      nullptr);
+  require(!explicit_result.target_reached &&
+              std::isinf(explicit_result.target_distances[0]) &&
+              !explicit_telemetry.unbounded_fallback_triggered,
+          "explicit fixed box silently used the workspace fallback policy");
+  require_bounds_telemetry("explicit box after automatic fallback",
+                           explicit_telemetry,
+                           explicit_bounds,
+                           0);
+}
+
+void test_bounded_delta_dijkstra_oracle_matrix(hipStream_t stream) {
+  constexpr int kVertexCount = 31;
+  constexpr int kActiveVertexCount = 28;
+  constexpr std::uint32_t kSeed = 0xB0A1D5u;
+  const HostCsrF32 graph = make_random_graph(
+      kVertexCount, kActiveVertexCount, 6 * kActiveVertexCount, kSeed);
+
+  std::vector<std::pair<std::int32_t, std::int32_t>> coordinates;
+  coordinates.reserve(kVertexCount);
+  for (int vertex = 0; vertex < kVertexCount; ++vertex) {
+    coordinates.push_back({vertex % 8, vertex / 8});
+  }
+  coordinates[13] =
+      {ri::kMissingRouteCoordinate, ri::kMissingRouteCoordinate};
+  const ri::RoutingCsrSidecars sidecars =
+      make_delta_route_sidecars(coordinates);
+  const std::vector<int> sources = {0, 8, 0};
+  const std::vector<DeltaSteppingCsrBoundingBox> boxes = {
+      make_delta_bounds(0, 3, 0, 2),
+      make_delta_bounds(0, 7, 0, 3),
+  };
+  const std::vector<float> deltas = {0.75f, 3.5f};
+  std::vector<float> vertex_costs(kVertexCount, 1.0f);
+  for (int vertex = 0; vertex < kVertexCount; ++vertex) {
+    vertex_costs[static_cast<std::size_t>(vertex)] =
+        0.5f + 0.25f * static_cast<float>(vertex % 7);
+  }
+
+  for (const DeltaSteppingCsrOffsetMode offset_mode : {
+           DeltaSteppingCsrOffsetMode::kAuto,
+           DeltaSteppingCsrOffsetMode::kForce64Bit}) {
+    DeltaSteppingCsrGraphOptions graph_options;
+    graph_options.offset_mode = offset_mode;
+    auto shared_graph = std::make_shared<DeltaSteppingCsrGraph>(
+        graph, sidecars, stream, graph_options);
+    for (const ControllerTestCase& controller : {
+             kHostCheckedControllerTestCase,
+             kReducedBatchFourControllerTestCase}) {
+      for (const bool use_vertex_costs : {false, true}) {
+        std::ostringstream base_label;
+        base_label << "bounded random Dijkstra seed " << kSeed << ' '
+                   << (offset_mode == DeltaSteppingCsrOffsetMode::kAuto
+                           ? "compact-offset "
+                           : "wide-offset ")
+                   << controller.label << ' '
+                   << (use_vertex_costs ? "vertex-costs"
+                                        : "edge-costs");
+        DeltaSteppingCsrWorkspaceOptions workspace_options;
+        workspace_options.execution_mode =
+            DeltaSteppingCsrExecutionMode::kForceGeneric;
+        workspace_options.controller_mode = controller.mode;
+        workspace_options.controller_batch_size = controller.batch_size;
+        DeltaSteppingCsrWorkspace workspace(
+            shared_graph, stream, workspace_options);
+        if (use_vertex_costs) {
+          workspace.update_vertex_costs(vertex_costs, stream);
+        }
+        const std::vector<float>* active_vertex_costs =
+            use_vertex_costs ? &vertex_costs : nullptr;
+
+        bool first_run = true;
+        for (std::size_t box_index = 0; box_index < boxes.size();
+             ++box_index) {
+          for (std::size_t delta_index = 0; delta_index < deltas.size();
+               ++delta_index) {
+            std::ostringstream label;
+            label << base_label.str() << " box " << box_index << " delta "
+                  << deltas[delta_index];
+            const std::vector<float> expected =
+                cpu_bounded_dijkstra_outgoing_multi_source(
+                    graph,
+                    sidecars,
+                    sources,
+                    boxes[box_index],
+                    active_vertex_costs);
+            DeltaSteppingCsrTelemetry telemetry;
+            DeltaSteppingCsrRunOptions run_options =
+                make_bounded_run_options(
+                    boxes[box_index], first_run ? nullptr : &telemetry);
+            const DeltaSteppingCsrResult result = workspace.run_distances(
+                sources,
+                deltas[delta_index],
+                -1,
+                run_options,
+                stream,
+                nullptr,
+                nullptr);
+            validate_distances_only_result(label.str(), expected, result);
+            require_no_mutable_path_storage(label.str(), workspace);
+            if (first_run) {
+              require(!workspace.allocation_state().telemetry_counters,
+                      label.str() +
+                          ": telemetry-disabled bounded run allocated "
+                          "counter storage");
+              first_run = false;
+            } else {
+              require_bounds_telemetry(
+                  label.str(), telemetry, boxes[box_index], 1);
+              require(telemetry.execution_path ==
+                              DeltaSteppingCsrExecutionPath::
+                                  kGenericDistancesOnly &&
+                          telemetry.force_generic == true &&
+                          telemetry.has_vertex_costs == use_vertex_costs,
+                      label.str() +
+                          ": oracle run reported the wrong generic mode");
+              require_controller_telemetry(
+                  label.str(), telemetry, controller);
+            }
+          }
+        }
+      }
+    }
+  }
+}
+
 }  // namespace
 
 int main() {
@@ -3873,6 +4852,13 @@ int main() {
     test_compact_legacy_mode_alternation(stream.get());
     test_seeded_random_graphs(stream.get());
     test_parallel_randomized_explicit_streams();
+    test_bounded_delta_validation(stream.get());
+    test_bounded_delta_inclusive_exact_unit(stream.get());
+    test_bounded_delta_outside_detour_and_reuse(stream.get());
+    test_bounded_delta_spill_light_heavy_controllers(stream.get());
+    test_bounded_delta_vertex_costs(stream.get());
+    test_bounded_delta_automatic_policy(stream.get());
+    test_bounded_delta_dijkstra_oracle_matrix(stream.get());
     test_stream_affinity(stream.get());
     check_hip(hipStreamSynchronize(stream.get()), "final hipStreamSynchronize");
     std::cout << "Delta-Stepping outgoing-CSR HIP regression test passed\n";

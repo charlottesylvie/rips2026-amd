@@ -232,7 +232,7 @@ grep '^{"type":"delta_stepping_telemetry"' \
 ```
 
 After all workers join, `pathfinder` writes exactly one compact JSON line to
-standard output with `type="delta_stepping_telemetry"`, `schema_version=2`,
+standard output with `type="delta_stepping_telemetry"`, `schema_version=3`,
 and `scope="pathfinder_run"`. `queries` counts actual SSSP invocations, not net
 slots; a net with no unresolved target leaves its slot uncollected.
 `completed_queries` counts records whose cleanup and final synchronization
@@ -246,6 +246,14 @@ and `controller_fallback_queries`. The configured names use
 `host-checked`/`reduced-round-trip`. Counter fields are summed across queries;
 the three queue high-water fields under `maxima` are maxima across queries,
 not sums.
+
+The `bounding` object exposes the configured automatic-box policy, bounded and
+fallback query counts, summed rejected-edge visits, and every collected
+query's inclusive coordinates. `bounds_unknown_coordinate_nodes` is an
+immutable graph statistic and uses the maximum repeated value rather than a
+query sum.
+Rejected edges remain part of the ordinary light/heavy visit counts but do not
+contribute to `distance_atomic_attempts`.
 
 The counters are exact under these definitions:
 
@@ -272,6 +280,10 @@ The counters are exact under these definitions:
 | `controller_round_trips` | Explicitly counted host-visible status/count transfers used for control decisions. It is not a count of every HIP call or synchronization. |
 | `controller_mode`, `controller_batch_size` | Run-level requested A/B configuration. These fields alone do not prove that the reduced controller executed. |
 | `effective_controller_modes`, `controller_fallback_queries` | Query counts by controller actually used and the number that fell back to host checking. Reject a performance sample when either total does not match the intended A/B arm. |
+| `bounding.bounds_enabled_queries`, `bounding.unbounded_fallback_triggered_queries` | Number of collected queries that used an automatic box and number that reset and retried once unbounded. |
+| `bounding.bounds_rejected_edges` | Sum of destination edge visits rejected by enabled boxes across queries and workers. |
+| `bounding.bounds_unknown_coordinate_nodes` | Maximum repeated immutable graph count, not a query sum. Missing-coordinate nodes remain admissible spill resources. |
+| `bounding.query_boxes` | Per-query inclusive coordinates, rejection count, and fallback outcome in deterministic flattened net order. |
 | `compact_parent_fallback_events` | One when an automatic compact-parent vector-target query had to use legacy parents because its edge-to-source map was unavailable; otherwise zero. |
 | `current_queue_high_water`, `pending_queue_high_water`, `heavy_queue_high_water` | Maximum observed queue entry counts within one invocation. The exact-unit current queue is append-only, so its peak is cumulative rather than one BFS layer's width. The run-level JSON reports the maximum per-query value; these are entries, not bytes. |
 

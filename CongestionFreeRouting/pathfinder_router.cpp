@@ -191,7 +191,7 @@ void print_usage(const char* program) {
       << "  --routes-to-phys <path>        Route reconstructor. Env: ROUTES_TO_PHYS\n"
       << "  Env PATHFINDER_PROFILE_COMMAND Shell prefix applied only to the inner pathfinder command.\n"
       << "  --strict-routing               Fail instead of writing partial routes.\n"
-      << "  --sssp-engine <unit-bfs|delta-step|bellman-ford>\n"
+      << "  --sssp-engine <unit-bfs|delta-step|bellman-ford|bf11>\n"
       << "                                 Forwarded to pathfinder. Default: unit-bfs\n"
       << "  --use-delta-step               Forwarded to pathfinder for comparison.\n"
       << "  --delta-force-generic          Force generic Delta-Stepping even for exact-unit weights.\n"
@@ -203,11 +203,22 @@ void print_usage(const char* program) {
       << "                                 Forward generic Delta controller selection.\n"
       << "  --delta-controller-batch-size <positive-int>\n"
       << "                                 Forward reduced-round-trip controller batch size.\n"
+      << "  --delta-bbox                   Enable automatic Delta query bounding.\n"
+      << "  --delta-bbox-margin-x <int>    Forward Delta horizontal bounding margin.\n"
+      << "  --delta-bbox-margin-y <int>    Forward Delta vertical bounding margin.\n"
+      << "  --delta-no-unbounded-fallback  Keep an unreachable automatic Delta query bounded.\n"
       << "  --delta-benchmark-weights <unit|all-light|all-heavy|mixed>\n"
       << "                                 Forward a reproducible benchmark weight family.\n"
       << "  --delta-benchmark-weight-seed <nonnegative-int>\n"
       << "                                 Forward a seed; valid only with mixed weights.\n"
       << "  --max-sssp-iters <int>         Forwarded to pathfinder.\n"
+      << "  --bf11-unbounded               Disable automatic BF11 endpoint bounding.\n"
+      << "  --bf11-bbox-margin-x <int>     Forward BF11 horizontal bounding margin.\n"
+      << "  --bf11-bbox-margin-y <int>     Forward BF11 vertical bounding margin.\n"
+      << "  --bf11-target-check-interval <int>\n"
+      << "                                 Forward BF11 device target-check interval.\n"
+      << "  --bf11-no-unbounded-fallback   Keep an unreachable BF11 query bounded.\n"
+      << "  --bf11-telemetry               Forward opt-in aggregate BF11 telemetry.\n"
       << "  --net-limit <count>            Forwarded to pathfinder.\n"
       << "  --parallel-net-workers <count> Forwarded to pathfinder; 0 enables engine-dependent auto-selection.\n"
       << "  --capacity <int>               Forwarded for overuse diagnostics.\n"
@@ -242,6 +253,7 @@ Options parse_args(int argc, char** argv) {
   std::string delta_benchmark_weights;
   bool delta_benchmark_weight_seed_provided = false;
   bool delta_telemetry = false;
+  bool bf11_telemetry = false;
 
   for (int i = 3; i < argc; ++i) {
     const std::string option = argv[i];
@@ -271,12 +283,21 @@ Options parse_args(int argc, char** argv) {
       options.allow_unrouted = false;
     } else if (option == "--use-delta-step" ||
                option == "--delta-force-generic" ||
-               option == "--delta-force-legacy-parent") {
+               option == "--delta-force-legacy-parent" ||
+               option == "--delta-bbox" ||
+               option == "--delta-no-unbounded-fallback" ||
+               option == "--bf11-unbounded" ||
+               option == "--bf11-no-unbounded-fallback") {
       options.pathfinder_args.push_back(option);
     } else if (option == "--delta-telemetry") {
       if (!delta_telemetry) {
         options.pathfinder_args.push_back(option);
         delta_telemetry = true;
+      }
+    } else if (option == "--bf11-telemetry") {
+      if (!bf11_telemetry) {
+        options.pathfinder_args.push_back(option);
+        bf11_telemetry = true;
       }
     } else if (option == "--delta-benchmark-weights") {
       delta_benchmark_weights = require_value("--delta-benchmark-weights");
@@ -293,6 +314,11 @@ Options parse_args(int argc, char** argv) {
                option == "--delta-multiplier" ||
                option == "--delta-controller" ||
                option == "--delta-controller-batch-size" ||
+               option == "--delta-bbox-margin-x" ||
+               option == "--delta-bbox-margin-y" ||
+               option == "--bf11-bbox-margin-x" ||
+               option == "--bf11-bbox-margin-y" ||
+               option == "--bf11-target-check-interval" ||
                option == "--max-pathfinder-iters" ||
                option == "--max-sssp-iters" ||
                option == "--net-limit" ||

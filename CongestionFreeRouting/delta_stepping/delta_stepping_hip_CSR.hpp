@@ -1,5 +1,6 @@
 #pragma once
 
+#include "../interchange/routing_csr_sidecars.hpp"
 #include "../sssp_query_capacity.hpp"
 #include "bf_hip_CSR.hpp"
 #include "delta_stepping_auto_delta.hpp"
@@ -31,6 +32,17 @@ enum class DeltaSteppingCsrExecutionPath {
   kCompactGeneric,
   kLegacyGeneric,
   kGenericDistancesOnly,
+};
+
+// Inclusive destination-node bounds for one fixed Delta-Stepping attempt.
+// Known-coordinate destinations outside the rectangle are rejected, while
+// missing-coordinate routing resources remain admissible spill vertices.
+struct DeltaSteppingCsrBoundingBox {
+  bool enabled = false;
+  std::int32_t min_x = 0;
+  std::int32_t max_x = 0;
+  std::int32_t min_y = 0;
+  std::int32_t max_y = 0;
 };
 
 // Per-invocation telemetry. Every counter is exact under the semantics below;
@@ -78,6 +90,17 @@ struct DeltaSteppingCsrTelemetry {
       kDeltaSteppingCsrRecommendedControllerBatchSize;
   std::uint32_t effective_controller_batch_size = 1;
   bool controller_fallback = false;
+  // Appended for aggregate-initializer compatibility. Rejected edges remain
+  // part of the ordinary light/heavy visit counts, but never reach a distance
+  // atomic. The unknown-coordinate count is an immutable graph statistic.
+  bool bounds_enabled = false;
+  std::int32_t bounds_min_x = 0;
+  std::int32_t bounds_max_x = 0;
+  std::int32_t bounds_min_y = 0;
+  std::int32_t bounds_max_y = 0;
+  std::uint64_t bounds_rejected_edges = 0;
+  std::uint64_t bounds_unknown_coordinate_nodes = 0;
+  bool unbounded_fallback_triggered = false;
 };
 
 struct DeltaSteppingCsrRunOptions {
@@ -87,6 +110,9 @@ struct DeltaSteppingCsrRunOptions {
   // Process exactly the distance buckets that can contain a path strictly
   // below this value. Infinity preserves an ordinary unbounded run.
   float exclusive_distance_limit = std::numeric_limits<float>::infinity();
+  // An enabled box is an exact fixed-subgraph request and never widens or
+  // silently falls back. Disabled preserves the workspace's ordinary policy.
+  DeltaSteppingCsrBoundingBox bounds{};
 };
 
 const char* delta_stepping_execution_path_name(
@@ -155,6 +181,15 @@ struct DeltaSteppingCsrWorkspaceOptions {
   // seeds the next generic generation advance. It has no effect in Boolean
   // membership mode.
   std::uint32_t controller_generation_seed_for_testing = 0;
+  // Ordinary vector-target runs derive one inclusive box from all known
+  // sources and every target when enabled. This remains opt-in so existing
+  // Delta callers are unbounded by default.
+  bool auto_bounds = false;
+  std::int32_t auto_margin_x = 2;
+  std::int32_t auto_margin_y = 14;
+  // A failed automatic bounded attempt may restart once from clean sparse
+  // state without bounds. Explicit RunOptions::bounds never uses this policy.
+  bool unbounded_fallback = false;
 };
 
 struct DeltaSteppingCsrGraphOptions {
@@ -196,6 +231,15 @@ class DeltaSteppingCsrGraph {
   DeltaSteppingCsrGraph(const HostCsrF32& adjacency,
                         hipStream_t stream,
                         DeltaSteppingCsrGraphOptions options);
+  DeltaSteppingCsrGraph(
+      const HostCsrF32& adjacency,
+      const routing::interchange::RoutingCsrSidecars& sidecars,
+      hipStream_t stream = nullptr);
+  DeltaSteppingCsrGraph(
+      const HostCsrF32& adjacency,
+      const routing::interchange::RoutingCsrSidecars& sidecars,
+      hipStream_t stream,
+      DeltaSteppingCsrGraphOptions options);
   ~DeltaSteppingCsrGraph();
 
   DeltaSteppingCsrGraph(const DeltaSteppingCsrGraph&) = delete;
@@ -240,6 +284,15 @@ class DeltaSteppingCsrWorkspace {
   }
   DeltaSteppingCsrWorkspace(
       const HostCsrF32& adjacency,
+      hipStream_t stream,
+      DeltaSteppingCsrWorkspaceOptions options);
+  DeltaSteppingCsrWorkspace(
+      const HostCsrF32& adjacency,
+      const routing::interchange::RoutingCsrSidecars& sidecars,
+      hipStream_t stream = nullptr);
+  DeltaSteppingCsrWorkspace(
+      const HostCsrF32& adjacency,
+      const routing::interchange::RoutingCsrSidecars& sidecars,
       hipStream_t stream,
       DeltaSteppingCsrWorkspaceOptions options);
   // Shared-graph workspaces keep private mutable search state but reuse the
@@ -398,6 +451,8 @@ class DeltaSteppingCsrWorkspace {
   }
 
  private:
+  void apply_workspace_options(const DeltaSteppingCsrWorkspaceOptions& options);
+
   template <typename Run>
   DeltaSteppingCsrResult run_with_telemetry(
       DeltaSteppingCsrRunOptions run_options,
@@ -411,19 +466,27 @@ class DeltaSteppingCsrWorkspace {
       throw std::invalid_argument(
           "Delta-Stepping distance limit must be nonnegative or infinity");
     }
+    if (run_options.bounds.enabled &&
+        (run_options.bounds.min_x > run_options.bounds.max_x ||
+         run_options.bounds.min_y > run_options.bounds.max_y)) {
+      throw std::invalid_argument("Delta-Stepping bounding box is inverted");
+    }
     if (run_options.telemetry != nullptr) {
       *run_options.telemetry = DeltaSteppingCsrTelemetry{};
     }
     active_telemetry_ = run_options.telemetry;
     active_distance_limit_ = run_options.exclusive_distance_limit;
+    active_bounds_ = run_options.bounds;
     try {
       DeltaSteppingCsrResult result = run();
       active_telemetry_ = nullptr;
       active_distance_limit_ = std::numeric_limits<float>::infinity();
+      active_bounds_ = {};
       return result;
     } catch (...) {
       active_telemetry_ = nullptr;
       active_distance_limit_ = std::numeric_limits<float>::infinity();
+      active_bounds_ = {};
       throw;
     }
   }
@@ -439,8 +502,13 @@ class DeltaSteppingCsrWorkspace {
   std::uint32_t controller_batch_size_ =
       kDeltaSteppingCsrRecommendedControllerBatchSize;
   std::uint32_t controller_generation_seed_for_testing_ = 0;
+  bool auto_bounds_ = false;
+  std::int32_t auto_margin_x_ = 2;
+  std::int32_t auto_margin_y_ = 14;
+  bool unbounded_fallback_ = false;
   DeltaSteppingCsrTelemetry* active_telemetry_ = nullptr;
   float active_distance_limit_ = std::numeric_limits<float>::infinity();
+  DeltaSteppingCsrBoundingBox active_bounds_{};
   std::unique_ptr<Impl> impl_;
 };
 

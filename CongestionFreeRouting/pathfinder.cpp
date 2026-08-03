@@ -1,6 +1,8 @@
 #include "pathfinder.hpp"
 
 #include "bellman_ford/bf10.hpp"
+#include "bellman_ford/bf11.hpp"
+#include "bellman_ford/bf11_worker_policy.hpp"
 #include "delta_stepping/delta_stepping_hip_CSR.hpp"
 #include "interchange/import_policy.hpp"
 #include "profiling/roctx_ranges.hpp"
@@ -11,17 +13,18 @@
 // This keeps the same benchmark-facing and route JSON APIs, but the routing
 // pass intentionally ignores present/historical congestion.  The default
 // engine uses a unit-weight GPU BFS specialized for the converter's unit
-// routing graph. GPU delta-stepping and Bellman-Ford bf10 remain selectable for
-// comparison.
+// routing graph. GPU delta-stepping, reference BF10, and bounded dynamic-cost
+// BF11 remain selectable for weighted routing and comparison.
 //
 // Example GPU build from the repository root:
-//   hipcc -std=c++17 -O3 -x hip -DBF10_NO_MAIN \
+//   hipcc -std=c++17 -O3 -x hip -DBF10_NO_MAIN -DBF11_NO_MAIN \
 //     -I HIP_kernel/bellman_ford/src \
 //     -I CongestionFreeRouting/bellman_ford \
 //     -I CongestionFreeRouting/delta_stepping \
 //     -I CongestionFreeRouting/unit_bfs \
 //     CongestionFreeRouting/pathfinder.cpp \
 //     CongestionFreeRouting/bellman_ford/bf10.cpp \
+//     CongestionFreeRouting/bellman_ford/bf11.cpp \
 //     CongestionFreeRouting/delta_stepping/delta_stepping_hip_CSR.cpp \
 //     CongestionFreeRouting/unit_bfs/unit_bfs_hip_CSR.cpp \
 //     -pthread \
@@ -38,6 +41,7 @@
 #include <chrono>
 #include <cmath>
 #include <cstddef>
+#include <condition_variable>
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
@@ -57,7 +61,8 @@ namespace {
 constexpr char CSR_MAGIC[8] = {'R', 'I', 'P', 'S', 'C', 'S', 'R', '1'};
 constexpr char METADATA_MAGIC[8] = {'R', 'I', 'P', 'S', 'I', 'F', 'M', '1'};
 constexpr std::uint64_t LEGACY_CSR_VERSION = 1;
-constexpr std::uint64_t CURRENT_CSR_VERSION = 2;
+constexpr std::uint64_t PAIRED_CSR_VERSION = 2;
+constexpr std::uint64_t CURRENT_CSR_VERSION = 3;
 constexpr std::uint64_t LEGACY_METADATA_VERSION = 4;
 constexpr std::uint64_t FIRST_PAIRED_METADATA_VERSION = 5;
 constexpr std::uint64_t CURRENT_METADATA_VERSION = 6;
@@ -90,6 +95,15 @@ static_assert(std::is_trivially_copyable<SitePinNodeDisk>::value,
 
 std::uint64_t read_u64(std::ifstream& in, const char* name) {
   std::uint64_t value = 0;
+  in.read(reinterpret_cast<char*>(&value), sizeof(value));
+  if (!in) {
+    throw std::runtime_error(std::string("failed while reading ") + name);
+  }
+  return value;
+}
+
+std::int64_t read_i64(std::ifstream& in, const char* name) {
+  std::int64_t value = 0;
   in.read(reinterpret_cast<char*>(&value), sizeof(value));
   if (!in) {
     throw std::runtime_error(std::string("failed while reading ") + name);
@@ -312,6 +326,11 @@ void validate_options(const PathfinderOptions& options) {
         "Delta-Stepping controller batch size requires reduced-round-trip "
         "controller mode");
   }
+  if (options.delta_bbox_margin_x < 0 ||
+      options.delta_bbox_margin_y < 0) {
+    throw std::invalid_argument(
+        "Delta-Stepping bounding-box margins must be nonnegative");
+  }
   if (options.sssp_engine != SsspEngine::kDeltaStep) {
     if (options.delta_force_generic ||
         options.delta_force_legacy_parent ||
@@ -320,6 +339,11 @@ void validate_options(const PathfinderOptions& options) {
         options.delta_multiplier != 1.0f ||
         options.delta_controls_explicit ||
         options.delta_controller_controls_explicit ||
+        options.delta_bbox_enabled ||
+        options.delta_bbox_margin_x != 2 ||
+        options.delta_bbox_margin_y != 14 ||
+        !options.delta_unbounded_fallback ||
+        options.delta_bbox_controls_explicit ||
         options.delta_controller_mode !=
             DeltaSteppingCsrControllerMode::kHostChecked ||
         options.delta_controller_batch_size !=
@@ -348,6 +372,19 @@ void validate_options(const PathfinderOptions& options) {
   }
   if (options.capacity <= 0) {
     throw std::invalid_argument("capacity must be positive");
+  }
+
+  if (options.bf11_bbox_margin_x < 0 || options.bf11_bbox_margin_y < 0) {
+    throw std::invalid_argument("BF11 bounding-box margins must be nonnegative");
+  }
+  if (options.bf11_target_check_interval <= 0) {
+    throw std::invalid_argument(
+        "BF11 target-check interval must be positive");
+  }
+  if (options.sssp_engine != SsspEngine::kBellmanFord11 &&
+      (options.bf11_controls_explicit || options.bf11_telemetry)) {
+    throw std::invalid_argument(
+        "BF11 controls require --sssp-engine bf11");
   }
 }
 
@@ -865,11 +902,17 @@ bool extract_routed_sink_candidate(
       !sssp.target_distances.empty() || !sssp.target_sources.empty() ||
       !sssp.target_path_offsets.empty() ||
       !sssp.target_edge_offsets.empty() ||
-      !sssp.target_path_nodes.empty() || !sssp.target_path_edges.empty();
+      !sssp.target_path_nodes.empty() || !sssp.target_path_edges.empty() ||
+      !sssp.target_path_edge_costs.empty();
 
   if (has_compact_target_paths) {
     if (target_pos >= target_count) {
       throw std::out_of_range("route target position is outside SSSP result");
+    }
+    if (!sssp.target_path_edge_costs.empty() &&
+        sssp.target_path_edge_costs.size() != sssp.target_path_edges.size()) {
+      throw std::runtime_error(
+          "SSSP returned compact edge costs with inconsistent size");
     }
     const float distance = sssp.target_distances[target_pos];
     if (!std::isfinite(distance)) {
@@ -941,8 +984,15 @@ bool extract_routed_sink_candidate(
           graph.colind[static_cast<std::size_t>(csr_edge)] != to) {
         throw std::runtime_error("SSSP compact path contains an invalid CSR edge");
       }
-      candidate->edges.push_back(
-          {from, to, csr_edge, graph.values[static_cast<std::size_t>(csr_edge)]});
+      const float path_cost = sssp.target_path_edge_costs.empty()
+                                  ? graph.values[static_cast<std::size_t>(csr_edge)]
+                                  : sssp.target_path_edge_costs[
+                                        static_cast<std::size_t>(edge_index)];
+      if (!std::isfinite(path_cost) || path_cost < 0.0f) {
+        throw std::runtime_error(
+            "SSSP compact path contains an invalid effective edge cost");
+      }
+      candidate->edges.push_back({from, to, csr_edge, path_cost});
     }
     candidate->distance = routed_path_cost(*candidate);
     trim_routed_sink_to_tree(*candidate, tree_seen, tree_stamp);
@@ -1077,7 +1127,8 @@ RoutedNet route_net(const HostCsrF32& graph,
       delta_telemetry->push_back(std::move(initial_telemetry));
     }
     const bool initial_paths_certified =
-        options.sssp_engine != SsspEngine::kBellmanFord ||
+        (options.sssp_engine != SsspEngine::kBellmanFord &&
+         options.sssp_engine != SsspEngine::kBellmanFord11) ||
         initial_sssp.stopped_on_target || initial_sssp.converged;
 
     for (std::size_t target_pos = 0;
@@ -1494,6 +1545,61 @@ std::size_t recommend_delta_worker_count(minplus_sparse::Offset rows,
 #endif
 }
 
+struct Bf11WorkerRecommendation {
+  bf11_worker_policy::Recommendation policy;
+  std::size_t peak_workspace_device_bytes_estimate = 0;
+  std::size_t free_device_bytes = 0;
+  std::string device_architecture;
+  int compute_unit_count = 0;
+};
+
+Bf11WorkerRecommendation recommend_bf11_worker_count(
+    minplus_sparse::Offset rows,
+    const SsspQueryCapacityHints& capacity_hints,
+    std::size_t route_request_count,
+    hipStream_t stream,
+    bool telemetry_enabled) {
+  Bf11WorkerRecommendation result;
+  if (rows <= 0) return result;
+  result.peak_workspace_device_bytes_estimate =
+      bf11_worker_policy::automatic_worker_device_bytes_estimate(
+          static_cast<std::size_t>(rows), capacity_hints.max_sources,
+          capacity_hints.max_targets, telemetry_enabled);
+
+#if defined(__HIPCC__) || defined(__HIP_PLATFORM_AMD__)
+  std::size_t total_device_bytes = 0;
+  if (hipMemGetInfo(&result.free_device_bytes, &total_device_bytes) !=
+      hipSuccess) {
+    result.free_device_bytes = 0;
+  }
+  (void)total_device_bytes;
+#endif
+
+#if defined(__HIPCC__)
+  int device = 0;
+  hipDeviceProp_t properties{};
+  if (hipGetDevice(&device) == hipSuccess &&
+      hipGetDeviceProperties(&properties, device) == hipSuccess) {
+    result.device_architecture = properties.gcnArchName;
+    result.compute_unit_count = properties.multiProcessorCount;
+  } else {
+    (void)hipGetLastError();
+  }
+#endif
+
+  const std::size_t cpu_threads =
+      std::max<unsigned int>(1, std::thread::hardware_concurrency());
+  result.policy = bf11_worker_policy::recommend(
+      {route_request_count,
+       cpu_threads,
+       result.free_device_bytes,
+       result.peak_workspace_device_bytes_estimate,
+       result.device_architecture,
+       result.compute_unit_count});
+  if (stream != nullptr) result.policy.worker_count = 1;
+  return result;
+}
+
 template <typename WorkspaceFactory>
 void route_all_nets_with_workspace(const HostCsrF32& base_graph,
                                    const RoutingMetadata& metadata,
@@ -1568,8 +1674,24 @@ void route_all_nets_with_workspace(const HostCsrF32& base_graph,
   std::exception_ptr first_exception;
   std::mutex exception_mutex;
   std::mutex progress_mutex;
+  std::mutex workspace_barrier_mutex;
+  std::condition_variable workspace_barrier_cv;
+  std::size_t workspaces_ready = 0;
+  bool workspace_barrier_failed = false;
   std::size_t last_reported = 0;
   const int worker_device = current_worker_device();
+
+  auto signal_worker_failure = [&]() {
+    // Publish the barrier predicate while holding the same mutex used by
+    // wait(). Otherwise a constructor failure can notify between a waiter's
+    // predicate check and unlock, losing the only wakeup.
+    {
+      std::lock_guard<std::mutex> lock(workspace_barrier_mutex);
+      workspace_barrier_failed = true;
+      failed.store(true, std::memory_order_relaxed);
+    }
+    workspace_barrier_cv.notify_all();
+  };
 
   auto report_progress = [&](std::size_t completed) {
     std::lock_guard<std::mutex> lock(progress_mutex);
@@ -1592,6 +1714,23 @@ void route_all_nets_with_workspace(const HostCsrF32& base_graph,
       WorkerStream worker_stream(stream == nullptr);
       hipStream_t local_stream = worker_stream.get(stream);
       auto sssp_workspace = workspace_factory(local_stream);
+      if (options.bf11_telemetry) {
+        // Keep every telemetry-enabled BF11 worker idle until all persistent
+        // workspaces exist. The last constructor can then sample free memory
+        // without earlier workers' demand-grown query buffers muddying the
+        // post-construction measurement. Disabled runs never enter this path.
+        std::unique_lock<std::mutex> lock(workspace_barrier_mutex);
+        ++workspaces_ready;
+        if (workspaces_ready == worker_count) {
+          workspace_barrier_cv.notify_all();
+        } else {
+          workspace_barrier_cv.wait(lock, [&]() {
+            return workspaces_ready == worker_count ||
+                   workspace_barrier_failed;
+          });
+        }
+        if (workspace_barrier_failed) return;
+      }
       std::vector<std::uint32_t> route_tree_seen(
           static_cast<std::size_t>(base_graph.rows), 0);
       std::vector<int> route_parent_by_child(
@@ -1639,7 +1778,7 @@ void route_all_nets_with_workspace(const HostCsrF32& base_graph,
         report_progress(completed);
       }
     } catch (...) {
-      failed.store(true, std::memory_order_relaxed);
+      signal_worker_failure();
       std::lock_guard<std::mutex> lock(exception_mutex);
       if (!first_exception) {
         first_exception = std::current_exception();
@@ -1665,7 +1804,7 @@ void route_all_nets_with_workspace(const HostCsrF32& base_graph,
     // started, those joinable threads must be stopped and joined before the
     // vector is destroyed. Otherwise std::thread::~thread calls terminate()
     // instead of allowing the construction error to reach the caller.
-    failed.store(true, std::memory_order_relaxed);
+    signal_worker_failure();
     join_workers();
     throw;
   }
@@ -1681,6 +1820,10 @@ struct DeltaTelemetryTotals {
   std::array<std::uint64_t, 4> path_counts{};
   std::array<std::uint64_t, 2> effective_controller_counts{};
   std::uint64_t controller_fallback_queries = 0;
+  std::uint64_t bounds_enabled_queries = 0;
+  std::uint64_t bounds_rejected_edges = 0;
+  std::uint64_t bounds_unknown_coordinate_nodes = 0;
+  std::uint64_t unbounded_fallback_queries = 0;
   DeltaSteppingCsrTelemetry sums;
   std::uint64_t current_queue_high_water = 0;
   std::uint64_t pending_queue_high_water = 0;
@@ -1722,6 +1865,18 @@ DeltaTelemetryTotals aggregate_delta_telemetry(
     }
     if (record.controller_fallback) {
       ++totals.controller_fallback_queries;
+    }
+    if (record.bounds_enabled) {
+      ++totals.bounds_enabled_queries;
+      totals.bounds_rejected_edges += record.bounds_rejected_edges;
+    }
+    // This is one immutable graph statistic repeated in every query record,
+    // not work that should be summed across workers or queries.
+    totals.bounds_unknown_coordinate_nodes =
+        std::max(totals.bounds_unknown_coordinate_nodes,
+                 record.bounds_unknown_coordinate_nodes);
+    if (record.unbounded_fallback_triggered) {
+      ++totals.unbounded_fallback_queries;
     }
     totals.sums.outer_buckets_processed +=
         record.outer_buckets_processed;
@@ -1781,7 +1936,7 @@ std::string delta_telemetry_aggregate_json(
   std::ostringstream out;
   out.precision(std::numeric_limits<float>::max_digits10);
   out << "{\"type\":\"delta_stepping_telemetry\""
-      << ",\"schema_version\":2"
+      << ",\"schema_version\":3"
       << ",\"scope\":\"pathfinder_run\""
       << ",\"queries\":" << totals.queries
       << ",\"completed_queries\":" << totals.completed_queries
@@ -1809,6 +1964,37 @@ std::string delta_telemetry_aggregate_json(
       << "}"
       << ",\"controller_fallback_queries\":"
       << totals.controller_fallback_queries
+      << ",\"bounding\":{"
+      << "\"bounds_enabled\":"
+      << (options.delta_bbox_enabled ? "true" : "false")
+      << ",\"margin_x\":" << options.delta_bbox_margin_x
+      << ",\"margin_y\":" << options.delta_bbox_margin_y
+      << ",\"unbounded_fallback_enabled\":"
+      << (options.delta_bbox_enabled && options.delta_unbounded_fallback
+              ? "true"
+              : "false")
+      << ",\"bounds_enabled_queries\":" << totals.bounds_enabled_queries
+      << ",\"bounds_rejected_edges\":" << totals.bounds_rejected_edges
+      << ",\"bounds_unknown_coordinate_nodes\":"
+      << totals.bounds_unknown_coordinate_nodes
+      << ",\"unbounded_fallback_triggered_queries\":"
+      << totals.unbounded_fallback_queries
+      << ",\"query_boxes\":[";
+  bool first_box = true;
+  for (const DeltaSteppingCsrTelemetry& record : records) {
+    if (!record.collected || !record.bounds_enabled) continue;
+    if (!first_box) out << ',';
+    first_box = false;
+    out << "{\"bounds_min_x\":" << record.bounds_min_x
+        << ",\"bounds_max_x\":" << record.bounds_max_x
+        << ",\"bounds_min_y\":" << record.bounds_min_y
+        << ",\"bounds_max_y\":" << record.bounds_max_y
+        << ",\"bounds_rejected_edges\":" << record.bounds_rejected_edges
+        << ",\"unbounded_fallback_triggered\":"
+        << (record.unbounded_fallback_triggered ? "true" : "false")
+        << '}';
+  }
+  out << "]}"
       << ",\"execution_paths\":{"
       << "\"exact_unit\":" << totals.path_counts[0]
       << ",\"compact_generic\":" << totals.path_counts[1]
@@ -2060,6 +2246,10 @@ SsspEngine parse_sssp_engine_arg(const char* text) {
       value == "bf9" || value == "bf10") {
     return SsspEngine::kBellmanFord;
   }
+  if (value == "bf11" || value == "bellman-ford-11" ||
+      value == "bellman_ford_11") {
+    return SsspEngine::kBellmanFord11;
+  }
   throw std::runtime_error("invalid sssp-engine: " + value);
 }
 
@@ -2071,6 +2261,8 @@ const char* sssp_engine_name(SsspEngine engine) {
       return "delta-step";
     case SsspEngine::kBellmanFord:
       return "bellman-ford";
+    case SsspEngine::kBellmanFord11:
+      return "bf11";
   }
   return "unknown";
 }
@@ -2080,19 +2272,31 @@ void print_usage(const char* program) {
       << "Usage:\n"
       << "  " << program << " <graph.csrbin> [metadata.ifmeta.bin] [options]\n\n"
       << "Options:\n"
-      << "  --sssp-engine <unit-bfs|delta-step|bellman-ford|bf10>\n"
+      << "  --sssp-engine <unit-bfs|delta-step|bellman-ford|bf10|bf11>\n"
       << "                                  Shortest-path backend. bellman-ford and bf10 select BF10;\n"
-      << "                                  bf8 and bf9 are compatibility aliases. Default: unit-bfs\n"
+      << "                                  bf11 selects bounded dynamic-cost BF11; bf8/bf9 are compatibility aliases.\n"
+      << "                                  Default: unit-bfs\n"
       << "  --use-delta-step                Use delta-step backend for comparison.\n"
       << "  --delta <float|auto>            Delta-stepping bucket width. Default: 1\n"
       << "  --delta-multiplier <float>      Positive sweep multiplier for --delta auto. Default: 1\n"
       << "  --max-sssp-iters <int>          Delta rounds, BFS depth, or Bellman-Ford rounds; -1 for default.\n"
+      << "  --bf11-unbounded                Disable BF11 automatic endpoint bounding.\n"
+      << "  --bf11-bbox-margin-x <int>      Nonnegative BF11 horizontal margin. Default: 2\n"
+      << "  --bf11-bbox-margin-y <int>      Nonnegative BF11 vertical margin. Default: 14\n"
+      << "  --bf11-target-check-interval <int>\n"
+      << "                                  Positive device-side target-check interval. Default: 1\n"
+      << "  --bf11-no-unbounded-fallback    Do not retry an unreachable bounded query unbounded.\n"
+      << "  --bf11-telemetry                Emit one aggregate BF11 phase/work/memory telemetry record.\n"
       << "  --delta-force-generic           Bypass exact-unit specialization; retain weights and delta.\n"
       << "  --delta-force-legacy-parent     Force generic Delta predecessor recovery for A/B comparison.\n"
       << "  --delta-controller <host-checked|reduced-round-trip>\n"
       << "                                  Generic Delta controller. Default: host-checked\n"
       << "  --delta-controller-batch-size <positive-int>\n"
       << "                                  Reduced-round-trip controller batch size. Default: 4\n"
+      << "  --delta-bbox                    Derive one inclusive Delta box from all query terminals.\n"
+      << "  --delta-bbox-margin-x <int>     Nonnegative horizontal expansion. Default: 2\n"
+      << "  --delta-bbox-margin-y <int>     Nonnegative vertical expansion. Default: 14\n"
+      << "  --delta-no-unbounded-fallback   Keep an unreachable automatic Delta query bounded.\n"
       << "  --delta-telemetry               Emit one aggregate Delta-Stepping telemetry JSON record.\n"
       << "  --delta-benchmark-weights <unit|all-light|all-heavy|mixed>\n"
       << "                                  Replace CSR weights deterministically for numeric-delta benchmarks.\n"
@@ -2115,7 +2319,9 @@ void print_usage(const char* program) {
 
 HostCsrF32 load_csrbin(
     const std::filesystem::path& path,
-    std::optional<interchange::InterchangeArtifactPairId>* artifact_pair_id) {
+    std::optional<interchange::InterchangeArtifactPairId>* artifact_pair_id,
+    interchange::RoutingCsrSidecars* routing_sidecars,
+    bool load_spatial_edge_shards) {
   std::ifstream in(path, std::ios::binary);
   if (!in) {
     throw std::runtime_error("could not open CSR file: " + path.string());
@@ -2129,7 +2335,7 @@ HostCsrF32 load_csrbin(
 
   const std::uint64_t version = read_u64(in, "CSR format version");
   const std::uint64_t orientation = read_u64(in, "CSR orientation");
-  if (version != LEGACY_CSR_VERSION && version != CURRENT_CSR_VERSION) {
+  if (version < LEGACY_CSR_VERSION || version > CURRENT_CSR_VERSION) {
     throw std::runtime_error("unsupported CSR format version");
   }
   if (orientation != EXPECTED_OUTGOING_EDGE_ORIENTATION) {
@@ -2137,7 +2343,7 @@ HostCsrF32 load_csrbin(
   }
 
   std::optional<interchange::InterchangeArtifactPairId> parsed_pair_id;
-  if (version == CURRENT_CSR_VERSION) {
+  if (version >= PAIRED_CSR_VERSION) {
     interchange::InterchangeArtifactPairId id;
     id.high = read_u64(in, "CSR artifact pair id high");
     id.low = read_u64(in, "CSR artifact pair id low");
@@ -2156,6 +2362,27 @@ HostCsrF32 load_csrbin(
   const std::uint64_t colind_count = read_u64(in, "CSR colind count");
   const std::uint64_t values_count = read_u64(in, "CSR values count");
 
+  std::uint64_t route_x_count = 0;
+  std::uint64_t route_y_count = 0;
+  std::uint64_t base_cost_count = 0;
+  std::int64_t spatial_min_x = 0;
+  std::int64_t spatial_min_y = 0;
+  std::uint64_t spatial_width = 0;
+  std::uint64_t spatial_height = 0;
+  std::uint64_t spatial_offset_count = 0;
+  std::uint64_t spatial_edge_id_count = 0;
+  if (version >= CURRENT_CSR_VERSION) {
+    route_x_count = read_u64(in, "CSR route-end x count");
+    route_y_count = read_u64(in, "CSR route-end y count");
+    base_cost_count = read_u64(in, "CSR base vertex cost count");
+    spatial_min_x = read_i64(in, "CSR spatial shard minimum x");
+    spatial_min_y = read_i64(in, "CSR spatial shard minimum y");
+    spatial_width = read_u64(in, "CSR spatial shard width");
+    spatial_height = read_u64(in, "CSR spatial shard height");
+    spatial_offset_count = read_u64(in, "CSR spatial shard offset count");
+    spatial_edge_id_count = read_u64(in, "CSR spatial shard edge-id count");
+  }
+
   if (rows == 0 || rows != cols) {
     throw std::runtime_error("CSR graph must be nonempty and square");
   }
@@ -2167,6 +2394,32 @@ HostCsrF32 load_csrbin(
   if (rowptr_count != rows + 1 || colind_count != nnz || values_count != nnz) {
     throw std::runtime_error("CSR header counts are inconsistent");
   }
+  if (version >= CURRENT_CSR_VERSION) {
+    if (route_x_count != rows || route_y_count != rows ||
+        base_cost_count != rows || spatial_edge_id_count != nnz) {
+      throw std::runtime_error("CSR routing sidecar counts are inconsistent");
+    }
+    if (spatial_min_x < std::numeric_limits<std::int32_t>::min() ||
+        spatial_min_x > std::numeric_limits<std::int32_t>::max() ||
+        spatial_min_y < std::numeric_limits<std::int32_t>::min() ||
+        spatial_min_y > std::numeric_limits<std::int32_t>::max()) {
+      throw std::runtime_error("CSR spatial shard origin exceeds int32 range");
+    }
+    if ((spatial_width == 0) != (spatial_height == 0) ||
+        (spatial_width != 0 &&
+         spatial_height >
+             std::numeric_limits<std::uint64_t>::max() / spatial_width)) {
+      throw std::runtime_error("CSR spatial shard grid dimensions are invalid");
+    }
+    const std::uint64_t regular_shards = spatial_width * spatial_height;
+    if (regular_shards >
+            interchange::maximum_dense_spatial_cells(
+                static_cast<std::size_t>(rows)) ||
+        regular_shards > std::numeric_limits<std::uint64_t>::max() - 2 ||
+        spatial_offset_count != regular_shards + 2) {
+      throw std::runtime_error("CSR spatial shard offset count is inconsistent");
+    }
+  }
 
   HostCsrF32 graph;
   graph.rows = static_cast<minplus_sparse::Offset>(rows);
@@ -2175,9 +2428,62 @@ HostCsrF32 load_csrbin(
   read_array(in, graph.rowptr, rowptr_count, "CSR rowptr");
   read_array(in, graph.colind, colind_count, "CSR colind");
   read_array(in, graph.values, values_count, "CSR values");
+
+  interchange::RoutingCsrSidecars parsed_sidecars;
+  if (version >= CURRENT_CSR_VERSION) {
+    if (routing_sidecars != nullptr) {
+      read_array(in, parsed_sidecars.route_end_x, route_x_count,
+                 "CSR route-end x coordinates");
+      read_array(in, parsed_sidecars.route_end_y, route_y_count,
+                 "CSR route-end y coordinates");
+      read_array(in, parsed_sidecars.base_vertex_cost, base_cost_count,
+                 "CSR base vertex costs");
+      if (load_spatial_edge_shards) {
+        parsed_sidecars.spatial_edges.min_x =
+            static_cast<std::int32_t>(spatial_min_x);
+        parsed_sidecars.spatial_edges.min_y =
+            static_cast<std::int32_t>(spatial_min_y);
+        parsed_sidecars.spatial_edges.width = spatial_width;
+        parsed_sidecars.spatial_edges.height = spatial_height;
+        read_array(in, parsed_sidecars.spatial_edges.offsets,
+                   spatial_offset_count, "CSR spatial shard offsets");
+        read_array(in, parsed_sidecars.spatial_edges.edge_ids,
+                   spatial_edge_id_count, "CSR spatial shard edge IDs");
+      } else {
+        skip_array<std::uint64_t>(in, spatial_offset_count,
+                                  "CSR spatial shard offsets");
+        skip_array<std::uint32_t>(in, spatial_edge_id_count,
+                                  "CSR spatial shard edge IDs");
+      }
+      if (load_spatial_edge_shards) {
+        interchange::validate_destination_spatial_edge_shards(
+            parsed_sidecars, static_cast<std::size_t>(rows), graph.colind);
+      } else {
+        interchange::validate_routing_csr_sidecars(
+            parsed_sidecars,
+            static_cast<std::size_t>(rows),
+            static_cast<std::size_t>(nnz),
+            false);
+      }
+    } else {
+      skip_array<std::int32_t>(in, route_x_count,
+                               "CSR route-end x coordinates");
+      skip_array<std::int32_t>(in, route_y_count,
+                               "CSR route-end y coordinates");
+      skip_array<float>(in, base_cost_count, "CSR base vertex costs");
+      skip_array<std::uint64_t>(in, spatial_offset_count,
+                                "CSR spatial shard offsets");
+      skip_array<std::uint32_t>(in, spatial_edge_id_count,
+                                "CSR spatial shard edge IDs");
+    }
+  }
+  require_position_within_file(in, "CSR payload");
   validate_csr(graph);
   if (artifact_pair_id != nullptr) {
     *artifact_pair_id = parsed_pair_id;
+  }
+  if (routing_sidecars != nullptr) {
+    *routing_sidecars = std::move(parsed_sidecars);
   }
   return graph;
 }
@@ -2466,7 +2772,9 @@ PathfinderResult run_pathfinder(const HostCsrF32& base_graph,
                                 const RoutingMetadata& metadata,
                                 const PathfinderOptions& options,
                                 hipStream_t stream,
-                                UnitBfsPathDiagnostic* unit_bfs_diagnostic) {
+                                UnitBfsPathDiagnostic* unit_bfs_diagnostic,
+                                const interchange::RoutingCsrSidecars*
+                                    routing_sidecars) {
   PATHFINDER_PROFILE_RANGE("pathfinder.run");
   validate_options(options);
   int automatic_delta_wavefront_size = 0;
@@ -2487,6 +2795,19 @@ PathfinderResult run_pathfinder(const HostCsrF32& base_graph,
         options.delta_multiplier);
   } else {
     validate_csr_shape(base_graph);
+  }
+  if (options.sssp_engine == SsspEngine::kBellmanFord11 &&
+      routing_sidecars != nullptr &&
+      (!routing_sidecars->route_end_x.empty() ||
+       !routing_sidecars->route_end_y.empty() ||
+       !routing_sidecars->base_vertex_cost.empty() ||
+       !routing_sidecars->spatial_edges.offsets.empty() ||
+       !routing_sidecars->spatial_edges.edge_ids.empty())) {
+    interchange::validate_routing_csr_sidecars(
+        *routing_sidecars,
+        static_cast<std::size_t>(base_graph.rows),
+        static_cast<std::size_t>(base_graph.nnz),
+        !routing_sidecars->spatial_edges.offsets.empty());
   }
   const std::size_t metadata_node_count =
       metadata.declared_node_count != 0
@@ -2618,8 +2939,25 @@ PathfinderResult run_pathfinder(const HostCsrF32& base_graph,
       std::cout << "[pathfinder] validating and uploading Delta graph..."
                 << std::flush;
       const auto graph_upload_started = std::chrono::steady_clock::now();
-      auto shared_graph =
-          std::make_shared<DeltaSteppingCsrGraph>(base_graph, stream);
+      const bool has_routing_sidecars =
+          routing_sidecars != nullptr &&
+          !routing_sidecars->route_end_x.empty();
+      if (delta_options.delta_bbox_enabled && !has_routing_sidecars) {
+        throw std::runtime_error(
+            "bounded Delta-Stepping requires CSR v3 route-end sidecars; "
+            "regenerate the CSR or omit --delta-bbox for a legacy artifact");
+      }
+      std::shared_ptr<DeltaSteppingCsrGraph> shared_graph;
+      if (delta_options.delta_bbox_enabled) {
+        shared_graph = std::make_shared<DeltaSteppingCsrGraph>(
+            base_graph,
+            *routing_sidecars,
+            stream,
+            DeltaSteppingCsrGraphOptions{});
+      } else {
+        shared_graph =
+            std::make_shared<DeltaSteppingCsrGraph>(base_graph, stream);
+      }
       std::cout << " done ("
                 << std::chrono::duration<double>(
                        std::chrono::steady_clock::now() -
@@ -2659,6 +2997,22 @@ PathfinderResult run_pathfinder(const HostCsrF32& base_graph,
       workspace_options.controller_batch_size =
           delta_options.delta_controller_batch_size;
       workspace_options.capacity_hints = query_capacity_hints;
+      workspace_options.auto_bounds = delta_options.delta_bbox_enabled;
+      workspace_options.auto_margin_x =
+          static_cast<std::int32_t>(delta_options.delta_bbox_margin_x);
+      workspace_options.auto_margin_y =
+          static_cast<std::int32_t>(delta_options.delta_bbox_margin_y);
+      workspace_options.unbounded_fallback =
+          delta_options.delta_bbox_enabled &&
+          delta_options.delta_unbounded_fallback;
+      if (workspace_options.auto_bounds) {
+        std::cout << "[pathfinder] enabled automatic Delta bounding "
+                  << "margin_x=" << workspace_options.auto_margin_x
+                  << " margin_y=" << workspace_options.auto_margin_y
+                  << " unbounded_fallback="
+                  << (workspace_options.unbounded_fallback ? "true" : "false")
+                  << '\n';
+      }
       if (workspace_options.execution_mode ==
           DeltaSteppingCsrExecutionMode::kForceGeneric) {
         std::cout << "[pathfinder] selected forced generic delta execution\n";
@@ -2736,6 +3090,186 @@ PathfinderResult run_pathfinder(const HostCsrF32& base_graph,
           [shared_graph](hipStream_t worker_stream) {
             return BellmanFord10CsrWorkspace(shared_graph, worker_stream);
           });
+      break;
+    }
+    case SsspEngine::kBellmanFord11: {
+      const auto bf11_backend_started = std::chrono::steady_clock::now();
+      std::cout << "[pathfinder] selected bounded dynamic-cost BF11 backend\n";
+      reset_bellman_ford11_runtime_stats();
+      const bool has_routing_sidecars =
+          routing_sidecars != nullptr &&
+          !routing_sidecars->route_end_x.empty();
+      if (!has_routing_sidecars && options.bf11_bounds_enabled) {
+        throw std::runtime_error(
+            "bounded BF11 requires CSR v3 route-end sidecars; regenerate the "
+            "CSR or pass --bf11-unbounded for a legacy artifact");
+      }
+
+      std::shared_ptr<BellmanFord11CsrGraph> shared_graph;
+      if (has_routing_sidecars) {
+        shared_graph = std::make_shared<BellmanFord11CsrGraph>(
+            base_graph, *routing_sidecars, stream);
+      } else {
+        BellmanFord11NodeSidecars legacy_sidecars;
+        legacy_sidecars.route_end_x.assign(
+            static_cast<std::size_t>(base_graph.rows),
+            interchange::kMissingRouteCoordinate);
+        legacy_sidecars.route_end_y.assign(
+            static_cast<std::size_t>(base_graph.rows),
+            interchange::kMissingRouteCoordinate);
+        legacy_sidecars.base_vertex_costs.assign(
+            static_cast<std::size_t>(base_graph.rows), 1.0f);
+        shared_graph = std::make_shared<BellmanFord11CsrGraph>(
+            base_graph, legacy_sidecars, stream);
+      }
+
+      PathfinderOptions bf11_options = options;
+      const std::size_t bf11_requested_worker_count =
+          bf11_options.parallel_net_workers;
+      const Bf11WorkerRecommendation bf11_recommendation =
+          recommend_bf11_worker_count(base_graph.rows, query_capacity_hints,
+                                      route_request_count, stream,
+                                      bf11_options.bf11_telemetry);
+      if (bf11_options.parallel_net_workers == 0) {
+        bf11_options.parallel_net_workers =
+            bf11_recommendation.policy.worker_count;
+      }
+      const std::size_t bf11_worker_count =
+          stream != nullptr
+              ? 1
+              : std::min<std::size_t>(
+                    bf11_options.parallel_net_workers,
+                    std::max<std::size_t>(1, route_request_count));
+      std::cout << "[pathfinder] BF11 workers requested=";
+      if (bf11_requested_worker_count == 0) {
+        std::cout << "auto";
+      } else {
+        std::cout << bf11_requested_worker_count;
+      }
+      std::cout << " selected=" << bf11_worker_count
+                << " peak_workspace_device_bytes_estimate="
+                << bf11_recommendation.peak_workspace_device_bytes_estimate
+                << " free_device_bytes_before_workers="
+                << bf11_recommendation.free_device_bytes;
+      if (!bf11_recommendation.device_architecture.empty()) {
+        std::cout << " architecture="
+                  << bf11_recommendation.device_architecture
+                  << " compute_units="
+                  << bf11_recommendation.compute_unit_count;
+      }
+      std::cout << '\n';
+      configure_bellman_ford11_runtime_stats(
+          bf11_options.bf11_telemetry,
+          static_cast<std::uint64_t>(bf11_requested_worker_count),
+          static_cast<std::uint64_t>(bf11_worker_count),
+          static_cast<std::uint64_t>(
+              bf11_recommendation.free_device_bytes));
+      if (bf11_worker_count > 1) {
+        std::cout
+            << "[pathfinder] BF11 parallel workers use independent explicit "
+               "streams with the host-checked controller; the persistent "
+               "cooperative controller remains single-worker only\n";
+      }
+      BellmanFord11WorkspaceOptions workspace_options;
+      workspace_options.auto_bounds = bf11_options.bf11_bounds_enabled;
+      workspace_options.auto_margin_x =
+          static_cast<std::int32_t>(bf11_options.bf11_bbox_margin_x);
+      workspace_options.auto_margin_y =
+          static_cast<std::int32_t>(bf11_options.bf11_bbox_margin_y);
+      workspace_options.unbounded_fallback =
+          bf11_options.bf11_bounds_enabled &&
+          bf11_options.bf11_unbounded_fallback;
+      workspace_options.target_check_interval =
+          bf11_options.bf11_target_check_interval;
+      workspace_options.telemetry = bf11_options.bf11_telemetry;
+      route_all_nets_with_workspace(
+          base_graph,
+          metadata,
+          bf11_options,
+          stream,
+          route_request_count,
+          progress_interval,
+          result.nets,
+          [shared_graph, workspace_options](hipStream_t worker_stream) {
+            return BellmanFord11CsrWorkspace(
+                shared_graph, worker_stream, workspace_options);
+          });
+      const BellmanFord11RuntimeStats bf11_stats =
+          bellman_ford11_runtime_stats();
+      const double bf11_backend_seconds =
+          std::chrono::duration<double>(std::chrono::steady_clock::now() -
+                                        bf11_backend_started)
+              .count();
+      std::cout << "{\"type\":\"bf11_runtime_stats\""
+                << ",\"schema_version\":2"
+                << ",\"workers\":" << bf11_worker_count
+                << ",\"requested_workers\":"
+                << bf11_requested_worker_count
+                << ",\"effective_workers\":" << bf11_worker_count
+                << ",\"routing_seconds\":" << bf11_backend_seconds
+                << ",\"persistent_controller_runs\":"
+                << bf11_stats.persistent_controller_runs
+                << ",\"host_controller_runs\":"
+                << bf11_stats.host_controller_runs
+                << ",\"target_checks\":" << bf11_stats.target_checks
+                << ",\"auto_unbounded_retries\":"
+                << bf11_stats.auto_unbounded_retries
+                << ",\"sparse_state_resets\":"
+                << bf11_stats.sparse_state_resets
+                << ",\"workspace_state_initializations\":"
+                << bf11_stats.workspace_state_initializations
+                << ",\"defensive_dense_state_resets\":"
+                << bf11_stats.defensive_dense_state_resets << "}\n";
+      if (bf11_options.bf11_telemetry) {
+        std::cout
+            << "{\"type\":\"bf11_telemetry\",\"schema_version\":1"
+            << ",\"requested_workers\":" << bf11_stats.requested_workers
+            << ",\"effective_workers\":" << bf11_stats.effective_workers
+            << ",\"queries\":" << bf11_stats.telemetry_queries
+            << ",\"completed_queries\":"
+            << bf11_stats.telemetry_completed_queries
+            << ",\"timing_nanoseconds\":{"
+            << "\"total_query_cpu\":"
+            << bf11_stats.total_query_nanoseconds
+            << ",\"reset_seed_gpu\":"
+            << bf11_stats.reset_seed_gpu_nanoseconds
+            << ",\"relaxation_gpu\":"
+            << bf11_stats.relaxation_gpu_nanoseconds
+            << ",\"target_check_gpu\":"
+            << bf11_stats.target_check_gpu_nanoseconds
+            << ",\"iteration_status_copy_gpu\":"
+            << bf11_stats.iteration_status_copy_gpu_nanoseconds
+            << ",\"stream_synchronize_cpu\":"
+            << bf11_stats.stream_synchronize_cpu_nanoseconds
+            << ",\"target_summary_gpu\":"
+            << bf11_stats.target_summary_gpu_nanoseconds
+            << ",\"path_reconstruction_gpu\":"
+            << bf11_stats.path_reconstruction_gpu_nanoseconds
+            << "},\"work\":{"
+            << "\"iterations\":" << bf11_stats.iterations
+            << ",\"frontier_vertices_processed\":"
+            << bf11_stats.frontier_vertices_processed
+            << ",\"edges_examined\":" << bf11_stats.edges_examined
+            << ",\"successful_relaxations\":"
+            << bf11_stats.successful_relaxations
+            << ",\"touched_vertices\":" << bf11_stats.touched_vertices
+            << ",\"maximum_touched_vertices\":"
+            << bf11_stats.maximum_touched_vertices
+            << ",\"maximum_touched_fraction\":"
+            << bf11_stats.maximum_touched_fraction
+            << "},\"memory\":{"
+            << "\"peak_workspace_device_bytes_estimate\":"
+            << bf11_recommendation.peak_workspace_device_bytes_estimate
+            << ","
+            << "\"workspace_device_bytes_total\":"
+            << bf11_stats.workspace_device_bytes_total
+            << ",\"workspace_device_bytes_per_worker_max\":"
+            << bf11_stats.workspace_device_bytes_per_worker_max
+            << ",\"gpu_free_before_workers\":"
+            << bf11_stats.gpu_free_before_workers
+            << ",\"gpu_free_after_workers\":"
+            << bf11_stats.gpu_free_after_workers << "}}\n";
+      }
       break;
     }
   }
@@ -3067,10 +3601,48 @@ int main(int argc, char** argv) {
       } else if (option == "--max-sssp-iters") {
         options.max_sssp_iterations =
             routing::parse_int_arg(require_value("--max-sssp-iters"), "max-sssp-iters");
+      } else if (option == "--bf11-unbounded") {
+        options.bf11_bounds_enabled = false;
+        options.bf11_controls_explicit = true;
+      } else if (option == "--bf11-bbox-margin-x") {
+        options.bf11_bbox_margin_x = routing::parse_int_arg(
+            require_value("--bf11-bbox-margin-x"), "bf11-bbox-margin-x");
+        options.bf11_controls_explicit = true;
+      } else if (option == "--bf11-bbox-margin-y") {
+        options.bf11_bbox_margin_y = routing::parse_int_arg(
+            require_value("--bf11-bbox-margin-y"), "bf11-bbox-margin-y");
+        options.bf11_controls_explicit = true;
+      } else if (option == "--bf11-target-check-interval") {
+        options.bf11_target_check_interval = routing::parse_int_arg(
+            require_value("--bf11-target-check-interval"),
+            "bf11-target-check-interval");
+        options.bf11_controls_explicit = true;
+      } else if (option == "--bf11-no-unbounded-fallback") {
+        options.bf11_unbounded_fallback = false;
+        options.bf11_controls_explicit = true;
+      } else if (option == "--bf11-telemetry") {
+        options.bf11_telemetry = true;
+        options.bf11_controls_explicit = true;
       } else if (option == "--delta-force-legacy-parent") {
         options.delta_force_legacy_parent = true;
       } else if (option == "--delta-force-generic") {
         options.delta_force_generic = true;
+      } else if (option == "--delta-bbox") {
+        options.delta_bbox_enabled = true;
+        options.delta_bbox_controls_explicit = true;
+      } else if (option == "--delta-bbox-margin-x") {
+        options.delta_bbox_margin_x = routing::parse_int_arg(
+            require_value("--delta-bbox-margin-x"),
+            "delta-bbox-margin-x");
+        options.delta_bbox_controls_explicit = true;
+      } else if (option == "--delta-bbox-margin-y") {
+        options.delta_bbox_margin_y = routing::parse_int_arg(
+            require_value("--delta-bbox-margin-y"),
+            "delta-bbox-margin-y");
+        options.delta_bbox_controls_explicit = true;
+      } else if (option == "--delta-no-unbounded-fallback") {
+        options.delta_unbounded_fallback = false;
+        options.delta_bbox_controls_explicit = true;
       } else if (option == "--delta-controller") {
         options.delta_controller_mode =
             routing::parse_delta_controller_arg(
@@ -3195,11 +3767,21 @@ int main(int argc, char** argv) {
 
     std::optional<routing::interchange::InterchangeArtifactPairId>
         csr_artifact_pair_id;
+    routing::interchange::RoutingCsrSidecars routing_sidecars;
+    routing::interchange::RoutingCsrSidecars* routing_sidecars_output =
+        (options.sssp_engine == routing::SsspEngine::kBellmanFord11 ||
+         (options.sssp_engine == routing::SsspEngine::kDeltaStep &&
+          options.delta_bbox_enabled))
+            ? &routing_sidecars
+            : nullptr;
     std::cout << "[pathfinder] loading CSR..." << std::flush;
     const auto csr_load_started = std::chrono::steady_clock::now();
     HostCsrF32 graph = [&]() {
       PATHFINDER_PROFILE_RANGE("pathfinder.load_csr");
-      return routing::load_csrbin(csr_path, &csr_artifact_pair_id);
+      return routing::load_csrbin(csr_path,
+                                  &csr_artifact_pair_id,
+                                  routing_sidecars_output,
+                                  false);
     }();
     std::cout << " done ("
               << std::chrono::duration<double>(
@@ -3269,13 +3851,24 @@ int main(int argc, char** argv) {
                 << std::flush;
     }
 
+    const auto routing_started = std::chrono::steady_clock::now();
     routing::PathfinderResult result =
         routing::run_pathfinder(
             graph,
             metadata,
             options,
             nullptr,
-            diagnose_unit_bfs ? &unit_bfs_diagnostic : nullptr);
+            diagnose_unit_bfs ? &unit_bfs_diagnostic : nullptr,
+            routing_sidecars_output);
+    if (options.sssp_engine == routing::SsspEngine::kBellmanFord11 &&
+        options.bf11_telemetry) {
+      std::cout << "{\"type\":\"bf11_routing_time\",\"schema_version\":1"
+                << ",\"routing_seconds\":"
+                << std::chrono::duration<double>(
+                       std::chrono::steady_clock::now() - routing_started)
+                       .count()
+                << "}\n";
+    }
 
     if (diagnose_unit_bfs) {
       std::cout << routing::unit_bfs_path_diagnostic_json(

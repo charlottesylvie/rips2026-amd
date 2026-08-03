@@ -488,7 +488,7 @@ void write_minimal_csr_fixture(
   out.write(magic, sizeof(magic));
   write_fixture_u64(out, version);
   write_fixture_u64(out, 2);
-  if (version == 2) {
+  if (version >= 2) {
     const auto value = id.value_or(
         routing::interchange::InterchangeArtifactPairId{});
     write_fixture_u64(out, value.high);
@@ -502,8 +502,29 @@ void write_minimal_csr_fixture(
   write_fixture_u64(out, 2);  // rowptr count
   write_fixture_u64(out, 0);  // colind count
   write_fixture_u64(out, 0);  // values count
+  if (version >= 3) {
+    write_fixture_u64(out, 1);  // route-end x count
+    write_fixture_u64(out, 1);  // route-end y count
+    write_fixture_u64(out, 1);  // base vertex cost count
+    write_fixture_u64(out, 0);  // signed spatial minimum x
+    write_fixture_u64(out, 0);  // signed spatial minimum y
+    write_fixture_u64(out, 1);  // spatial width
+    write_fixture_u64(out, 1);  // spatial height
+    write_fixture_u64(out, 3);  // regular + spill + terminal offset
+    write_fixture_u64(out, 0);  // spatial edge-id count
+  }
   const std::int64_t rowptr[2] = {0, 0};
   out.write(reinterpret_cast<const char*>(rowptr), sizeof(rowptr));
+  if (version >= 3) {
+    const std::int32_t route_end = 0;
+    const float base_cost = 1.0f;
+    const std::uint64_t shard_offsets[3] = {0, 0, 0};
+    out.write(reinterpret_cast<const char*>(&route_end), sizeof(route_end));
+    out.write(reinterpret_cast<const char*>(&route_end), sizeof(route_end));
+    out.write(reinterpret_cast<const char*>(&base_cost), sizeof(base_cost));
+    out.write(reinterpret_cast<const char*>(shard_offsets),
+              sizeof(shard_offsets));
+  }
 }
 
 void write_minimal_metadata_fixture(
@@ -561,6 +582,36 @@ void test_interchange_artifact_pair_loaders() {
   routing::interchange::require_matching_interchange_pair_ids(
       csr_id, loaded_metadata.artifact_pair_id, pair);
 
+  write_minimal_csr_fixture(csr, 3, pair);
+  routing::interchange::RoutingCsrSidecars csr_sidecars;
+  csr_id.reset();
+  const HostCsrF32 graph_v3 =
+      routing::load_csrbin(csr, &csr_id, &csr_sidecars);
+  require(graph_v3.rows == 1 && graph_v3.nnz == 0 && csr_id == pair &&
+              csr_sidecars.route_end_x == std::vector<std::int32_t>({0}) &&
+              csr_sidecars.route_end_y == std::vector<std::int32_t>({0}) &&
+              csr_sidecars.base_vertex_cost == std::vector<float>({1.0f}) &&
+              csr_sidecars.spatial_edges.width == 1 &&
+              csr_sidecars.spatial_edges.height == 1 &&
+              csr_sidecars.spatial_edges.offsets ==
+                  std::vector<std::uint64_t>({0, 0, 0}) &&
+              csr_sidecars.spatial_edges.edge_ids.empty(),
+          "CSR v3 routing sidecars did not load exactly");
+  routing::interchange::RoutingCsrSidecars node_sidecars_only;
+  (void)routing::load_csrbin(csr, &csr_id, &node_sidecars_only, false);
+  require(node_sidecars_only.route_end_x ==
+              std::vector<std::int32_t>({0}) &&
+              node_sidecars_only.route_end_y ==
+                  std::vector<std::int32_t>({0}) &&
+              node_sidecars_only.base_vertex_cost ==
+                  std::vector<float>({1.0f}) &&
+              node_sidecars_only.spatial_edges.offsets.empty() &&
+              node_sidecars_only.spatial_edges.edge_ids.empty(),
+          "CSR v3 node-only loading unexpectedly materialized spatial shards");
+  // A graph-only caller may skip the optional payload without materializing
+  // graph-sized geometry or shard arrays.
+  (void)routing::load_csrbin(csr, &csr_id);
+
   write_minimal_csr_fixture(csr, 1, std::nullopt);
   write_minimal_metadata_fixture(metadata, 4, std::nullopt);
   csr_id = pair;
@@ -595,6 +646,18 @@ void test_interchange_artifact_pair_loaders() {
             pair, std::nullopt, pair);
       },
       "mixed legacy/current artifact pair was accepted");
+
+  write_minimal_csr_fixture(csr, 3, pair);
+  std::filesystem::resize_file(csr, std::filesystem::file_size(csr) - 1);
+  require_failure(
+      [&] { (void)routing::load_csrbin(csr); },
+      "graph-only CSR loading accepted a truncated v3 spatial payload");
+  require_failure(
+      [&] {
+        routing::interchange::RoutingCsrSidecars node_sidecars;
+        (void)routing::load_csrbin(csr, nullptr, &node_sidecars, false);
+      },
+      "node-only CSR loading accepted a truncated v3 spatial payload");
 
   write_minimal_csr_fixture(csr, 2, std::nullopt);
   require_failure(
@@ -1413,6 +1476,8 @@ BellmanFordCsrResult BellmanFord10CsrWorkspace::run(
              progress_user_data);
 }
 
+#include "bf11_pathfinder_cpu_stub.inc"
+
 struct DeltaSteppingCsrGraph::Impl {
   explicit Impl(const HostCsrF32& adjacency) : graph(adjacency) {}
 
@@ -1424,6 +1489,16 @@ DeltaSteppingCsrGraph::DeltaSteppingCsrGraph(const HostCsrF32& adjacency,
     : impl_(std::make_shared<Impl>(adjacency)) {
   (void)stream;
   ++g_delta_graph_uploads;
+}
+
+DeltaSteppingCsrGraph::DeltaSteppingCsrGraph(
+    const HostCsrF32& adjacency,
+    const routing::interchange::RoutingCsrSidecars& sidecars,
+    hipStream_t stream,
+    DeltaSteppingCsrGraphOptions options)
+    : DeltaSteppingCsrGraph(adjacency, stream) {
+  (void)sidecars;
+  (void)options;
 }
 
 DeltaSteppingCsrGraph::~DeltaSteppingCsrGraph() = default;
@@ -1943,6 +2018,13 @@ int main() {
   }
 
   const routing::PathfinderOptions default_pathfinder_options;
+  const BellmanFord11WorkspaceOptions default_bf11_workspace_options;
+  require(default_pathfinder_options.bf11_bbox_margin_x == 2 &&
+              default_pathfinder_options.bf11_bbox_margin_y == 14 &&
+              default_bf11_workspace_options.auto_margin_x == 2 &&
+              default_bf11_workspace_options.auto_margin_y == 14,
+          "BF11 inclusive automatic margins must match RWRoute's strict "
+          "3/15 bounding-box admission");
   require(default_pathfinder_options.delta == 1.0f,
           "default delta-stepping bucket width must be one");
   require(!default_pathfinder_options.delta_auto,
@@ -2461,8 +2543,27 @@ int main() {
       DeltaSteppingCsrControllerMode::kReducedRoundTrip;
   aggregate_records[3].requested_controller_batch_size = 7;
   aggregate_records[3].controller_fallback = true;
+  aggregate_records[0].bounds_enabled = true;
+  aggregate_records[0].bounds_min_x = 1;
+  aggregate_records[0].bounds_max_x = 7;
+  aggregate_records[0].bounds_min_y = 2;
+  aggregate_records[0].bounds_max_y = 20;
+  aggregate_records[0].bounds_rejected_edges = 3;
+  aggregate_records[0].bounds_unknown_coordinate_nodes = 9;
+  aggregate_records[2].bounds_enabled = true;
+  aggregate_records[2].bounds_min_x = 4;
+  aggregate_records[2].bounds_max_x = 11;
+  aggregate_records[2].bounds_min_y = 6;
+  aggregate_records[2].bounds_max_y = 24;
+  aggregate_records[2].bounds_rejected_edges = 5;
+  aggregate_records[2].bounds_unknown_coordinate_nodes = 9;
+  aggregate_records[2].unbounded_fallback_triggered = true;
   DeltaSteppingCsrTelemetry ignored_record;
   ignored_record.outer_buckets_processed = 100000;
+  ignored_record.bounds_enabled = true;
+  ignored_record.bounds_rejected_edges = 100000;
+  ignored_record.bounds_unknown_coordinate_nodes = 100000;
+  ignored_record.unbounded_fallback_triggered = true;
   ignored_record.current_queue_high_water = 100000;
   aggregate_records.push_back(ignored_record);
 
@@ -2474,7 +2575,11 @@ int main() {
                   std::array<std::uint64_t, 4>{1, 1, 1, 1} &&
               telemetry_totals.effective_controller_counts ==
                   std::array<std::uint64_t, 2>{3, 1} &&
-              telemetry_totals.controller_fallback_queries == 1,
+              telemetry_totals.controller_fallback_queries == 1 &&
+              telemetry_totals.bounds_enabled_queries == 2 &&
+              telemetry_totals.bounds_rejected_edges == 8 &&
+              telemetry_totals.bounds_unknown_coordinate_nodes == 9 &&
+              telemetry_totals.unbounded_fallback_queries == 1,
           "telemetry aggregation must count collected, completed, and path records");
   const DeltaSteppingCsrTelemetry& telemetry_sums = telemetry_totals.sums;
   require(telemetry_sums.outer_buckets_processed == 10 &&
@@ -2512,10 +2617,14 @@ int main() {
   aggregate_json_options.delta_controller_mode =
       DeltaSteppingCsrControllerMode::kReducedRoundTrip;
   aggregate_json_options.delta_controller_batch_size = 7;
+  aggregate_json_options.delta_bbox_enabled = true;
+  aggregate_json_options.delta_bbox_margin_x = 4;
+  aggregate_json_options.delta_bbox_margin_y = 18;
+  aggregate_json_options.delta_unbounded_fallback = false;
   const std::string aggregate_json = routing::delta_telemetry_aggregate_json(
       aggregate_records, aggregate_json_options, 2.5f, 64, 3);
   require(aggregate_json.find('\n') == std::string::npos &&
-              aggregate_json.find("\"schema_version\":2") !=
+              aggregate_json.find("\"schema_version\":3") !=
                   std::string::npos &&
               aggregate_json.find("\"queries\":4") != std::string::npos &&
               aggregate_json.find("\"completed_queries\":3") !=
@@ -2527,6 +2636,23 @@ int main() {
                   "\"effective_controller_modes\":{\"host_checked\":3,"
                   "\"reduced_round_trip\":1}") != std::string::npos &&
               aggregate_json.find("\"controller_fallback_queries\":1") !=
+                  std::string::npos &&
+              aggregate_json.find(
+                  "\"bounding\":{\"bounds_enabled\":true,"
+                  "\"margin_x\":4,\"margin_y\":18,"
+                  "\"unbounded_fallback_enabled\":false,"
+                  "\"bounds_enabled_queries\":2,"
+                  "\"bounds_rejected_edges\":8,"
+                  "\"bounds_unknown_coordinate_nodes\":9,"
+                  "\"unbounded_fallback_triggered_queries\":1") !=
+                  std::string::npos &&
+              aggregate_json.find(
+                  "\"bounds_min_x\":1,\"bounds_max_x\":7,"
+                  "\"bounds_min_y\":2,\"bounds_max_y\":20") !=
+                  std::string::npos &&
+              aggregate_json.find(
+                  "\"bounds_min_x\":4,\"bounds_max_x\":11,"
+                  "\"bounds_min_y\":6,\"bounds_max_y\":24") !=
                   std::string::npos &&
               aggregate_json.find(
                   "\"execution_paths\":{\"exact_unit\":1,"
@@ -2629,6 +2755,120 @@ int main() {
                                        expected_parallel_hints.max_targets;
                           }),
           "every parallel UnitBFS workspace must receive identical hints");
+
+  routing::interchange::RoutingCsrSidecars bf11_sidecars;
+  bf11_sidecars.route_end_x.resize(
+      static_cast<std::size_t>(congestion_graph.rows));
+  bf11_sidecars.route_end_y.assign(
+      static_cast<std::size_t>(congestion_graph.rows), 0);
+  bf11_sidecars.base_vertex_cost.assign(
+      static_cast<std::size_t>(congestion_graph.rows), 1.0f);
+  for (int node = 0; node < congestion_graph.rows; ++node) {
+    bf11_sidecars.route_end_x[static_cast<std::size_t>(node)] = node;
+  }
+
+  routing::PathfinderOptions explicit_bf11_options = parallel_options;
+  explicit_bf11_options.sssp_engine = routing::SsspEngine::kBellmanFord11;
+  explicit_bf11_options.parallel_net_workers = 8;
+  explicit_bf11_options.bf11_telemetry = true;
+  explicit_bf11_options.bf11_controls_explicit = true;
+  routing::PathfinderResult explicit_bf11_result;
+  std::string explicit_bf11_stdout;
+  {
+    ScopedCoutCapture capture;
+    explicit_bf11_result = routing::run_pathfinder(
+        congestion_graph, congestion_metadata, explicit_bf11_options, nullptr,
+        nullptr, &bf11_sidecars);
+    explicit_bf11_stdout = capture.str();
+  }
+  require(explicit_bf11_result.routed &&
+              explicit_bf11_result.nets[0].sinks[0].nodes ==
+                  parallel_result.nets[0].sinks[0].nodes &&
+              explicit_bf11_result.nets[1].sinks[0].nodes ==
+                  parallel_result.nets[1].sinks[0].nodes,
+          "explicit BF11 workers changed PathFinder route results");
+  require(g_bf11_stub_requested_workers == 8 &&
+              g_bf11_stub_effective_workers == 2 &&
+              g_bf11_stub_workspace_constructions == 2 &&
+              g_bf11_stub_telemetry_workspaces == 2 &&
+              g_bf11_stub_telemetry_enabled,
+          "PathFinder lost requested/effective BF11 workers or telemetry options");
+  require(explicit_bf11_stdout.find(
+              "BF11 workers requested=8 selected=2") != std::string::npos &&
+              explicit_bf11_stdout.find("\"type\":\"bf11_telemetry\"") !=
+                  std::string::npos &&
+              explicit_bf11_stdout.find("\"requested_workers\":8") !=
+                  std::string::npos &&
+              explicit_bf11_stdout.find("\"effective_workers\":2") !=
+                  std::string::npos &&
+              explicit_bf11_stdout.find(
+                  "\"peak_workspace_device_bytes_estimate\":") !=
+                  std::string::npos,
+          "BF11 worker selection/telemetry logging is incomplete");
+
+  // A telemetry worker can wait for all persistent workspaces while another
+  // worker's constructor fails. The failure publication and barrier wakeup
+  // must be indivisible with respect to the waiter; a watchdog makes a lost
+  // wakeup a bounded test failure instead of hanging the host suite forever.
+  g_bf11_stub_throw_on_workspace_construction = 2;
+  std::mutex bf11_failure_watchdog_mutex;
+  std::condition_variable bf11_failure_watchdog_cv;
+  bool bf11_failure_test_finished = false;
+  std::thread bf11_failure_watchdog([&]() {
+    std::unique_lock<std::mutex> lock(bf11_failure_watchdog_mutex);
+    if (!bf11_failure_watchdog_cv.wait_for(
+            lock, std::chrono::seconds(5),
+            [&]() { return bf11_failure_test_finished; })) {
+      std::_Exit(124);
+    }
+  });
+  bool bf11_construction_failure_observed = false;
+  try {
+    (void)routing::run_pathfinder(
+        congestion_graph, congestion_metadata, explicit_bf11_options, nullptr,
+        nullptr, &bf11_sidecars);
+  } catch (const std::runtime_error& error) {
+    bf11_construction_failure_observed =
+        std::string(error.what()).find(
+            "injected BF11 workspace construction failure") !=
+        std::string::npos;
+  }
+  g_bf11_stub_throw_on_workspace_construction = 0;
+  {
+    std::lock_guard<std::mutex> lock(bf11_failure_watchdog_mutex);
+    bf11_failure_test_finished = true;
+  }
+  bf11_failure_watchdog_cv.notify_one();
+  bf11_failure_watchdog.join();
+  require(bf11_construction_failure_observed,
+          "BF11 telemetry workspace failure did not escape without deadlock");
+
+  routing::PathfinderOptions automatic_bf11_options = explicit_bf11_options;
+  automatic_bf11_options.parallel_net_workers = 0;
+  automatic_bf11_options.bf11_telemetry = false;
+  automatic_bf11_options.bf11_controls_explicit = false;
+  std::string automatic_bf11_stdout;
+  {
+    ScopedCoutCapture capture;
+    const routing::PathfinderResult automatic_bf11_result =
+        routing::run_pathfinder(congestion_graph, congestion_metadata,
+                                automatic_bf11_options, nullptr, nullptr,
+                                &bf11_sidecars);
+    require(automatic_bf11_result.routed,
+            "automatic BF11 worker selection changed routed status");
+    automatic_bf11_stdout = capture.str();
+  }
+  require(g_bf11_stub_requested_workers == 0 &&
+              g_bf11_stub_effective_workers == 1 &&
+              g_bf11_stub_workspace_constructions == 1 &&
+              g_bf11_stub_telemetry_workspaces == 0 &&
+              !g_bf11_stub_telemetry_enabled &&
+              automatic_bf11_stdout.find(
+                  "BF11 workers requested=auto selected=1") !=
+                  std::string::npos &&
+              automatic_bf11_stdout.find(
+                  "\"type\":\"bf11_telemetry\"") == std::string::npos,
+          "unmeasured-device BF11 auto policy or disabled telemetry regressed");
 
   routing::PathfinderOptions parallel_delta_options = parallel_options;
   parallel_delta_options.sssp_engine = routing::SsspEngine::kDeltaStep;
@@ -2741,7 +2981,7 @@ int main() {
       single_delta_telemetry_json_line(parallel_telemetry_stdout);
   require(parallel_telemetry_json.find("\"queries\":2") !=
                   std::string::npos &&
-              parallel_telemetry_json.find("\"schema_version\":2") !=
+              parallel_telemetry_json.find("\"schema_version\":3") !=
                   std::string::npos &&
               parallel_telemetry_json.find("\"completed_queries\":2") !=
                   std::string::npos &&

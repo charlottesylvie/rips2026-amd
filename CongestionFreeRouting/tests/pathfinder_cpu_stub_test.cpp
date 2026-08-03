@@ -10,6 +10,11 @@ namespace {
 
 std::atomic<int> g_multisource_delta_calls{0};
 std::atomic<int> g_delta_graph_uploads{0};
+std::atomic<int> g_delta_sidecar_graph_uploads{0};
+std::atomic<int> g_delta_bounded_workspace_constructions{0};
+std::atomic<int> g_delta_margin_x_total{0};
+std::atomic<int> g_delta_margin_y_total{0};
+std::atomic<int> g_delta_unbounded_fallback_workspaces{0};
 std::atomic<int> g_bellman_ford_calls{0};
 std::atomic<int> g_bellman_ford_graph_uploads{0};
 std::atomic<int> g_bellman_ford_workspace_constructions{0};
@@ -198,6 +203,40 @@ HostCsrF32 make_three_net_overlap_graph() {
   graph.colind = {2, 2, 4, 5, 7};
   graph.values = {1.0f, 1.0f, 1.0f, 1.0f, 1.0f};
   return graph;
+}
+
+routing::interchange::RoutingCsrSidecars make_routing_sidecars(
+    const HostCsrF32& graph) {
+  routing::interchange::RoutingCsrSidecars sidecars;
+  const std::size_t vertex_count = static_cast<std::size_t>(graph.rows);
+  sidecars.route_end_x.resize(vertex_count);
+  sidecars.route_end_y.assign(vertex_count, 0);
+  sidecars.base_vertex_cost.assign(vertex_count, 1.0f);
+  for (std::size_t node = 0; node < vertex_count; ++node) {
+    sidecars.route_end_x[node] = static_cast<std::int32_t>(node);
+  }
+
+  auto& shards = sidecars.spatial_edges;
+  shards.width = vertex_count;
+  shards.height = vertex_count == 0 ? 0 : 1;
+  std::vector<std::uint64_t> counts(vertex_count + 1, 0);
+  for (const int destination : graph.colind) {
+    ++counts[static_cast<std::size_t>(destination)];
+  }
+  shards.offsets.resize(counts.size() + 1, 0);
+  for (std::size_t shard = 0; shard < counts.size(); ++shard) {
+    shards.offsets[shard + 1] = shards.offsets[shard] + counts[shard];
+  }
+  shards.edge_ids.resize(static_cast<std::size_t>(graph.nnz));
+  std::vector<std::uint64_t> cursors(shards.offsets.begin(),
+                                     shards.offsets.end() - 1);
+  for (std::size_t edge = 0; edge < graph.colind.size(); ++edge) {
+    const std::size_t shard =
+        static_cast<std::size_t>(graph.colind[edge]);
+    shards.edge_ids[static_cast<std::size_t>(cursors[shard]++)] =
+        static_cast<std::uint32_t>(edge);
+  }
+  return sidecars;
 }
 
 routing::RoutingMetadata make_metadata() {
@@ -403,6 +442,8 @@ BellmanFordCsrResult BellmanFord10CsrWorkspace::run(
              progress_user_data);
 }
 
+#include "bf11_pathfinder_cpu_stub.inc"
+
 struct DeltaSteppingCsrGraph::Impl {
   explicit Impl(const HostCsrF32& adjacency) : graph(adjacency) {}
 
@@ -414,6 +455,17 @@ DeltaSteppingCsrGraph::DeltaSteppingCsrGraph(const HostCsrF32& adjacency,
     : impl_(std::make_shared<Impl>(adjacency)) {
   (void)stream;
   ++g_delta_graph_uploads;
+}
+
+DeltaSteppingCsrGraph::DeltaSteppingCsrGraph(
+    const HostCsrF32& adjacency,
+    const routing::interchange::RoutingCsrSidecars& sidecars,
+    hipStream_t stream,
+    DeltaSteppingCsrGraphOptions options)
+    : DeltaSteppingCsrGraph(adjacency, stream) {
+  (void)sidecars;
+  (void)options;
+  ++g_delta_sidecar_graph_uploads;
 }
 
 DeltaSteppingCsrGraph::~DeltaSteppingCsrGraph() = default;
@@ -459,6 +511,14 @@ DeltaSteppingCsrWorkspace::DeltaSteppingCsrWorkspace(
   controller_mode_ = options.controller_mode;
   controller_batch_size_ = options.controller_batch_size;
   sssp_capacity::validate_reservation(options.capacity_hints);
+  if (options.auto_bounds) {
+    ++g_delta_bounded_workspace_constructions;
+    g_delta_margin_x_total += options.auto_margin_x;
+    g_delta_margin_y_total += options.auto_margin_y;
+    if (options.unbounded_fallback) {
+      ++g_delta_unbounded_fallback_workspaces;
+    }
+  }
 }
 
 DeltaSteppingCsrWorkspace::DeltaSteppingCsrWorkspace(
@@ -472,6 +532,14 @@ DeltaSteppingCsrWorkspace::DeltaSteppingCsrWorkspace(
   controller_mode_ = options.controller_mode;
   controller_batch_size_ = options.controller_batch_size;
   sssp_capacity::validate_reservation(options.capacity_hints);
+  if (options.auto_bounds) {
+    ++g_delta_bounded_workspace_constructions;
+    g_delta_margin_x_total += options.auto_margin_x;
+    g_delta_margin_y_total += options.auto_margin_y;
+    if (options.unbounded_fallback) {
+      ++g_delta_unbounded_fallback_workspaces;
+    }
+  }
 }
 
 DeltaSteppingCsrWorkspace::~DeltaSteppingCsrWorkspace() = default;
@@ -894,6 +962,140 @@ int main() {
   require(g_unit_bfs_calls == 0,
           "parallel explicit delta routing should not call unit BFS");
 
+  routing::PathfinderOptions bounded_delta_options = parallel_delta_options;
+  bounded_delta_options.delta_bbox_enabled = true;
+  bounded_delta_options.delta_bbox_margin_x = 4;
+  bounded_delta_options.delta_bbox_margin_y = 18;
+  bounded_delta_options.delta_unbounded_fallback = false;
+  const routing::interchange::RoutingCsrSidecars delta_sidecars =
+      make_routing_sidecars(congestion_graph);
+  bool bounded_delta_without_sidecars_rejected = false;
+  try {
+    (void)routing::run_pathfinder(congestion_graph,
+                                  congestion_metadata,
+                                  bounded_delta_options,
+                                  nullptr);
+  } catch (const std::runtime_error&) {
+    bounded_delta_without_sidecars_rejected = true;
+  }
+  require(bounded_delta_without_sidecars_rejected,
+          "bounded Delta should reject a graph without CSR v3 sidecars");
+
+  g_multisource_delta_calls = 0;
+  g_delta_graph_uploads = 0;
+  g_delta_sidecar_graph_uploads = 0;
+  g_delta_bounded_workspace_constructions = 0;
+  g_delta_margin_x_total = 0;
+  g_delta_margin_y_total = 0;
+  g_delta_unbounded_fallback_workspaces = 0;
+  const routing::PathfinderResult bounded_delta_result =
+      routing::run_pathfinder(congestion_graph,
+                              congestion_metadata,
+                              bounded_delta_options,
+                              nullptr,
+                              nullptr,
+                              &delta_sidecars);
+  require(bounded_delta_result.routed,
+          "bounded Delta routing should preserve routed status");
+  require(g_delta_graph_uploads == 1 &&
+              g_delta_sidecar_graph_uploads == 1,
+          "bounded Delta workers should share one sidecar-aware graph upload");
+  require(g_delta_bounded_workspace_constructions == 2 &&
+              g_delta_margin_x_total == 8 &&
+              g_delta_margin_y_total == 36 &&
+              g_delta_unbounded_fallback_workspaces == 0,
+          "bounded Delta workers did not receive one identical box policy");
+
+  DeltaSteppingCsrTelemetry bounded_telemetry_a;
+  bounded_telemetry_a.collected = true;
+  bounded_telemetry_a.completed = true;
+  bounded_telemetry_a.bounds_enabled = true;
+  bounded_telemetry_a.bounds_min_x = 1;
+  bounded_telemetry_a.bounds_max_x = 7;
+  bounded_telemetry_a.bounds_min_y = 2;
+  bounded_telemetry_a.bounds_max_y = 20;
+  bounded_telemetry_a.bounds_rejected_edges = 3;
+  bounded_telemetry_a.bounds_unknown_coordinate_nodes = 2;
+  DeltaSteppingCsrTelemetry bounded_telemetry_b = bounded_telemetry_a;
+  bounded_telemetry_b.bounds_min_x = 4;
+  bounded_telemetry_b.bounds_max_x = 11;
+  bounded_telemetry_b.bounds_min_y = 6;
+  bounded_telemetry_b.bounds_max_y = 24;
+  bounded_telemetry_b.bounds_rejected_edges = 5;
+  bounded_telemetry_b.unbounded_fallback_triggered = true;
+  const std::string bounded_telemetry_json =
+      routing::delta_telemetry_aggregate_json(
+          {bounded_telemetry_a, bounded_telemetry_b},
+          bounded_delta_options,
+          1.0f,
+          64,
+          2);
+  require(bounded_telemetry_json.find("\"schema_version\":3") !=
+                  std::string::npos &&
+              bounded_telemetry_json.find("\"bounds_enabled\":true") !=
+                  std::string::npos &&
+              bounded_telemetry_json.find("\"bounds_enabled_queries\":2") !=
+                  std::string::npos &&
+              bounded_telemetry_json.find("\"bounds_rejected_edges\":8") !=
+                  std::string::npos &&
+              bounded_telemetry_json.find(
+                  "\"bounds_unknown_coordinate_nodes\":2") !=
+                  std::string::npos &&
+              bounded_telemetry_json.find(
+                  "\"unbounded_fallback_triggered_queries\":1") !=
+                  std::string::npos &&
+              bounded_telemetry_json.find(
+                  "\"bounds_min_x\":1,\"bounds_max_x\":7,\"bounds_min_y\":2,\"bounds_max_y\":20") !=
+                  std::string::npos &&
+              bounded_telemetry_json.find(
+                  "\"bounds_min_x\":4,\"bounds_max_x\":11,\"bounds_min_y\":6,\"bounds_max_y\":24") !=
+                  std::string::npos,
+          "bounded Delta telemetry did not aggregate worker records or boxes");
+
+  routing::PathfinderOptions wrong_engine_bbox_options = parallel_options;
+  wrong_engine_bbox_options.delta_bbox_enabled = true;
+  bool wrong_engine_bbox_rejected = false;
+  try {
+    (void)routing::run_pathfinder(congestion_graph,
+                                  congestion_metadata,
+                                  wrong_engine_bbox_options,
+                                  nullptr);
+  } catch (const std::invalid_argument&) {
+    wrong_engine_bbox_rejected = true;
+  }
+  require(wrong_engine_bbox_rejected,
+          "Delta bounding controls should reject a non-Delta engine");
+
+  routing::PathfinderOptions explicit_default_bbox_options = parallel_options;
+  explicit_default_bbox_options.delta_bbox_controls_explicit = true;
+  bool explicit_default_bbox_rejected = false;
+  try {
+    (void)routing::run_pathfinder(congestion_graph,
+                                  congestion_metadata,
+                                  explicit_default_bbox_options,
+                                  nullptr);
+  } catch (const std::invalid_argument&) {
+    explicit_default_bbox_rejected = true;
+  }
+  require(explicit_default_bbox_rejected,
+          "explicit default Delta bounding controls should reject a "
+          "non-Delta engine");
+
+  routing::PathfinderOptions negative_delta_margin_options =
+      parallel_delta_options;
+  negative_delta_margin_options.delta_bbox_margin_x = -1;
+  bool negative_delta_margin_rejected = false;
+  try {
+    (void)routing::run_pathfinder(congestion_graph,
+                                  congestion_metadata,
+                                  negative_delta_margin_options,
+                                  nullptr);
+  } catch (const std::invalid_argument&) {
+    negative_delta_margin_rejected = true;
+  }
+  require(negative_delta_margin_rejected,
+          "Delta bounding should reject a negative margin");
+
   routing::PathfinderOptions parallel_bellman_ford_options = parallel_options;
   parallel_bellman_ford_options.sssp_engine =
       routing::SsspEngine::kBellmanFord;
@@ -925,6 +1127,68 @@ int main() {
           "explicit Bellman-Ford routing should not call delta-step");
   require(g_unit_bfs_calls == 0,
           "explicit Bellman-Ford routing should not call unit BFS");
+
+  const routing::interchange::RoutingCsrSidecars bf11_sidecars =
+      make_routing_sidecars(congestion_graph);
+  routing::PathfinderOptions bf11_options = parallel_options;
+  bf11_options.sssp_engine = routing::SsspEngine::kBellmanFord11;
+  const routing::PathfinderResult bf11_result = routing::run_pathfinder(
+      congestion_graph,
+      congestion_metadata,
+      bf11_options,
+      nullptr,
+      nullptr,
+      &bf11_sidecars);
+  require(bf11_result.routed,
+          "bounded BF11 should route with CSR v3 sidecars");
+  require(bf11_result.nets[0].sinks[0].nodes ==
+              std::vector<int>({0, 2, 4}) &&
+              bf11_result.nets[1].sinks[0].nodes ==
+                  std::vector<int>({1, 2, 5}),
+          "bounded BF11 should preserve compact route paths");
+
+  routing::interchange::RoutingCsrSidecars weighted_bf11_sidecars =
+      bf11_sidecars;
+  weighted_bf11_sidecars.base_vertex_cost =
+      {1.0f, 1.0f, 2.0f, 100.0f, 3.0f, 4.0f};
+  const routing::PathfinderResult weighted_bf11_result =
+      routing::run_pathfinder(congestion_graph,
+                              congestion_metadata,
+                              bf11_options,
+                              nullptr,
+                              nullptr,
+                              &weighted_bf11_sidecars);
+  require(weighted_bf11_result.routed &&
+              weighted_bf11_result.nets[0].sinks[0].distance == 5.0f &&
+              weighted_bf11_result.nets[0].sinks[0].edges.size() == 2 &&
+              weighted_bf11_result.nets[0].sinks[0].edges[0].cost == 2.0f &&
+              weighted_bf11_result.nets[0].sinks[0].edges[1].cost == 3.0f &&
+              weighted_bf11_result.nets[1].sinks[0].distance == 6.0f &&
+              weighted_bf11_result.nets[1].sinks[0].edges.size() == 2 &&
+              weighted_bf11_result.nets[1].sinks[0].edges[0].cost == 2.0f &&
+              weighted_bf11_result.nets[1].sinks[0].edges[1].cost == 4.0f,
+          "PathFinder must retain BF11 effective destination costs");
+
+  bool bounded_legacy_bf11_rejected = false;
+  try {
+    (void)routing::run_pathfinder(congestion_graph,
+                                  congestion_metadata,
+                                  bf11_options,
+                                  nullptr);
+  } catch (const std::runtime_error&) {
+    bounded_legacy_bf11_rejected = true;
+  }
+  require(bounded_legacy_bf11_rejected,
+          "bounded BF11 should reject a legacy CSR without route sidecars");
+
+  bf11_options.bf11_bounds_enabled = false;
+  const routing::PathfinderResult legacy_bf11_result =
+      routing::run_pathfinder(congestion_graph,
+                              congestion_metadata,
+                              bf11_options,
+                              nullptr);
+  require(legacy_bf11_result.routed,
+          "explicit unbounded BF11 should remain usable with a legacy CSR");
 
   const std::filesystem::path bellman_ford_routes_path =
       "/tmp/congestion_free_bellman_ford_routes.jsonl";
@@ -962,6 +1226,11 @@ int main() {
   require(std::string(routing::sssp_engine_name(
               routing::SsspEngine::kBellmanFord)) == "bellman-ford",
           "Bellman-Ford engine should have a stable display name");
+  require(routing::parse_sssp_engine_arg("bf11") ==
+              routing::SsspEngine::kBellmanFord11 &&
+              std::string(routing::sssp_engine_name(
+                  routing::SsspEngine::kBellmanFord11)) == "bf11",
+          "BF11 engine selection should parse and display canonically");
 
   routing::PathfinderOptions auto_worker_options = parallel_options;
   auto_worker_options.parallel_net_workers = 0;

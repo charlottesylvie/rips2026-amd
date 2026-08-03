@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cerrno>
+#include <cmath>
 #include <cstddef>
 #include <cstring>
 #include <fstream>
@@ -15,10 +16,12 @@ namespace routing::interchange {
 namespace {
 
 constexpr char DEVICE_GRAPH_MAGIC[8] = {'R', 'I', 'P', 'S', 'D', 'R', 'G', '1'};
-// Version 3 changes graph-builder semantics and the lookup layout: pseudo PIPs
-// are excluded unless their site occupancy can be represented, and site-pin
-// aliases retain the possible site type for design-specific resolution.
-constexpr std::uint64_t DEVICE_GRAPH_VERSION = 3;
+// Version 3 changed graph-builder semantics and the lookup layout. Version 4
+// appends compact route-end X/Y and base-cost columns to the physical node
+// prefix. Readers retain v3 compatibility and synthesize those columns from
+// the conservative node extents.
+constexpr std::uint64_t MIN_DEVICE_GRAPH_VERSION = 3;
+constexpr std::uint64_t DEVICE_GRAPH_VERSION = 4;
 
 static_assert(sizeof(std::int64_t) == 8, "int64_t must be 8 bytes");
 static_assert(sizeof(std::int32_t) == 4, "int32_t must be 4 bytes");
@@ -209,7 +212,10 @@ void validate_node_arrays(const DeviceRoutingGraph& graph) {
       graph.node_min_y.size() != node_count ||
       graph.node_max_y.size() != node_count ||
       graph.node_tile_type_strings.size() != node_count ||
-      graph.node_wire_type_strings.size() != node_count) {
+      graph.node_wire_type_strings.size() != node_count ||
+      graph.node_route_end_x.size() != node_count ||
+      graph.node_route_end_y.size() != node_count ||
+      graph.node_base_vertex_cost.size() != node_count) {
     throw std::runtime_error(
         "device-graph node metadata arrays do not match node count");
   }
@@ -355,6 +361,20 @@ void validate_static_metadata(const DeviceRoutingGraph& graph) {
       throw std::runtime_error(
           "device graph contains an invalid node type string");
     }
+    const std::int32_t route_x = graph.node_route_end_x[node];
+    const std::int32_t route_y = graph.node_route_end_y[node];
+    const bool x_missing = route_x == kMissingRouteCoordinate;
+    const bool y_missing = route_y == kMissingRouteCoordinate;
+    if (x_missing != y_missing ||
+        (!x_missing && (route_x < 0 || route_y < 0))) {
+      throw std::runtime_error(
+          "device graph contains an invalid route-end coordinate pair");
+    }
+    const float base_cost = graph.node_base_vertex_cost[node];
+    if (!std::isfinite(base_cost) || !(base_cost > 0.0f)) {
+      throw std::runtime_error(
+          "device graph base vertex costs must be finite and positive");
+    }
   }
 }
 
@@ -364,9 +384,45 @@ void validate_filtering_projection(const DeviceRoutingGraph& graph) {
       !graph.node_max_x.empty() || !graph.node_min_y.empty() ||
       !graph.node_max_y.empty() ||
       !graph.node_tile_type_strings.empty() ||
-      !graph.node_wire_type_strings.empty()) {
+      !graph.node_wire_type_strings.empty() ||
+      !graph.node_route_end_x.empty() || !graph.node_route_end_y.empty() ||
+      !graph.node_base_vertex_cost.empty()) {
     throw std::runtime_error(
         "device graph filtering projection retained physical node arrays");
+  }
+  validate_static_metadata_common(graph, node_count);
+}
+
+void validate_routing_projection(const DeviceRoutingGraph& graph) {
+  const std::size_t node_count = device_routing_graph_node_count(graph);
+  if (!graph.node_device_ids.empty() || !graph.node_min_x.empty() ||
+      !graph.node_max_x.empty() || !graph.node_min_y.empty() ||
+      !graph.node_max_y.empty() ||
+      !graph.node_tile_type_strings.empty() ||
+      !graph.node_wire_type_strings.empty()) {
+    throw std::runtime_error(
+        "device graph routing projection retained legacy physical node arrays");
+  }
+  if (graph.node_route_end_x.size() != node_count ||
+      graph.node_route_end_y.size() != node_count ||
+      graph.node_base_vertex_cost.size() != node_count) {
+    throw std::runtime_error(
+        "device graph routing projection sidecars do not match node count");
+  }
+  for (std::size_t node = 0; node < node_count; ++node) {
+    const std::int32_t x = graph.node_route_end_x[node];
+    const std::int32_t y = graph.node_route_end_y[node];
+    const bool x_missing = x == kMissingRouteCoordinate;
+    const bool y_missing = y == kMissingRouteCoordinate;
+    if (x_missing != y_missing || (!x_missing && (x < 0 || y < 0))) {
+      throw std::runtime_error(
+          "device graph routing projection has invalid route coordinates");
+    }
+    const float cost = graph.node_base_vertex_cost[node];
+    if (!std::isfinite(cost) || !(cost > 0.0f)) {
+      throw std::runtime_error(
+          "device graph routing projection has invalid base costs");
+    }
   }
   validate_static_metadata_common(graph, node_count);
 }
@@ -456,6 +512,12 @@ void write_header_and_static_prefix(std::ofstream& out,
   write_array(out, graph.node_max_y, "node maximum Y coordinates");
   write_array(out, graph.node_tile_type_strings, "node tile type strings");
   write_array(out, graph.node_wire_type_strings, "node wire type strings");
+  write_array(out, graph.node_route_end_x,
+              "node representative route-end X coordinates");
+  write_array(out, graph.node_route_end_y,
+              "node representative route-end Y coordinates");
+  write_array(out, graph.node_base_vertex_cost,
+              "node base vertex costs");
   write_array(out, graph.rowptr, "base CSR row pointers");
 }
 
@@ -815,7 +877,75 @@ namespace {
 enum class DeviceRoutingGraphReadProfile {
   kFull,
   kFilteringProjection,
+  kRoutingProjection,
 };
+
+std::int32_t representative_coordinate_from_extent(std::int32_t minimum,
+                                                   std::int32_t maximum) {
+  if (minimum == kMissingRouteCoordinate &&
+      maximum == kMissingRouteCoordinate) {
+    return kMissingRouteCoordinate;
+  }
+  if (minimum < 0 || maximum < minimum) {
+    throw std::runtime_error(
+        "legacy device graph contains an invalid coordinate extent");
+  }
+  return static_cast<std::int32_t>(
+      static_cast<std::int64_t>(minimum) +
+      (static_cast<std::int64_t>(maximum) - minimum) / 2);
+}
+
+void synthesize_route_sidecars_from_extents(DeviceRoutingGraph& graph) {
+  const std::size_t node_count = device_routing_graph_node_count(graph);
+  if (graph.node_min_x.size() != node_count ||
+      graph.node_max_x.size() != node_count ||
+      graph.node_min_y.size() != node_count ||
+      graph.node_max_y.size() != node_count) {
+    throw std::runtime_error(
+        "legacy device graph extents do not match node count");
+  }
+  graph.node_route_end_x.resize(node_count);
+  graph.node_route_end_y.resize(node_count);
+  graph.node_base_vertex_cost.assign(node_count, 1.0f);
+  for (std::size_t node = 0; node < node_count; ++node) {
+    graph.node_route_end_x[node] = representative_coordinate_from_extent(
+        graph.node_min_x[node], graph.node_max_x[node]);
+    graph.node_route_end_y[node] = representative_coordinate_from_extent(
+        graph.node_min_y[node], graph.node_max_y[node]);
+  }
+}
+
+void read_legacy_route_sidecars_projection(std::ifstream& in,
+                                           std::uint64_t node_count,
+                                           DeviceRoutingGraph& graph) {
+  skip_bytes(in,
+             checked_byte_count(checked_size(node_count, "node count"),
+                                sizeof(std::uint64_t),
+                                "device node IDs"),
+             "device node IDs");
+  read_array(in, graph.node_route_end_x, node_count,
+             "legacy node minimum X coordinates");
+  std::vector<std::int32_t> maxima;
+  read_array(in, maxima, node_count, "legacy node maximum X coordinates");
+  for (std::size_t node = 0; node < maxima.size(); ++node) {
+    graph.node_route_end_x[node] = representative_coordinate_from_extent(
+        graph.node_route_end_x[node], maxima[node]);
+  }
+  read_array(in, graph.node_route_end_y, node_count,
+             "legacy node minimum Y coordinates");
+  read_array(in, maxima, node_count, "legacy node maximum Y coordinates");
+  for (std::size_t node = 0; node < maxima.size(); ++node) {
+    graph.node_route_end_y[node] = representative_coordinate_from_extent(
+        graph.node_route_end_y[node], maxima[node]);
+  }
+  skip_bytes(in,
+             checked_byte_count(checked_size(node_count, "node count"),
+                                2 * sizeof(std::uint64_t),
+                                "legacy node type arrays"),
+             "legacy node type arrays");
+  graph.node_base_vertex_cost.assign(checked_size(node_count, "node count"),
+                                     1.0f);
+}
 
 DeviceRoutingGraph read_device_routing_graph_impl(
     const std::filesystem::path& path,
@@ -833,7 +963,9 @@ DeviceRoutingGraph read_device_routing_graph_impl(
     throw std::runtime_error(
         "input is not a recognized RIPS device-routing graph");
   }
-  if (read_u64(in, "device-graph version") != DEVICE_GRAPH_VERSION) {
+  const std::uint64_t version = read_u64(in, "device-graph version");
+  if (version < MIN_DEVICE_GRAPH_VERSION ||
+      version > DEVICE_GRAPH_VERSION) {
     throw std::runtime_error("unsupported device-routing graph version");
   }
 
@@ -901,7 +1033,18 @@ DeviceRoutingGraph read_device_routing_graph_impl(
                "node tile type strings");
     read_array(in, graph.node_wire_type_strings, node_count,
                "node wire type strings");
-  } else {
+    if (version >= 4) {
+      read_array(in, graph.node_route_end_x, node_count,
+                 "node representative route-end X coordinates");
+      read_array(in, graph.node_route_end_y, node_count,
+                 "node representative route-end Y coordinates");
+      read_array(in, graph.node_base_vertex_cost, node_count,
+                 "node base vertex costs");
+    } else {
+      synthesize_route_sidecars_from_extents(graph);
+    }
+  } else if (profile ==
+             DeviceRoutingGraphReadProfile::kFilteringProjection) {
     constexpr std::size_t kPhysicalNodeBytes =
         3 * sizeof(std::uint64_t) + 4 * sizeof(std::int32_t);
     static_assert(kPhysicalNodeBytes == 40,
@@ -911,6 +1054,31 @@ DeviceRoutingGraph read_device_routing_graph_impl(
                                   kPhysicalNodeBytes,
                                   "physical node arrays"),
                "physical node arrays");
+    if (version >= 4) {
+      constexpr std::size_t kRoutingSidecarBytes =
+          2 * sizeof(std::int32_t) + sizeof(float);
+      skip_bytes(in,
+                 checked_byte_count(retained_node_count,
+                                    kRoutingSidecarBytes,
+                                    "routing node sidecars"),
+                 "routing node sidecars");
+    }
+  } else if (version >= 4) {
+    constexpr std::size_t kPhysicalNodeBytes =
+        3 * sizeof(std::uint64_t) + 4 * sizeof(std::int32_t);
+    skip_bytes(in,
+               checked_byte_count(retained_node_count,
+                                  kPhysicalNodeBytes,
+                                  "physical node arrays"),
+               "physical node arrays");
+    read_array(in, graph.node_route_end_x, node_count,
+               "node representative route-end X coordinates");
+    read_array(in, graph.node_route_end_y, node_count,
+               "node representative route-end Y coordinates");
+    read_array(in, graph.node_base_vertex_cost, node_count,
+               "node base vertex costs");
+  } else {
+    read_legacy_route_sidecars_projection(in, node_count, graph);
   }
   read_array(in, graph.rowptr, node_count + 1, "base CSR row pointers");
   read_array(in, graph.colind, edge_count, "base CSR destinations");
@@ -940,10 +1108,17 @@ DeviceRoutingGraph read_device_routing_graph_impl(
         "failed while checking the end of device-routing graph");
   }
 
-  if (profile == DeviceRoutingGraphReadProfile::kFull) {
-    validate_device_routing_graph(graph);
-  } else {
-    (void)validate_filtering_csr_shape(graph);
+  switch (profile) {
+    case DeviceRoutingGraphReadProfile::kFull:
+      validate_device_routing_graph(graph);
+      break;
+    case DeviceRoutingGraphReadProfile::kFilteringProjection:
+      (void)validate_filtering_csr_shape(graph);
+      break;
+    case DeviceRoutingGraphReadProfile::kRoutingProjection:
+      validate_routing_projection(graph);
+      (void)validate_csr_arrays(graph);
+      break;
   }
   return graph;
 }
@@ -960,6 +1135,12 @@ DeviceRoutingGraph read_device_routing_graph_for_filtering(
     const std::filesystem::path& path) {
   return read_device_routing_graph_impl(
       path, DeviceRoutingGraphReadProfile::kFilteringProjection);
+}
+
+DeviceRoutingGraph read_device_routing_graph_for_routing(
+    const std::filesystem::path& path) {
+  return read_device_routing_graph_impl(
+      path, DeviceRoutingGraphReadProfile::kRoutingProjection);
 }
 
 void write_device_routing_graph(const DeviceRoutingGraph& graph,
