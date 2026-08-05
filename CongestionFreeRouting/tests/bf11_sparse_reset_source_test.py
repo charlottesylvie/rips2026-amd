@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Source-level guardrails for BF11's HIP-only reset/controller policy."""
+"""Source guardrails for BF11 reset, mark, root, and controller invariants."""
 
 import re
 from pathlib import Path
@@ -7,7 +7,6 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
 SOURCE = ROOT / "CongestionFreeRouting/bellman_ford/bf11.cpp"
-HIP_TEST = ROOT / "CongestionFreeRouting/tests/bf11_bounded_dynamic_hip_test.cpp"
 
 
 def require(condition: bool, message: str) -> None:
@@ -15,39 +14,64 @@ def require(condition: bool, message: str) -> None:
         raise AssertionError(message)
 
 
-def function_body(source: str, signature: str, next_signature: str) -> str:
+def braced_region(source: str, signature: str) -> str:
+    """Return one definition, including nested braces, from its signature."""
     begin = source.index(signature)
-    end = source.index(next_signature, begin)
-    return source[begin:end]
+    opening = source.index("{", begin)
+    depth = 0
+    for offset in range(opening, len(source)):
+        character = source[offset]
+        if character == "{":
+            depth += 1
+        elif character == "}":
+            depth -= 1
+            if depth == 0:
+                return source[begin : offset + 1]
+    raise AssertionError(f"unterminated source region: {signature}")
 
 
 def main() -> None:
     source = SOURCE.read_text(encoding="utf-8")
-    hip_test = HIP_TEST.read_text(encoding="utf-8")
 
     require(
-        "workspace.stream == nullptr ? cooperative_block_count(workspace) : 0"
-        in source,
-        "explicit BF11 streams can still enter the full-residency cooperative controller",
+        '#include "bf11_execution_policy.hpp"' in source,
+        "BF11 production code no longer includes its host-tested policy",
+    )
+    require(
+        "workspace.stream == nullptr" in source
+        and "retain_default_cooperative_path" in source
+        and "workspace_options.segment_rounds == 1" in source,
+        "explicit BF11 streams can still enter the full-residency controller",
+    )
+    graph_enqueue = braced_region(source, "bool enqueue_graph_segment(")
+    require(
+        "same_bounds(workspace.graph_bounds, options.bounds)" in graph_enqueue
+        and "workspace.graph_bounds = options.bounds" in graph_enqueue,
+        "BF11 HIP Graph replay can reuse kernel arguments from another box",
     )
     require(
         "Index* touched_nodes" in source and "int* touched_count" in source,
         "BF11 workspace lost its sparse touched-state storage",
     )
     require(
-        "relaxation.first_discovery" in source
-        and "touched_nodes[touched_slot] = dst" in source,
-        "first finite BF11 labels are no longer recorded for sparse reset",
+        "source_mask" not in source,
+        "BF11 reintroduced the graph-sized source mask or a hot source-mask read",
     )
-    atomic_relax = function_body(
+
+    atomic_relax = braced_region(
         source,
         "__device__ __forceinline__ AtomicRelaxResult atomic_relax_strict(",
-        "__device__ __forceinline__ float effective_edge_weight(",
     )
     require(
         "unsigned long long old_state = coherent_atomic_load(address);"
         in atomic_relax,
         "BF11 first-discovery checks bypass the coherent atomic-load helper",
+    )
+    require(
+        "candidate_bits < state_distance_bits(old_state)" in atomic_relax
+        and "state_distance_bits(assumed) == kInfinityBits" in atomic_relax,
+        "BF11 no longer uses a strict packed-state improvement with one "
+        "infinity-to-finite owner",
     )
     require(
         "BF11_FORCE_CAS_ATOMIC_LOAD" in source,
@@ -60,16 +84,11 @@ def main() -> None:
             source,
         )
         is not None,
-        "BF11 primary state observation is not a relaxed agent-scope HIP atomic load",
+        "BF11 primary state observation is not a relaxed agent-scope atomic load",
     )
-    require(
-        "atomicCAS(address, 0ULL, 0ULL)" in source,
-        "BF11 lost the proven CAS compatibility load",
-    )
-    coherent_load = function_body(
+    coherent_load = braced_region(
         source,
         "__device__ __forceinline__ unsigned long long coherent_atomic_load(",
-        "__device__ __forceinline__ AtomicRelaxResult atomic_relax_strict(",
     )
     require(
         "BF11_FORCE_CAS_ATOMIC_LOAD" in coherent_load
@@ -84,19 +103,129 @@ def main() -> None:
         "BF11 coherent state observation regressed to an ordinary cached load",
     )
 
-    telemetry_initialization = function_body(
+    relax_vertex = braced_region(
         source,
-        "void initialize_workspace_telemetry(",
-        "void begin_telemetry_event(",
+        "__device__ __forceinline__ unsigned int relax_frontier_vertex(",
+    )
+    require(
+        "publication.first_discovery" in relax_vertex
+        and "pending_touched" in relax_vertex
+        and "touched_nodes" in relax_vertex
+        and "touched_count" in relax_vertex,
+        "first finite BF11 labels are no longer published for sparse reset",
+    )
+    require(
+        "coherent_atomic_load(&best_state[from])" in relax_vertex,
+        "BF11 reads a concurrently CAS-updated frontier label non-atomically",
+    )
+    segmented_relax = braced_region(
+        source, "__global__ void segmented_frontier_relax_kernel("
+    )
+    require(
+        "block_reserve_one" in segmented_relax
+        and "pending_touched" in segmented_relax
+        and "pending_queue" in segmented_relax,
+        "segmented BF11 lost aggregated frontier/touched-list reservations",
+    )
+
+    summarize = braced_region(
+        source, "__global__ void summarize_target_paths_kernel("
+    )
+    require(
+        "edge == kNoPredecessor" in summarize
+        and "state_distance_bits(state) == 0u" in summarize,
+        "BF11 reconstruction no longer recognizes roots by zero distance and "
+        "no predecessor",
+    )
+    materialize = braced_region(
+        source, "__global__ void materialize_target_paths_kernel("
+    )
+    require(
+        "state_distance_bits(root_state) != 0u" in materialize
+        and "kNoPredecessor" in materialize,
+        "BF11 materialization lost its final root-state validation",
+    )
+
+    mark_reservation = braced_region(
+        source, "unsigned int reserve_query_mark_tokens("
+    )
+    require(
+        "reserve_mark_tokens(" in mark_reservation
+        and "dense_reset_required" in mark_reservation,
+        "production BF11 bypasses the forced-wrap-tested mark-token policy",
+    )
+    require(
+        "next_mark_generation" in source
+        and "clear_marks_kernel" in source
+        and "g_bf11_mark_generation_limit" in source
+        and "bf11_internal_set_mark_generation_limit" in source,
+        "BF11 lost generation marks or its forced-wrap test control",
+    )
+    sparse_reset = braced_region(
+        source, "__global__ void clear_touched_state_kernel("
+    )
+    require(
+        "next_marks" not in sparse_reset,
+        "normal BF11 sparse/adaptive reset unnecessarily clears frontier marks",
+    )
+    require(
+        "dense_threshold" in sparse_reset
+        and "touched_count" in sparse_reset
+        and "controller->reset_mode" in sparse_reset
+        and "for (Offset row" in sparse_reset
+        and "touched_nodes[item]" in sparse_reset,
+        "BF11 reset no longer selects sparse versus contiguous dense work on-device",
+    )
+    require(
+        "hipMemcpy" not in sparse_reset
+        and "hipStreamSynchronize" not in sparse_reset,
+        "BF11 adaptive reset reintroduced a host decision rendezvous",
+    )
+
+    prepare_query = braced_region(source, "void prepare_query_controller(")
+    require(
+        "clear_touched_state_kernel" in prepare_query
+        and "clear_marks_kernel" not in prepare_query
+        and "next_marks" not in prepare_query,
+        "normal query setup regressed to per-query mark clearing",
+    )
+    require(
+        "hipMemcpy" not in prepare_query
+        and "hipStreamSynchronize" not in prepare_query,
+        "BF11 added a host round trip between reset, seed, and round one",
+    )
+    seed_sources = braced_region(source, "__global__ void seed_sources_kernel(")
+    require(
+        "pack_state(0u, kNoPredecessor)" in seed_sources
+        and "touched_nodes[item] = source" in seed_sources
+        and "next_marks" not in seed_sources,
+        "source seeding lost its root/touched invariant or clears generation marks",
+    )
+    defensive_reset = braced_region(
+        source, "void fully_reset_workspace_state("
+    )
+    require(
+        "clear_state_kernel" in defensive_reset
+        and "next_mark_generation = 1" in defensive_reset,
+        "exception recovery lost its defensive state/mark reset",
+    )
+
+    for signature in (
+        "__global__ void begin_segment_round_kernel(",
+        "__global__ void segmented_frontier_relax_kernel(",
+        "__global__ void finalize_segment_round_kernel(",
+    ):
+        require(signature in source, f"BF11 lost segmented kernel {signature}")
+
+    telemetry_initialization = braced_region(
+        source, "void initialize_workspace_telemetry("
     )
     require(
         "hipDeviceAttributeWallClockRate" in telemetry_initialization,
         "BF11 cooperative telemetry does not query the fixed wall-clock rate",
     )
-    cooperative_controller = function_body(
-        source,
-        "__global__ void frontier_controller_kernel(",
-        "__global__ void summarize_target_paths_kernel(",
+    cooperative_controller = braced_region(
+        source, "__global__ void frontier_controller_kernel("
     )
     require(
         "wall_clock64()" in cooperative_controller,
@@ -111,43 +240,31 @@ def main() -> None:
         "BF11 telemetry converts timer ticks with multiprocessor clockRate",
     )
 
-    host_controller = function_body(
-        source, "SsspStatus run_host_controller(", "SsspStatus run_sssp("
+    require(
+        "float* dynamic_vertex_cost = nullptr" in source
+        and "dynamic_cost_identity = true" in source,
+        "BF11 lost lazy identity-mode dynamic-cost storage",
     )
     require(
-        "clear_touched_state_kernel" in host_controller
-        and "clear_state_kernel" not in host_controller,
-        "the normal BF11 host controller regressed to a full graph clear",
+        "dynamic_cost_epoch_valid" in source
+        and "dynamic costs require a complete replacement" in source
+        and "after a failed update" in source,
+        "BF11 can silently reuse a partially updated dynamic-cost epoch",
     )
-    host_initialization = host_controller.split("int frontier_count", 1)[0]
+    make_workspace = braced_region(source, "DeviceWorkspace make_workspace(")
     require(
-        "hipStreamSynchronize" not in host_initialization,
-        "BF11 reintroduced a host round trip between reset, seed, and round 1",
-    )
-    gpu_controller = function_body(
-        source, "__global__ void frontier_controller_kernel(",
-        "__global__ void summarize_target_paths_kernel(",
-    )
-    require(
-        "prior_touched_count" in gpu_controller
-        and "for (Offset row = thread; row < graph.rows" not in gpu_controller,
-        "the persistent BF11 controller regressed to a per-query full graph clear",
+        "device_allocate<float>" not in make_workspace,
+        "BF11 eagerly allocates a graph-sized dynamic multiplier array",
     )
     require(
         "needs_full_state_reset = true" in source
         and "fully_reset_workspace_state(workspace)" in source,
-        "BF11 lost its defensive dense reset after an exceptional query",
+        "BF11 lost defensive dense recovery after an exceptional query",
     )
     require(
-        "test_parallel_explicit_stream_host_controller" in hip_test
-        and "bf11_internal_gpu_controller_launch_count() == 0" in hip_test
-        and "bf11_internal_controller_fallback_count() == 16" in hip_test,
-        "BF11 no longer has a concurrent explicit-stream fallback regression",
-    )
-    require(
-        "test_defensive_reset_after_controller_error" in hip_test
-        and "bf11_internal_dense_state_reset_count() == 1" in hip_test,
-        "BF11 no longer behaviorally tests exceptional-query recovery",
+        "compact_node_transfer_capacity" in source
+        and "compact_edge_transfer_capacity" in source,
+        "BF11 again transfers retained compact-arena high-water bytes per query",
     )
 
     print("BF11 sparse-reset/controller source policy test passed")

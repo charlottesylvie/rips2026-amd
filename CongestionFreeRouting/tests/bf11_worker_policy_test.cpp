@@ -38,30 +38,67 @@ int main() {
   try {
     using namespace bf11_worker_policy;
 
-    static_assert(kPersistentBytesPerVertex == 29);
-    static_assert(kFixedDeviceStatusBytes == 60);
+    static_assert(kIdentityPersistentBytesPerVertex == 24);
+    static_assert(kLazyDynamicBytesPerVertex == 4);
+    static_assert(kSparseUpdateStagingBytesPerVertex == 8);
+    static_assert(kWorstCaseDynamicPersistentBytesPerVertex == 36);
+    static_assert(kPersistentBytesPerVertex ==
+                  kIdentityPersistentBytesPerVertex);
+    static_assert(kControllerDescriptorBytes == 320);
+    static_assert(kExtractionHeaderBytes == 40);
+    static_assert(kTouchedCountDeviceBytes == 4);
+    static_assert(kFixedDeviceStatusBytes == 364);
     static_assert(kDeviceBytesPerSourceCapacity == 4);
     static_assert(kDeviceBytesPerTargetCapacity == 52);
-    static_assert(kTelemetryDeviceBytes == 48);
+    static_assert(kTelemetryDeviceBytes == 96);
     static_assert(kDeviceBytesPerCompactNode == 4);
     static_assert(kDeviceBytesPerCompactEdge == 8);
+    static_assert(kInitialArenaElementLimit == (1u << 20));
     static_assert(kMaxAutomaticWorkers == 4);
     static_assert(kGfx1151PreferredWorkers == 3);
-    static_assert(persistent_device_workspace_bytes(0, 0, 0) == 60);
+    static_assert(persistent_device_workspace_bytes(0, 0, 0) == 364);
     static_assert(retained_query_capacity(100, 0) == 0);
     static_assert(retained_query_capacity(100, 1) == 1);
     static_assert(retained_query_capacity(100, 3) == 4);
     static_assert(retained_query_capacity(100, 4) == 4);
     static_assert(retained_query_capacity(5, 5) == 5);
     static_assert(retained_query_capacity(5, 100) == 5);
-    static_assert(persistent_device_workspace_bytes(10, 2, 3) == 566);
+    static_assert(query_capacity_device_bytes(10, 2, 3) == 216);
+    static_assert(persistent_device_workspace_bytes(10, 2, 3) == 820);
     static_assert(persistent_device_workspace_bytes(10, 2, 3, true) ==
-                  614);
+                  916);
+    static_assert(
+        worst_case_dynamic_persistent_device_workspace_bytes(10, 2, 3) ==
+        940);
+    static_assert(
+        worst_case_dynamic_persistent_device_workspace_bytes(10, 2, 3,
+                                                              true) == 1036);
     static_assert(compact_path_device_bytes_ceiling(10, 3) == 384);
+    static_assert(initial_compact_path_device_bytes(10, 3) == 384);
+    static_assert(initial_compact_path_device_bytes(2, 2) == 32);
     static_assert(automatic_worker_device_bytes_estimate(10, 2, 3) ==
-                  1550);
+                  1804);
     static_assert(automatic_worker_device_bytes_estimate(10, 2, 3, true) ==
-                  1598);
+                  1900);
+    static_assert(
+        worst_case_dynamic_automatic_worker_device_bytes_estimate(10, 2, 3) ==
+        2004);
+    static_assert(
+        worst_case_dynamic_automatic_worker_device_bytes_estimate(
+            10, 2, 3, true) == 2100);
+    constexpr SsspQueryCapacityHints capacity_hints{/*max_sources=*/2,
+                                                     /*max_targets=*/3};
+    constexpr WorkspaceDeviceBytesEstimate workspace_estimate =
+        estimate_workspace_device_bytes(10, capacity_hints);
+    static_assert(workspace_estimate.preallocated_query_device_bytes == 600);
+    static_assert(workspace_estimate.identity_retained_device_bytes == 1204);
+    static_assert(
+        workspace_estimate.worst_case_dynamic_retained_device_bytes == 1324);
+    static_assert(
+        workspace_estimate.identity_automatic_peak_device_bytes == 1804);
+    static_assert(
+        workspace_estimate.worst_case_dynamic_automatic_peak_device_bytes ==
+        2004);
     static_assert(is_measured_gfx1151("gfx1151"));
     static_assert(is_measured_gfx1151("gfx1151:sramecc+:xnack-"));
     static_assert(!is_measured_gfx1151("gfx11510"));
@@ -75,8 +112,12 @@ int main() {
         "vertex-byte overflow was not rejected");
     require(persistent_device_workspace_bytes(
                 1, std::numeric_limits<std::size_t>::max(),
-                std::numeric_limits<std::size_t>::max()) == 145,
+                std::numeric_limits<std::size_t>::max()) == 444,
             "raw endpoint hints were not capped by the deduplicated V limit");
+    require(worst_case_dynamic_persistent_device_workspace_bytes(
+                1, std::numeric_limits<std::size_t>::max(),
+                std::numeric_limits<std::size_t>::max()) == 456,
+            "dynamic-cost storage omitted its retained sparse-update staging");
 
     const std::size_t workspace_bytes =
         automatic_worker_device_bytes_estimate(1'000, 8, 16);
@@ -85,8 +126,17 @@ int main() {
     require(measured.worker_count == 3 &&
                 measured.performance_preference == 3 &&
                 measured.resource_limit == 4 &&
-                measured.uses_measured_gfx1151_policy,
+                measured.uses_measured_gfx1151_policy &&
+                measured.workspace_cost_storage_mode ==
+                    WorkspaceCostStorageMode::kIdentity,
             "gfx1151 did not select the smallest measured plateau count");
+
+    Inputs dynamic_inputs = ample_inputs("gfx1151", workspace_bytes);
+    dynamic_inputs.workspace_cost_storage_mode =
+        WorkspaceCostStorageMode::kDynamic;
+    require(recommend(dynamic_inputs).workspace_cost_storage_mode ==
+                WorkspaceCostStorageMode::kDynamic,
+            "worker recommendation lost its explicit dynamic-cost mode");
 
     const Recommendation qualified_arch = recommend(
         ample_inputs("gfx1151:sramecc+:xnack-", workspace_bytes));

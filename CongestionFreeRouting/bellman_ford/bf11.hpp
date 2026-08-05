@@ -2,6 +2,7 @@
 
 #include "../../HIP_kernel/bellman_ford/src/bf_hip_CSR.hpp"
 #include "../interchange/routing_csr_sidecars.hpp"
+#include "../sssp_query_capacity.hpp"
 
 #include <hip/hip_runtime.h>
 
@@ -39,6 +40,17 @@ struct BellmanFord11RunOptions {
   int target_check_interval = 1;
 };
 
+enum class BellmanFord11HipGraphMode {
+  // Use graph replay only when the runtime path has been validated as
+  // supported and segment_rounds is greater than one. Any setup or launch
+  // failure falls back to direct segmented enqueue.
+  kAuto,
+  // Request graph replay, retaining the same safe direct-enqueue fallback.
+  kOn,
+  // Always enqueue the segment's ordinary kernels directly.
+  kOff,
+};
+
 struct BellmanFord11WorkspaceOptions {
   // The legacy-shaped run() overload is unbounded unless this is enabled.
   bool auto_bounds = false;
@@ -53,8 +65,19 @@ struct BellmanFord11WorkspaceOptions {
   bool unbounded_fallback = false;
   int target_check_interval = 1;
   // Collect aggregate phase/work telemetry. Disabled workspaces do not create
-  // HIP events or execute telemetry counter operations.
+  // HIP events or execute telemetry counter operations. Keep this before newer
+  // controls so historical positional aggregate initialization retains its
+  // meaning.
   bool telemetry = false;
+  // Explicit-stream controllers enqueue this many relaxation/finalize rounds
+  // before copying controller status to the host. Supported values are
+  // 1, 2, 4, 8, and 16; one is the compatibility/control path.
+  int segment_rounds = 1;
+  BellmanFord11HipGraphMode hip_graph_mode =
+      BellmanFord11HipGraphMode::kAuto;
+  // Select a dense state reset when the touched fraction is greater than or
+  // equal to this value. The device makes the choice without a host readback.
+  double adaptive_reset_threshold = 0.25;
 };
 
 // Process-wide aggregate for one benchmark/run interval. PathFinder resets it
@@ -74,6 +97,24 @@ struct BellmanFord11RuntimeStats {
   std::uint64_t effective_workers = 0;
   std::uint64_t telemetry_queries = 0;
   std::uint64_t telemetry_completed_queries = 0;
+  std::uint64_t rounds = 0;
+  std::uint64_t segments = 0;
+  std::uint64_t no_op_segment_rounds = 0;
+  std::uint64_t direct_segments = 0;
+  std::uint64_t hip_graph_segments = 0;
+  std::uint64_t status_copies = 0;
+  std::uint64_t stream_synchronizations = 0;
+  std::uint64_t graph_fallbacks = 0;
+  std::uint64_t adaptive_dense_state_resets = 0;
+  std::uint64_t constant_one_queries = 0;
+  std::uint64_t static_cost_queries = 0;
+  std::uint64_t dynamic_cost_queries = 0;
+  std::uint64_t first_discoveries = 0;
+  std::uint64_t mark_cas_attempts = 0;
+  std::uint64_t mark_cas_wins = 0;
+  std::uint64_t queue_reservations = 0;
+  std::uint64_t bounded_fallbacks = 0;
+  std::uint64_t avoided_failed_attempt_extractions = 0;
   std::uint64_t total_query_nanoseconds = 0;
   std::uint64_t reset_seed_gpu_nanoseconds = 0;
   std::uint64_t relaxation_gpu_nanoseconds = 0;
@@ -81,7 +122,9 @@ struct BellmanFord11RuntimeStats {
   std::uint64_t iteration_status_copy_gpu_nanoseconds = 0;
   std::uint64_t stream_synchronize_cpu_nanoseconds = 0;
   std::uint64_t target_summary_gpu_nanoseconds = 0;
+  std::uint64_t target_prefix_gpu_nanoseconds = 0;
   std::uint64_t path_reconstruction_gpu_nanoseconds = 0;
+  std::uint64_t output_transfer_gpu_nanoseconds = 0;
   std::uint64_t iterations = 0;
   std::uint64_t frontier_vertices_processed = 0;
   std::uint64_t edges_examined = 0;
@@ -91,6 +134,7 @@ struct BellmanFord11RuntimeStats {
   double maximum_touched_fraction = 0.0;
   std::uint64_t workspace_device_bytes_total = 0;
   std::uint64_t workspace_device_bytes_per_worker_max = 0;
+  std::uint64_t workspace_device_bytes_current_total = 0;
   std::uint64_t gpu_free_before_workers = 0;
   std::uint64_t gpu_free_after_workers = 0;
 };
@@ -137,13 +181,30 @@ class BellmanFord11CsrWorkspace {
       BellmanFord11WorkspaceOptions options = {});
   BellmanFord11CsrWorkspace(
       const HostCsrF32& adjacency,
+      const routing::interchange::RoutingCsrSidecars& sidecars,
+      hipStream_t stream,
+      BellmanFord11WorkspaceOptions options,
+      SsspQueryCapacityHints capacity_hints);
+  BellmanFord11CsrWorkspace(
+      const HostCsrF32& adjacency,
       const BellmanFord11NodeSidecars& sidecars,
       hipStream_t stream = nullptr,
       BellmanFord11WorkspaceOptions options = {});
+  BellmanFord11CsrWorkspace(
+      const HostCsrF32& adjacency,
+      const BellmanFord11NodeSidecars& sidecars,
+      hipStream_t stream,
+      BellmanFord11WorkspaceOptions options,
+      SsspQueryCapacityHints capacity_hints);
   explicit BellmanFord11CsrWorkspace(
       std::shared_ptr<const BellmanFord11CsrGraph> adjacency,
       hipStream_t stream = nullptr,
       BellmanFord11WorkspaceOptions options = {});
+  BellmanFord11CsrWorkspace(
+      std::shared_ptr<const BellmanFord11CsrGraph> adjacency,
+      hipStream_t stream,
+      BellmanFord11WorkspaceOptions options,
+      SsspQueryCapacityHints capacity_hints);
   ~BellmanFord11CsrWorkspace();
 
   BellmanFord11CsrWorkspace(const BellmanFord11CsrWorkspace&) = delete;
