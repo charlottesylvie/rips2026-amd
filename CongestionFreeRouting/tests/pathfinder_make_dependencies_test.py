@@ -80,6 +80,7 @@ def main() -> None:
             "CongestionFreeRouting/pathfinder.cpp",
             "CongestionFreeRouting/bellman_ford/bf10.cpp",
             "CongestionFreeRouting/bellman_ford/bf11.cpp",
+            "CongestionFreeRouting/bellman_ford/bf11_execution_policy.hpp",
             "CongestionFreeRouting/bellman_ford/bf11.hpp",
             "CongestionFreeRouting/bellman_ford/bf11_worker_policy.hpp",
             "CongestionFreeRouting/delta_stepping/delta_stepping_hip_CSR.cpp",
@@ -99,6 +100,7 @@ def main() -> None:
         rebuild_inputs = (
             "CongestionFreeRouting/delta_stepping/delta_stepping_hip_CSR.cpp",
             "CongestionFreeRouting/bellman_ford/bf11.cpp",
+            "CongestionFreeRouting/bellman_ford/bf11_execution_policy.hpp",
             "CongestionFreeRouting/bellman_ford/bf11_worker_policy.hpp",
             "CongestionFreeRouting/interchange/routing_csr_sidecars.hpp",
             "CongestionFreeRouting/interchange/import_policy.hpp",

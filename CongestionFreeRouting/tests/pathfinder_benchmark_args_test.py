@@ -86,6 +86,9 @@ def main() -> None:
         and defaults.bf11_bbox_margin_x is None
         and defaults.bf11_bbox_margin_y is None
         and defaults.bf11_target_check_interval is None
+        and defaults.bf11_segment_rounds is None
+        and defaults.bf11_hip_graph is None
+        and defaults.bf11_adaptive_reset_threshold is None
         and not defaults.bf11_no_unbounded_fallback
         and not defaults.bf11_telemetry,
         "BF11 controls must remain unset by default",
@@ -228,6 +231,20 @@ def main() -> None:
     )
     for invalid in ("-1", "1.5", "margin", "2147483648"):
         require_arg_rejected(benchmark.nonnegative_i32_arg, invalid)
+    for rounds in (1, 2, 4, 8, 16):
+        require(
+            benchmark.bf11_segment_rounds_arg(str(rounds)) == rounds,
+            f"BF11 segment parser rejected supported K={rounds}",
+        )
+    for invalid in ("0", "3", "6", "32", "1.5", "rounds"):
+        require_arg_rejected(benchmark.bf11_segment_rounds_arg, invalid)
+    require(
+        benchmark.bf11_reset_threshold_arg("1") == 1.0
+        and benchmark.bf11_reset_threshold_arg("0.25") == 0.25,
+        "BF11 reset threshold parser rejected valid boundary/interior values",
+    )
+    for invalid in ("0", "-0.1", "1.0001", "nan", "inf", "threshold"):
+        require_arg_rejected(benchmark.bf11_reset_threshold_arg, invalid)
 
     bf11 = benchmark.parse_args(
         [
@@ -242,6 +259,12 @@ def main() -> None:
             "18",
             "--bf11-target-check-interval",
             "3",
+            "--bf11-segment-rounds",
+            "8",
+            "--bf11-hip-graph",
+            "on",
+            "--bf11-adaptive-reset-threshold",
+            "0.5",
             "--bf11-no-unbounded-fallback",
             "--bf11-telemetry",
             "--bf11-telemetry",
@@ -261,6 +284,12 @@ def main() -> None:
             "18",
             "--bf11-target-check-interval",
             "3",
+            "--bf11-segment-rounds",
+            "8",
+            "--bf11-hip-graph",
+            "on",
+            "--bf11-adaptive-reset-threshold",
+            "0.5",
         ],
         "BF11 controls were not forwarded canonically",
     )
@@ -270,6 +299,9 @@ def main() -> None:
         ["--bf11-bbox-margin-x", "4"],
         ["--bf11-bbox-margin-y", "18"],
         ["--bf11-target-check-interval", "3"],
+        ["--bf11-segment-rounds", "8"],
+        ["--bf11-hip-graph", "on"],
+        ["--bf11-adaptive-reset-threshold", "0.5"],
         ["--bf11-no-unbounded-fallback"],
         ["--bf11-telemetry"],
     ):
@@ -281,6 +313,31 @@ def main() -> None:
             ["--sssp-engine", "unit-bfs", *bf11_controls],
             "BF11-specific controls were accepted with unit-BFS",
         )
+
+    for invalid_rounds in ("0", "3", "32"):
+        require_parse_rejected(
+            [
+                "--sssp-engine",
+                "bf11",
+                "--bf11-segment-rounds",
+                invalid_rounds,
+            ],
+            f"unsupported BF11 segment rounds {invalid_rounds!r} were accepted",
+        )
+    for invalid_threshold in ("0", "-0.1", "1.1", "nan", "inf"):
+        require_parse_rejected(
+            [
+                "--sssp-engine",
+                "bf11",
+                "--bf11-adaptive-reset-threshold",
+                invalid_threshold,
+            ],
+            f"invalid BF11 reset threshold {invalid_threshold!r} was accepted",
+        )
+    require_parse_rejected(
+        ["--sssp-engine", "bf11", "--bf11-hip-graph", "force"],
+        "unknown BF11 HIP Graph mode was accepted",
+    )
 
     for delta_controls in (
         ["--delta", "1"],

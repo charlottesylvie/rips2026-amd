@@ -305,6 +305,39 @@ void validate_csr_shape(const HostCsrF32& graph) {
   }
 }
 
+bool is_supported_bf11_segment_rounds(int rounds) {
+  switch (rounds) {
+    case 1:
+    case 2:
+    case 4:
+    case 8:
+    case 16:
+      return true;
+    default:
+      return false;
+  }
+}
+
+const char* bf11_hip_graph_mode_name(BellmanFord11HipGraphMode mode) {
+  switch (mode) {
+    case BellmanFord11HipGraphMode::kAuto:
+      return "auto";
+    case BellmanFord11HipGraphMode::kOn:
+      return "on";
+    case BellmanFord11HipGraphMode::kOff:
+      return "off";
+  }
+  return "unknown";
+}
+
+BellmanFord11HipGraphMode parse_bf11_hip_graph_mode_arg(const char* text) {
+  const std::string value(text);
+  if (value == "auto") return BellmanFord11HipGraphMode::kAuto;
+  if (value == "on") return BellmanFord11HipGraphMode::kOn;
+  if (value == "off") return BellmanFord11HipGraphMode::kOff;
+  throw std::runtime_error("invalid bf11-hip-graph mode: " + value);
+}
+
 void validate_options(const PathfinderOptions& options) {
   switch (options.delta_controller_mode) {
     case DeltaSteppingCsrControllerMode::kHostChecked:
@@ -371,8 +404,29 @@ void validate_options(const PathfinderOptions& options) {
     throw std::invalid_argument(
         "BF11 target-check interval must be positive");
   }
+  if (!is_supported_bf11_segment_rounds(options.bf11_segment_rounds)) {
+    throw std::invalid_argument(
+        "BF11 segment rounds must be one of 1, 2, 4, 8, or 16");
+  }
+  switch (options.bf11_hip_graph_mode) {
+    case BellmanFord11HipGraphMode::kAuto:
+    case BellmanFord11HipGraphMode::kOn:
+    case BellmanFord11HipGraphMode::kOff:
+      break;
+    default:
+      throw std::invalid_argument("invalid BF11 HIP Graph mode");
+  }
+  if (!(options.bf11_adaptive_reset_threshold > 0.0) ||
+      options.bf11_adaptive_reset_threshold > 1.0 ||
+      !std::isfinite(options.bf11_adaptive_reset_threshold)) {
+    throw std::invalid_argument(
+        "BF11 adaptive reset threshold must be finite and in (0, 1]");
+  }
   if (options.sssp_engine != SsspEngine::kBellmanFord11 &&
-      (options.bf11_controls_explicit || options.bf11_telemetry)) {
+      (options.bf11_controls_explicit || options.bf11_telemetry ||
+       options.bf11_segment_rounds != 1 ||
+       options.bf11_hip_graph_mode != BellmanFord11HipGraphMode::kAuto ||
+       options.bf11_adaptive_reset_threshold != 0.25)) {
     throw std::invalid_argument(
         "BF11 controls require --sssp-engine bf11");
   }
@@ -1537,7 +1591,11 @@ std::size_t recommend_delta_worker_count(minplus_sparse::Offset rows,
 
 struct Bf11WorkerRecommendation {
   bf11_worker_policy::Recommendation policy;
+  std::size_t preallocated_query_device_bytes_estimate = 0;
+  std::size_t retained_workspace_device_bytes_estimate = 0;
+  std::size_t worst_case_dynamic_retained_workspace_device_bytes_estimate = 0;
   std::size_t peak_workspace_device_bytes_estimate = 0;
+  std::size_t worst_case_dynamic_peak_workspace_device_bytes_estimate = 0;
   std::size_t free_device_bytes = 0;
   std::string device_architecture;
   int compute_unit_count = 0;
@@ -1551,10 +1609,23 @@ Bf11WorkerRecommendation recommend_bf11_worker_count(
     bool telemetry_enabled) {
   Bf11WorkerRecommendation result;
   if (rows <= 0) return result;
+  // PathFinder never updates BF11's destination multipliers, so automatic
+  // selection may use the exact identity-mode allocation. Keep the lazy
+  // dynamic ceiling beside it for diagnostics and future callers that do
+  // leave identity mode.
+  const bf11_worker_policy::WorkspaceDeviceBytesEstimate workspace_estimate =
+      bf11_worker_policy::estimate_workspace_device_bytes(
+          static_cast<std::size_t>(rows), capacity_hints, telemetry_enabled);
+  result.preallocated_query_device_bytes_estimate =
+      workspace_estimate.preallocated_query_device_bytes;
+  result.retained_workspace_device_bytes_estimate =
+      workspace_estimate.identity_retained_device_bytes;
+  result.worst_case_dynamic_retained_workspace_device_bytes_estimate =
+      workspace_estimate.worst_case_dynamic_retained_device_bytes;
   result.peak_workspace_device_bytes_estimate =
-      bf11_worker_policy::automatic_worker_device_bytes_estimate(
-          static_cast<std::size_t>(rows), capacity_hints.max_sources,
-          capacity_hints.max_targets, telemetry_enabled);
+      workspace_estimate.identity_automatic_peak_device_bytes;
+  result.worst_case_dynamic_peak_workspace_device_bytes_estimate =
+      workspace_estimate.worst_case_dynamic_automatic_peak_device_bytes;
 
 #if defined(__HIPCC__) || defined(__HIP_PLATFORM_AMD__)
   std::size_t total_device_bytes = 0;
@@ -1585,7 +1656,8 @@ Bf11WorkerRecommendation recommend_bf11_worker_count(
        result.free_device_bytes,
        result.peak_workspace_device_bytes_estimate,
        result.device_architecture,
-       result.compute_unit_count});
+       result.compute_unit_count,
+       bf11_worker_policy::WorkspaceCostStorageMode::kIdentity});
   if (stream != nullptr) result.policy.worker_count = 1;
   return result;
 }
@@ -2228,6 +2300,11 @@ void print_usage(const char* program) {
       << "  --bf11-bbox-margin-y <int>      Nonnegative BF11 vertical margin. Default: 14\n"
       << "  --bf11-target-check-interval <int>\n"
       << "                                  Positive device-side target-check interval. Default: 1\n"
+      << "  --bf11-segment-rounds <1|2|4|8|16>\n"
+      << "                                  Explicit-stream rounds per controller check-in. Default: 1\n"
+      << "  --bf11-hip-graph <auto|on|off>  HIP Graph replay policy for multi-round segments. Default: auto\n"
+      << "  --bf11-adaptive-reset-threshold <fraction>\n"
+      << "                                  Dense-reset touched fraction in (0, 1]. Default: 0.25\n"
       << "  --bf11-no-unbounded-fallback    Do not retry an unreachable bounded query unbounded.\n"
       << "  --bf11-telemetry                Emit one aggregate BF11 phase/work/memory telemetry record.\n"
       << "  --delta-force-generic           Bypass exact-unit specialization; retain weights and delta.\n"
@@ -3053,8 +3130,21 @@ PathfinderResult run_pathfinder(const HostCsrF32& base_graph,
         std::cout << bf11_requested_worker_count;
       }
       std::cout << " selected=" << bf11_worker_count
+                << " workspace_cost_mode=identity"
+                << " preallocated_query_device_bytes_estimate="
+                << bf11_recommendation
+                       .preallocated_query_device_bytes_estimate
+                << " retained_workspace_device_bytes_estimate="
+                << bf11_recommendation
+                       .retained_workspace_device_bytes_estimate
                 << " peak_workspace_device_bytes_estimate="
                 << bf11_recommendation.peak_workspace_device_bytes_estimate
+                << " worst_case_dynamic_retained_workspace_device_bytes_estimate="
+                << bf11_recommendation
+                       .worst_case_dynamic_retained_workspace_device_bytes_estimate
+                << " worst_case_dynamic_peak_workspace_device_bytes_estimate="
+                << bf11_recommendation
+                       .worst_case_dynamic_peak_workspace_device_bytes_estimate
                 << " free_device_bytes_before_workers="
                 << bf11_recommendation.free_device_bytes;
       if (!bf11_recommendation.device_architecture.empty()) {
@@ -3073,7 +3163,7 @@ PathfinderResult run_pathfinder(const HostCsrF32& base_graph,
       if (bf11_worker_count > 1) {
         std::cout
             << "[pathfinder] BF11 parallel workers use independent explicit "
-               "streams with the host-checked controller; the persistent "
+               "streams with the segmented controller; the persistent "
                "cooperative controller remains single-worker only\n";
       }
       BellmanFord11WorkspaceOptions workspace_options;
@@ -3087,6 +3177,10 @@ PathfinderResult run_pathfinder(const HostCsrF32& base_graph,
           bf11_options.bf11_unbounded_fallback;
       workspace_options.target_check_interval =
           bf11_options.bf11_target_check_interval;
+      workspace_options.segment_rounds = bf11_options.bf11_segment_rounds;
+      workspace_options.hip_graph_mode = bf11_options.bf11_hip_graph_mode;
+      workspace_options.adaptive_reset_threshold =
+          bf11_options.bf11_adaptive_reset_threshold;
       workspace_options.telemetry = bf11_options.bf11_telemetry;
       route_all_nets_with_workspace(
           base_graph,
@@ -3096,9 +3190,11 @@ PathfinderResult run_pathfinder(const HostCsrF32& base_graph,
           route_request_count,
           progress_interval,
           result.nets,
-          [shared_graph, workspace_options](hipStream_t worker_stream) {
+          [shared_graph, workspace_options,
+           query_capacity_hints](hipStream_t worker_stream) {
             return BellmanFord11CsrWorkspace(
-                shared_graph, worker_stream, workspace_options);
+                shared_graph, worker_stream, workspace_options,
+                query_capacity_hints);
           });
       const BellmanFord11RuntimeStats bf11_stats =
           bellman_ford11_runtime_stats();
@@ -3107,17 +3203,43 @@ PathfinderResult run_pathfinder(const HostCsrF32& base_graph,
                                         bf11_backend_started)
               .count();
       std::cout << "{\"type\":\"bf11_runtime_stats\""
-                << ",\"schema_version\":2"
+                << ",\"schema_version\":3"
                 << ",\"workers\":" << bf11_worker_count
                 << ",\"requested_workers\":"
                 << bf11_requested_worker_count
                 << ",\"effective_workers\":" << bf11_worker_count
                 << ",\"routing_seconds\":" << bf11_backend_seconds
+                << ",\"segment_rounds\":"
+                << bf11_options.bf11_segment_rounds
+                << ",\"hip_graph\":\""
+                << bf11_hip_graph_mode_name(
+                       bf11_options.bf11_hip_graph_mode)
+                << "\""
+                << ",\"adaptive_reset_threshold\":"
+                << bf11_options.bf11_adaptive_reset_threshold
+                << ",\"workspace_cost_mode\":\"identity\""
+                << ",\"peak_workspace_device_bytes_estimate\":"
+                << bf11_recommendation
+                       .peak_workspace_device_bytes_estimate
+                << ",\"worst_case_dynamic_peak_workspace_device_bytes_estimate\":"
+                << bf11_recommendation
+                       .worst_case_dynamic_peak_workspace_device_bytes_estimate
                 << ",\"persistent_controller_runs\":"
                 << bf11_stats.persistent_controller_runs
                 << ",\"host_controller_runs\":"
                 << bf11_stats.host_controller_runs
                 << ",\"target_checks\":" << bf11_stats.target_checks
+                << ",\"rounds\":" << bf11_stats.rounds
+                << ",\"segments\":" << bf11_stats.segments
+                << ",\"no_op_segment_rounds\":"
+                << bf11_stats.no_op_segment_rounds
+                << ",\"direct_segments\":" << bf11_stats.direct_segments
+                << ",\"hip_graph_segments\":"
+                << bf11_stats.hip_graph_segments
+                << ",\"status_copies\":" << bf11_stats.status_copies
+                << ",\"stream_synchronizations\":"
+                << bf11_stats.stream_synchronizations
+                << ",\"graph_fallbacks\":" << bf11_stats.graph_fallbacks
                 << ",\"auto_unbounded_retries\":"
                 << bf11_stats.auto_unbounded_retries
                 << ",\"sparse_state_resets\":"
@@ -3125,12 +3247,20 @@ PathfinderResult run_pathfinder(const HostCsrF32& base_graph,
                 << ",\"workspace_state_initializations\":"
                 << bf11_stats.workspace_state_initializations
                 << ",\"defensive_dense_state_resets\":"
-                << bf11_stats.defensive_dense_state_resets << "}\n";
+                << bf11_stats.defensive_dense_state_resets
+                << ",\"adaptive_dense_state_resets\":"
+                << bf11_stats.adaptive_dense_state_resets << "}\n";
       if (bf11_options.bf11_telemetry) {
         std::cout
-            << "{\"type\":\"bf11_telemetry\",\"schema_version\":1"
+            << "{\"type\":\"bf11_telemetry\",\"schema_version\":2"
             << ",\"requested_workers\":" << bf11_stats.requested_workers
             << ",\"effective_workers\":" << bf11_stats.effective_workers
+            << ",\"configuration\":{\"segment_rounds\":"
+            << bf11_options.bf11_segment_rounds
+            << ",\"hip_graph\":\""
+            << bf11_hip_graph_mode_name(bf11_options.bf11_hip_graph_mode)
+            << "\",\"adaptive_reset_threshold\":"
+            << bf11_options.bf11_adaptive_reset_threshold << "}"
             << ",\"queries\":" << bf11_stats.telemetry_queries
             << ",\"completed_queries\":"
             << bf11_stats.telemetry_completed_queries
@@ -3149,28 +3279,77 @@ PathfinderResult run_pathfinder(const HostCsrF32& base_graph,
             << bf11_stats.stream_synchronize_cpu_nanoseconds
             << ",\"target_summary_gpu\":"
             << bf11_stats.target_summary_gpu_nanoseconds
+            << ",\"target_prefix_gpu\":"
+            << bf11_stats.target_prefix_gpu_nanoseconds
             << ",\"path_reconstruction_gpu\":"
             << bf11_stats.path_reconstruction_gpu_nanoseconds
+            << ",\"output_transfer_gpu\":"
+            << bf11_stats.output_transfer_gpu_nanoseconds
             << "},\"work\":{"
             << "\"iterations\":" << bf11_stats.iterations
+            << ",\"rounds\":" << bf11_stats.rounds
+            << ",\"segments\":" << bf11_stats.segments
+            << ",\"no_op_segment_rounds\":"
+            << bf11_stats.no_op_segment_rounds
+            << ",\"direct_segments\":" << bf11_stats.direct_segments
+            << ",\"hip_graph_segments\":"
+            << bf11_stats.hip_graph_segments
+            << ",\"status_copies\":" << bf11_stats.status_copies
+            << ",\"stream_synchronizations\":"
+            << bf11_stats.stream_synchronizations
+            << ",\"graph_fallbacks\":" << bf11_stats.graph_fallbacks
             << ",\"frontier_vertices_processed\":"
             << bf11_stats.frontier_vertices_processed
             << ",\"edges_examined\":" << bf11_stats.edges_examined
             << ",\"successful_relaxations\":"
             << bf11_stats.successful_relaxations
+            << ",\"first_discoveries\":" << bf11_stats.first_discoveries
+            << ",\"mark_cas_attempts\":" << bf11_stats.mark_cas_attempts
+            << ",\"mark_cas_wins\":" << bf11_stats.mark_cas_wins
+            << ",\"queue_reservations\":"
+            << bf11_stats.queue_reservations
             << ",\"touched_vertices\":" << bf11_stats.touched_vertices
             << ",\"maximum_touched_vertices\":"
             << bf11_stats.maximum_touched_vertices
             << ",\"maximum_touched_fraction\":"
             << bf11_stats.maximum_touched_fraction
+            << "},\"resets\":{\"sparse\":"
+            << bf11_stats.sparse_state_resets
+            << ",\"adaptive_dense\":"
+            << bf11_stats.adaptive_dense_state_resets
+            << ",\"defensive_dense\":"
+            << bf11_stats.defensive_dense_state_resets
+            << "},\"cost_modes\":{\"constant_one\":"
+            << bf11_stats.constant_one_queries
+            << ",\"static\":" << bf11_stats.static_cost_queries
+            << ",\"dynamic\":" << bf11_stats.dynamic_cost_queries
+            << "},\"fallback\":{\"bounded\":"
+            << bf11_stats.bounded_fallbacks
+            << ",\"avoided_failed_attempt_extractions\":"
+            << bf11_stats.avoided_failed_attempt_extractions
             << "},\"memory\":{"
-            << "\"peak_workspace_device_bytes_estimate\":"
+            << "\"workspace_cost_mode\":\"identity\""
+            << ",\"preallocated_query_device_bytes_estimate\":"
+            << bf11_recommendation
+                   .preallocated_query_device_bytes_estimate
+            << ",\"retained_workspace_device_bytes_estimate\":"
+            << bf11_recommendation
+                   .retained_workspace_device_bytes_estimate
+            << ",\"peak_workspace_device_bytes_estimate\":"
             << bf11_recommendation.peak_workspace_device_bytes_estimate
+            << ",\"worst_case_dynamic_retained_workspace_device_bytes_estimate\":"
+            << bf11_recommendation
+                   .worst_case_dynamic_retained_workspace_device_bytes_estimate
+            << ",\"worst_case_dynamic_peak_workspace_device_bytes_estimate\":"
+            << bf11_recommendation
+                   .worst_case_dynamic_peak_workspace_device_bytes_estimate
             << ","
             << "\"workspace_device_bytes_total\":"
             << bf11_stats.workspace_device_bytes_total
             << ",\"workspace_device_bytes_per_worker_max\":"
             << bf11_stats.workspace_device_bytes_per_worker_max
+            << ",\"workspace_device_bytes_current_total\":"
+            << bf11_stats.workspace_device_bytes_current_total
             << ",\"gpu_free_before_workers\":"
             << bf11_stats.gpu_free_before_workers
             << ",\"gpu_free_after_workers\":"
@@ -3522,6 +3701,21 @@ int main(int argc, char** argv) {
         options.bf11_target_check_interval = routing::parse_int_arg(
             require_value("--bf11-target-check-interval"),
             "bf11-target-check-interval");
+        options.bf11_controls_explicit = true;
+      } else if (option == "--bf11-segment-rounds") {
+        options.bf11_segment_rounds = routing::parse_int_arg(
+            require_value("--bf11-segment-rounds"),
+            "bf11-segment-rounds");
+        options.bf11_controls_explicit = true;
+      } else if (option == "--bf11-hip-graph") {
+        options.bf11_hip_graph_mode =
+            routing::parse_bf11_hip_graph_mode_arg(
+                require_value("--bf11-hip-graph"));
+        options.bf11_controls_explicit = true;
+      } else if (option == "--bf11-adaptive-reset-threshold") {
+        options.bf11_adaptive_reset_threshold = routing::parse_float_arg(
+            require_value("--bf11-adaptive-reset-threshold"),
+            "bf11-adaptive-reset-threshold");
         options.bf11_controls_explicit = true;
       } else if (option == "--bf11-no-unbounded-fallback") {
         options.bf11_unbounded_fallback = false;

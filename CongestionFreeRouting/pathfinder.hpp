@@ -1,6 +1,7 @@
 #pragma once
 
 #include "../HIP_kernel/bellman_ford/src/bf_hip_CSR.hpp"
+#include "bellman_ford/bf11.hpp"
 #include "delta_stepping/delta_stepping_policy.hpp"
 #include "interchange/import_policy.hpp"
 #include "interchange/routing_csr_sidecars.hpp"
@@ -158,6 +159,13 @@ struct PathfinderOptions {
   // Collect aggregate BF11 phase/work/memory telemetry. Disabled by default;
   // enabling it adds HIP events and device-side work counters.
   bool bf11_telemetry = false;
+  // Additive BF11 pre-profile controls. Segment size one is the exact
+  // compatibility path; graph auto remains conservative and never activates
+  // replay for a one-round segment.
+  int bf11_segment_rounds = 1;
+  BellmanFord11HipGraphMode bf11_hip_graph_mode =
+      BellmanFord11HipGraphMode::kAuto;
+  double bf11_adaptive_reset_threshold = 0.25;
 };
 
 struct PathfinderResult {

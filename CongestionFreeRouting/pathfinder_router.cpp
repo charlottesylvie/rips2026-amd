@@ -213,6 +213,11 @@ void print_usage(const char* program) {
       << "  --bf11-bbox-margin-y <int>     Forward BF11 vertical bounding margin.\n"
       << "  --bf11-target-check-interval <int>\n"
       << "                                 Forward BF11 device target-check interval.\n"
+      << "  --bf11-segment-rounds <1|2|4|8|16>\n"
+      << "                                 Forward explicit-stream controller segment size.\n"
+      << "  --bf11-hip-graph <auto|on|off> Forward BF11 HIP Graph replay policy.\n"
+      << "  --bf11-adaptive-reset-threshold <fraction>\n"
+      << "                                 Forward BF11 dense-reset touched fraction.\n"
       << "  --bf11-no-unbounded-fallback   Keep an unreachable BF11 query bounded.\n"
       << "  --bf11-telemetry               Forward opt-in aggregate BF11 telemetry.\n"
       << "  --net-limit <count>            Forwarded to pathfinder.\n"
@@ -311,6 +316,9 @@ Options parse_args(int argc, char** argv) {
                option == "--bf11-bbox-margin-x" ||
                option == "--bf11-bbox-margin-y" ||
                option == "--bf11-target-check-interval" ||
+               option == "--bf11-segment-rounds" ||
+               option == "--bf11-hip-graph" ||
+               option == "--bf11-adaptive-reset-threshold" ||
                option == "--max-pathfinder-iters" ||
                option == "--max-sssp-iters" ||
                option == "--net-limit" ||

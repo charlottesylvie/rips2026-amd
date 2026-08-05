@@ -141,6 +141,34 @@ def nonnegative_i32_arg(value: str) -> int:
     return numeric
 
 
+def bf11_segment_rounds_arg(value: str) -> int:
+    try:
+        numeric = int(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(
+            "BF11 segment rounds must be one of 1, 2, 4, 8, or 16"
+        ) from exc
+    if numeric not in (1, 2, 4, 8, 16):
+        raise argparse.ArgumentTypeError(
+            "BF11 segment rounds must be one of 1, 2, 4, 8, or 16"
+        )
+    return numeric
+
+
+def bf11_reset_threshold_arg(value: str) -> float:
+    try:
+        numeric = float(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(
+            "BF11 adaptive reset threshold must be finite and in (0, 1]"
+        ) from exc
+    if not math.isfinite(numeric) or numeric <= 0.0 or numeric > 1.0:
+        raise argparse.ArgumentTypeError(
+            "BF11 adaptive reset threshold must be finite and in (0, 1]"
+        )
+    return numeric
+
+
 def default_schema_dir() -> Path | None:
     env_schema = os.environ.get("FPGA_INTERCHANGE_SCHEMA_DIR")
     if env_schema:
@@ -278,6 +306,21 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         help="positive BF11 device target-check interval",
     )
     parser.add_argument(
+        "--bf11-segment-rounds",
+        type=bf11_segment_rounds_arg,
+        help="BF11 explicit-stream segment size: 1, 2, 4, 8, or 16",
+    )
+    parser.add_argument(
+        "--bf11-hip-graph",
+        choices=("auto", "on", "off"),
+        help="BF11 HIP Graph replay policy for multi-round segments",
+    )
+    parser.add_argument(
+        "--bf11-adaptive-reset-threshold",
+        type=bf11_reset_threshold_arg,
+        help="BF11 dense-reset touched fraction in (0, 1]",
+    )
+    parser.add_argument(
         "--bf11-no-unbounded-fallback",
         action="store_true",
         help="do not retry an unreachable bounded BF11 query unbounded",
@@ -349,6 +392,9 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         or args.bf11_bbox_margin_x is not None
         or args.bf11_bbox_margin_y is not None
         or args.bf11_target_check_interval is not None
+        or args.bf11_segment_rounds is not None
+        or args.bf11_hip_graph is not None
+        or args.bf11_adaptive_reset_threshold is not None
         or args.bf11_no_unbounded_fallback
         or args.bf11_telemetry
     )
@@ -407,6 +453,12 @@ def pathfinder_args(args: argparse.Namespace) -> list[str]:
         ("bf11_bbox_margin_x", "--bf11-bbox-margin-x"),
         ("bf11_bbox_margin_y", "--bf11-bbox-margin-y"),
         ("bf11_target_check_interval", "--bf11-target-check-interval"),
+        ("bf11_segment_rounds", "--bf11-segment-rounds"),
+        ("bf11_hip_graph", "--bf11-hip-graph"),
+        (
+            "bf11_adaptive_reset_threshold",
+            "--bf11-adaptive-reset-threshold",
+        ),
         ("max_pathfinder_iters", "--max-pathfinder-iters"),
         ("max_sssp_iters", "--max-sssp-iters"),
         ("capacity", "--capacity"),

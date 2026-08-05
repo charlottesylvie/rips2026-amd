@@ -2009,12 +2009,83 @@ int main() {
 
   const routing::PathfinderOptions default_pathfinder_options;
   const BellmanFord11WorkspaceOptions default_bf11_workspace_options;
+  const BellmanFord11WorkspaceOptions legacy_bf11_workspace_options{
+      true, 2, 14, true, 3, true};
   require(default_pathfinder_options.bf11_bbox_margin_x == 2 &&
               default_pathfinder_options.bf11_bbox_margin_y == 14 &&
+              default_pathfinder_options.bf11_segment_rounds == 1 &&
+              default_pathfinder_options.bf11_hip_graph_mode ==
+                  BellmanFord11HipGraphMode::kAuto &&
+              default_pathfinder_options.bf11_adaptive_reset_threshold ==
+                  0.25 &&
               default_bf11_workspace_options.auto_margin_x == 2 &&
-              default_bf11_workspace_options.auto_margin_y == 14,
-          "BF11 inclusive automatic margins must match RWRoute's strict "
-          "3/15 bounding-box admission");
+              default_bf11_workspace_options.auto_margin_y == 14 &&
+              default_bf11_workspace_options.segment_rounds == 1 &&
+              default_bf11_workspace_options.hip_graph_mode ==
+                  BellmanFord11HipGraphMode::kAuto &&
+              default_bf11_workspace_options.adaptive_reset_threshold ==
+                  0.25,
+          "BF11 automatic bounds and pre-profile controls have incorrect "
+          "compatibility defaults");
+  require(legacy_bf11_workspace_options.auto_bounds &&
+              legacy_bf11_workspace_options.auto_margin_x == 2 &&
+              legacy_bf11_workspace_options.auto_margin_y == 14 &&
+              legacy_bf11_workspace_options.unbounded_fallback &&
+              legacy_bf11_workspace_options.target_check_interval == 3 &&
+              legacy_bf11_workspace_options.telemetry &&
+              legacy_bf11_workspace_options.segment_rounds == 1 &&
+              legacy_bf11_workspace_options.hip_graph_mode ==
+                  BellmanFord11HipGraphMode::kAuto &&
+              legacy_bf11_workspace_options.adaptive_reset_threshold == 0.25,
+          "additive BF11 workspace controls changed legacy positional "
+          "aggregate initialization");
+  for (const int segment_rounds : {1, 2, 4, 8, 16}) {
+    routing::PathfinderOptions supported_bf11 = default_pathfinder_options;
+    supported_bf11.sssp_engine = routing::SsspEngine::kBellmanFord11;
+    supported_bf11.bf11_segment_rounds = segment_rounds;
+    routing::validate_options(supported_bf11);
+  }
+  for (const int segment_rounds : {-1, 0, 3, 6, 32}) {
+    routing::PathfinderOptions invalid_bf11 = default_pathfinder_options;
+    invalid_bf11.sssp_engine = routing::SsspEngine::kBellmanFord11;
+    invalid_bf11.bf11_segment_rounds = segment_rounds;
+    bool rejected = false;
+    try {
+      routing::validate_options(invalid_bf11);
+    } catch (const std::invalid_argument&) {
+      rejected = true;
+    }
+    require(rejected, "PathFinder accepted unsupported BF11 segment rounds");
+  }
+  for (const double threshold :
+       {-1.0, 0.0, 1.0001, std::numeric_limits<double>::infinity(),
+        std::numeric_limits<double>::quiet_NaN()}) {
+    routing::PathfinderOptions invalid_bf11 = default_pathfinder_options;
+    invalid_bf11.sssp_engine = routing::SsspEngine::kBellmanFord11;
+    invalid_bf11.bf11_adaptive_reset_threshold = threshold;
+    bool rejected = false;
+    try {
+      routing::validate_options(invalid_bf11);
+    } catch (const std::invalid_argument&) {
+      rejected = true;
+    }
+    require(rejected, "PathFinder accepted an invalid BF11 reset threshold");
+  }
+  require(routing::parse_bf11_hip_graph_mode_arg("auto") ==
+                  BellmanFord11HipGraphMode::kAuto &&
+              routing::parse_bf11_hip_graph_mode_arg("on") ==
+                  BellmanFord11HipGraphMode::kOn &&
+              routing::parse_bf11_hip_graph_mode_arg("off") ==
+                  BellmanFord11HipGraphMode::kOff,
+          "PathFinder did not parse every BF11 HIP Graph mode");
+  bool invalid_bf11_graph_mode_rejected = false;
+  try {
+    (void)routing::parse_bf11_hip_graph_mode_arg("force");
+  } catch (const std::runtime_error&) {
+    invalid_bf11_graph_mode_rejected = true;
+  }
+  require(invalid_bf11_graph_mode_rejected,
+          "PathFinder accepted an unknown BF11 HIP Graph mode");
   require(default_pathfinder_options.delta == 1.0f,
           "default delta-stepping bucket width must be one");
   require(!default_pathfinder_options.delta_auto,
@@ -2717,6 +2788,10 @@ int main() {
   explicit_bf11_options.sssp_engine = routing::SsspEngine::kBellmanFord11;
   explicit_bf11_options.parallel_net_workers = 8;
   explicit_bf11_options.bf11_telemetry = true;
+  explicit_bf11_options.bf11_segment_rounds = 8;
+  explicit_bf11_options.bf11_hip_graph_mode =
+      BellmanFord11HipGraphMode::kOn;
+  explicit_bf11_options.bf11_adaptive_reset_threshold = 0.5;
   explicit_bf11_options.bf11_controls_explicit = true;
   routing::PathfinderResult explicit_bf11_result;
   std::string explicit_bf11_stdout;
@@ -2739,16 +2814,74 @@ int main() {
               g_bf11_stub_telemetry_workspaces == 2 &&
               g_bf11_stub_telemetry_enabled,
           "PathFinder lost requested/effective BF11 workers or telemetry options");
+  const SsspQueryCapacityHints expected_bf11_hints =
+      routing::derive_query_capacity_hints(
+          congestion_metadata, congestion_metadata.route_requests.size());
+  const std::vector<BellmanFord11WorkspaceOptions>
+      recorded_bf11_workspace_options =
+          recorded_bf11_stub_workspace_options();
+  const std::vector<SsspQueryCapacityHints> recorded_bf11_capacity_hints =
+      recorded_bf11_stub_capacity_hints();
+  require(recorded_bf11_workspace_options.size() == 2 &&
+              std::all_of(
+                  recorded_bf11_workspace_options.begin(),
+                  recorded_bf11_workspace_options.end(),
+                  [](const BellmanFord11WorkspaceOptions& workspace_options) {
+                    return workspace_options.segment_rounds == 8 &&
+                           workspace_options.hip_graph_mode ==
+                               BellmanFord11HipGraphMode::kOn &&
+                           workspace_options.adaptive_reset_threshold == 0.5;
+                  }),
+          "PathFinder did not apply BF11 segment, graph, and reset controls "
+          "to every worker");
+  require(recorded_bf11_capacity_hints.size() == 2 &&
+              std::all_of(
+                  recorded_bf11_capacity_hints.begin(),
+                  recorded_bf11_capacity_hints.end(),
+                  [expected_bf11_hints](
+                      const SsspQueryCapacityHints& capacity_hints) {
+                    return capacity_hints.max_sources ==
+                               expected_bf11_hints.max_sources &&
+                           capacity_hints.max_targets ==
+                               expected_bf11_hints.max_targets;
+                  }),
+          "PathFinder did not pass metadata-derived capacity hints to every "
+          "BF11 workspace");
   require(explicit_bf11_stdout.find(
               "BF11 workers requested=8 selected=2") != std::string::npos &&
-              explicit_bf11_stdout.find("\"type\":\"bf11_telemetry\"") !=
+              explicit_bf11_stdout.find(
+                  "workspace_cost_mode=identity") != std::string::npos &&
+              explicit_bf11_stdout.find(
+                  "preallocated_query_device_bytes_estimate=") !=
+                  std::string::npos &&
+              explicit_bf11_stdout.find(
+                  "worst_case_dynamic_peak_workspace_device_bytes_estimate=") !=
+                  std::string::npos &&
+              explicit_bf11_stdout.find(
+                  "\"type\":\"bf11_runtime_stats\",\"schema_version\":3") !=
+                  std::string::npos &&
+              explicit_bf11_stdout.find(
+                  "\"type\":\"bf11_telemetry\",\"schema_version\":2") !=
                   std::string::npos &&
               explicit_bf11_stdout.find("\"requested_workers\":8") !=
                   std::string::npos &&
               explicit_bf11_stdout.find("\"effective_workers\":2") !=
                   std::string::npos &&
+              explicit_bf11_stdout.find("\"segment_rounds\":8") !=
+                  std::string::npos &&
+              explicit_bf11_stdout.find("\"hip_graph\":\"on\"") !=
+                  std::string::npos &&
+              explicit_bf11_stdout.find(
+                  "\"adaptive_reset_threshold\":0.5") !=
+                  std::string::npos &&
               explicit_bf11_stdout.find(
                   "\"peak_workspace_device_bytes_estimate\":") !=
+                  std::string::npos &&
+              explicit_bf11_stdout.find(
+                  "\"workspace_cost_mode\":\"identity\"") !=
+                  std::string::npos &&
+              explicit_bf11_stdout.find(
+                  "\"worst_case_dynamic_peak_workspace_device_bytes_estimate\":") !=
                   std::string::npos,
           "BF11 worker selection/telemetry logging is incomplete");
 
@@ -2811,6 +2944,12 @@ int main() {
               !g_bf11_stub_telemetry_enabled &&
               automatic_bf11_stdout.find(
                   "BF11 workers requested=auto selected=1") !=
+                  std::string::npos &&
+              automatic_bf11_stdout.find(
+                  "\"workspace_cost_mode\":\"identity\"") !=
+                  std::string::npos &&
+              automatic_bf11_stdout.find(
+                  "\"worst_case_dynamic_peak_workspace_device_bytes_estimate\":") !=
                   std::string::npos &&
               automatic_bf11_stdout.find(
                   "\"type\":\"bf11_telemetry\"") == std::string::npos,

@@ -111,6 +111,12 @@ int main() {
          "18",
          "--bf11-target-check-interval",
          "3",
+         "--bf11-segment-rounds",
+         "8",
+         "--bf11-hip-graph",
+         "on",
+         "--bf11-adaptive-reset-threshold",
+         "0.5",
          "--bf11-no-unbounded-fallback",
          "--bf11-telemetry",
          "--bf11-telemetry"});
@@ -124,6 +130,12 @@ int main() {
                                           "18",
                                           "--bf11-target-check-interval",
                                           "3",
+                                          "--bf11-segment-rounds",
+                                          "8",
+                                          "--bf11-hip-graph",
+                                          "on",
+                                          "--bf11-adaptive-reset-threshold",
+                                          "0.5",
                                           "--bf11-no-unbounded-fallback",
                                           "--bf11-telemetry"}),
             "router did not preserve BF11 option forwarding");
@@ -155,6 +167,18 @@ int main() {
     }
     require(missing_controller_batch_rejected,
             "router accepted a controller batch option without its value");
+
+    bool missing_bf11_segment_rounds_rejected = false;
+    try {
+      (void)parse({"PathFinderFile",
+                   "design_unrouted.phys",
+                   "design_routed.phys",
+                   "--bf11-segment-rounds"});
+    } catch (const std::runtime_error&) {
+      missing_bf11_segment_rounds_rejected = true;
+    }
+    require(missing_bf11_segment_rounds_rejected,
+            "router accepted BF11 segment rounds without a value");
 
     for (const std::string& weight_family :
          std::vector<std::string>({"unit", "all-light", "all-heavy"})) {

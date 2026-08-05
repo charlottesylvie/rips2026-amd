@@ -8,16 +8,36 @@ std::atomic<std::uint64_t> g_bf11_stub_free_before_workers{0};
 std::atomic<std::uint64_t> g_bf11_stub_workspace_constructions{0};
 std::atomic<std::uint64_t> g_bf11_stub_telemetry_workspaces{0};
 std::atomic<bool> g_bf11_stub_telemetry_enabled{false};
+std::mutex g_bf11_stub_workspace_records_mutex;
+std::vector<BellmanFord11WorkspaceOptions>
+    g_bf11_stub_recorded_workspace_options;
+std::vector<SsspQueryCapacityHints> g_bf11_stub_recorded_capacity_hints;
 // Test-only failure injection. Deliberately not cleared by PathFinder's stats
 // reset so a test can arm it before run_pathfinder constructs worker state.
 std::atomic<std::uint64_t> g_bf11_stub_throw_on_workspace_construction{0};
 
-void record_bf11_stub_workspace_construction(bool telemetry) {
+void record_bf11_stub_workspace_construction(
+    const BellmanFord11WorkspaceOptions& options,
+    const SsspQueryCapacityHints& capacity_hints) {
   const std::uint64_t ordinal = ++g_bf11_stub_workspace_constructions;
   if (ordinal == g_bf11_stub_throw_on_workspace_construction.load()) {
     throw std::runtime_error("injected BF11 workspace construction failure");
   }
-  if (telemetry) ++g_bf11_stub_telemetry_workspaces;
+  if (options.telemetry) ++g_bf11_stub_telemetry_workspaces;
+  std::lock_guard<std::mutex> lock(g_bf11_stub_workspace_records_mutex);
+  g_bf11_stub_recorded_workspace_options.push_back(options);
+  g_bf11_stub_recorded_capacity_hints.push_back(capacity_hints);
+}
+
+std::vector<BellmanFord11WorkspaceOptions>
+recorded_bf11_stub_workspace_options() {
+  std::lock_guard<std::mutex> lock(g_bf11_stub_workspace_records_mutex);
+  return g_bf11_stub_recorded_workspace_options;
+}
+
+std::vector<SsspQueryCapacityHints> recorded_bf11_stub_capacity_hints() {
+  std::lock_guard<std::mutex> lock(g_bf11_stub_workspace_records_mutex);
+  return g_bf11_stub_recorded_capacity_hints;
 }
 
 void reset_bellman_ford11_runtime_stats() {
@@ -27,6 +47,9 @@ void reset_bellman_ford11_runtime_stats() {
   g_bf11_stub_workspace_constructions = 0;
   g_bf11_stub_telemetry_workspaces = 0;
   g_bf11_stub_telemetry_enabled = false;
+  std::lock_guard<std::mutex> lock(g_bf11_stub_workspace_records_mutex);
+  g_bf11_stub_recorded_workspace_options.clear();
+  g_bf11_stub_recorded_capacity_hints.clear();
 }
 
 void configure_bellman_ford11_runtime_stats(
@@ -86,6 +109,7 @@ BellmanFord11CsrGraph& BellmanFord11CsrGraph::operator=(
 struct BellmanFord11CsrWorkspace::Impl {
   std::shared_ptr<const BellmanFord11CsrGraph::Impl> graph;
   BellmanFord11WorkspaceOptions options;
+  SsspQueryCapacityHints capacity_hints;
   std::vector<float> dynamic_vertex_cost;
 };
 
@@ -94,14 +118,24 @@ BellmanFord11CsrWorkspace::BellmanFord11CsrWorkspace(
     const routing::interchange::RoutingCsrSidecars& sidecars,
     hipStream_t stream,
     BellmanFord11WorkspaceOptions options)
+    : BellmanFord11CsrWorkspace(adjacency, sidecars, stream, options,
+                                SsspQueryCapacityHints{}) {}
+
+BellmanFord11CsrWorkspace::BellmanFord11CsrWorkspace(
+    const HostCsrF32& adjacency,
+    const routing::interchange::RoutingCsrSidecars& sidecars,
+    hipStream_t stream,
+    BellmanFord11WorkspaceOptions options,
+    SsspQueryCapacityHints capacity_hints)
     : impl_(std::make_unique<Impl>()) {
   (void)stream;
   impl_->graph = std::make_shared<BellmanFord11CsrGraph::Impl>(
       adjacency, sidecars.base_vertex_cost);
   impl_->options = options;
+  impl_->capacity_hints = capacity_hints;
   impl_->dynamic_vertex_cost.assign(static_cast<std::size_t>(adjacency.rows),
                                     1.0f);
-  record_bf11_stub_workspace_construction(options.telemetry);
+  record_bf11_stub_workspace_construction(options, capacity_hints);
 }
 
 BellmanFord11CsrWorkspace::BellmanFord11CsrWorkspace(
@@ -109,20 +143,38 @@ BellmanFord11CsrWorkspace::BellmanFord11CsrWorkspace(
     const BellmanFord11NodeSidecars& sidecars,
     hipStream_t stream,
     BellmanFord11WorkspaceOptions options)
+    : BellmanFord11CsrWorkspace(adjacency, sidecars, stream, options,
+                                SsspQueryCapacityHints{}) {}
+
+BellmanFord11CsrWorkspace::BellmanFord11CsrWorkspace(
+    const HostCsrF32& adjacency,
+    const BellmanFord11NodeSidecars& sidecars,
+    hipStream_t stream,
+    BellmanFord11WorkspaceOptions options,
+    SsspQueryCapacityHints capacity_hints)
     : impl_(std::make_unique<Impl>()) {
   (void)stream;
   impl_->graph = std::make_shared<BellmanFord11CsrGraph::Impl>(
       adjacency, sidecars.base_vertex_costs);
   impl_->options = options;
+  impl_->capacity_hints = capacity_hints;
   impl_->dynamic_vertex_cost.assign(static_cast<std::size_t>(adjacency.rows),
                                     1.0f);
-  record_bf11_stub_workspace_construction(options.telemetry);
+  record_bf11_stub_workspace_construction(options, capacity_hints);
 }
 
 BellmanFord11CsrWorkspace::BellmanFord11CsrWorkspace(
     std::shared_ptr<const BellmanFord11CsrGraph> adjacency,
     hipStream_t stream,
     BellmanFord11WorkspaceOptions options)
+    : BellmanFord11CsrWorkspace(std::move(adjacency), stream, options,
+                                SsspQueryCapacityHints{}) {}
+
+BellmanFord11CsrWorkspace::BellmanFord11CsrWorkspace(
+    std::shared_ptr<const BellmanFord11CsrGraph> adjacency,
+    hipStream_t stream,
+    BellmanFord11WorkspaceOptions options,
+    SsspQueryCapacityHints capacity_hints)
     : impl_(std::make_unique<Impl>()) {
   (void)stream;
   if (!adjacency || !adjacency->impl_) {
@@ -130,9 +182,10 @@ BellmanFord11CsrWorkspace::BellmanFord11CsrWorkspace(
   }
   impl_->graph = adjacency->impl_;
   impl_->options = options;
+  impl_->capacity_hints = capacity_hints;
   impl_->dynamic_vertex_cost.assign(
       static_cast<std::size_t>(impl_->graph->graph.rows), 1.0f);
-  record_bf11_stub_workspace_construction(options.telemetry);
+  record_bf11_stub_workspace_construction(options, capacity_hints);
 }
 
 BellmanFord11CsrWorkspace::~BellmanFord11CsrWorkspace() = default;
