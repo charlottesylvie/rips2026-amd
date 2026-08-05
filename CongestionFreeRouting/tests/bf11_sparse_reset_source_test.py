@@ -124,6 +124,46 @@ def main() -> None:
         "hipStreamSynchronize" not in host_initialization,
         "BF11 reintroduced a host round trip between reset, seed, and round 1",
     )
+    require(
+        "if (workspace.iterations_per_host_check == 1)" in host_controller
+        and "Preserve the original one-iteration host loop exactly"
+        in host_controller,
+        "BF11 no longer preserves an exact K=1 host-controller branch",
+    )
+    batched_relax = function_body(
+        source,
+        "__global__ void host_window_frontier_relax_kernel(",
+        "__global__ void update_host_window_target_status_kernel(",
+    )
+    require(
+        "controller_result->done != 0" in batched_relax
+        and "controller_result->current_frontier_index" in batched_relax
+        and "controller_result->iterations_used + 1" in batched_relax
+        and "item += thread_count" in batched_relax,
+        "BF11 host windows lost terminal gating, absolute tokens, parity, or "
+        "grid-stride frontier coverage",
+    )
+    advance = function_body(
+        source,
+        "__global__ void advance_host_window_controller_kernel(",
+        "__global__ void sparse_cost_update_kernel(",
+    )
+    terminal = advance.find("controller_result->done = 1")
+    reset = advance.find("iteration_status->next_count = 0", terminal)
+    require(
+        "controller_result->done != 0) return" in advance
+        and terminal >= 0
+        and reset > terminal
+        and "controller_result->current_frontier_index ^= 1" in advance,
+        "BF11 host-window finalization can erase terminal state or lost frontier parity",
+    )
+    require(
+        "sizeof(ControllerResult), hipMemcpyDeviceToHost" in host_controller
+        and "window_size" in host_controller
+        and "terminal_noops" in host_controller,
+        "BF11 host windows no longer transfer one persistent controller latch "
+        "or account for terminal no-ops",
+    )
     gpu_controller = function_body(
         source, "__global__ void frontier_controller_kernel(",
         "__global__ void summarize_target_paths_kernel(",

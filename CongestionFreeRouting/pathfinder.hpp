@@ -158,6 +158,10 @@ struct PathfinderOptions {
   // Collect aggregate BF11 phase/work/memory telemetry. Disabled by default;
   // enabling it adds HIP events and device-side work counters.
   bool bf11_telemetry = false;
+  // Number of ordered device iterations enqueued between CPU checks by the
+  // explicit-stream BF11 host controller. The persistent controller is
+  // unchanged. Keep the production default at one until measured otherwise.
+  int bf11_iterations_per_host_check = 1;
 };
 
 struct PathfinderResult {

@@ -65,6 +65,13 @@ std::atomic<std::uint64_t> g_bf11_workspace_device_bytes_per_worker_max{0};
 std::atomic<std::uint64_t> g_bf11_gpu_free_before_workers{0};
 std::atomic<std::uint64_t> g_bf11_gpu_free_after_workers{0};
 std::atomic<std::uint64_t> g_bf11_constructed_workers{0};
+std::atomic<std::uint64_t> g_bf11_iterations_per_host_check{1};
+std::atomic<std::uint64_t> g_bf11_host_check_rounds{0};
+std::atomic<std::uint64_t> g_bf11_iteration_status_copies{0};
+std::atomic<std::uint64_t> g_bf11_iteration_control_stream_syncs{0};
+std::atomic<std::uint64_t> g_bf11_device_iterations_enqueued{0};
+std::atomic<std::uint64_t> g_bf11_device_iterations_executed{0};
+std::atomic<std::uint64_t> g_bf11_terminal_noop_iterations{0};
 
 void atomic_max(std::atomic<std::uint64_t>& destination,
                 std::uint64_t value) {
@@ -103,6 +110,14 @@ void reset_bf11_telemetry_counters() {
   g_bf11_gpu_free_before_workers.store(0, std::memory_order_relaxed);
   g_bf11_gpu_free_after_workers.store(0, std::memory_order_relaxed);
   g_bf11_constructed_workers.store(0, std::memory_order_relaxed);
+  g_bf11_iterations_per_host_check.store(1, std::memory_order_relaxed);
+  g_bf11_host_check_rounds.store(0, std::memory_order_relaxed);
+  g_bf11_iteration_status_copies.store(0, std::memory_order_relaxed);
+  g_bf11_iteration_control_stream_syncs.store(0,
+                                               std::memory_order_relaxed);
+  g_bf11_device_iterations_enqueued.store(0, std::memory_order_relaxed);
+  g_bf11_device_iterations_executed.store(0, std::memory_order_relaxed);
+  g_bf11_terminal_noop_iterations.store(0, std::memory_order_relaxed);
 }
 
 }  // namespace
@@ -124,7 +139,8 @@ void configure_bellman_ford11_runtime_stats(
     bool telemetry_enabled,
     std::uint64_t requested_workers,
     std::uint64_t effective_workers,
-    std::uint64_t gpu_free_before_workers) {
+    std::uint64_t gpu_free_before_workers,
+    std::uint64_t iterations_per_host_check) {
   g_bf11_telemetry_enabled.store(telemetry_enabled,
                                  std::memory_order_relaxed);
   g_bf11_requested_workers.store(requested_workers,
@@ -135,6 +151,8 @@ void configure_bellman_ford11_runtime_stats(
                                        std::memory_order_relaxed);
   g_bf11_gpu_free_after_workers.store(0, std::memory_order_relaxed);
   g_bf11_constructed_workers.store(0, std::memory_order_relaxed);
+  g_bf11_iterations_per_host_check.store(iterations_per_host_check,
+                                          std::memory_order_relaxed);
 }
 
 BellmanFord11RuntimeStats bellman_ford11_runtime_stats() {
@@ -205,6 +223,21 @@ BellmanFord11RuntimeStats bellman_ford11_runtime_stats() {
       g_bf11_gpu_free_before_workers.load(std::memory_order_relaxed);
   stats.gpu_free_after_workers =
       g_bf11_gpu_free_after_workers.load(std::memory_order_relaxed);
+  stats.iterations_per_host_check =
+      g_bf11_iterations_per_host_check.load(std::memory_order_relaxed);
+  stats.host_check_rounds =
+      g_bf11_host_check_rounds.load(std::memory_order_relaxed);
+  stats.iteration_status_copies =
+      g_bf11_iteration_status_copies.load(std::memory_order_relaxed);
+  stats.stream_synchronizations_for_iteration_control =
+      g_bf11_iteration_control_stream_syncs.load(std::memory_order_relaxed);
+  stats.device_iterations_enqueued =
+      g_bf11_device_iterations_enqueued.load(std::memory_order_relaxed);
+  stats.device_iterations_executed =
+      g_bf11_device_iterations_executed.load(std::memory_order_relaxed);
+  stats.terminal_noop_iterations =
+      g_bf11_terminal_noop_iterations.load(std::memory_order_relaxed);
+  stats.speculative_iterations = stats.terminal_noop_iterations;
   return stats;
 }
 
@@ -349,6 +382,7 @@ struct DeviceGraphOwner {
 struct DeviceWorkspace {
   Offset rows = 0;
   hipStream_t stream = nullptr;
+  int iterations_per_host_check = 1;
   unsigned long long* best_state = nullptr;
   Index* frontier = nullptr;
   Index* next_frontier = nullptr;
@@ -399,6 +433,8 @@ struct DeviceWorkspace {
   TelemetryEventPair status_copy_events;
   TelemetryEventPair target_summary_events;
   TelemetryEventPair reconstruction_events;
+  std::vector<TelemetryEventPair> batched_relaxation_events;
+  std::vector<TelemetryEventPair> batched_target_check_events;
 };
 
 struct SsspStatus {
@@ -406,6 +442,33 @@ struct SsspStatus {
   bool converged = false;
   bool early_stopped = false;
   bool hit_max_iters = false;
+};
+
+struct HostControllerCounterBatch {
+  std::uint64_t target_checks = 0;
+  std::uint64_t host_check_rounds = 0;
+  std::uint64_t iteration_status_copies = 0;
+  std::uint64_t iteration_control_stream_syncs = 0;
+  std::uint64_t device_iterations_enqueued = 0;
+  std::uint64_t device_iterations_executed = 0;
+  std::uint64_t terminal_noop_iterations = 0;
+
+  ~HostControllerCounterBatch() noexcept {
+    add(g_bf11_target_checks, target_checks);
+    add(g_bf11_host_check_rounds, host_check_rounds);
+    add(g_bf11_iteration_status_copies, iteration_status_copies);
+    add(g_bf11_iteration_control_stream_syncs,
+        iteration_control_stream_syncs);
+    add(g_bf11_device_iterations_enqueued, device_iterations_enqueued);
+    add(g_bf11_device_iterations_executed, device_iterations_executed);
+    add(g_bf11_terminal_noop_iterations, terminal_noop_iterations);
+  }
+
+ private:
+  static void add(std::atomic<std::uint64_t>& destination,
+                  std::uint64_t value) noexcept {
+    if (value != 0) destination.fetch_add(value, std::memory_order_relaxed);
+  }
 };
 
 void check_hip(hipError_t status, const char* what) {
@@ -519,6 +582,24 @@ dim3 sparse_reset_grid(Offset rows) {
       std::min(required, kMaxSparseResetBlocks)));
 }
 
+dim3 host_batched_relaxation_grid(Offset rows, int known_frontier_count) {
+  constexpr Offset kMinimumBlocks = 32;
+  constexpr Offset kMaximumBlocks = 256;
+  // Only the first frontier size in a host window is visible to the CPU.
+  // Keep enough resident work for later device-produced frontiers, and use the
+  // kernel's grid-stride loop when they outgrow this bounded launch geometry.
+  const Offset row_blocks =
+      std::max<Offset>(1, (rows + kBlockSize - 1) / kBlockSize);
+  const Offset known_blocks = known_frontier_count <= 0
+      ? 1
+      : (static_cast<Offset>(known_frontier_count) + kBlockSize - 1) /
+            kBlockSize;
+  const Offset blocks = std::min(
+      row_blocks,
+      std::min(kMaximumBlocks, std::max(kMinimumBlocks, known_blocks)));
+  return dim3(static_cast<unsigned>(blocks));
+}
+
 template <typename T>
 T* device_allocate(std::size_t count, const char* what) {
   if (count == 0) return nullptr;
@@ -560,6 +641,41 @@ void destroy_telemetry_event_pair(TelemetryEventPair& events) noexcept {
   events = {};
 }
 
+void ensure_host_window_telemetry_events(DeviceWorkspace& workspace) {
+  if (!workspace.telemetry_enabled ||
+      workspace.iterations_per_host_check <= 1) {
+    return;
+  }
+  const std::size_t event_count =
+      static_cast<std::size_t>(workspace.iterations_per_host_check);
+  if (workspace.batched_relaxation_events.size() == event_count &&
+      workspace.batched_target_check_events.size() == event_count) {
+    return;
+  }
+  if (!workspace.batched_relaxation_events.empty() ||
+      !workspace.batched_target_check_events.empty()) {
+    throw std::runtime_error("BF11 host-window telemetry event state is invalid");
+  }
+  try {
+    workspace.batched_relaxation_events.resize(event_count);
+    workspace.batched_target_check_events.resize(event_count);
+    for (std::size_t i = 0; i < event_count; ++i) {
+      create_telemetry_event_pair(workspace.batched_relaxation_events[i]);
+      create_telemetry_event_pair(workspace.batched_target_check_events[i]);
+    }
+  } catch (...) {
+    for (TelemetryEventPair& events : workspace.batched_relaxation_events) {
+      destroy_telemetry_event_pair(events);
+    }
+    for (TelemetryEventPair& events : workspace.batched_target_check_events) {
+      destroy_telemetry_event_pair(events);
+    }
+    workspace.batched_relaxation_events.clear();
+    workspace.batched_target_check_events.clear();
+    throw;
+  }
+}
+
 void initialize_workspace_telemetry(DeviceWorkspace& workspace) {
   if (!workspace.telemetry_enabled) return;
   try {
@@ -575,6 +691,10 @@ void initialize_workspace_telemetry(DeviceWorkspace& workspace) {
     create_telemetry_event_pair(workspace.status_copy_events);
     create_telemetry_event_pair(workspace.target_summary_events);
     create_telemetry_event_pair(workspace.reconstruction_events);
+    if (workspace.iterations_per_host_check > 1 &&
+        workspace.stream != nullptr) {
+      ensure_host_window_telemetry_events(workspace);
+    }
     int device = -1;
     check_hip(hipGetDevice(&device), "get BF11 telemetry HIP device");
     check_hip(hipDeviceGetAttribute(&workspace.wall_clock_rate_khz,
@@ -587,6 +707,14 @@ void initialize_workspace_telemetry(DeviceWorkspace& workspace) {
     destroy_telemetry_event_pair(workspace.status_copy_events);
     destroy_telemetry_event_pair(workspace.target_summary_events);
     destroy_telemetry_event_pair(workspace.reconstruction_events);
+    for (TelemetryEventPair& events : workspace.batched_relaxation_events) {
+      destroy_telemetry_event_pair(events);
+    }
+    for (TelemetryEventPair& events : workspace.batched_target_check_events) {
+      destroy_telemetry_event_pair(events);
+    }
+    workspace.batched_relaxation_events.clear();
+    workspace.batched_target_check_events.clear();
     if (workspace.telemetry_counters) (void)hipFree(workspace.telemetry_counters);
     if (workspace.host_telemetry_counters)
       (void)hipHostFree(workspace.host_telemetry_counters);
@@ -953,6 +1081,27 @@ __global__ void reset_iteration_status_kernel(IterationStatus* status) {
   status->max_target_dist_bits = 0;
 }
 
+__global__ void initialize_host_window_controller_kernel(
+    int source_count,
+    IterationStatus* iteration_status,
+    ControllerResult* controller_result) {
+  if (logical_thread_id() != 0) return;
+  iteration_status->next_count = 0;
+  iteration_status->error_status = 0;
+  iteration_status->reached_target_count = 0;
+  iteration_status->min_next_frontier_dist_bits = kInfinityBits;
+  iteration_status->max_target_dist_bits = 0;
+  controller_result->iterations_used = 0;
+  controller_result->error_status = 0;
+  controller_result->frontier_count = source_count;
+  controller_result->current_frontier_index = 0;
+  controller_result->converged = 0;
+  controller_result->early_stopped = 0;
+  controller_result->hit_max_iters = 0;
+  controller_result->done = 0;
+  controller_result->target_checks = 0;
+}
+
 template <bool CollectTelemetry>
 __global__ void frontier_relax_kernel(
     DeviceGraph graph,
@@ -1018,6 +1167,123 @@ __global__ void update_target_status_kernel(
   if (bits == kInfinityBits) return;
   atomicAdd(&status->reached_target_count, 1);
   atomicMax(&status->max_target_dist_bits, bits);
+}
+
+template <bool CollectTelemetry>
+__global__ void host_window_frontier_relax_kernel(
+    DeviceGraph graph,
+    Index* frontier,
+    Index* next_frontier,
+    const float* dynamic_vertex_cost,
+    BellmanFord11BoundingBox bounds,
+    unsigned long long* best_state,
+    int* next_marks,
+    const unsigned char* source_mask,
+    Index* touched_nodes,
+    int* touched_count,
+    IterationStatus* status,
+    const ControllerResult* controller_result,
+    DeviceTelemetryCounters* telemetry) {
+  if (controller_result->done != 0) return;
+  const int frontier_count = controller_result->frontier_count;
+  const int current_index = controller_result->current_frontier_index;
+  const int mark_token = controller_result->iterations_used + 1;
+  const Index* current = current_index == 0 ? frontier : next_frontier;
+  Index* next = current_index == 0 ? next_frontier : frontier;
+  const Offset thread = logical_thread_id();
+  const Offset thread_count =
+      static_cast<Offset>(gridDim.x) * static_cast<Offset>(gridDim.y) *
+      static_cast<Offset>(blockDim.x);
+  if constexpr (CollectTelemetry) {
+    if (thread == 0) {
+      atomicAdd(&telemetry->frontier_vertices_processed,
+                static_cast<unsigned long long>(frontier_count));
+    }
+  }
+  for (Offset item = thread; item < static_cast<Offset>(frontier_count);
+       item += thread_count) {
+    const Index from = current[item];
+    if (from < 0 || static_cast<Offset>(from) >= graph.rows) {
+      atomicExch(&status->error_status, 1);
+      continue;
+    }
+    const float from_dist = state_distance(best_state[from]);
+    if (!finite_device(from_dist)) continue;
+    const Offset begin = static_cast<Offset>(graph.rowptr[from]);
+    const Offset end = static_cast<Offset>(graph.rowptr[from + 1]);
+    if (end < begin || end > graph.nnz) {
+      atomicExch(&status->error_status, 2);
+      continue;
+    }
+    if constexpr (CollectTelemetry) {
+      atomicAdd(&telemetry->edges_examined,
+                static_cast<unsigned long long>(end - begin));
+    }
+    unsigned int local_min = kInfinityBits;
+    for (Offset edge = begin; edge < end; ++edge) {
+      const unsigned int candidate = relax_edge<CollectTelemetry>(
+          graph, edge, from_dist, dynamic_vertex_cost, bounds, mark_token,
+          best_state, next, next_marks, source_mask, touched_nodes,
+          touched_count, status, telemetry);
+      local_min = candidate < local_min ? candidate : local_min;
+    }
+    if (local_min != kInfinityBits) {
+      atomicMin(&status->min_next_frontier_dist_bits, local_min);
+    }
+  }
+}
+
+__global__ void update_host_window_target_status_kernel(
+    const unsigned long long* best_state,
+    const Index* target_nodes,
+    Offset target_count,
+    IterationStatus* status,
+    const ControllerResult* controller_result) {
+  if (controller_result->done != 0 || status->error_status != 0) return;
+  const Offset item = logical_thread_id();
+  if (item >= target_count) return;
+  const unsigned int bits = state_distance_bits(best_state[target_nodes[item]]);
+  if (bits == kInfinityBits) return;
+  atomicAdd(&status->reached_target_count, 1);
+  atomicMax(&status->max_target_dist_bits, bits);
+}
+
+__global__ void advance_host_window_controller_kernel(
+    IterationStatus* iteration_status,
+    ControllerResult* controller_result,
+    int target_count,
+    int max_iters,
+    int target_check_interval) {
+  if (logical_thread_id() != 0 || controller_result->done != 0) return;
+  const int completed_iteration = controller_result->iterations_used + 1;
+  const bool check_targets =
+      completed_iteration % target_check_interval == 0;
+  controller_result->iterations_used = completed_iteration;
+  controller_result->frontier_count = iteration_status->next_count;
+  if (check_targets) ++controller_result->target_checks;
+  if (iteration_status->error_status != 0) {
+    controller_result->error_status = iteration_status->error_status;
+    controller_result->done = 1;
+  } else if (iteration_status->next_count == 0) {
+    controller_result->converged = 1;
+    controller_result->done = 1;
+  } else if (check_targets &&
+             iteration_status->reached_target_count == target_count &&
+             iteration_status->min_next_frontier_dist_bits >=
+                 iteration_status->max_target_dist_bits) {
+    controller_result->early_stopped = 1;
+    controller_result->done = 1;
+  } else if (completed_iteration >= max_iters) {
+    controller_result->hit_max_iters = 1;
+    controller_result->done = 1;
+  } else {
+    controller_result->current_frontier_index ^= 1;
+    iteration_status->next_count = 0;
+    iteration_status->error_status = 0;
+    iteration_status->reached_target_count = 0;
+    iteration_status->min_next_frontier_dist_bits = kInfinityBits;
+    iteration_status->max_target_dist_bits = 0;
+  }
 }
 
 __global__ void sparse_cost_update_kernel(const Index* nodes,
@@ -1513,11 +1779,13 @@ void free_graph(DeviceGraphOwner* owner) noexcept {
 
 DeviceWorkspace make_workspace(Offset rows,
                                hipStream_t stream,
-                               bool telemetry_enabled) {
+                               bool telemetry_enabled,
+                               int iterations_per_host_check) {
   DeviceWorkspace workspace;
   workspace.rows = rows;
   workspace.stream = stream;
   workspace.telemetry_enabled = telemetry_enabled;
+  workspace.iterations_per_host_check = iterations_per_host_check;
   try {
     const std::size_t count = static_cast<std::size_t>(rows);
     workspace.best_state = device_allocate<unsigned long long>(
@@ -1595,6 +1863,12 @@ void free_workspace(DeviceWorkspace* workspace) noexcept {
   destroy_telemetry_event_pair(workspace->status_copy_events);
   destroy_telemetry_event_pair(workspace->target_summary_events);
   destroy_telemetry_event_pair(workspace->reconstruction_events);
+  for (TelemetryEventPair& events : workspace->batched_relaxation_events) {
+    destroy_telemetry_event_pair(events);
+  }
+  for (TelemetryEventPair& events : workspace->batched_target_check_events) {
+    destroy_telemetry_event_pair(events);
+  }
   if (workspace->best_state) (void)hipFree(workspace->best_state);
   if (workspace->frontier) (void)hipFree(workspace->frontier);
   if (workspace->next_frontier) (void)hipFree(workspace->next_frontier);
@@ -2024,6 +2298,8 @@ SsspStatus run_host_controller(const DeviceGraph& graph,
   PATHFINDER_PROFILE_RANGE("bf11.controller_fallback");
   g_bf11_controller_fallbacks.fetch_add(1, std::memory_order_relaxed);
   g_bf11_sparse_state_resets.fetch_add(1, std::memory_order_relaxed);
+  HostControllerCounterBatch control_counters;
+  ensure_host_window_telemetry_events(workspace);
   if (workspace.telemetry_enabled) {
     check_hip(hipMemsetAsync(workspace.telemetry_counters, 0,
                              sizeof(DeviceTelemetryCounters), workspace.stream),
@@ -2053,82 +2329,254 @@ SsspStatus run_host_controller(const DeviceGraph& graph,
 
   int frontier_count = static_cast<int>(source_count);
   SsspStatus result;
-  for (int iteration = 0; iteration < max_iters && frontier_count > 0;
-       ++iteration) {
-    hipLaunchKernelGGL(reset_iteration_status_kernel, dim3(1), dim3(1), 0,
-                       workspace.stream, workspace.iteration_status);
-    check_hip(hipGetLastError(), "reset BF11 iteration status");
-    begin_telemetry_event(workspace, workspace.relaxation_events);
-    if (workspace.telemetry_enabled) {
-      hipLaunchKernelGGL((frontier_relax_kernel<true>),
-                         grid_for_items(frontier_count), dim3(kBlockSize), 0,
-                         workspace.stream, graph, workspace.frontier,
-                         frontier_count, iteration + 1,
-                         workspace.dynamic_vertex_cost, options.bounds,
-                         workspace.best_state, workspace.next_frontier,
-                         workspace.next_marks, workspace.source_mask,
-                         workspace.touched_nodes, workspace.touched_count,
-                         workspace.iteration_status,
-                         workspace.telemetry_counters);
-    } else {
-      hipLaunchKernelGGL((frontier_relax_kernel<false>),
-                         grid_for_items(frontier_count), dim3(kBlockSize), 0,
-                         workspace.stream, graph, workspace.frontier,
-                         frontier_count, iteration + 1,
-                         workspace.dynamic_vertex_cost, options.bounds,
-                         workspace.best_state, workspace.next_frontier,
-                         workspace.next_marks, workspace.source_mask,
-                         workspace.touched_nodes, workspace.touched_count,
-                         workspace.iteration_status,
-                         static_cast<DeviceTelemetryCounters*>(nullptr));
+  if (workspace.iterations_per_host_check == 1) {
+    // Preserve the original one-iteration host loop exactly for the control
+    // arm of this experiment. Only the additive counters below are new.
+    for (int iteration = 0; iteration < max_iters && frontier_count > 0;
+         ++iteration) {
+      hipLaunchKernelGGL(reset_iteration_status_kernel, dim3(1), dim3(1), 0,
+                         workspace.stream, workspace.iteration_status);
+      check_hip(hipGetLastError(), "reset BF11 iteration status");
+      begin_telemetry_event(workspace, workspace.relaxation_events);
+      if (workspace.telemetry_enabled) {
+        hipLaunchKernelGGL((frontier_relax_kernel<true>),
+                           grid_for_items(frontier_count), dim3(kBlockSize), 0,
+                           workspace.stream, graph, workspace.frontier,
+                           frontier_count, iteration + 1,
+                           workspace.dynamic_vertex_cost, options.bounds,
+                           workspace.best_state, workspace.next_frontier,
+                           workspace.next_marks, workspace.source_mask,
+                           workspace.touched_nodes, workspace.touched_count,
+                           workspace.iteration_status,
+                           workspace.telemetry_counters);
+      } else {
+        hipLaunchKernelGGL((frontier_relax_kernel<false>),
+                           grid_for_items(frontier_count), dim3(kBlockSize), 0,
+                           workspace.stream, graph, workspace.frontier,
+                           frontier_count, iteration + 1,
+                           workspace.dynamic_vertex_cost, options.bounds,
+                           workspace.best_state, workspace.next_frontier,
+                           workspace.next_marks, workspace.source_mask,
+                           workspace.touched_nodes, workspace.touched_count,
+                           workspace.iteration_status,
+                           static_cast<DeviceTelemetryCounters*>(nullptr));
+      }
+      check_hip(hipGetLastError(), "launch BF11 frontier relaxation");
+      end_telemetry_event(workspace, workspace.relaxation_events);
+      const bool check_targets =
+          (iteration + 1) % options.target_check_interval == 0;
+      if (check_targets) {
+        begin_telemetry_event(workspace, workspace.target_check_events);
+        hipLaunchKernelGGL(update_target_status_kernel,
+                           grid_for_items(target_count), dim3(kBlockSize), 0,
+                           workspace.stream, workspace.best_state,
+                           workspace.target_nodes, target_count,
+                           workspace.iteration_status);
+        check_hip(hipGetLastError(), "launch BF11 target check");
+        end_telemetry_event(workspace, workspace.target_check_events);
+        ++control_counters.target_checks;
+      }
+      ++control_counters.device_iterations_enqueued;
+      begin_telemetry_event(workspace, workspace.status_copy_events);
+      check_hip(hipMemcpyAsync(workspace.host_iteration_status,
+                               workspace.iteration_status,
+                               sizeof(IterationStatus), hipMemcpyDeviceToHost,
+                               workspace.stream),
+                "copy BF11 iteration status");
+      ++control_counters.iteration_status_copies;
+      end_telemetry_event(workspace, workspace.status_copy_events);
+      synchronize_query_stream(workspace,
+                               "synchronize BF11 iteration status");
+      ++control_counters.iteration_control_stream_syncs;
+      ++control_counters.host_check_rounds;
+      accumulate_telemetry_event(workspace.reset_seed_events,
+                                 g_bf11_reset_seed_gpu_nanoseconds);
+      accumulate_telemetry_event(workspace.relaxation_events,
+                                 g_bf11_relaxation_gpu_nanoseconds);
+      accumulate_telemetry_event(workspace.target_check_events,
+                                 g_bf11_target_check_gpu_nanoseconds);
+      accumulate_telemetry_event(workspace.status_copy_events,
+                                 g_bf11_status_copy_gpu_nanoseconds);
+      const IterationStatus status = *workspace.host_iteration_status;
+      ++control_counters.device_iterations_executed;
+      if (status.error_status != 0) throw_controller_error(status.error_status);
+      result.iterations_used = iteration + 1;
+      frontier_count = status.next_count;
+      if (frontier_count == 0) {
+        result.converged = true;
+        break;
+      }
+      if (check_targets &&
+          status.reached_target_count == static_cast<int>(target_count) &&
+          status.min_next_frontier_dist_bits >= status.max_target_dist_bits) {
+        result.early_stopped = true;
+        break;
+      }
+      std::swap(workspace.frontier, workspace.next_frontier);
     }
-    check_hip(hipGetLastError(), "launch BF11 frontier relaxation");
-    end_telemetry_event(workspace, workspace.relaxation_events);
-    const bool check_targets =
-        (iteration + 1) % options.target_check_interval == 0;
-    if (check_targets) {
-      begin_telemetry_event(workspace, workspace.target_check_events);
-      hipLaunchKernelGGL(update_target_status_kernel,
-                         grid_for_items(target_count), dim3(kBlockSize), 0,
-                         workspace.stream, workspace.best_state,
-                         workspace.target_nodes, target_count,
-                         workspace.iteration_status);
-      check_hip(hipGetLastError(), "launch BF11 target check");
-      end_telemetry_event(workspace, workspace.target_check_events);
-      g_bf11_target_checks.fetch_add(1, std::memory_order_relaxed);
-    }
-    begin_telemetry_event(workspace, workspace.status_copy_events);
-    check_hip(hipMemcpyAsync(workspace.host_iteration_status,
+  } else if (max_iters > 0 && frontier_count > 0) {
+    hipLaunchKernelGGL(initialize_host_window_controller_kernel,
+                       dim3(1), dim3(1), 0, workspace.stream,
+                       frontier_count, workspace.iteration_status,
+                       workspace.controller_result);
+    check_hip(hipGetLastError(),
+              "initialize BF11 host-window controller");
+
+    int iterations_enqueued = 0;
+    int observed_iterations = 0;
+    int observed_target_checks = 0;
+    while (iterations_enqueued < max_iters) {
+      const int window_size = std::min(
+          workspace.iterations_per_host_check,
+          max_iters - iterations_enqueued);
+      const dim3 relaxation_grid =
+          host_batched_relaxation_grid(graph.rows, frontier_count);
+      for (int offset = 0; offset < window_size; ++offset) {
+        TelemetryEventPair& relaxation_events =
+            workspace.batched_relaxation_events.empty()
+            ? workspace.relaxation_events
+            : workspace.batched_relaxation_events[
+                  static_cast<std::size_t>(offset)];
+        begin_telemetry_event(workspace, relaxation_events);
+        if (workspace.telemetry_enabled) {
+          hipLaunchKernelGGL((host_window_frontier_relax_kernel<true>),
+                             relaxation_grid, dim3(kBlockSize), 0,
+                             workspace.stream, graph, workspace.frontier,
+                             workspace.next_frontier,
+                             workspace.dynamic_vertex_cost, options.bounds,
+                             workspace.best_state, workspace.next_marks,
+                             workspace.source_mask, workspace.touched_nodes,
+                             workspace.touched_count,
                              workspace.iteration_status,
-                             sizeof(IterationStatus), hipMemcpyDeviceToHost,
-                             workspace.stream),
-              "copy BF11 iteration status");
-    end_telemetry_event(workspace, workspace.status_copy_events);
-    synchronize_query_stream(workspace,
-                             "synchronize BF11 iteration status");
-    accumulate_telemetry_event(workspace.reset_seed_events,
-                               g_bf11_reset_seed_gpu_nanoseconds);
-    accumulate_telemetry_event(workspace.relaxation_events,
-                               g_bf11_relaxation_gpu_nanoseconds);
-    accumulate_telemetry_event(workspace.target_check_events,
-                               g_bf11_target_check_gpu_nanoseconds);
-    accumulate_telemetry_event(workspace.status_copy_events,
-                               g_bf11_status_copy_gpu_nanoseconds);
-    const IterationStatus status = *workspace.host_iteration_status;
-    if (status.error_status != 0) throw_controller_error(status.error_status);
-    result.iterations_used = iteration + 1;
-    frontier_count = status.next_count;
-    if (frontier_count == 0) {
-      result.converged = true;
-      break;
+                             workspace.controller_result,
+                             workspace.telemetry_counters);
+        } else {
+          hipLaunchKernelGGL((host_window_frontier_relax_kernel<false>),
+                             relaxation_grid, dim3(kBlockSize), 0,
+                             workspace.stream, graph, workspace.frontier,
+                             workspace.next_frontier,
+                             workspace.dynamic_vertex_cost, options.bounds,
+                             workspace.best_state, workspace.next_marks,
+                             workspace.source_mask, workspace.touched_nodes,
+                             workspace.touched_count,
+                             workspace.iteration_status,
+                             workspace.controller_result,
+                             static_cast<DeviceTelemetryCounters*>(nullptr));
+        }
+        check_hip(hipGetLastError(),
+                  "launch BF11 host-window frontier relaxation");
+        end_telemetry_event(workspace, relaxation_events);
+
+        const int logical_iteration = iterations_enqueued + offset + 1;
+        const bool check_targets =
+            logical_iteration % options.target_check_interval == 0;
+        if (check_targets) {
+          TelemetryEventPair& target_events =
+              workspace.batched_target_check_events.empty()
+              ? workspace.target_check_events
+              : workspace.batched_target_check_events[
+                    static_cast<std::size_t>(offset)];
+          begin_telemetry_event(workspace, target_events);
+          hipLaunchKernelGGL(update_host_window_target_status_kernel,
+                             grid_for_items(target_count), dim3(kBlockSize), 0,
+                             workspace.stream, workspace.best_state,
+                             workspace.target_nodes, target_count,
+                             workspace.iteration_status,
+                             workspace.controller_result);
+          check_hip(hipGetLastError(),
+                    "launch BF11 host-window target check");
+          end_telemetry_event(workspace, target_events);
+        }
+        hipLaunchKernelGGL(advance_host_window_controller_kernel,
+                           dim3(1), dim3(1), 0, workspace.stream,
+                           workspace.iteration_status,
+                           workspace.controller_result,
+                           static_cast<int>(target_count), max_iters,
+                           options.target_check_interval);
+        check_hip(hipGetLastError(),
+                  "advance BF11 host-window controller");
+        ++control_counters.device_iterations_enqueued;
+      }
+
+      begin_telemetry_event(workspace, workspace.status_copy_events);
+      check_hip(hipMemcpyAsync(workspace.host_controller_result,
+                               workspace.controller_result,
+                               sizeof(ControllerResult), hipMemcpyDeviceToHost,
+                               workspace.stream),
+                "copy BF11 host-window controller result");
+      ++control_counters.iteration_status_copies;
+      end_telemetry_event(workspace, workspace.status_copy_events);
+      synchronize_query_stream(
+          workspace, "synchronize BF11 host-window controller result");
+      ++control_counters.iteration_control_stream_syncs;
+      ++control_counters.host_check_rounds;
+
+      accumulate_telemetry_event(workspace.reset_seed_events,
+                                 g_bf11_reset_seed_gpu_nanoseconds);
+      for (int offset = 0; offset < window_size; ++offset) {
+        if (!workspace.batched_relaxation_events.empty()) {
+          accumulate_telemetry_event(
+              workspace.batched_relaxation_events[
+                  static_cast<std::size_t>(offset)],
+              g_bf11_relaxation_gpu_nanoseconds);
+          accumulate_telemetry_event(
+              workspace.batched_target_check_events[
+                  static_cast<std::size_t>(offset)],
+              g_bf11_target_check_gpu_nanoseconds);
+        }
+      }
+      accumulate_telemetry_event(workspace.status_copy_events,
+                                 g_bf11_status_copy_gpu_nanoseconds);
+
+      const ControllerResult status = *workspace.host_controller_result;
+      const int termination_count =
+          status.converged + status.early_stopped + status.hit_max_iters;
+      const int maximum_observed_iteration =
+          iterations_enqueued + window_size;
+      if (status.iterations_used < observed_iterations ||
+          status.iterations_used > maximum_observed_iteration ||
+          (status.error_status == 0 &&
+           (status.frontier_count < 0 ||
+            static_cast<Offset>(status.frontier_count) > graph.rows ||
+            status.current_frontier_index < 0 ||
+            status.current_frontier_index > 1)) ||
+          status.target_checks < observed_target_checks ||
+          status.target_checks > status.iterations_used ||
+          status.done < 0 || status.done > 1 ||
+          (status.done == 0 &&
+           (status.iterations_used != maximum_observed_iteration ||
+            status.frontier_count <= 0 ||
+            status.iterations_used >= max_iters)) ||
+          (status.error_status == 0 && status.done == 0 &&
+           termination_count != 0) ||
+          (status.error_status == 0 && status.done != 0 &&
+           termination_count != 1) ||
+          (status.error_status != 0 &&
+           (status.done != 1 || termination_count != 0))) {
+        throw std::runtime_error(
+            "BF11 host-window controller returned bad status");
+      }
+      const int executed = status.iterations_used - observed_iterations;
+      const int terminal_noops = window_size - executed;
+      control_counters.device_iterations_executed +=
+          static_cast<std::uint64_t>(executed);
+      control_counters.terminal_noop_iterations +=
+          static_cast<std::uint64_t>(terminal_noops);
+      control_counters.target_checks += static_cast<std::uint64_t>(
+          status.target_checks - observed_target_checks);
+      observed_iterations = status.iterations_used;
+      observed_target_checks = status.target_checks;
+      iterations_enqueued += window_size;
+      result.iterations_used = status.iterations_used;
+      result.converged = status.converged != 0;
+      result.early_stopped = status.early_stopped != 0;
+      result.hit_max_iters = status.hit_max_iters != 0;
+      frontier_count = status.frontier_count;
+      if (status.error_status != 0) {
+        throw_controller_error(status.error_status);
+      }
+      if (status.done != 0) break;
     }
-    if (check_targets &&
-        status.reached_target_count == static_cast<int>(target_count) &&
-        status.min_next_frontier_dist_bits >= status.max_target_dist_bits) {
-      result.early_stopped = true;
-      break;
-    }
-    std::swap(workspace.frontier, workspace.next_frontier);
   }
   if (workspace.telemetry_enabled) {
     check_hip(hipMemcpyAsync(workspace.host_telemetry_counters,
@@ -2379,9 +2827,14 @@ struct BellmanFord11CsrWorkspace::Impl {
        BellmanFord11WorkspaceOptions options_in)
       : graph(std::move(graph_in)), stream(stream_in), options(options_in) {
     if (options.auto_margin_x < 0 || options.auto_margin_y < 0 ||
-        options.target_check_interval <= 0) {
+        options.target_check_interval <= 0 ||
+        options.iterations_per_host_check <= 0 ||
+        options.iterations_per_host_check >
+            kBellmanFord11MaximumIterationsPerHostCheck) {
       throw std::invalid_argument(
-          "BF11 auto-bound margins and target interval must be nonnegative/positive");
+          "BF11 auto-bound margins and target interval must be "
+          "nonnegative/positive, and iterations per host check must be in "
+          "[1, 64]");
     }
     int current_device = -1;
     rips_sssp_bf11::check_hip(hipGetDevice(&current_device),
@@ -2390,7 +2843,8 @@ struct BellmanFord11CsrWorkspace::Impl {
       throw std::invalid_argument("BF11 graph belongs to another HIP device");
     }
     workspace = rips_sssp_bf11::make_workspace(
-        graph->rows, stream, options.telemetry);
+        graph->rows, stream, options.telemetry,
+        options.iterations_per_host_check);
     if (options.telemetry) {
       maximum_workspace_device_bytes =
           rips_sssp_bf11::workspace_device_bytes(workspace);

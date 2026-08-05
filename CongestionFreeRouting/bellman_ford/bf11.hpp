@@ -31,6 +31,8 @@ struct BellmanFord11BoundingBox {
   std::int32_t max_y = 0;
 };
 
+inline constexpr int kBellmanFord11MaximumIterationsPerHostCheck = 64;
+
 struct BellmanFord11RunOptions {
   BellmanFord11BoundingBox bounds{};
   // The persistent controller evaluates its exact nonnegative-distance target
@@ -55,6 +57,11 @@ struct BellmanFord11WorkspaceOptions {
   // Collect aggregate phase/work telemetry. Disabled workspaces do not create
   // HIP events or execute telemetry counter operations.
   bool telemetry = false;
+  // Explicit-stream workspaces use the host-controlled BF11 path. Values
+  // larger than one let that path enqueue several ordered device iterations
+  // before copying controller state back to the CPU. The cooperative
+  // single-worker controller ignores this setting.
+  int iterations_per_host_check = 1;
 };
 
 // Process-wide aggregate for one benchmark/run interval. PathFinder resets it
@@ -93,6 +100,14 @@ struct BellmanFord11RuntimeStats {
   std::uint64_t workspace_device_bytes_per_worker_max = 0;
   std::uint64_t gpu_free_before_workers = 0;
   std::uint64_t gpu_free_after_workers = 0;
+  std::uint64_t iterations_per_host_check = 1;
+  std::uint64_t host_check_rounds = 0;
+  std::uint64_t iteration_status_copies = 0;
+  std::uint64_t stream_synchronizations_for_iteration_control = 0;
+  std::uint64_t device_iterations_enqueued = 0;
+  std::uint64_t device_iterations_executed = 0;
+  std::uint64_t terminal_noop_iterations = 0;
+  std::uint64_t speculative_iterations = 0;
 };
 
 void reset_bellman_ford11_runtime_stats();
@@ -100,7 +115,8 @@ void configure_bellman_ford11_runtime_stats(
     bool telemetry_enabled,
     std::uint64_t requested_workers,
     std::uint64_t effective_workers,
-    std::uint64_t gpu_free_before_workers);
+    std::uint64_t gpu_free_before_workers,
+    std::uint64_t iterations_per_host_check = 1);
 BellmanFord11RuntimeStats bellman_ford11_runtime_stats();
 
 class BellmanFord11CsrGraph {

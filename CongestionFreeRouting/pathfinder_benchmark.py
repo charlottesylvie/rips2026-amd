@@ -127,6 +127,15 @@ def positive_int_arg(value: str) -> int:
     return numeric
 
 
+def bf11_iterations_per_host_check_arg(value: str) -> int:
+    numeric = positive_int_arg(value)
+    if numeric > 64:
+        raise argparse.ArgumentTypeError(
+            "BF11 iterations per host check must be between 1 and 64"
+        )
+    return numeric
+
+
 def nonnegative_i32_arg(value: str) -> int:
     try:
         numeric = int(value)
@@ -278,6 +287,11 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         help="positive BF11 device target-check interval",
     )
     parser.add_argument(
+        "--bf11-iterations-per-host-check",
+        type=bf11_iterations_per_host_check_arg,
+        help="BF11 host-controlled device iterations per status check (1-64)",
+    )
+    parser.add_argument(
         "--bf11-no-unbounded-fallback",
         action="store_true",
         help="do not retry an unreachable bounded BF11 query unbounded",
@@ -349,6 +363,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         or args.bf11_bbox_margin_x is not None
         or args.bf11_bbox_margin_y is not None
         or args.bf11_target_check_interval is not None
+        or args.bf11_iterations_per_host_check is not None
         or args.bf11_no_unbounded_fallback
         or args.bf11_telemetry
     )
@@ -407,6 +422,10 @@ def pathfinder_args(args: argparse.Namespace) -> list[str]:
         ("bf11_bbox_margin_x", "--bf11-bbox-margin-x"),
         ("bf11_bbox_margin_y", "--bf11-bbox-margin-y"),
         ("bf11_target_check_interval", "--bf11-target-check-interval"),
+        (
+            "bf11_iterations_per_host_check",
+            "--bf11-iterations-per-host-check",
+        ),
         ("max_pathfinder_iters", "--max-pathfinder-iters"),
         ("max_sssp_iters", "--max-sssp-iters"),
         ("capacity", "--capacity"),

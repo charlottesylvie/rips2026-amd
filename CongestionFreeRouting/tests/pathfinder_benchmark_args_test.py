@@ -86,6 +86,7 @@ def main() -> None:
         and defaults.bf11_bbox_margin_x is None
         and defaults.bf11_bbox_margin_y is None
         and defaults.bf11_target_check_interval is None
+        and defaults.bf11_iterations_per_host_check is None
         and not defaults.bf11_no_unbounded_fallback
         and not defaults.bf11_telemetry,
         "BF11 controls must remain unset by default",
@@ -228,6 +229,15 @@ def main() -> None:
     )
     for invalid in ("-1", "1.5", "margin", "2147483648"):
         require_arg_rejected(benchmark.nonnegative_i32_arg, invalid)
+    for valid in ("1", "2", "4", "64"):
+        require(
+            benchmark.bf11_iterations_per_host_check_arg(valid) == int(valid),
+            "BF11 host-check parser rejected a supported value",
+        )
+    for invalid in ("0", "-1", "1.5", "not-a-number", "65"):
+        require_arg_rejected(
+            benchmark.bf11_iterations_per_host_check_arg, invalid
+        )
 
     bf11 = benchmark.parse_args(
         [
@@ -242,6 +252,8 @@ def main() -> None:
             "18",
             "--bf11-target-check-interval",
             "3",
+            "--bf11-iterations-per-host-check",
+            "4",
             "--bf11-no-unbounded-fallback",
             "--bf11-telemetry",
             "--bf11-telemetry",
@@ -261,6 +273,8 @@ def main() -> None:
             "18",
             "--bf11-target-check-interval",
             "3",
+            "--bf11-iterations-per-host-check",
+            "4",
         ],
         "BF11 controls were not forwarded canonically",
     )
@@ -270,6 +284,7 @@ def main() -> None:
         ["--bf11-bbox-margin-x", "4"],
         ["--bf11-bbox-margin-y", "18"],
         ["--bf11-target-check-interval", "3"],
+        ["--bf11-iterations-per-host-check", "4"],
         ["--bf11-no-unbounded-fallback"],
         ["--bf11-telemetry"],
     ):

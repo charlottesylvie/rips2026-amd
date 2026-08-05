@@ -8,6 +8,7 @@ std::atomic<std::uint64_t> g_bf11_stub_free_before_workers{0};
 std::atomic<std::uint64_t> g_bf11_stub_workspace_constructions{0};
 std::atomic<std::uint64_t> g_bf11_stub_telemetry_workspaces{0};
 std::atomic<bool> g_bf11_stub_telemetry_enabled{false};
+std::atomic<std::uint64_t> g_bf11_stub_iterations_per_host_check{1};
 // Test-only failure injection. Deliberately not cleared by PathFinder's stats
 // reset so a test can arm it before run_pathfinder constructs worker state.
 std::atomic<std::uint64_t> g_bf11_stub_throw_on_workspace_construction{0};
@@ -27,17 +28,20 @@ void reset_bellman_ford11_runtime_stats() {
   g_bf11_stub_workspace_constructions = 0;
   g_bf11_stub_telemetry_workspaces = 0;
   g_bf11_stub_telemetry_enabled = false;
+  g_bf11_stub_iterations_per_host_check = 1;
 }
 
 void configure_bellman_ford11_runtime_stats(
     bool telemetry_enabled,
     std::uint64_t requested_workers,
     std::uint64_t effective_workers,
-    std::uint64_t gpu_free_before_workers) {
+    std::uint64_t gpu_free_before_workers,
+    std::uint64_t iterations_per_host_check) {
   g_bf11_stub_telemetry_enabled = telemetry_enabled;
   g_bf11_stub_requested_workers = requested_workers;
   g_bf11_stub_effective_workers = effective_workers;
   g_bf11_stub_free_before_workers = gpu_free_before_workers;
+  g_bf11_stub_iterations_per_host_check = iterations_per_host_check;
 }
 
 BellmanFord11RuntimeStats bellman_ford11_runtime_stats() {
@@ -48,6 +52,8 @@ BellmanFord11RuntimeStats bellman_ford11_runtime_stats() {
   stats.workspace_state_initializations =
       g_bf11_stub_workspace_constructions;
   stats.gpu_free_before_workers = g_bf11_stub_free_before_workers;
+  stats.iterations_per_host_check =
+      g_bf11_stub_iterations_per_host_check;
   return stats;
 }
 

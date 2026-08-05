@@ -371,6 +371,12 @@ void validate_options(const PathfinderOptions& options) {
     throw std::invalid_argument(
         "BF11 target-check interval must be positive");
   }
+  if (options.bf11_iterations_per_host_check <= 0 ||
+      options.bf11_iterations_per_host_check >
+          kBellmanFord11MaximumIterationsPerHostCheck) {
+    throw std::invalid_argument(
+        "BF11 iterations per host check must be between 1 and 64");
+  }
   if (options.sssp_engine != SsspEngine::kBellmanFord11 &&
       (options.bf11_controls_explicit || options.bf11_telemetry)) {
     throw std::invalid_argument(
@@ -2228,6 +2234,8 @@ void print_usage(const char* program) {
       << "  --bf11-bbox-margin-y <int>      Nonnegative BF11 vertical margin. Default: 14\n"
       << "  --bf11-target-check-interval <int>\n"
       << "                                  Positive device-side target-check interval. Default: 1\n"
+      << "  --bf11-iterations-per-host-check <int>\n"
+      << "                                  Host-controlled BF11 iterations per status check (1-64). Default: 1\n"
       << "  --bf11-no-unbounded-fallback    Do not retry an unreachable bounded query unbounded.\n"
       << "  --bf11-telemetry                Emit one aggregate BF11 phase/work/memory telemetry record.\n"
       << "  --delta-force-generic           Bypass exact-unit specialization; retain weights and delta.\n"
@@ -3069,7 +3077,9 @@ PathfinderResult run_pathfinder(const HostCsrF32& base_graph,
           static_cast<std::uint64_t>(bf11_requested_worker_count),
           static_cast<std::uint64_t>(bf11_worker_count),
           static_cast<std::uint64_t>(
-              bf11_recommendation.free_device_bytes));
+              bf11_recommendation.free_device_bytes),
+          static_cast<std::uint64_t>(
+              bf11_options.bf11_iterations_per_host_check));
       if (bf11_worker_count > 1) {
         std::cout
             << "[pathfinder] BF11 parallel workers use independent explicit "
@@ -3088,6 +3098,8 @@ PathfinderResult run_pathfinder(const HostCsrF32& base_graph,
       workspace_options.target_check_interval =
           bf11_options.bf11_target_check_interval;
       workspace_options.telemetry = bf11_options.bf11_telemetry;
+      workspace_options.iterations_per_host_check =
+          bf11_options.bf11_iterations_per_host_check;
       route_all_nets_with_workspace(
           base_graph,
           metadata,
@@ -3117,6 +3129,22 @@ PathfinderResult run_pathfinder(const HostCsrF32& base_graph,
                 << bf11_stats.persistent_controller_runs
                 << ",\"host_controller_runs\":"
                 << bf11_stats.host_controller_runs
+                << ",\"iterations_per_host_check\":"
+                << bf11_stats.iterations_per_host_check
+                << ",\"host_check_rounds\":"
+                << bf11_stats.host_check_rounds
+                << ",\"iteration_status_copies\":"
+                << bf11_stats.iteration_status_copies
+                << ",\"stream_synchronizations_for_iteration_control\":"
+                << bf11_stats.stream_synchronizations_for_iteration_control
+                << ",\"device_iterations_enqueued\":"
+                << bf11_stats.device_iterations_enqueued
+                << ",\"device_iterations_executed\":"
+                << bf11_stats.device_iterations_executed
+                << ",\"terminal_noop_iterations\":"
+                << bf11_stats.terminal_noop_iterations
+                << ",\"speculative_iterations\":"
+                << bf11_stats.speculative_iterations
                 << ",\"target_checks\":" << bf11_stats.target_checks
                 << ",\"auto_unbounded_retries\":"
                 << bf11_stats.auto_unbounded_retries
@@ -3134,7 +3162,24 @@ PathfinderResult run_pathfinder(const HostCsrF32& base_graph,
             << ",\"queries\":" << bf11_stats.telemetry_queries
             << ",\"completed_queries\":"
             << bf11_stats.telemetry_completed_queries
-            << ",\"timing_nanoseconds\":{"
+            << ",\"iteration_control\":{"
+            << "\"iterations_per_host_check\":"
+            << bf11_stats.iterations_per_host_check
+            << ",\"host_check_rounds\":"
+            << bf11_stats.host_check_rounds
+            << ",\"iteration_status_copies\":"
+            << bf11_stats.iteration_status_copies
+            << ",\"stream_synchronizations_for_iteration_control\":"
+            << bf11_stats.stream_synchronizations_for_iteration_control
+            << ",\"device_iterations_enqueued\":"
+            << bf11_stats.device_iterations_enqueued
+            << ",\"device_iterations_executed\":"
+            << bf11_stats.device_iterations_executed
+            << ",\"terminal_noop_iterations\":"
+            << bf11_stats.terminal_noop_iterations
+            << ",\"speculative_iterations\":"
+            << bf11_stats.speculative_iterations
+            << "},\"timing_nanoseconds\":{"
             << "\"total_query_cpu\":"
             << bf11_stats.total_query_nanoseconds
             << ",\"reset_seed_gpu\":"
@@ -3522,6 +3567,11 @@ int main(int argc, char** argv) {
         options.bf11_target_check_interval = routing::parse_int_arg(
             require_value("--bf11-target-check-interval"),
             "bf11-target-check-interval");
+        options.bf11_controls_explicit = true;
+      } else if (option == "--bf11-iterations-per-host-check") {
+        options.bf11_iterations_per_host_check = routing::parse_int_arg(
+            require_value("--bf11-iterations-per-host-check"),
+            "bf11-iterations-per-host-check");
         options.bf11_controls_explicit = true;
       } else if (option == "--bf11-no-unbounded-fallback") {
         options.bf11_unbounded_fallback = false;

@@ -469,6 +469,7 @@ Tuning options:
 | `--bf11-bbox-margin-x <int>` | `2` | Nonnegative horizontal expansion applied to BF11's inclusive endpoint box, matching the integer layers admitted by RWRoute's strict X extension of 3. |
 | `--bf11-bbox-margin-y <int>` | `14` | Nonnegative vertical expansion applied to BF11's inclusive endpoint box, matching the integer layers admitted by RWRoute's strict Y extension of 15. |
 | `--bf11-target-check-interval <int>` | `1` | Check BF11's exact nonnegative-distance target certificate every N relaxation rounds. |
+| `--bf11-iterations-per-host-check <int>` | `1` | Enqueue 1-64 ordered iterations between status transfers on the host-controlled BF11 path. The single-worker persistent controller is unchanged. |
 | `--bf11-no-unbounded-fallback` | unset | Keep an unreachable auto-bounded query inside its initial box instead of retrying once unbounded. |
 | `--bf11-telemetry` | unset | Emit aggregate BF11 GPU phase times, blocking synchronization time, work counts, touched density, worker workspace bytes, and free-memory snapshots. |
 | `--capacity <int>` | `1` | Capacity used only for overuse diagnostics. |
@@ -498,6 +499,41 @@ all dynamic destination multipliers or update a sparse node list between
 queries; compact results carry effective per-edge costs so PathFinder preserves
 the weighted route distance. The one-shot PathFinder controller currently
 leaves dynamic multipliers at `1`.
+
+#### BF11 host-check experiment
+
+On the Radeon 8060S/gfx1151 benchmark host, the following command builds the
+normal timing binary for `gfx1151`, runs one warm-up plus five measured passes
+for K=1,2,4,8 with four workers and the first 1,000 d181 nets, validates route
+trees against K=1, and profiles K=1 plus the fastest experimental K:
+
+```bash
+python3 CongestionFreeRouting/profiling/bf11_host_check_experiment.py \
+  --build \
+  --pathfinder ./pathfinder \
+  --graph d181-profile-work/mlcad_d181_lefttwo3rds_PathFinderFile.csrbin \
+  --metadata d181-profile-work/mlcad_d181_lefttwo3rds_PathFinderFile.csrbin.ifmeta.bin \
+  --output-dir d181-profile-work/bf11-host-check-results \
+  --profile
+```
+
+`--build` invokes `make` with `PATHFINDER_BUILD_COMPONENTS=1` and
+`PATHFINDER_HIP_FLAGS=-std=c++17 -O3 -x hip --offload-arch=gfx1151`. It also
+builds a separate `pathfinder-roctx` executable for trace runs, leaving ROCTx
+overhead out of the unprofiled measurements. The profile build requires the
+`rocprofiler-sdk-roctx` headers and library.
+
+The output directory contains every warm-up/measured/route log, one route
+JSONL per K, `summary.json`/`summary.md`, the requested CSV/PFTrace artifacts,
+a required fresh RocPD database, per-trace summaries, and
+`profile-comparison.json`/`.md`. A missing CSV or PFTrace is recorded as a
+warning when profiler finalization still left an analyzable database. The
+analyzer uses the `pathfinder.run` ROCTx interval, unions overlapping GPU
+dispatches across worker streams, and reports dispatch, copy, synchronization, active-time,
+relaxation-duration, runtime-copy, and inter-dispatch-gap comparisons. A
+profiler finalization status of 139 (or direct SIGSEGV) remains usable only
+when Pathfinder reports 1,000 completed queries and a fresh nonempty RocPD
+database can be analyzed.
 
 The converter emits exact unit weights. An automatic vector-target Delta
 workspace uses its append-only exact-unit specialization only when the graph
@@ -633,7 +669,7 @@ Useful wrapper options:
 | `--interchange-to-csr <path>` | Override converter executable. Env: `INTERCHANGE_TO_CSR`. |
 | `--pathfinder <path>` | Override PathFinder executable. Env: `PATHFINDER_BIN`. |
 | `--routes-to-phys <path>` | Override route reconstructor. Env: `ROUTES_TO_PHYS`. |
-| `--sssp-engine`, `--use-delta-step`, `--delta`, `--delta-multiplier`, `--delta-force-generic`, `--delta-force-legacy-parent`, `--delta-controller`, `--delta-controller-batch-size`, `--delta-telemetry`, `--delta-benchmark-weights`, `--delta-benchmark-weight-seed`, `--bf11-unbounded`, `--bf11-bbox-margin-x`, `--bf11-bbox-margin-y`, `--bf11-target-check-interval`, `--bf11-no-unbounded-fallback`, `--bf11-telemetry`, `--max-sssp-iters`, `--net-limit`, `--parallel-net-workers`, `--capacity` | Forwarded to `pathfinder`. |
+| `--sssp-engine`, `--use-delta-step`, `--delta`, `--delta-multiplier`, `--delta-force-generic`, `--delta-force-legacy-parent`, `--delta-controller`, `--delta-controller-batch-size`, `--delta-telemetry`, `--delta-benchmark-weights`, `--delta-benchmark-weight-seed`, `--bf11-unbounded`, `--bf11-bbox-margin-x`, `--bf11-bbox-margin-y`, `--bf11-target-check-interval`, `--bf11-iterations-per-host-check`, `--bf11-no-unbounded-fallback`, `--bf11-telemetry`, `--max-sssp-iters`, `--net-limit`, `--parallel-net-workers`, `--capacity` | Forwarded to `pathfinder`. |
 | `--max-pathfinder-iters`, `--present-factor`, `--present-multiplier`, `--history-factor`, `--route-batch-size` | Compatibility-only; forwarded to `pathfinder` and ignored. |
 
 ## File Formats And Artifacts
@@ -830,6 +866,13 @@ Host-side BF11 sparse-reset and explicit-stream controller policy guard:
 
 ```bash
 python3 CongestionFreeRouting/tests/bf11_sparse_reset_source_test.py
+```
+
+Host-only BF11 experiment-runner parsing, route-equivalence, and synthetic
+RocPD analysis test:
+
+```bash
+python3 CongestionFreeRouting/tests/bf11_host_check_experiment_test.py
 ```
 
 Python route-writer regression test:

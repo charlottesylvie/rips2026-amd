@@ -111,6 +111,8 @@ int main() {
          "18",
          "--bf11-target-check-interval",
          "3",
+         "--bf11-iterations-per-host-check",
+         "4",
          "--bf11-no-unbounded-fallback",
          "--bf11-telemetry",
          "--bf11-telemetry"});
@@ -124,6 +126,8 @@ int main() {
                                           "18",
                                           "--bf11-target-check-interval",
                                           "3",
+                                          "--bf11-iterations-per-host-check",
+                                          "4",
                                           "--bf11-no-unbounded-fallback",
                                           "--bf11-telemetry"}),
             "router did not preserve BF11 option forwarding");
@@ -155,6 +159,18 @@ int main() {
     }
     require(missing_controller_batch_rejected,
             "router accepted a controller batch option without its value");
+
+    bool missing_bf11_host_check_rejected = false;
+    try {
+      (void)parse({"PathFinderFile",
+                   "design_unrouted.phys",
+                   "design_routed.phys",
+                   "--bf11-iterations-per-host-check"});
+    } catch (const std::runtime_error&) {
+      missing_bf11_host_check_rejected = true;
+    }
+    require(missing_bf11_host_check_rejected,
+            "router accepted a BF11 host-check option without its value");
 
     for (const std::string& weight_family :
          std::vector<std::string>({"unit", "all-light", "all-heavy"})) {

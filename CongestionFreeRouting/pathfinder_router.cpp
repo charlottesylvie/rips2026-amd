@@ -213,6 +213,8 @@ void print_usage(const char* program) {
       << "  --bf11-bbox-margin-y <int>     Forward BF11 vertical bounding margin.\n"
       << "  --bf11-target-check-interval <int>\n"
       << "                                 Forward BF11 device target-check interval.\n"
+      << "  --bf11-iterations-per-host-check <int>\n"
+      << "                                 Forward BF11 host-control check interval.\n"
       << "  --bf11-no-unbounded-fallback   Keep an unreachable BF11 query bounded.\n"
       << "  --bf11-telemetry               Forward opt-in aggregate BF11 telemetry.\n"
       << "  --net-limit <count>            Forwarded to pathfinder.\n"
@@ -311,6 +313,7 @@ Options parse_args(int argc, char** argv) {
                option == "--bf11-bbox-margin-x" ||
                option == "--bf11-bbox-margin-y" ||
                option == "--bf11-target-check-interval" ||
+               option == "--bf11-iterations-per-host-check" ||
                option == "--max-pathfinder-iters" ||
                option == "--max-sssp-iters" ||
                option == "--net-limit" ||

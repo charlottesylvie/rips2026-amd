@@ -326,6 +326,15 @@ void test_validation_and_dynamic_updates() {
 
   auto shared_graph =
       std::make_shared<BellmanFord11CsrGraph>(graph, sidecars, nullptr);
+  for (const int invalid_host_check : {0, 65}) {
+    require_throws<std::invalid_argument>(
+        "out-of-range BF11 iterations per host check", [&] {
+          BellmanFord11WorkspaceOptions invalid_options;
+          invalid_options.iterations_per_host_check = invalid_host_check;
+          BellmanFord11CsrWorkspace rejected(
+              shared_graph, nullptr, invalid_options);
+        });
+  }
   BellmanFord11CsrWorkspace first(shared_graph, nullptr);
   BellmanFord11CsrWorkspace independent(shared_graph, nullptr);
   const std::vector<float> unit_dynamic(4, 1.0f);
@@ -441,9 +450,13 @@ void test_defensive_reset_after_controller_error() {
   const ri::RoutingCsrSidecars sidecars =
       make_sidecars({0, 1, 2}, {0, 0, 0}, {1.0f, 1.0f, largest});
   HipStream stream;
-  BellmanFord11CsrWorkspace workspace(graph, sidecars, stream.get());
+  BellmanFord11WorkspaceOptions options;
+  options.iterations_per_host_check = 4;
+  BellmanFord11CsrWorkspace workspace(
+      graph, sidecars, stream.get(), options);
 
   bf11_internal_reset_counters();
+  configure_bellman_ford11_runtime_stats(false, 1, 1, 0, 4);
   require_throws<std::runtime_error>("nonfinite BF11 effective edge weight",
                                      [&] {
     (void)workspace.run(std::vector<int>{0}, std::vector<int>{1}, 1.0f, -1,
@@ -455,8 +468,15 @@ void test_defensive_reset_after_controller_error() {
       nullptr, nullptr);
   validate_paths("BF11 defensive reset after controller error", graph,
                  sidecars, std::vector<float>(3, 1.0f), {2}, {1}, recovered);
+  const BellmanFord11RuntimeStats stats = bellman_ford11_runtime_stats();
   require(!recovered.target_reached && recovered.target_path_nodes.empty() &&
-              bf11_internal_dense_state_reset_count() == 1,
+              bf11_internal_dense_state_reset_count() == 1 &&
+              stats.iterations_per_host_check == 4 &&
+              stats.host_check_rounds == 2 &&
+              stats.iteration_status_copies == 2 &&
+              stats.device_iterations_enqueued == 4 &&
+              stats.device_iterations_executed == 2 &&
+              stats.terminal_noop_iterations == 2,
           "BF11 reused partial state instead of taking one defensive reset");
 }
 
@@ -878,6 +898,18 @@ void test_opt_in_telemetry() {
               measured_gpu_phase_nanoseconds > 0 &&
               enabled_stats.stream_synchronize_cpu_nanoseconds > 0 &&
               enabled_stats.iterations > 0 &&
+              enabled_stats.iterations_per_host_check == 1 &&
+              enabled_stats.host_check_rounds == enabled_stats.iterations &&
+              enabled_stats.iteration_status_copies ==
+                  enabled_stats.host_check_rounds &&
+              enabled_stats
+                      .stream_synchronizations_for_iteration_control ==
+                  enabled_stats.host_check_rounds &&
+              enabled_stats.device_iterations_enqueued ==
+                  enabled_stats.iterations &&
+              enabled_stats.device_iterations_executed ==
+                  enabled_stats.iterations &&
+              enabled_stats.terminal_noop_iterations == 0 &&
               enabled_stats.frontier_vertices_processed > 0 &&
               enabled_stats.edges_examined > 0 &&
               enabled_stats.successful_relaxations > 0 &&
@@ -1085,11 +1117,159 @@ void require_same_result(const std::string& label,
           label + ": worker count changed the complete BF11 result");
 }
 
+struct HostWindowObservation {
+  BellmanFordCsrResult result;
+  BellmanFord11RuntimeStats stats;
+};
+
+HostWindowObservation run_host_window_observation(
+    const HostCsrF32& graph,
+    const ri::RoutingCsrSidecars& sidecars,
+    const std::vector<int>& sources,
+    const std::vector<int>& targets,
+    int iterations_per_host_check,
+    int max_iters = -1,
+    int target_check_interval = 1) {
+  HipStream stream;
+  BellmanFord11WorkspaceOptions options;
+  options.telemetry = true;
+  options.target_check_interval = target_check_interval;
+  options.iterations_per_host_check = iterations_per_host_check;
+  reset_bellman_ford11_runtime_stats();
+  configure_bellman_ford11_runtime_stats(
+      true, 1, 1, 0,
+      static_cast<std::uint64_t>(iterations_per_host_check));
+  BellmanFord11CsrWorkspace workspace(
+      graph, sidecars, stream.get(), options);
+  HostWindowObservation observation;
+  observation.result = workspace.run(
+      sources, targets, 1.0f, max_iters, stream.get(), nullptr, nullptr);
+  observation.stats = bellman_ford11_runtime_stats();
+  return observation;
+}
+
+void require_host_window_counters(const std::string& label,
+                                  const BellmanFord11RuntimeStats& stats,
+                                  int iterations_per_host_check,
+                                  std::uint64_t host_checks,
+                                  std::uint64_t enqueued,
+                                  std::uint64_t executed,
+                                  std::uint64_t terminal_noops) {
+  require(stats.iterations_per_host_check ==
+                  static_cast<std::uint64_t>(iterations_per_host_check) &&
+              stats.host_controller_runs == 1 &&
+              stats.persistent_controller_runs == 0 &&
+              stats.host_check_rounds == host_checks &&
+              stats.iteration_status_copies == host_checks &&
+              stats.stream_synchronizations_for_iteration_control ==
+                  host_checks &&
+              stats.device_iterations_enqueued == enqueued &&
+              stats.device_iterations_executed == executed &&
+              stats.terminal_noop_iterations == terminal_noops &&
+              stats.speculative_iterations == terminal_noops &&
+              enqueued == executed + terminal_noops,
+          label + ": host-window control counters are inconsistent");
+}
+
+void test_host_check_windows_and_terminal_noops() {
+  constexpr int kChainGraphVertices = 9;
+  const HostCsrF32 chain_graph = make_graph(
+      kChainGraphVertices,
+      {{0, 1, 1.0f}, {1, 2, 1.0f}, {2, 3, 1.0f},
+       {3, 4, 1.0f}, {4, 5, 1.0f}});
+  const ri::RoutingCsrSidecars chain_sidecars = make_sidecars(
+      {0, 1, 2, 3, 4, 5, 6, 7, 8},
+      {0, 0, 0, 0, 0, 0, 0, 0, 0});
+  const std::vector<float> chain_dynamic(kChainGraphVertices, 1.0f);
+
+  const HostWindowObservation default_k1 = run_host_window_observation(
+      chain_graph, chain_sidecars, {0}, {5}, 1);
+  validate_paths("BF11 default-sized host check", chain_graph, chain_sidecars,
+                 chain_dynamic, {0}, {5}, default_k1.result);
+  require(default_k1.result.iterations_used == 5 &&
+              default_k1.result.stopped_on_target &&
+              default_k1.stats.edges_examined == 5,
+          "BF11 K=1 control route did not retain the original semantics");
+  require_host_window_counters("BF11 K=1", default_k1.stats, 1, 5, 5, 5, 0);
+
+  const HostWindowObservation k2 = run_host_window_observation(
+      chain_graph, chain_sidecars, {0}, {5}, 2);
+  const HostWindowObservation k4 = run_host_window_observation(
+      chain_graph, chain_sidecars, {0}, {5}, 4);
+  validate_paths("BF11 K=2 frontier parity", chain_graph, chain_sidecars,
+                 chain_dynamic, {0}, {5}, k2.result);
+  validate_paths("BF11 K=4 frontier parity", chain_graph, chain_sidecars,
+                 chain_dynamic, {0}, {5}, k4.result);
+  require_same_result("BF11 K=2 route equivalence", default_k1.result,
+                      k2.result);
+  require_same_result("BF11 K=4 route equivalence", default_k1.result,
+                      k4.result);
+  require(k2.stats.edges_examined == 5 && k4.stats.edges_examined == 5,
+          "BF11 host windows repeated graph traversal after completion");
+  require_host_window_counters("BF11 K=2", k2.stats, 2, 3, 6, 5, 1);
+  require_host_window_counters("BF11 K=4", k4.stats, 4, 2, 8, 5, 3);
+
+  const HostCsrF32 early_graph = make_graph(5, {{0, 1, 1.0f}});
+  const ri::RoutingCsrSidecars early_sidecars = make_sidecars(
+      {0, 1, 2, 3, 4}, {0, 0, 0, 0, 0});
+  const HostWindowObservation early = run_host_window_observation(
+      early_graph, early_sidecars, {0}, {1}, 4);
+  validate_paths("BF11 early terminal host window", early_graph,
+                 early_sidecars, std::vector<float>(5, 1.0f), {0}, {1},
+                 early.result);
+  require(early.result.iterations_used == 1 &&
+              early.result.stopped_on_target &&
+              early.stats.edges_examined == 1,
+          "BF11 did meaningful work after an early terminal latch");
+  require_host_window_counters("BF11 early K=4", early.stats, 4, 1, 4, 1, 3);
+
+  const HostCsrF32 empty_graph = make_graph(5, {});
+  const ri::RoutingCsrSidecars empty_sidecars = make_sidecars(
+      {0, 1, 2, 3, 4}, {0, 0, 0, 0, 0});
+  const HostWindowObservation empty = run_host_window_observation(
+      empty_graph, empty_sidecars, {0}, {1}, 4);
+  validate_paths("BF11 empty frontier host window", empty_graph,
+                 empty_sidecars, std::vector<float>(5, 1.0f), {0}, {1},
+                 empty.result);
+  require(empty.result.iterations_used == 1 && empty.result.converged &&
+              !empty.result.target_reached && empty.stats.edges_examined == 0,
+          "BF11 did meaningful work after empty-frontier termination");
+  require_host_window_counters("BF11 empty K=4", empty.stats, 4, 1, 4, 1, 3);
+
+  auto shared_graph = std::make_shared<BellmanFord11CsrGraph>(
+      chain_graph, chain_sidecars, nullptr);
+  BellmanFord11WorkspaceOptions persistent_options;
+  persistent_options.telemetry = true;
+  persistent_options.iterations_per_host_check = 4;
+  reset_bellman_ford11_runtime_stats();
+  configure_bellman_ford11_runtime_stats(true, 1, 1, 0, 4);
+  BellmanFord11CsrWorkspace persistent_workspace(
+      shared_graph, nullptr, persistent_options);
+  const BellmanFordCsrResult persistent = persistent_workspace.run(
+      std::vector<int>{0}, std::vector<int>{5}, 1.0f, -1,
+      nullptr, nullptr, nullptr);
+  const BellmanFord11RuntimeStats persistent_stats =
+      bellman_ford11_runtime_stats();
+  require_same_result("BF11 persistent K compatibility", default_k1.result,
+                      persistent);
+  if (persistent_stats.persistent_controller_runs != 0) {
+    require(persistent_stats.persistent_controller_runs == 1 &&
+                persistent_stats.host_controller_runs == 0 &&
+                persistent_stats.host_check_rounds == 0 &&
+                persistent_stats.iteration_status_copies == 0 &&
+                persistent_stats
+                        .stream_synchronizations_for_iteration_control == 0 &&
+                persistent_stats.device_iterations_enqueued == 0,
+            "BF11 host-check K changed the cooperative persistent controller");
+  }
+}
+
 std::vector<BellmanFordCsrResult> run_explicit_stream_workers(
     const std::shared_ptr<BellmanFord11CsrGraph>& shared_graph,
     const std::vector<float>& dynamic_cost,
     const std::vector<WorkerCountQuery>& queries,
-    std::size_t worker_count) {
+    std::size_t worker_count,
+    int iterations_per_host_check = 1) {
   require(worker_count > 0 && worker_count <= queries.size(),
           "invalid BF11 worker-count test configuration");
 
@@ -1099,8 +1279,10 @@ std::vector<BellmanFordCsrResult> run_explicit_stream_workers(
   workspaces.reserve(worker_count);
   for (std::size_t worker = 0; worker < worker_count; ++worker) {
     streams.push_back(std::make_unique<HipStream>());
+    BellmanFord11WorkspaceOptions workspace_options;
+    workspace_options.iterations_per_host_check = iterations_per_host_check;
     workspaces.push_back(std::make_unique<BellmanFord11CsrWorkspace>(
-        shared_graph, streams.back()->get()));
+        shared_graph, streams.back()->get(), workspace_options));
     workspaces.back()->update_vertex_costs(dynamic_cost,
                                            streams.back()->get());
   }
@@ -1248,6 +1430,19 @@ void test_explicit_stream_worker_count_invariance() {
       sequential_results = std::move(results);
     }
   }
+  for (const int iterations_per_host_check : {2, 4}) {
+    const std::vector<BellmanFordCsrResult> results =
+        run_explicit_stream_workers(shared_graph, dynamic_cost, queries, 4,
+                                    iterations_per_host_check);
+    for (std::size_t query_index = 0; query_index < queries.size();
+         ++query_index) {
+      require_same_result(
+          "BF11 four-worker K=" +
+              std::to_string(iterations_per_host_check) + " " +
+              queries[query_index].label,
+          sequential_results[query_index], results[query_index]);
+    }
+  }
 }
 
 }  // namespace
@@ -1262,6 +1457,7 @@ int main() {
     test_target_check_interval_and_settlement();
     test_opt_in_telemetry();
     test_parallel_explicit_stream_host_controller();
+    test_host_check_windows_and_terminal_noops();
     test_explicit_stream_worker_count_invariance();
     std::cout << "BF11 bounded dynamic HIP tests passed\n";
     return 0;

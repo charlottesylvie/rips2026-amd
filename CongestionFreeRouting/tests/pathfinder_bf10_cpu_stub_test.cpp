@@ -2012,9 +2012,35 @@ int main() {
   require(default_pathfinder_options.bf11_bbox_margin_x == 2 &&
               default_pathfinder_options.bf11_bbox_margin_y == 14 &&
               default_bf11_workspace_options.auto_margin_x == 2 &&
-              default_bf11_workspace_options.auto_margin_y == 14,
+              default_bf11_workspace_options.auto_margin_y == 14 &&
+              default_pathfinder_options.bf11_iterations_per_host_check == 1 &&
+              default_bf11_workspace_options.iterations_per_host_check == 1,
           "BF11 inclusive automatic margins must match RWRoute's strict "
-          "3/15 bounding-box admission");
+          "3/15 bounding-box admission and host-check batching must default "
+          "to one iteration");
+  for (const int invalid_host_check : {0, 65}) {
+    routing::PathfinderOptions invalid_bf11_options;
+    invalid_bf11_options.sssp_engine =
+        routing::SsspEngine::kBellmanFord11;
+    invalid_bf11_options.bf11_iterations_per_host_check = invalid_host_check;
+    bool rejected = false;
+    try {
+      routing::validate_options(invalid_bf11_options);
+    } catch (const std::invalid_argument&) {
+      rejected = true;
+    }
+    require(rejected,
+            "BF11 accepted an out-of-range iterations-per-host-check value");
+  }
+  bool nonnumeric_bf11_host_check_rejected = false;
+  try {
+    (void)routing::parse_int_arg("not-a-number",
+                                 "bf11-iterations-per-host-check");
+  } catch (const std::runtime_error&) {
+    nonnumeric_bf11_host_check_rejected = true;
+  }
+  require(nonnumeric_bf11_host_check_rejected,
+          "BF11 accepted a nonnumeric iterations-per-host-check value");
   require(default_pathfinder_options.delta == 1.0f,
           "default delta-stepping bucket width must be one");
   require(!default_pathfinder_options.delta_auto,
@@ -2717,6 +2743,7 @@ int main() {
   explicit_bf11_options.sssp_engine = routing::SsspEngine::kBellmanFord11;
   explicit_bf11_options.parallel_net_workers = 8;
   explicit_bf11_options.bf11_telemetry = true;
+  explicit_bf11_options.bf11_iterations_per_host_check = 4;
   explicit_bf11_options.bf11_controls_explicit = true;
   routing::PathfinderResult explicit_bf11_result;
   std::string explicit_bf11_stdout;
@@ -2737,6 +2764,7 @@ int main() {
               g_bf11_stub_effective_workers == 2 &&
               g_bf11_stub_workspace_constructions == 2 &&
               g_bf11_stub_telemetry_workspaces == 2 &&
+              g_bf11_stub_iterations_per_host_check == 4 &&
               g_bf11_stub_telemetry_enabled,
           "PathFinder lost requested/effective BF11 workers or telemetry options");
   require(explicit_bf11_stdout.find(
@@ -2747,6 +2775,18 @@ int main() {
                   std::string::npos &&
               explicit_bf11_stdout.find("\"effective_workers\":2") !=
                   std::string::npos &&
+              explicit_bf11_stdout.find(
+                  "\"iterations_per_host_check\":4") !=
+                  std::string::npos &&
+              explicit_bf11_stdout.find("\"host_check_rounds\":") !=
+                  std::string::npos &&
+              explicit_bf11_stdout.find(
+                  "\"iteration_status_copies\":") != std::string::npos &&
+              explicit_bf11_stdout.find(
+                  "\"stream_synchronizations_for_iteration_control\":") !=
+                  std::string::npos &&
+              explicit_bf11_stdout.find(
+                  "\"terminal_noop_iterations\":") != std::string::npos &&
               explicit_bf11_stdout.find(
                   "\"peak_workspace_device_bytes_estimate\":") !=
                   std::string::npos,
