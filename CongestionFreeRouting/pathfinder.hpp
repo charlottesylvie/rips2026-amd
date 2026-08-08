@@ -32,10 +32,36 @@ struct PipData {
   bool forward = true;
 };
 
+// Numeric values are part of the v7 metadata ABI.
+enum class EndpointPipRole : std::uint64_t {
+  kSource = 0,
+  kSink = 1,
+};
+
+// A sparse, endpoint-owned pseudo-PIP.  csr_edge/from/to identify the exact
+// directed CSR edge; the remaining PIP fields make route reconstruction
+// independently checkable against the ordinary edge/PIP tables.  The exact
+// physical endpoint and role prevent the pseudo-PIP from being used as a
+// general transit edge.
+struct EndpointPip {
+  minplus_sparse::Offset csr_edge = -1;
+  int from = -1;
+  int to = -1;
+  std::uint64_t tile_string = kNoIndex;
+  std::uint64_t wire0_string = kNoIndex;
+  std::uint64_t wire1_string = kNoIndex;
+  bool forward = true;
+  std::uint64_t site_string = kNoIndex;
+  int endpoint_node = -1;
+  EndpointPipRole role = EndpointPipRole::kSource;
+};
+
 struct SitePinNode {
   int node = -1;
   std::uint64_t site_string = 0;
   std::uint64_t pin_string = 0;
+  // kNoIndex means that this endpoint permits no attachment pseudo-PIP.
+  std::uint64_t endpoint_pip_index = kNoIndex;
 };
 
 struct RouteRequest {
@@ -57,6 +83,7 @@ struct RoutingMetadata {
   std::vector<std::uint64_t> node_wire_type_strings;
   std::vector<EdgeAttr> edge_attrs;
   std::vector<PipData> pip_data;
+  std::vector<EndpointPip> endpoint_pips;
   std::vector<SitePinNode> site_pin_attrs;
   std::vector<RouteRequest> route_requests;
   std::vector<std::uint64_t> blocked_nodes;
@@ -65,7 +92,7 @@ struct RoutingMetadata {
   std::uint64_t physical_path_string = kNoIndex;
   std::uint64_t logical_path_string = kNoIndex;
   std::uint64_t logical_design_name_string = kNoIndex;
-  // The routing-only v6 sidecar deliberately omits graph-sized per-node
+  // The routing-only v6+ sidecar deliberately omits graph-sized per-node
   // metadata arrays.  Keep the declared header count separately so callers
   // can still verify that the sidecar and CSR describe the same graph.  Zero
   // preserves the historical direct-test convention of deriving the count
@@ -74,11 +101,14 @@ struct RoutingMetadata {
   // Like declared_node_count, this lets the routing-only loader validate the
   // CSR/metadata pairing without retaining the graph-sized edge/PIP tables.
   std::uint64_t declared_edge_attr_count = 0;
+  // Routing-only loads retain the sparse-table cardinality so v7 endpoint
+  // references can still be range-checked without materializing the table.
+  std::uint64_t declared_endpoint_pip_count = 0;
 };
 
 enum class InterchangeMetadataLoadMode {
   // Materialize every section represented by RoutingMetadata.  V6 still has
-  // no per-node arrays because those sections are absent from the format.
+  // no per-node arrays, and later versions retain that compact representation.
   kFull,
   // Load only strings and route requests needed by PathFinder. Large unused
   // sections are range-checked and skipped without throwaway allocations.

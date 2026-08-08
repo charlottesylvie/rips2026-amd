@@ -76,6 +76,139 @@ constexpr bool include_pip_in_static_graph(bool conventional) {
   return conventional;
 }
 
+// The xcvu3p IOB does not connect directly to ordinary inter-site routing.
+// Two directional XIPHY pseudo PIPs cross a BITSLICE site at the boundary:
+// RX_D_PIN -> RX_Q5 for an IOB/I source and TX_D0 -> TX_Q for an IOB/OP
+// sink.  They are not general route-throughs.  The reusable device graph may
+// describe only these audited signatures, and the design-specific projection
+// must still authorize each concrete edge from an exact typed endpoint.
+enum class IobAttachmentRole : std::uint32_t {
+  kSource = 0,
+  kSink = 1,
+};
+
+struct AuditedIobAttachmentPip {
+  IobAttachmentRole role = IobAttachmentRole::kSource;
+  std::string_view from_site_pin;
+  std::string_view to_site_pin;
+};
+
+inline std::optional<std::string_view> xiphy_bitslice_wire_instance(
+    std::string_view wire,
+    std::string_view suffix) {
+  constexpr std::string_view kPrefix = "XIPHY_BITSLICE_TILE_";
+  if (wire.size() <= kPrefix.size() + suffix.size() ||
+      wire.compare(0, kPrefix.size(), kPrefix) != 0 ||
+      wire.compare(wire.size() - suffix.size(), suffix.size(), suffix) != 0) {
+    return std::nullopt;
+  }
+  const std::string_view instance = wire.substr(
+      kPrefix.size(), wire.size() - kPrefix.size() - suffix.size());
+  if (instance.empty()) {
+    return std::nullopt;
+  }
+  for (const char digit : instance) {
+    if (digit < '0' || digit > '9') {
+      return std::nullopt;
+    }
+  }
+  return instance;
+}
+
+inline std::optional<AuditedIobAttachmentPip>
+classify_audited_iob_attachment_pip(std::string_view device_name,
+                                    std::string_view tile_type_name,
+                                    std::string_view wire0,
+                                    std::string_view wire1,
+                                    bool conventional,
+                                    bool directional) {
+  if (device_name != "xcvu3p" || tile_type_name != "XIPHY_BYTE_L" ||
+      conventional || !directional) {
+    return std::nullopt;
+  }
+
+  const auto source_instance0 =
+      xiphy_bitslice_wire_instance(wire0, "_RX_D_PIN");
+  const auto source_instance1 =
+      xiphy_bitslice_wire_instance(wire1, "_RX_Q5");
+  if (source_instance0.has_value() && source_instance1.has_value() &&
+      *source_instance0 == *source_instance1) {
+    return AuditedIobAttachmentPip{IobAttachmentRole::kSource, "RX_D",
+                                   "RX_Q5"};
+  }
+
+  const auto sink_instance0 =
+      xiphy_bitslice_wire_instance(wire0, "_TX_D0");
+  const auto sink_instance1 =
+      xiphy_bitslice_wire_instance(wire1, "_TX_Q");
+  if (sink_instance0.has_value() && sink_instance1.has_value() &&
+      *sink_instance0 == *sink_instance1) {
+    return AuditedIobAttachmentPip{IobAttachmentRole::kSink, "TX_D0",
+                                   "TX_Q"};
+  }
+  return std::nullopt;
+}
+
+// Return a stable bit position for each resource in the audited
+// DeviceResources pseudo-cell signature.  Builders require the exact 0xf mask
+// and exactly three pseudo cells, so a similarly named or partially described
+// route-through cannot be admitted accidentally.
+inline std::optional<std::uint32_t> audited_iob_pseudo_resource_bit(
+    IobAttachmentRole role,
+    std::string_view bel,
+    std::string_view pin) {
+  if (role == IobAttachmentRole::kSource) {
+    if (bel == "RX_Q5" && pin == "RX_Q5") return 0;
+    if (bel == "RXTX_BITSLICE" && pin == "DATAIN") return 1;
+    if (bel == "RXTX_BITSLICE" && pin == "Q5") return 2;
+    if (bel == "RX_D" && pin == "RX_D") return 3;
+    return std::nullopt;
+  }
+  if (bel == "RXTX_BITSLICE" && pin == "D0") return 0;
+  if (bel == "RXTX_BITSLICE" && pin == "O") return 1;
+  if (bel == "TX_Q" && pin == "TX_Q") return 2;
+  if (bel == "TX_D0" && pin == "TX_D0") return 3;
+  return std::nullopt;
+}
+
+inline bool is_audited_iob_site_name(std::string_view site) {
+  constexpr std::string_view kPrefix = "IOB_X";
+  if (site.compare(0, kPrefix.size(), kPrefix) != 0) {
+    return false;
+  }
+  std::size_t cursor = kPrefix.size();
+  const std::size_t x_begin = cursor;
+  while (cursor < site.size() && site[cursor] >= '0' &&
+         site[cursor] <= '9') {
+    ++cursor;
+  }
+  if (cursor == x_begin || cursor == site.size() || site[cursor] != 'Y') {
+    return false;
+  }
+  ++cursor;
+  const std::size_t y_begin = cursor;
+  while (cursor < site.size() && site[cursor] >= '0' &&
+         site[cursor] <= '9') {
+    ++cursor;
+  }
+  return cursor == site.size() && cursor != y_begin;
+}
+
+inline bool is_audited_iob_site_type(std::string_view site_type) {
+  return site_type == "HPIOB_M" || site_type == "HPIOB_S" ||
+         site_type == "HPIOB_SNGL";
+}
+
+inline bool is_audited_iob_endpoint(IobAttachmentRole role,
+                                    std::string_view site,
+                                    std::string_view site_type,
+                                    std::string_view pin) {
+  return is_audited_iob_site_name(site) &&
+         is_audited_iob_site_type(site_type) &&
+         ((role == IobAttachmentRole::kSource && pin == "I") ||
+          (role == IobAttachmentRole::kSink && pin == "OP"));
+}
+
 inline bool physical_part_matches_device(const std::string& device_name,
                                          const std::string& physical_part) {
   return !device_name.empty() && !physical_part.empty() &&

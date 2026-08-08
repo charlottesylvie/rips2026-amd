@@ -673,10 +673,11 @@ constexpr std::uint64_t CURRENT_CSR_VERSION = 3;
 constexpr std::uint64_t ARTIFACT_PAIR_CSR_VERSION = 2;
 constexpr std::uint64_t ROUTING_SIDECAR_CSR_VERSION = 3;
 constexpr std::uint64_t MIN_METADATA_VERSION = 3;
-constexpr std::uint64_t CURRENT_METADATA_VERSION = 6;
+constexpr std::uint64_t CURRENT_METADATA_VERSION = 7;
 constexpr std::uint64_t NODE_PHYSICAL_METADATA_VERSION = 4;
 constexpr std::uint64_t ARTIFACT_PAIR_METADATA_VERSION = 5;
 constexpr std::uint64_t COMPACT_METADATA_VERSION = 6;
+constexpr std::uint64_t ENDPOINT_PIP_METADATA_VERSION = 7;
 constexpr std::uint64_t EXPECTED_OUTGOING_EDGE_ORIENTATION = 2;
 constexpr unsigned int kPackedNoPredEdge = 0xffffffffu;
 constexpr std::uint64_t kNoIndex = std::numeric_limits<std::uint64_t>::max();
@@ -708,6 +709,7 @@ struct SitePinNode {
   int node = -1;
   std::uint64_t site_string = kNoIndex;
   std::uint64_t pin_string = kNoIndex;
+  std::uint64_t endpoint_pip_index = kNoIndex;
 };
 
 struct RouteRequest {
@@ -1282,7 +1284,7 @@ RoutingMetadata load_routing_metadata(const std::filesystem::path& path,
   const std::uint64_t orientation = read_u64(in, "metadata orientation");
   if (version < MIN_METADATA_VERSION || version > CURRENT_METADATA_VERSION) {
     throw std::runtime_error(
-        "unsupported RIPSIFM1 metadata version (expected version 3, 4, 5, or 6)");
+        "unsupported RIPSIFM1 metadata version (expected version 3, 4, 5, 6, or 7)");
   }
   if (orientation != EXPECTED_OUTGOING_EDGE_ORIENTATION) {
     throw std::runtime_error(
@@ -1310,6 +1312,10 @@ RoutingMetadata load_routing_metadata(const std::filesystem::path& path,
         "metadata edge attribute count does not match outgoing CSR nnz");
   }
   const std::uint64_t pip_data_count = read_u64(in, "metadata pip data count");
+  const std::uint64_t endpoint_pip_count =
+      version >= ENDPOINT_PIP_METADATA_VERSION
+          ? read_u64(in, "metadata endpoint PIP count")
+          : 0;
   const std::uint64_t site_pin_attr_count = read_u64(in, "metadata site pin attr count");
   const std::uint64_t route_request_count = read_u64(in, "metadata route request count");
   const std::uint64_t blocked_node_count = read_u64(in, "metadata blocked node count");
@@ -1376,6 +1382,11 @@ RoutingMetadata load_routing_metadata(const std::filesystem::path& path,
              checked_byte_count(pip_data_count, 3 * sizeof(std::uint64_t), "metadata pip data"),
              "metadata pip data");
   skip_bytes(in,
+             checked_byte_count(endpoint_pip_count,
+                                10 * sizeof(std::uint64_t),
+                                "metadata endpoint PIPs"),
+             "metadata endpoint PIPs");
+  skip_bytes(in,
              checked_byte_count(site_pin_attr_count,
                                 3 * sizeof(std::uint64_t),
                                 "metadata site pin attrs"),
@@ -1391,6 +1402,15 @@ RoutingMetadata load_routing_metadata(const std::filesystem::path& path,
       source.node = node_from_u64(read_u64(in, "metadata source node"));
       source.site_string = read_u64(in, "metadata source site");
       source.pin_string = read_u64(in, "metadata source pin");
+      source.endpoint_pip_index =
+          version >= ENDPOINT_PIP_METADATA_VERSION
+              ? read_u64(in, "metadata source endpoint PIP index")
+              : kNoIndex;
+      if (source.endpoint_pip_index != kNoIndex &&
+          source.endpoint_pip_index >= endpoint_pip_count) {
+        throw std::runtime_error(
+            "metadata source references an invalid endpoint PIP");
+      }
     }
 
     const std::uint64_t sink_count = read_u64(in, "metadata sink count");
@@ -1399,6 +1419,15 @@ RoutingMetadata load_routing_metadata(const std::filesystem::path& path,
       sink.node = node_from_u64(read_u64(in, "metadata sink node"));
       sink.site_string = read_u64(in, "metadata sink site");
       sink.pin_string = read_u64(in, "metadata sink pin");
+      sink.endpoint_pip_index =
+          version >= ENDPOINT_PIP_METADATA_VERSION
+              ? read_u64(in, "metadata sink endpoint PIP index")
+              : kNoIndex;
+      if (sink.endpoint_pip_index != kNoIndex &&
+          sink.endpoint_pip_index >= endpoint_pip_count) {
+        throw std::runtime_error(
+            "metadata sink references an invalid endpoint PIP");
+      }
     }
   }
 

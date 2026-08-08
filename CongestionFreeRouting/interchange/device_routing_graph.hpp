@@ -20,6 +20,9 @@ constexpr std::uint64_t kNoIndex =
     std::numeric_limits<std::uint64_t>::max();
 constexpr std::uint64_t kNoLogicalNetIndex = kNoIndex;
 constexpr std::uint64_t kNoStringIndex = kNoIndex;
+constexpr std::uint64_t kMinimumDeviceRoutingGraphVersion = 3;
+constexpr std::uint64_t kEndpointAttachmentDeviceRoutingGraphVersion = 5;
+constexpr std::uint64_t kCurrentDeviceRoutingGraphVersion = 5;
 
 enum class NodeBoundsMode : std::uint64_t {
   kPocBaseWire = 0,
@@ -95,6 +98,64 @@ struct SitePinNodeLookup {
 bool operator<(const SitePinNodeLookup& lhs,
                const SitePinNodeLookup& rhs);
 
+// Audited pseudo PIPs are admitted only as fixed directed corridors between a
+// concrete route endpoint and ordinary fabric. They are never general-purpose
+// route-throughs.
+enum class EndpointAttachmentRole : std::uint32_t {
+  kSource = 0,
+  kSink = 1,
+};
+
+// Direction of one BEL pin consumed by a pseudo PIP. This mirrors the three
+// FPGA Interchange logical directions without retaining a schema dependency in
+// the persistent device graph.
+enum class PseudoCellPinDirection : std::uint32_t {
+  kInput = 0,
+  kOutput = 1,
+  kInout = 2,
+};
+
+struct PseudoCellPinResource {
+  std::uint32_t bel_string = 0;
+  std::uint32_t pin_string = 0;
+  PseudoCellPinDirection direction = PseudoCellPinDirection::kInput;
+};
+
+// One record describes one concrete, directed pseudo PIP. pip_data_index is
+// unique across this array and identifies the otherwise unchanged PipData and
+// EdgeAttr records. Source corridors are endpoint_node -> from_node -> to_node;
+// sink corridors are from_node -> to_node -> endpoint_node. The first/last
+// edge respectively is conventional and the middle edge is this attachment.
+struct EndpointAttachment {
+  std::uint32_t endpoint_site_string = 0;
+  std::uint32_t endpoint_site_type_string = 0;
+  std::uint32_t endpoint_pin_string = 0;
+  EndpointAttachmentRole role = EndpointAttachmentRole::kSource;
+  NodeId endpoint_node = kInvalidRouteNode;
+  NodeId from_node = kInvalidRouteNode;
+  NodeId to_node = kInvalidRouteNode;
+  std::uint64_t pip_data_index = kNoIndex;
+  std::uint32_t traversed_site_string = 0;
+  std::uint64_t traversed_site_type_begin = 0;
+  std::uint64_t traversed_site_type_count = 0;
+  std::uint64_t pseudo_cell_pin_begin = 0;
+  std::uint64_t pseudo_cell_pin_count = 0;
+};
+
+// Exact endpoint active-type authorization key. attachment_index indexes
+// DeviceRoutingGraph::endpoint_attachments. The allowed active types of the
+// distinct traversed site live in that attachment's traversed-site-type slice.
+struct EndpointAttachmentLookup {
+  std::uint32_t endpoint_site_string = 0;
+  std::uint32_t endpoint_site_type_string = 0;
+  std::uint32_t endpoint_pin_string = 0;
+  EndpointAttachmentRole role = EndpointAttachmentRole::kSource;
+  std::uint32_t attachment_index = 0;
+};
+
+bool operator<(const EndpointAttachmentLookup& lhs,
+               const EndpointAttachmentLookup& rhs);
+
 enum class LookupConflictPolicy {
   kReject,
   kDropAmbiguous,
@@ -126,6 +187,10 @@ struct StaticCsrEntry {
 // Immutable data determined solely by DeviceResources plus bounds policy.
 struct DeviceRoutingGraph {
   StringTable string_table;
+  // The writer always emits kCurrentDeviceRoutingGraphVersion. Readers retain
+  // the original version so production callers can reject stale v3/v4 caches
+  // while generic inspection remains backward compatible.
+  std::uint64_t format_version = kCurrentDeviceRoutingGraphVersion;
   std::uint64_t device_fingerprint = 0;
   std::uint64_t device_path_string = 0;
   std::uint64_t device_name_string = 0;
@@ -166,6 +231,14 @@ struct DeviceRoutingGraph {
   // physical-netlist parsing.
   std::vector<PairNodeLookup> tile_wire_nodes;
   std::vector<SitePinNodeLookup> site_pin_nodes;
+
+  // Sparse v5 endpoint-attachment metadata. Allowed active types of the
+  // concrete traversed site are compact string IDs sliced by
+  // EndpointAttachment. Pseudo-cell BEL/pin resources use that same site.
+  std::vector<EndpointAttachment> endpoint_attachments;
+  std::vector<std::uint32_t> endpoint_attachment_traversed_site_types;
+  std::vector<PseudoCellPinResource> endpoint_attachment_pseudo_cell_pins;
+  std::vector<EndpointAttachmentLookup> endpoint_attachment_lookups;
 };
 
 // Return the authoritative node count for either a full graph or the compact
@@ -215,6 +288,36 @@ std::vector<NodeId> find_site_pin_candidates(
     const std::string& site,
     const std::string& pin);
 
+// Sort exact endpoint-attachment lookup keys, collapse identical aliases, and
+// reject a key that names more than one attachment.
+void sort_and_deduplicate_endpoint_attachment_lookups(
+    std::vector<EndpointAttachmentLookup>& records);
+
+// Rebuild the exact endpoint lookup. Attachments themselves must already be
+// ordered by unique pip_data_index.
+void rebuild_endpoint_attachment_lookups(DeviceRoutingGraph& graph);
+
+std::optional<std::uint32_t> find_endpoint_attachment_index(
+    const std::vector<EndpointAttachmentLookup>& records,
+    const StringTable& strings,
+    const std::string& endpoint_site,
+    const std::string& endpoint_site_type,
+    const std::string& endpoint_pin,
+    EndpointAttachmentRole role);
+
+// Test one active type of the concrete traversed site against an attachment's
+// sorted authorization slice. The endpoint site's active type is a separate,
+// exact scalar used by find_endpoint_attachment_index().
+bool endpoint_attachment_allows_traversed_site_type(
+    const DeviceRoutingGraph& graph,
+    std::uint32_t attachment_index,
+    const std::string& traversed_site_type);
+
+// Fail with an explicit regeneration diagnostic when a production path needs
+// endpoint-attachment semantics but was given a legacy v3/v4 cache.
+void require_endpoint_attachment_device_graph(
+    const DeviceRoutingGraph& graph);
+
 void validate_device_routing_graph(const DeviceRoutingGraph& graph);
 
 DeviceRoutingGraph read_device_routing_graph(
@@ -226,14 +329,16 @@ DeviceRoutingGraph read_device_routing_graph(
 // filter_device_routing_graph(), avoiding both 40 bytes/node of input and a
 // second scan of every large edge record in the per-design pipeline.
 DeviceRoutingGraph read_device_routing_graph_for_filtering(
-    const std::filesystem::path& path);
+    const std::filesystem::path& path,
+    bool require_endpoint_attachments = false);
 
 // Per-design filtering needs the immutable CSR/lookups plus BF11's compact
 // route-end/cost columns, but not the legacy 40-byte physical-node columns.
 // Version-3 artifacts synthesize representative coordinates from node extents
-// and unit base costs; version 4 reads the authored sidecars directly.
+// and unit base costs; versions 4/5 read the authored sidecars directly.
 DeviceRoutingGraph read_device_routing_graph_for_routing(
-    const std::filesystem::path& path);
+    const std::filesystem::path& path,
+    bool require_endpoint_attachments = true);
 
 // Standard writer used by tests and tools that already own split arrays.
 void write_device_routing_graph(const DeviceRoutingGraph& graph,
@@ -260,6 +365,9 @@ CsrGraph filter_device_routing_graph(
     const std::vector<std::uint8_t>& sink_node_stops,
     // Union of blocked nodes and exclusive route-source nodes. Keeping this
     // precombined avoids two unrelated random mask reads per destination edge.
-    const std::vector<std::uint8_t>& unavailable_destination_nodes);
+    const std::vector<std::uint8_t>& unavailable_destination_nodes,
+    // Indexed by endpoint_attachments. Empty means that every attachment is
+    // disabled. Non-attachment edges retain the existing conventional policy.
+    const std::vector<std::uint8_t>& enabled_endpoint_attachments = {});
 
 }  // namespace routing::interchange

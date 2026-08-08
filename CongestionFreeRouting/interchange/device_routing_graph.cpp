@@ -8,6 +8,7 @@
 #include <fstream>
 #include <limits>
 #include <stdexcept>
+#include <tuple>
 #include <type_traits>
 
 #include <unistd.h>
@@ -17,11 +18,10 @@ namespace {
 
 constexpr char DEVICE_GRAPH_MAGIC[8] = {'R', 'I', 'P', 'S', 'D', 'R', 'G', '1'};
 // Version 3 changed graph-builder semantics and the lookup layout. Version 4
-// appends compact route-end X/Y and base-cost columns to the physical node
-// prefix. Readers retain v3 compatibility and synthesize those columns from
-// the conservative node extents.
-constexpr std::uint64_t MIN_DEVICE_GRAPH_VERSION = 3;
-constexpr std::uint64_t DEVICE_GRAPH_VERSION = 4;
+// appended compact route-end X/Y and base-cost columns. Version 5 appends
+// sparse, concrete endpoint-attachment metadata after the legacy static
+// suffix. Generic readers retain v3/v4 compatibility; production routing can
+// require v5 explicitly.
 
 static_assert(sizeof(std::int64_t) == 8, "int64_t must be 8 bytes");
 static_assert(sizeof(std::int32_t) == 4, "int32_t must be 4 bytes");
@@ -45,6 +45,49 @@ struct PipDataDisk {
 };
 
 static_assert(sizeof(PipDataDisk) == 24, "PipDataDisk layout changed");
+
+struct EndpointAttachmentDisk {
+  std::uint32_t endpoint_site_string = 0;
+  std::uint32_t endpoint_site_type_string = 0;
+  std::uint32_t endpoint_pin_string = 0;
+  std::uint32_t role = 0;
+  NodeId endpoint_node = kInvalidRouteNode;
+  NodeId from_node = kInvalidRouteNode;
+  NodeId to_node = kInvalidRouteNode;
+  std::uint32_t traversed_site_string = 0;
+  std::uint64_t pip_data_index = kNoIndex;
+  std::uint64_t traversed_site_type_begin = 0;
+  std::uint64_t traversed_site_type_count = 0;
+  std::uint64_t pseudo_cell_pin_begin = 0;
+  std::uint64_t pseudo_cell_pin_count = 0;
+};
+
+static_assert(sizeof(EndpointAttachmentDisk) == 72,
+              "EndpointAttachmentDisk layout changed");
+static_assert(std::is_trivially_copyable<EndpointAttachmentDisk>::value,
+              "EndpointAttachmentDisk must support bulk I/O");
+
+struct PseudoCellPinResourceDisk {
+  std::uint32_t bel_string = 0;
+  std::uint32_t pin_string = 0;
+  std::uint32_t direction = 0;
+  std::uint32_t reserved = 0;
+};
+
+static_assert(sizeof(PseudoCellPinResourceDisk) == 16,
+              "PseudoCellPinResourceDisk layout changed");
+
+struct EndpointAttachmentLookupDisk {
+  std::uint32_t endpoint_site_string = 0;
+  std::uint32_t endpoint_site_type_string = 0;
+  std::uint32_t endpoint_pin_string = 0;
+  std::uint32_t role = 0;
+  std::uint32_t attachment_index = 0;
+  std::uint32_t reserved = 0;
+};
+
+static_assert(sizeof(EndpointAttachmentLookupDisk) == 24,
+              "EndpointAttachmentLookupDisk layout changed");
 
 std::size_t checked_size(std::uint64_t count, const char* name) {
   if (count > static_cast<std::uint64_t>(
@@ -250,6 +293,39 @@ bool is_valid_optional_string(std::uint64_t id, std::size_t string_count) {
   return id == kNoStringIndex || id < string_count;
 }
 
+bool is_valid_endpoint_attachment_role(EndpointAttachmentRole role) {
+  switch (role) {
+    case EndpointAttachmentRole::kSource:
+    case EndpointAttachmentRole::kSink:
+      return true;
+  }
+  return false;
+}
+
+bool is_valid_pseudo_cell_pin_direction(PseudoCellPinDirection direction) {
+  switch (direction) {
+    case PseudoCellPinDirection::kInput:
+    case PseudoCellPinDirection::kOutput:
+    case PseudoCellPinDirection::kInout:
+      return true;
+  }
+  return false;
+}
+
+std::size_t checked_slice_end(std::uint64_t begin,
+                              std::uint64_t count,
+                              std::size_t available,
+                              const char* name) {
+  if (begin > std::numeric_limits<std::uint64_t>::max() - count) {
+    throw std::runtime_error(std::string(name) + " slice overflows uint64");
+  }
+  const std::uint64_t end = begin + count;
+  if (end > available) {
+    throw std::runtime_error(std::string(name) + " slice is out of range");
+  }
+  return checked_size(end, name);
+}
+
 void validate_lookup_records(const std::vector<PairNodeLookup>& records,
                              std::size_t string_count,
                              std::size_t node_count,
@@ -302,6 +378,201 @@ void validate_site_pin_lookup_records(
   }
 }
 
+void validate_endpoint_attachment_metadata(
+    const DeviceRoutingGraph& graph,
+    std::size_t string_count,
+    std::size_t node_count) {
+  if (graph.format_version < kMinimumDeviceRoutingGraphVersion ||
+      graph.format_version > kCurrentDeviceRoutingGraphVersion) {
+    throw std::runtime_error("device graph has an invalid format version");
+  }
+  if (graph.format_version <
+      kEndpointAttachmentDeviceRoutingGraphVersion &&
+      (!graph.endpoint_attachments.empty() ||
+       !graph.endpoint_attachment_traversed_site_types.empty() ||
+       !graph.endpoint_attachment_pseudo_cell_pins.empty() ||
+       !graph.endpoint_attachment_lookups.empty())) {
+    throw std::runtime_error(
+        "legacy device graph cannot contain endpoint attachments");
+  }
+
+  std::uint64_t previous_pip = 0;
+  bool have_previous_pip = false;
+  std::size_t expected_type_begin = 0;
+  std::size_t expected_resource_begin = 0;
+  std::vector<std::size_t> expected_lookup_counts(
+      graph.endpoint_attachments.size(), 0);
+  for (std::size_t index = 0; index < graph.endpoint_attachments.size();
+       ++index) {
+    const EndpointAttachment& attachment =
+        graph.endpoint_attachments[index];
+    if (!is_valid_endpoint_attachment_role(attachment.role) ||
+        attachment.endpoint_site_string >= string_count ||
+        attachment.endpoint_site_type_string >= string_count ||
+        attachment.endpoint_pin_string >= string_count ||
+        attachment.traversed_site_string >= string_count ||
+        attachment.endpoint_node < 0 || attachment.from_node < 0 ||
+        attachment.to_node < 0 ||
+        static_cast<std::size_t>(attachment.endpoint_node) >= node_count ||
+        static_cast<std::size_t>(attachment.from_node) >= node_count ||
+        static_cast<std::size_t>(attachment.to_node) >= node_count ||
+        attachment.endpoint_node == attachment.from_node ||
+        attachment.endpoint_node == attachment.to_node ||
+        attachment.from_node == attachment.to_node ||
+        attachment.pip_data_index >= graph.pip_data.size()) {
+      throw std::runtime_error(
+          "device graph contains an invalid endpoint attachment");
+    }
+    if (have_previous_pip &&
+        attachment.pip_data_index <= previous_pip) {
+      throw std::runtime_error(
+          "endpoint attachments are not ordered by unique PIP data ID");
+    }
+    previous_pip = attachment.pip_data_index;
+    have_previous_pip = true;
+
+    if (attachment.traversed_site_type_count == 0 ||
+        attachment.pseudo_cell_pin_count == 0) {
+      throw std::runtime_error(
+          "endpoint attachment has an empty authorization/resource slice");
+    }
+    const std::size_t type_begin = checked_size(
+        attachment.traversed_site_type_begin,
+        "endpoint attachment traversed-site-type begin");
+    const std::size_t type_end = checked_slice_end(
+        attachment.traversed_site_type_begin,
+        attachment.traversed_site_type_count,
+        graph.endpoint_attachment_traversed_site_types.size(),
+        "endpoint attachment traversed site types");
+    if (type_begin != expected_type_begin) {
+      throw std::runtime_error(
+          "endpoint attachment traversed-site-type slices overlap or have gaps");
+    }
+    expected_type_begin = type_end;
+    std::uint32_t previous_type = 0;
+    bool have_previous_type = false;
+    for (std::size_t type = type_begin; type < type_end; ++type) {
+      const std::uint32_t type_string =
+          graph.endpoint_attachment_traversed_site_types[type];
+      if (type_string >= string_count ||
+          (have_previous_type && type_string <= previous_type)) {
+        throw std::runtime_error(
+            "endpoint attachment traversed site types are invalid or unsorted");
+      }
+      previous_type = type_string;
+      have_previous_type = true;
+    }
+    expected_lookup_counts[index] = 1;
+
+    SitePinNodeLookup endpoint_key;
+    endpoint_key.site_string = attachment.endpoint_site_string;
+    endpoint_key.site_type_string = attachment.endpoint_site_type_string;
+    endpoint_key.pin_string = attachment.endpoint_pin_string;
+    endpoint_key.node = std::numeric_limits<NodeId>::min();
+    const auto site_pin = std::lower_bound(
+        graph.site_pin_nodes.begin(), graph.site_pin_nodes.end(), endpoint_key);
+    if (site_pin == graph.site_pin_nodes.end() ||
+        site_pin->site_string != endpoint_key.site_string ||
+        site_pin->site_type_string != endpoint_key.site_type_string ||
+        site_pin->pin_string != endpoint_key.pin_string ||
+        site_pin->node != attachment.endpoint_node) {
+      throw std::runtime_error(
+          "endpoint attachment does not match its typed site-pin node");
+    }
+
+    const std::size_t resource_begin = checked_size(
+        attachment.pseudo_cell_pin_begin,
+        "endpoint attachment pseudo-cell-pin begin");
+    const std::size_t resource_end = checked_slice_end(
+        attachment.pseudo_cell_pin_begin,
+        attachment.pseudo_cell_pin_count,
+        graph.endpoint_attachment_pseudo_cell_pins.size(),
+        "endpoint attachment pseudo-cell pins");
+    if (resource_begin != expected_resource_begin) {
+      throw std::runtime_error(
+          "endpoint attachment pseudo-cell-pin slices overlap or have gaps");
+    }
+    expected_resource_begin = resource_end;
+    PseudoCellPinResource previous_resource;
+    bool have_previous_resource = false;
+    for (std::size_t resource = resource_begin; resource < resource_end;
+         ++resource) {
+      const PseudoCellPinResource& value =
+          graph.endpoint_attachment_pseudo_cell_pins[resource];
+      const auto key = std::make_tuple(
+          value.bel_string, value.pin_string,
+          static_cast<std::uint32_t>(value.direction));
+      const auto previous_key = std::make_tuple(
+          previous_resource.bel_string, previous_resource.pin_string,
+          static_cast<std::uint32_t>(previous_resource.direction));
+      if (value.bel_string >= string_count ||
+          value.pin_string >= string_count ||
+          !is_valid_pseudo_cell_pin_direction(value.direction) ||
+          (have_previous_resource && !(previous_key < key))) {
+        throw std::runtime_error(
+            "endpoint attachment pseudo-cell pins are invalid or unsorted");
+      }
+      previous_resource = value;
+      have_previous_resource = true;
+    }
+  }
+
+  if (expected_type_begin !=
+          graph.endpoint_attachment_traversed_site_types.size() ||
+      expected_resource_begin !=
+          graph.endpoint_attachment_pseudo_cell_pins.size()) {
+    throw std::runtime_error(
+        "endpoint attachment slices do not cover their backing arrays");
+  }
+
+  if (!std::is_sorted(graph.endpoint_attachment_lookups.begin(),
+                      graph.endpoint_attachment_lookups.end())) {
+    throw std::runtime_error("endpoint-attachment lookup is not sorted");
+  }
+  std::vector<std::size_t> actual_lookup_counts(
+      graph.endpoint_attachments.size(), 0);
+  for (std::size_t index = 0;
+       index < graph.endpoint_attachment_lookups.size(); ++index) {
+    const EndpointAttachmentLookup& lookup =
+        graph.endpoint_attachment_lookups[index];
+    if (!is_valid_endpoint_attachment_role(lookup.role) ||
+        lookup.endpoint_site_string >= string_count ||
+        lookup.endpoint_site_type_string >= string_count ||
+        lookup.endpoint_pin_string >= string_count ||
+        lookup.attachment_index >= graph.endpoint_attachments.size()) {
+      throw std::runtime_error(
+          "endpoint-attachment lookup contains an invalid record");
+    }
+    if (index > 0) {
+      const EndpointAttachmentLookup& previous =
+          graph.endpoint_attachment_lookups[index - 1];
+      if (lookup.endpoint_site_string == previous.endpoint_site_string &&
+          lookup.endpoint_site_type_string ==
+              previous.endpoint_site_type_string &&
+          lookup.endpoint_pin_string == previous.endpoint_pin_string &&
+          lookup.role == previous.role) {
+        throw std::runtime_error(
+            "endpoint-attachment lookup contains a duplicate exact key");
+      }
+    }
+    const EndpointAttachment& attachment =
+        graph.endpoint_attachments[lookup.attachment_index];
+    if (lookup.endpoint_site_string != attachment.endpoint_site_string ||
+        lookup.endpoint_site_type_string !=
+            attachment.endpoint_site_type_string ||
+        lookup.endpoint_pin_string != attachment.endpoint_pin_string ||
+        lookup.role != attachment.role) {
+      throw std::runtime_error(
+          "endpoint-attachment lookup contradicts its attachment");
+    }
+    ++actual_lookup_counts[lookup.attachment_index];
+  }
+  if (actual_lookup_counts != expected_lookup_counts) {
+    throw std::runtime_error(
+        "endpoint-attachment lookup is incomplete or has extra aliases");
+  }
+}
+
 void validate_static_metadata_common(const DeviceRoutingGraph& graph,
                                      std::size_t node_count) {
   const std::size_t string_count = graph.string_table.strings.size();
@@ -341,6 +612,7 @@ void validate_static_metadata_common(const DeviceRoutingGraph& graph,
                           "tile-wire");
   validate_site_pin_lookup_records(graph.site_pin_nodes, string_count,
                                    node_count);
+  validate_endpoint_attachment_metadata(graph, string_count, node_count);
 }
 
 void validate_static_metadata(const DeviceRoutingGraph& graph) {
@@ -475,7 +747,8 @@ void write_header_and_static_prefix(std::ofstream& out,
     throw std::runtime_error("failed while writing device-graph magic");
   }
 
-  write_u64(out, DEVICE_GRAPH_VERSION, "device-graph version");
+  write_u64(out, kCurrentDeviceRoutingGraphVersion,
+            "device-graph version");
   write_u64(out, graph.device_fingerprint, "device fingerprint");
   write_u64(out, static_cast<std::uint64_t>(graph.node_bounds_mode),
             "node bounds mode");
@@ -532,6 +805,73 @@ void write_static_suffix(std::ofstream& out,
   write_array(out, pip_disk, "PIP data");
   write_array(out, graph.tile_wire_nodes, "tile-wire lookup");
   write_array(out, graph.site_pin_nodes, "site-pin lookup");
+
+  // Version-5 extension trailer. Keeping this after the complete v4 suffix
+  // makes legacy inspection straightforward and prevents an old reader from
+  // silently accepting attachment-aware topology as conventional-only data.
+  write_u64(out,
+            static_cast<std::uint64_t>(graph.endpoint_attachments.size()),
+            "endpoint attachment count");
+  write_u64(
+      out,
+      static_cast<std::uint64_t>(
+          graph.endpoint_attachment_traversed_site_types.size()),
+      "endpoint attachment traversed-site-type count");
+  write_u64(out,
+            static_cast<std::uint64_t>(
+                graph.endpoint_attachment_pseudo_cell_pins.size()),
+            "endpoint attachment pseudo-cell-pin count");
+  write_u64(out,
+            static_cast<std::uint64_t>(
+                graph.endpoint_attachment_lookups.size()),
+            "endpoint attachment lookup count");
+
+  std::vector<EndpointAttachmentDisk> attachment_disk;
+  attachment_disk.reserve(graph.endpoint_attachments.size());
+  for (const EndpointAttachment& attachment : graph.endpoint_attachments) {
+    EndpointAttachmentDisk disk;
+    disk.endpoint_site_string = attachment.endpoint_site_string;
+    disk.endpoint_site_type_string = attachment.endpoint_site_type_string;
+    disk.endpoint_pin_string = attachment.endpoint_pin_string;
+    disk.role = static_cast<std::uint32_t>(attachment.role);
+    disk.endpoint_node = attachment.endpoint_node;
+    disk.from_node = attachment.from_node;
+    disk.to_node = attachment.to_node;
+    disk.traversed_site_string = attachment.traversed_site_string;
+    disk.pip_data_index = attachment.pip_data_index;
+    disk.traversed_site_type_begin =
+        attachment.traversed_site_type_begin;
+    disk.traversed_site_type_count =
+        attachment.traversed_site_type_count;
+    disk.pseudo_cell_pin_begin = attachment.pseudo_cell_pin_begin;
+    disk.pseudo_cell_pin_count = attachment.pseudo_cell_pin_count;
+    attachment_disk.push_back(disk);
+  }
+  write_array(out, attachment_disk, "endpoint attachments");
+  write_array(out, graph.endpoint_attachment_traversed_site_types,
+              "endpoint attachment traversed site types");
+
+  std::vector<PseudoCellPinResourceDisk> resource_disk;
+  resource_disk.reserve(
+      graph.endpoint_attachment_pseudo_cell_pins.size());
+  for (const PseudoCellPinResource& resource :
+       graph.endpoint_attachment_pseudo_cell_pins) {
+    resource_disk.push_back(
+        {resource.bel_string, resource.pin_string,
+         static_cast<std::uint32_t>(resource.direction), 0});
+  }
+  write_array(out, resource_disk, "endpoint attachment pseudo-cell pins");
+
+  std::vector<EndpointAttachmentLookupDisk> lookup_disk;
+  lookup_disk.reserve(graph.endpoint_attachment_lookups.size());
+  for (const EndpointAttachmentLookup& lookup :
+       graph.endpoint_attachment_lookups) {
+    lookup_disk.push_back(
+        {lookup.endpoint_site_string, lookup.endpoint_site_type_string,
+         lookup.endpoint_pin_string,
+         static_cast<std::uint32_t>(lookup.role), lookup.attachment_index, 0});
+  }
+  write_array(out, lookup_disk, "endpoint attachment lookup");
 }
 
 void ensure_parent_directory(const std::filesystem::path& path) {
@@ -681,6 +1021,24 @@ bool operator<(const SitePinNodeLookup& lhs,
   return lhs.node < rhs.node;
 }
 
+bool operator<(const EndpointAttachmentLookup& lhs,
+               const EndpointAttachmentLookup& rhs) {
+  if (lhs.endpoint_site_string != rhs.endpoint_site_string) {
+    return lhs.endpoint_site_string < rhs.endpoint_site_string;
+  }
+  if (lhs.endpoint_site_type_string != rhs.endpoint_site_type_string) {
+    return lhs.endpoint_site_type_string < rhs.endpoint_site_type_string;
+  }
+  if (lhs.endpoint_pin_string != rhs.endpoint_pin_string) {
+    return lhs.endpoint_pin_string < rhs.endpoint_pin_string;
+  }
+  if (lhs.role != rhs.role) {
+    return static_cast<std::uint32_t>(lhs.role) <
+           static_cast<std::uint32_t>(rhs.role);
+  }
+  return lhs.attachment_index < rhs.attachment_index;
+}
+
 std::size_t sort_and_deduplicate_pair_node_lookups(
     std::vector<PairNodeLookup>& records,
     LookupConflictPolicy conflict_policy,
@@ -735,6 +1093,61 @@ void sort_and_deduplicate_site_pin_lookups(
     begin = end;
   }
   records.resize(write);
+}
+
+void sort_and_deduplicate_endpoint_attachment_lookups(
+    std::vector<EndpointAttachmentLookup>& records) {
+  std::sort(records.begin(), records.end());
+  std::size_t write = 0;
+  for (std::size_t begin = 0; begin < records.size();) {
+    std::size_t end = begin + 1;
+    bool conflict = false;
+    while (end < records.size() &&
+           records[end].endpoint_site_string ==
+               records[begin].endpoint_site_string &&
+           records[end].endpoint_site_type_string ==
+               records[begin].endpoint_site_type_string &&
+           records[end].endpoint_pin_string ==
+               records[begin].endpoint_pin_string &&
+           records[end].role == records[begin].role) {
+      conflict = conflict ||
+                 records[end].attachment_index !=
+                     records[begin].attachment_index;
+      ++end;
+    }
+    if (conflict) {
+      throw std::runtime_error(
+          "endpoint-attachment lookup maps one exact key to multiple "
+          "attachments");
+    }
+    records[write++] = records[begin];
+    begin = end;
+  }
+  records.resize(write);
+}
+
+void rebuild_endpoint_attachment_lookups(DeviceRoutingGraph& graph) {
+  if (graph.endpoint_attachments.size() >
+      std::numeric_limits<std::uint32_t>::max()) {
+    throw std::runtime_error(
+        "device graph has too many endpoint attachments for compact lookups");
+  }
+  graph.endpoint_attachment_lookups.clear();
+  graph.endpoint_attachment_lookups.reserve(
+      graph.endpoint_attachments.size());
+  for (std::size_t index = 0; index < graph.endpoint_attachments.size();
+       ++index) {
+    const EndpointAttachment& attachment =
+        graph.endpoint_attachments[index];
+    graph.endpoint_attachment_lookups.push_back(
+        {attachment.endpoint_site_string,
+         attachment.endpoint_site_type_string,
+         attachment.endpoint_pin_string,
+         attachment.role,
+         static_cast<std::uint32_t>(index)});
+  }
+  sort_and_deduplicate_endpoint_attachment_lookups(
+      graph.endpoint_attachment_lookups);
 }
 
 std::uint32_t checked_lookup_string_id(std::uint64_t id) {
@@ -844,9 +1257,203 @@ std::optional<NodeId> find_site_pin_node(
   return found->node;
 }
 
+std::optional<std::uint32_t> find_endpoint_attachment_index(
+    const std::vector<EndpointAttachmentLookup>& records,
+    const StringTable& strings,
+    const std::string& endpoint_site,
+    const std::string& endpoint_site_type,
+    const std::string& endpoint_pin,
+    EndpointAttachmentRole role) {
+  const std::optional<std::uint64_t> site_id = strings.find(endpoint_site);
+  const std::optional<std::uint64_t> type_id =
+      strings.find(endpoint_site_type);
+  const std::optional<std::uint64_t> pin_id = strings.find(endpoint_pin);
+  if (!site_id.has_value() || !type_id.has_value() || !pin_id.has_value() ||
+      *site_id > std::numeric_limits<std::uint32_t>::max() ||
+      *type_id > std::numeric_limits<std::uint32_t>::max() ||
+      *pin_id > std::numeric_limits<std::uint32_t>::max() ||
+      !is_valid_endpoint_attachment_role(role)) {
+    return std::nullopt;
+  }
+
+  EndpointAttachmentLookup key;
+  key.endpoint_site_string = static_cast<std::uint32_t>(*site_id);
+  key.endpoint_site_type_string = static_cast<std::uint32_t>(*type_id);
+  key.endpoint_pin_string = static_cast<std::uint32_t>(*pin_id);
+  key.role = role;
+  const auto found = std::lower_bound(records.begin(), records.end(), key);
+  if (found == records.end() ||
+      found->endpoint_site_string != key.endpoint_site_string ||
+      found->endpoint_site_type_string != key.endpoint_site_type_string ||
+      found->endpoint_pin_string != key.endpoint_pin_string ||
+      found->role != key.role) {
+    return std::nullopt;
+  }
+  return found->attachment_index;
+}
+
+bool endpoint_attachment_allows_traversed_site_type(
+    const DeviceRoutingGraph& graph,
+    std::uint32_t attachment_index,
+    const std::string& traversed_site_type) {
+  if (attachment_index >= graph.endpoint_attachments.size()) {
+    return false;
+  }
+  const std::optional<std::uint64_t> type_id =
+      graph.string_table.find(traversed_site_type);
+  if (!type_id.has_value() ||
+      *type_id > std::numeric_limits<std::uint32_t>::max()) {
+    return false;
+  }
+  const EndpointAttachment& attachment =
+      graph.endpoint_attachments[attachment_index];
+  if (attachment.traversed_site_type_begin >
+          graph.endpoint_attachment_traversed_site_types.size() ||
+      attachment.traversed_site_type_count >
+          graph.endpoint_attachment_traversed_site_types.size() -
+              static_cast<std::size_t>(
+                  attachment.traversed_site_type_begin)) {
+    return false;
+  }
+  const auto begin = graph.endpoint_attachment_traversed_site_types.begin() +
+      static_cast<std::ptrdiff_t>(attachment.traversed_site_type_begin);
+  const auto end = begin +
+      static_cast<std::ptrdiff_t>(attachment.traversed_site_type_count);
+  return std::binary_search(begin, end,
+                            static_cast<std::uint32_t>(*type_id));
+}
+
+void require_endpoint_attachment_device_graph(
+    const DeviceRoutingGraph& graph) {
+  if (graph.format_version <
+      kEndpointAttachmentDeviceRoutingGraphVersion) {
+    throw std::runtime_error(
+        "device-routing graph predates endpoint-attachment metadata; "
+        "regenerate it with device_to_routing_graph");
+  }
+}
+
+namespace {
+
+class EndpointAttachmentCorridorValidator {
+ public:
+  explicit EndpointAttachmentCorridorValidator(
+      const DeviceRoutingGraph& graph)
+      : graph_(graph),
+        attachment_edge_count_(graph.endpoint_attachments.size(), 0),
+        corridor_edge_count_(graph.endpoint_attachments.size(), 0),
+        boundary_edge_count_(graph.endpoint_attachments.size(), 0) {
+    attachment_by_pip_.reserve(graph.endpoint_attachments.size());
+    source_from_node_.reserve(graph.endpoint_attachments.size());
+    sink_to_node_.reserve(graph.endpoint_attachments.size());
+    protected_node_.reserve(graph.endpoint_attachments.size());
+    for (std::size_t index = 0; index < graph.endpoint_attachments.size();
+         ++index) {
+      const EndpointAttachment& attachment =
+          graph.endpoint_attachments[index];
+      if (!attachment_by_pip_
+               .emplace(attachment.pip_data_index, index)
+               .second) {
+        throw std::runtime_error(
+            "endpoint attachments share a PIP data ID");
+      }
+      auto& boundary =
+          attachment.role == EndpointAttachmentRole::kSource
+              ? source_from_node_
+              : sink_to_node_;
+      const NodeId node =
+          attachment.role == EndpointAttachmentRole::kSource
+              ? attachment.from_node
+              : attachment.to_node;
+      if (!protected_node_.emplace(node, index).second ||
+          !boundary.emplace(node, index).second) {
+        throw std::runtime_error(
+            "endpoint attachments share a protected corridor node");
+      }
+    }
+  }
+
+  std::optional<std::size_t> observe(NodeId row,
+                                    NodeId col,
+                                    const EdgeAttr& attr) {
+    std::optional<std::size_t> edge_attachment;
+    const auto found_attachment =
+        attachment_by_pip_.find(attr.pip_data_index);
+    if (found_attachment != attachment_by_pip_.end()) {
+      edge_attachment = found_attachment->second;
+    }
+    if (edge_attachment.has_value()) {
+      const EndpointAttachment& attachment =
+          graph_.endpoint_attachments[*edge_attachment];
+      if (row != attachment.from_node || col != attachment.to_node) {
+        throw std::runtime_error(
+            "endpoint attachment PIP appears outside its directed edge");
+      }
+      ++attachment_edge_count_[*edge_attachment];
+    }
+
+    const auto source = source_from_node_.find(col);
+    if (source != source_from_node_.end()) {
+      const std::size_t index = source->second;
+      ++boundary_edge_count_[index];
+      const EndpointAttachment& attachment =
+          graph_.endpoint_attachments[index];
+      if (row == attachment.endpoint_node &&
+          !edge_attachment.has_value()) {
+        ++corridor_edge_count_[index];
+      }
+    }
+
+    const auto sink = sink_to_node_.find(row);
+    if (sink != sink_to_node_.end()) {
+      const std::size_t index = sink->second;
+      ++boundary_edge_count_[index];
+      const EndpointAttachment& attachment =
+          graph_.endpoint_attachments[index];
+      if (col == attachment.endpoint_node &&
+          !edge_attachment.has_value()) {
+        ++corridor_edge_count_[index];
+      }
+    }
+    return edge_attachment;
+  }
+
+  void finish() const {
+    for (std::size_t index = 0; index < graph_.endpoint_attachments.size();
+         ++index) {
+      if (attachment_edge_count_[index] != 1) {
+        throw std::runtime_error(
+            "endpoint attachment PIP must identify exactly one CSR edge");
+      }
+      if (corridor_edge_count_[index] != 1 ||
+          boundary_edge_count_[index] != 1) {
+        const EndpointAttachment& attachment =
+            graph_.endpoint_attachments[index];
+        throw std::runtime_error(
+            attachment.role == EndpointAttachmentRole::kSource
+                ? "source attachment corridor has an unrelated incoming edge"
+                : "sink attachment corridor has an unrelated outgoing edge");
+      }
+    }
+  }
+
+ private:
+  const DeviceRoutingGraph& graph_;
+  std::vector<std::size_t> attachment_edge_count_;
+  std::vector<std::size_t> corridor_edge_count_;
+  std::vector<std::size_t> boundary_edge_count_;
+  std::unordered_map<std::uint64_t, std::size_t> attachment_by_pip_;
+  std::unordered_map<NodeId, std::size_t> source_from_node_;
+  std::unordered_map<NodeId, std::size_t> sink_to_node_;
+  std::unordered_map<NodeId, std::size_t> protected_node_;
+};
+
+}  // namespace
+
 void validate_device_routing_graph(const DeviceRoutingGraph& graph) {
   const std::size_t node_count = device_routing_graph_node_count(graph);
   const std::size_t edge_count = validate_csr_shape(graph);
+  EndpointAttachmentCorridorValidator attachment_validator(graph);
   for (std::size_t row = 0; row < node_count; ++row) {
     const std::int64_t begin = graph.rowptr[row];
     const std::int64_t end = graph.rowptr[row + 1];
@@ -868,8 +1475,11 @@ void validate_device_routing_graph(const DeviceRoutingGraph& graph) {
           attr.pip_data_index >= graph.pip_data.size()) {
         throw std::runtime_error("device graph contains an invalid edge attr");
       }
+      attachment_validator.observe(
+          static_cast<NodeId>(row), col, attr);
     }
   }
+  attachment_validator.finish();
 }
 
 namespace {
@@ -949,7 +1559,8 @@ void read_legacy_route_sidecars_projection(std::ifstream& in,
 
 DeviceRoutingGraph read_device_routing_graph_impl(
     const std::filesystem::path& path,
-    DeviceRoutingGraphReadProfile profile) {
+    DeviceRoutingGraphReadProfile profile,
+    bool require_endpoint_attachments) {
   std::ifstream in(path, std::ios::binary);
   if (!in) {
     throw std::runtime_error("could not open device-routing graph: " +
@@ -964,12 +1575,19 @@ DeviceRoutingGraph read_device_routing_graph_impl(
         "input is not a recognized RIPS device-routing graph");
   }
   const std::uint64_t version = read_u64(in, "device-graph version");
-  if (version < MIN_DEVICE_GRAPH_VERSION ||
-      version > DEVICE_GRAPH_VERSION) {
+  if (version < kMinimumDeviceRoutingGraphVersion ||
+      version > kCurrentDeviceRoutingGraphVersion) {
     throw std::runtime_error("unsupported device-routing graph version");
+  }
+  if (require_endpoint_attachments &&
+      version < kEndpointAttachmentDeviceRoutingGraphVersion) {
+    throw std::runtime_error(
+        "device-routing graph predates endpoint-attachment metadata; "
+        "regenerate it with device_to_routing_graph");
   }
 
   DeviceRoutingGraph graph;
+  graph.format_version = version;
   graph.device_fingerprint = read_u64(in, "device fingerprint");
   const std::uint64_t raw_mode = read_u64(in, "node bounds mode");
   if (raw_mode > static_cast<std::uint64_t>(NodeBoundsMode::kIntersects)) {
@@ -1097,6 +1715,85 @@ DeviceRoutingGraph read_device_routing_graph_impl(
   read_array(in, graph.tile_wire_nodes, tile_wire_count, "tile-wire lookup");
   read_array(in, graph.site_pin_nodes, site_pin_count, "site-pin lookup");
 
+  if (version >= kEndpointAttachmentDeviceRoutingGraphVersion) {
+    const std::uint64_t attachment_count =
+        read_u64(in, "endpoint attachment count");
+    const std::uint64_t traversed_type_count =
+        read_u64(in, "endpoint attachment traversed-site-type count");
+    const std::uint64_t resource_count =
+        read_u64(in, "endpoint attachment pseudo-cell-pin count");
+    const std::uint64_t attachment_lookup_count =
+        read_u64(in, "endpoint attachment lookup count");
+
+    std::vector<EndpointAttachmentDisk> attachment_disk;
+    read_array(in, attachment_disk, attachment_count,
+               "endpoint attachments");
+    graph.endpoint_attachments.reserve(attachment_disk.size());
+    for (const EndpointAttachmentDisk& disk : attachment_disk) {
+      if (disk.role >
+          static_cast<std::uint32_t>(EndpointAttachmentRole::kSink)) {
+        throw std::runtime_error(
+            "device graph contains an invalid endpoint attachment role");
+      }
+      EndpointAttachment attachment;
+      attachment.endpoint_site_string = disk.endpoint_site_string;
+      attachment.endpoint_site_type_string =
+          disk.endpoint_site_type_string;
+      attachment.endpoint_pin_string = disk.endpoint_pin_string;
+      attachment.role = static_cast<EndpointAttachmentRole>(disk.role);
+      attachment.endpoint_node = disk.endpoint_node;
+      attachment.from_node = disk.from_node;
+      attachment.to_node = disk.to_node;
+      attachment.traversed_site_string = disk.traversed_site_string;
+      attachment.pip_data_index = disk.pip_data_index;
+      attachment.traversed_site_type_begin =
+          disk.traversed_site_type_begin;
+      attachment.traversed_site_type_count =
+          disk.traversed_site_type_count;
+      attachment.pseudo_cell_pin_begin = disk.pseudo_cell_pin_begin;
+      attachment.pseudo_cell_pin_count = disk.pseudo_cell_pin_count;
+      graph.endpoint_attachments.push_back(attachment);
+    }
+    read_array(in, graph.endpoint_attachment_traversed_site_types,
+               traversed_type_count,
+               "endpoint attachment traversed site types");
+
+    std::vector<PseudoCellPinResourceDisk> resource_disk;
+    read_array(in, resource_disk, resource_count,
+               "endpoint attachment pseudo-cell pins");
+    graph.endpoint_attachment_pseudo_cell_pins.reserve(
+        resource_disk.size());
+    for (const PseudoCellPinResourceDisk& disk : resource_disk) {
+      if (disk.reserved != 0 ||
+          disk.direction > static_cast<std::uint32_t>(
+                               PseudoCellPinDirection::kInout)) {
+        throw std::runtime_error(
+            "device graph contains an invalid pseudo-cell-pin resource");
+      }
+      graph.endpoint_attachment_pseudo_cell_pins.push_back(
+          {disk.bel_string, disk.pin_string,
+           static_cast<PseudoCellPinDirection>(disk.direction)});
+    }
+
+    std::vector<EndpointAttachmentLookupDisk> lookup_disk;
+    read_array(in, lookup_disk, attachment_lookup_count,
+               "endpoint attachment lookup");
+    graph.endpoint_attachment_lookups.reserve(lookup_disk.size());
+    for (const EndpointAttachmentLookupDisk& disk : lookup_disk) {
+      if (disk.reserved != 0 ||
+          disk.role >
+              static_cast<std::uint32_t>(EndpointAttachmentRole::kSink)) {
+        throw std::runtime_error(
+            "device graph contains an invalid endpoint-attachment lookup");
+      }
+      graph.endpoint_attachment_lookups.push_back(
+          {disk.endpoint_site_string, disk.endpoint_site_type_string,
+           disk.endpoint_pin_string,
+           static_cast<EndpointAttachmentRole>(disk.role),
+           disk.attachment_index});
+    }
+  }
+
   char trailing_byte = 0;
   in.read(&trailing_byte, 1);
   if (in.gcount() != 0) {
@@ -1128,23 +1825,32 @@ DeviceRoutingGraph read_device_routing_graph_impl(
 DeviceRoutingGraph read_device_routing_graph(
     const std::filesystem::path& path) {
   return read_device_routing_graph_impl(
-      path, DeviceRoutingGraphReadProfile::kFull);
+      path, DeviceRoutingGraphReadProfile::kFull, false);
 }
 
 DeviceRoutingGraph read_device_routing_graph_for_filtering(
-    const std::filesystem::path& path) {
+    const std::filesystem::path& path,
+    bool require_endpoint_attachments) {
   return read_device_routing_graph_impl(
-      path, DeviceRoutingGraphReadProfile::kFilteringProjection);
+      path, DeviceRoutingGraphReadProfile::kFilteringProjection,
+      require_endpoint_attachments);
 }
 
 DeviceRoutingGraph read_device_routing_graph_for_routing(
-    const std::filesystem::path& path) {
+    const std::filesystem::path& path,
+    bool require_endpoint_attachments) {
   return read_device_routing_graph_impl(
-      path, DeviceRoutingGraphReadProfile::kRoutingProjection);
+      path, DeviceRoutingGraphReadProfile::kRoutingProjection,
+      require_endpoint_attachments);
 }
 
 void write_device_routing_graph(const DeviceRoutingGraph& graph,
                                 const std::filesystem::path& path) {
+  if (graph.format_version != kCurrentDeviceRoutingGraphVersion) {
+    throw std::runtime_error(
+        "refusing to write a stale device graph as version 5; regenerate it "
+        "with device_to_routing_graph");
+  }
   validate_string_table_index(graph.string_table);
   validate_device_routing_graph(graph);
   ensure_parent_directory(path);
@@ -1164,6 +1870,11 @@ void write_device_routing_graph(
     const DeviceRoutingGraph& graph,
     const std::vector<StaticCsrEntry>& static_entries,
     const std::filesystem::path& path) {
+  if (graph.format_version != kCurrentDeviceRoutingGraphVersion) {
+    throw std::runtime_error(
+        "refusing to write a stale device graph as version 5; regenerate it "
+        "with device_to_routing_graph");
+  }
   validate_string_table_index(graph.string_table);
   validate_static_metadata(graph);
   const std::size_t edge_count = validate_row_pointers(graph);
@@ -1173,6 +1884,7 @@ void write_device_routing_graph(
     throw std::runtime_error(
         "preprocessor graph and static CSR entries are inconsistent");
   }
+  EndpointAttachmentCorridorValidator attachment_validator(graph);
   for (std::size_t row = 0; row < graph.node_device_ids.size(); ++row) {
     const std::size_t begin = static_cast<std::size_t>(graph.rowptr[row]);
     const std::size_t end = static_cast<std::size_t>(graph.rowptr[row + 1]);
@@ -1188,8 +1900,11 @@ void write_device_routing_graph(
         throw std::runtime_error("preprocessor CSR entries are invalid");
       }
       previous = entry.col;
+      (void)attachment_validator.observe(
+          static_cast<NodeId>(row), entry.col, entry.attr);
     }
   }
+  attachment_validator.finish();
 
   ensure_parent_directory(path);
   std::ofstream out(path, std::ios::binary);
@@ -1288,12 +2003,25 @@ CsrGraph filter_device_routing_graph(
     const DeviceRoutingGraph& graph,
     const std::vector<std::uint8_t>& blocked_node,
     const std::vector<std::uint8_t>& sink_node_stops,
-    const std::vector<std::uint8_t>& unavailable_destination_nodes) {
+    const std::vector<std::uint8_t>& unavailable_destination_nodes,
+    const std::vector<std::uint8_t>& enabled_endpoint_attachments) {
   const std::size_t node_count = device_routing_graph_node_count(graph);
   if (blocked_node.size() != node_count ||
       sink_node_stops.size() != node_count ||
       unavailable_destination_nodes.size() != node_count) {
     throw std::runtime_error("design masks do not match device graph rows");
+  }
+  if (!enabled_endpoint_attachments.empty() &&
+      enabled_endpoint_attachments.size() !=
+          graph.endpoint_attachments.size()) {
+    throw std::runtime_error(
+        "endpoint-attachment mask does not match device graph metadata");
+  }
+  for (const std::uint8_t enabled : enabled_endpoint_attachments) {
+    if (enabled > 1) {
+      throw std::runtime_error(
+          "endpoint-attachment mask contains a non-boolean value");
+    }
   }
   if (graph.rowptr.size() != node_count + 1 || graph.rowptr.front() != 0 ||
       graph.rowptr.back() < 0 ||
@@ -1304,6 +2032,42 @@ CsrGraph filter_device_routing_graph(
     throw std::runtime_error("device graph CSR shape is inconsistent");
   }
 
+  // Enabling a pseudo PIP is meaningful only for an endpoint that the design
+  // masks already make non-transit. The pseudo edge itself remains subject to
+  // the ordinary row/destination masks below.
+  for (std::size_t index = 0;
+       index < enabled_endpoint_attachments.size(); ++index) {
+    if (!enabled_endpoint_attachments[index]) {
+      continue;
+    }
+    const EndpointAttachment& attachment =
+        graph.endpoint_attachments[index];
+    const std::size_t endpoint =
+        static_cast<std::size_t>(attachment.endpoint_node);
+    if (endpoint >= node_count || blocked_node[endpoint]) {
+      throw std::runtime_error(
+          "enabled endpoint attachment names a blocked or invalid endpoint");
+    }
+    if (attachment.role == EndpointAttachmentRole::kSource) {
+      if (sink_node_stops[endpoint] ||
+          !unavailable_destination_nodes[endpoint]) {
+        throw std::runtime_error(
+            "enabled source attachment endpoint is not an exclusive active "
+            "source");
+      }
+    } else if (attachment.role == EndpointAttachmentRole::kSink) {
+      if (!sink_node_stops[endpoint] ||
+          unavailable_destination_nodes[endpoint]) {
+        throw std::runtime_error(
+            "enabled sink attachment endpoint is not an available terminal "
+            "sink");
+      }
+    } else {
+      throw std::runtime_error(
+          "enabled endpoint attachment has an invalid role");
+    }
+  }
+
   CsrGraph csr;
   csr.rows = static_cast<std::int64_t>(node_count);
   csr.cols = csr.rows;
@@ -1312,6 +2076,7 @@ CsrGraph filter_device_routing_graph(
   csr.rowptr.resize(node_count + 1, 0);
   csr.colind.reserve(graph.colind.size());
   csr.edge_attrs.reserve(graph.edge_attrs.size());
+  EndpointAttachmentCorridorValidator attachment_validator(graph);
 
   // Validate and compact in one pass. Contest masks are sparse, so reserving
   // the base edge count avoids reallocations without value-initializing a
@@ -1344,7 +2109,14 @@ CsrGraph filter_device_routing_graph(
             "device graph edge records are invalid or not sorted");
       }
       previous = col;
-      if (source_is_active &&
+      const std::optional<std::size_t> attachment_index =
+          attachment_validator.observe(
+              static_cast<NodeId>(row), col, attr);
+      const bool attachment_is_enabled =
+          !attachment_index.has_value() ||
+          (!enabled_endpoint_attachments.empty() &&
+           enabled_endpoint_attachments[*attachment_index] != 0);
+      if (attachment_is_enabled && source_is_active &&
           !unavailable_destination_nodes[static_cast<std::size_t>(col)]) {
         csr.colind.push_back(col);
         csr.edge_attrs.push_back(attr);
@@ -1356,6 +2128,7 @@ CsrGraph filter_device_routing_graph(
     }
     csr.rowptr[row + 1] = static_cast<std::int64_t>(csr.colind.size());
   }
+  attachment_validator.finish();
 
   csr.values.assign(csr.colind.size(), 1.0f);
   return csr;

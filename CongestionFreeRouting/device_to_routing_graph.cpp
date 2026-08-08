@@ -25,6 +25,7 @@
 #include <capnp/serialize.h>
 #include <kj/array.h>
 #include <algorithm>
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
@@ -44,11 +45,15 @@ namespace {
 using routing::interchange::Bounds;
 using routing::interchange::DeviceRoutingGraph;
 using routing::interchange::EdgeAttr;
+using routing::interchange::EndpointAttachment;
+using routing::interchange::EndpointAttachmentRole;
 using routing::interchange::NodeBoundsMode;
 using routing::interchange::NodeId;
 using routing::interchange::LookupConflictPolicy;
 using routing::interchange::PairNodeLookup;
 using routing::interchange::PipData;
+using routing::interchange::PseudoCellPinDirection;
+using routing::interchange::PseudoCellPinResource;
 using routing::interchange::StaticCsrEntry;
 using routing::interchange::checked_lookup_string_id;
 using routing::interchange::create_unique_staging_path;
@@ -60,6 +65,7 @@ using routing::interchange::node_bounds_mode_name;
 using routing::interchange::parse_node_bounds_mode;
 using routing::interchange::read_gzip_or_plain_chunks;
 using routing::interchange::require_distinct_interchange_paths;
+using routing::interchange::rebuild_endpoint_attachment_lookups;
 using routing::interchange::sort_and_deduplicate_pair_node_lookups;
 using routing::interchange::sort_and_deduplicate_site_pin_lookups;
 using routing::interchange::sort_and_deduplicate_static_csr;
@@ -372,6 +378,32 @@ struct TileInstance {
   std::uint32_t tile_type = 0;
 };
 
+struct AuditedAttachmentCandidate {
+  routing::interchange::IobAttachmentRole policy_role =
+      routing::interchange::IobAttachmentRole::kSource;
+  NodeId from_node = kInvalidRouteNode;
+  NodeId to_node = kInvalidRouteNode;
+  std::uint32_t tile_string = 0;
+  std::uint64_t pip_data_index = kNoIndex;
+  std::uint32_t traversed_site_string = 0;
+  std::vector<std::uint32_t> traversed_site_type_strings;
+  std::vector<PseudoCellPinResource> pseudo_cell_pins;
+
+  std::uint32_t endpoint_site_string = 0;
+  std::uint32_t endpoint_site_type_string = 0;
+  std::uint32_t endpoint_pin_string = 0;
+  NodeId endpoint_node = kInvalidRouteNode;
+};
+
+struct AuditedEndpoint {
+  routing::interchange::IobAttachmentRole role =
+      routing::interchange::IobAttachmentRole::kSource;
+  std::uint32_t site_string = 0;
+  std::uint32_t site_type_string = 0;
+  std::uint32_t pin_string = 0;
+  NodeId node = kInvalidRouteNode;
+};
+
 struct BuildResult {
   DeviceRoutingGraph graph;
   std::vector<StaticCsrEntry> entries;
@@ -680,93 +712,10 @@ BuildResult build_device_routing_graph(const Options& options) {
     }
   }
 
-  auto for_each_edge = [&](auto&& callback) {
-    for (const TileInstance& tile : tile_instances) {
-      for (PipTemplate& pip : pip_templates[tile.tile_type]) {
-        // Pseudo PIPs require traversed-site metadata and availability checks.
-        // The compact graph stores neither, and routes_to_phys cannot emit the
-        // required PhysPIP.site field, so accepting one could create a
-        // physically invalid route.  RWRoute likewise leaves route-throughs
-        // disabled unless their site resources are modeled explicitly.
-        if (!routing::interchange::include_pip_in_static_graph(
-                pip.conventional)) {
-          continue;
-        }
-        const std::optional<NodeId> node0 =
-            tile_wire_map.find(tile.tile_name, pip.wire0);
-        const std::optional<NodeId> node1 =
-            tile_wire_map.find(tile.tile_name, pip.wire1);
-        if (!node0.has_value() || !node1.has_value()) {
-          continue;
-        }
-        if (pip.forward_pip_data == kNoIndex) {
-          pip.forward_pip_data =
-              intern_pip_data(pip.wire0, pip.wire1, true);
-        }
-        callback(*node0, *node1, tile.tile_name,
-                 pip.forward_pip_data);
-        if (pip.bidirectional) {
-          if (pip.reverse_pip_data == kNoIndex) {
-            pip.reverse_pip_data =
-                intern_pip_data(pip.wire0, pip.wire1, false);
-          }
-          callback(*node1, *node0, tile.tile_name,
-                   pip.reverse_pip_data);
-        }
-      }
-    }
-  };
-
-  std::vector<std::int64_t> row_counts(graph.node_device_ids.size(), 0);
-  for_each_edge([&](NodeId from, NodeId to, std::uint64_t,
-                    std::uint64_t) {
-    ++graph.declared_edges;
-    if (from == to) {
-      return;
-    }
-    std::int64_t& count = row_counts[static_cast<std::size_t>(from)];
-    if (count == std::numeric_limits<std::int64_t>::max()) {
-      throw std::runtime_error("device graph row degree overflows int64");
-    }
-    ++count;
-  });
-
-  graph.rowptr.resize(graph.node_device_ids.size() + 1, 0);
-  for (std::size_t row = 0; row < row_counts.size(); ++row) {
-    if (row_counts[row] > std::numeric_limits<std::int64_t>::max() -
-                               graph.rowptr[row]) {
-      throw std::runtime_error("device graph edge count overflows int64");
-    }
-    graph.rowptr[row + 1] = graph.rowptr[row] + row_counts[row];
-  }
-  result.entries.resize(static_cast<std::size_t>(graph.rowptr.back()));
-  std::vector<std::int64_t> cursor = graph.rowptr;
-  for_each_edge([&](NodeId from, NodeId to, std::uint64_t tile_string,
-                    std::uint64_t pip_data_index) {
-    if (from == to) {
-      return;
-    }
-    const std::size_t row = static_cast<std::size_t>(from);
-    const std::int64_t position = cursor[row]++;
-    const std::int64_t ordinal = position - graph.rowptr[row];
-    if (ordinal > std::numeric_limits<std::uint32_t>::max()) {
-      throw std::runtime_error("device graph row degree exceeds uint32");
-    }
-    result.entries[static_cast<std::size_t>(position)] =
-        {to, static_cast<std::uint32_t>(ordinal),
-         EdgeAttr{tile_string, pip_data_index}};
-  });
-  release_storage(cursor);
-  release_storage(row_counts);
-
-  sort_and_deduplicate_static_csr(graph.rowptr, result.entries);
-  graph.loaded_edges = result.entries.size();
-  release_storage(pip_data_by_key);
-  release_storage(pip_templates);
-
-  // Resolve concrete site/pin pairs once. The per-design converter performs a
-  // single string-ID lookup plus binary search instead of rebuilding the three
-  // nested device tables on every benchmark.
+  // Resolve concrete site/pin pairs before admitting endpoint attachments.
+  // The audited pseudo-PIP corridors are authorized by an exact typed IOB
+  // endpoint, so their construction needs the same primary/alternate mapping
+  // used later by the per-design importer.
   const auto site_type_list = device.getSiteTypeList();
   std::vector<std::vector<std::uint32_t>> site_type_pin_names(
       site_type_list.size());
@@ -817,8 +766,7 @@ BuildResult build_device_routing_graph(const Options& options) {
 
       const auto primary_site_type = site_type_list[primary_type];
       const auto alternate_types = primary_site_type.getAltSiteTypes();
-      const auto alternate_parent_maps =
-          site_type.getAltPinsToPrimaryPins();
+      const auto alternate_parent_maps = site_type.getAltPinsToPrimaryPins();
       if (alternate_types.size() != alternate_parent_maps.size()) {
         throw std::runtime_error(
             "alternate site-type and parent-map counts do not match");
@@ -869,15 +817,512 @@ BuildResult build_device_routing_graph(const Options& options) {
           continue;
         }
         graph.site_pin_nodes.push_back(
-            {checked_lookup_string_id(
-                 intern_device_string(site.getName())),
-             pin.site_type_string,
-             pin.pin_string,
-             *node});
+            {checked_lookup_string_id(intern_device_string(site.getName())),
+             pin.site_type_string, pin.pin_string, *node});
       }
     }
   }
   sort_and_deduplicate_site_pin_lookups(graph.site_pin_nodes);
+
+  // First identify the exact xcvu3p pseudo-PIP signatures and retain all
+  // legality metadata that would otherwise be lost by the compact CSR.  A
+  // candidate is not emitted until a conventional one-edge corridor proves
+  // that it belongs to one exact typed IOB endpoint.
+  std::vector<AuditedAttachmentCandidate> attachment_candidates;
+  const std::string cached_device_name =
+      graph.string_table.strings[graph.device_name_string];
+  for (const TileInstance& tile_instance : tile_instances) {
+    const auto tile_type = tile_types[tile_instance.tile_type];
+    const std::uint32_t tile_type_name_string =
+        intern_device_string(tile_type.getName());
+    const std::string tile_type_name =
+        graph.string_table.strings[tile_type_name_string];
+    if (cached_device_name != "xcvu3p" ||
+        tile_type_name != "XIPHY_BYTE_L") {
+      continue;
+    }
+
+    const auto type_wires = tile_type.getWires();
+    const auto pips = tile_type.getPips();
+    for (std::uint32_t pip_index = 0; pip_index < pips.size(); ++pip_index) {
+      const auto pip = pips[pip_index];
+      const PipTemplate& pip_template =
+          pip_templates[tile_instance.tile_type][pip_index];
+      const std::string wire0 =
+          graph.string_table.strings[pip_template.wire0];
+      const std::string wire1 =
+          graph.string_table.strings[pip_template.wire1];
+      const auto policy =
+          routing::interchange::classify_audited_iob_attachment_pip(
+              cached_device_name, tile_type_name, wire0, wire1,
+              pip_template.conventional, pip.getDirectional());
+      if (!policy.has_value()) {
+        continue;
+      }
+      if (!pip.isPseudoCells()) {
+        throw std::runtime_error(
+            "audited IOB attachment PIP has no pseudo-cell metadata");
+      }
+
+      const std::optional<NodeId> node0 = tile_wire_map.find(
+          tile_instance.tile_name, pip_template.wire0);
+      const std::optional<NodeId> node1 = tile_wire_map.find(
+          tile_instance.tile_name, pip_template.wire1);
+      if (!node0.has_value() || !node1.has_value()) {
+        continue;
+      }
+
+      // Locate the unique traversed site by requiring both PIP wires to map
+      // to the expected primary site pins in one SiteTypeInTileType record.
+      const auto tile_site_types = tile_type.getSiteTypes();
+      std::optional<std::uint32_t> traversed_tile_site_type;
+      std::uint32_t from_primary_pin = 0;
+      std::uint32_t to_primary_pin = 0;
+      for (std::uint32_t site_type_index = 0;
+           site_type_index < tile_site_types.size(); ++site_type_index) {
+        const auto site_type = tile_site_types[site_type_index];
+        const auto pin_wires = site_type.getPrimaryPinsToTileWires();
+        std::optional<std::uint32_t> found_from;
+        std::optional<std::uint32_t> found_to;
+        for (std::uint32_t pin = 0; pin < pin_wires.size(); ++pin) {
+          if (pin_wires[pin] == type_wires[pip.getWire0()]) {
+            if (found_from.has_value()) {
+              throw std::runtime_error(
+                  "audited IOB PIP wire maps to duplicate site pins");
+            }
+            found_from = pin;
+          }
+          if (pin_wires[pin] == type_wires[pip.getWire1()]) {
+            if (found_to.has_value()) {
+              throw std::runtime_error(
+                  "audited IOB PIP wire maps to duplicate site pins");
+            }
+            found_to = pin;
+          }
+        }
+        if (!found_from.has_value() || !found_to.has_value()) {
+          continue;
+        }
+        if (traversed_tile_site_type.has_value()) {
+          throw std::runtime_error(
+              "audited IOB PIP maps through more than one site");
+        }
+        traversed_tile_site_type = site_type_index;
+        from_primary_pin = *found_from;
+        to_primary_pin = *found_to;
+      }
+      if (!traversed_tile_site_type.has_value()) {
+        throw std::runtime_error(
+            "audited IOB PIP does not map through a concrete site");
+      }
+
+      const auto traversed_site_type_in_tile =
+          tile_site_types[*traversed_tile_site_type];
+      const std::uint32_t primary_type_index =
+          traversed_site_type_in_tile.getPrimaryType();
+      if (primary_type_index >= site_type_list.size()) {
+        throw std::runtime_error(
+            "audited IOB PIP primary site type is out of range");
+      }
+      const auto primary_site_type = site_type_list[primary_type_index];
+      const auto primary_pins = primary_site_type.getPins();
+      if (from_primary_pin >= primary_pins.size() ||
+          to_primary_pin >= primary_pins.size()) {
+        throw std::runtime_error(
+            "audited IOB PIP primary site pin is out of range");
+      }
+      const std::string from_site_pin = graph.string_table.strings[
+          intern_device_string(primary_pins[from_primary_pin].getName())];
+      const std::string to_site_pin = graph.string_table.strings[
+          intern_device_string(primary_pins[to_primary_pin].getName())];
+      if (from_site_pin != policy->from_site_pin ||
+          to_site_pin != policy->to_site_pin) {
+        throw std::runtime_error(
+            "audited IOB PIP site-pin mapping changed unexpectedly");
+      }
+
+      const auto concrete_sites =
+          tile_list[tile_instance.tile_index].getSites();
+      std::optional<std::uint32_t> traversed_site_string;
+      for (std::uint32_t site_index = 0; site_index < concrete_sites.size();
+           ++site_index) {
+        const auto site = concrete_sites[site_index];
+        if (site.getType() != *traversed_tile_site_type) {
+          continue;
+        }
+        if (traversed_site_string.has_value()) {
+          throw std::runtime_error(
+              "audited IOB PIP maps to duplicate concrete sites");
+        }
+        traversed_site_string = checked_lookup_string_id(
+            intern_device_string(site.getName()));
+      }
+      if (!traversed_site_string.has_value()) {
+        throw std::runtime_error(
+            "audited IOB PIP concrete traversed site is missing");
+      }
+
+      AuditedAttachmentCandidate candidate;
+      candidate.policy_role = policy->role;
+      candidate.from_node = *node0;
+      candidate.to_node = *node1;
+      candidate.tile_string = tile_instance.tile_name;
+      candidate.traversed_site_string = *traversed_site_string;
+      candidate.traversed_site_type_strings.push_back(
+          site_type_name_strings[primary_type_index]);
+
+      // An alternate type is legal only when it exposes both primary pins of
+      // this directed crossing. This admits BITSLICE_COMPONENT_RX_TX for the
+      // benchmark while rejecting TX-only use of the RX attachment and vice
+      // versa. DeviceResources defines the PIP's pseudoCells in the primary
+      // site namespace; component alternates intentionally omit some of those
+      // routing BELs, so their canonical resource keys remain the primary
+      // BEL/pin names and are checked against placement/fixed occupancy later.
+      const auto alternate_types = primary_site_type.getAltSiteTypes();
+      const auto alternate_parent_maps =
+          traversed_site_type_in_tile.getAltPinsToPrimaryPins();
+      if (alternate_types.size() != alternate_parent_maps.size()) {
+        throw std::runtime_error(
+            "audited IOB alternate site-type maps are inconsistent");
+      }
+      for (std::uint32_t alternate = 0;
+           alternate < alternate_types.size(); ++alternate) {
+        const std::uint32_t alternate_type = alternate_types[alternate];
+        if (alternate_type >= site_type_name_strings.size()) {
+          throw std::runtime_error(
+              "audited IOB alternate site type is out of range");
+        }
+        bool maps_from = false;
+        bool maps_to = false;
+        const auto parents = alternate_parent_maps[alternate].getPins();
+        for (std::uint32_t pin = 0; pin < parents.size(); ++pin) {
+          maps_from = maps_from || parents[pin] == from_primary_pin;
+          maps_to = maps_to || parents[pin] == to_primary_pin;
+        }
+        if (maps_from && maps_to) {
+          candidate.traversed_site_type_strings.push_back(
+              site_type_name_strings[alternate_type]);
+        }
+      }
+      std::sort(candidate.traversed_site_type_strings.begin(),
+                candidate.traversed_site_type_strings.end());
+      candidate.traversed_site_type_strings.erase(
+          std::unique(candidate.traversed_site_type_strings.begin(),
+                      candidate.traversed_site_type_strings.end()),
+          candidate.traversed_site_type_strings.end());
+
+      const auto pseudo_cells = pip.getPseudoCells();
+      if (pseudo_cells.size() != 3) {
+        throw std::runtime_error(
+            "audited IOB PIP pseudo-cell count changed unexpectedly");
+      }
+      std::array<PseudoCellPinResource, 4> ordered_resources{};
+      std::uint32_t resource_mask = 0;
+      std::uint32_t resource_count = 0;
+      const auto primary_bel_pins = primary_site_type.getBelPins();
+      for (std::uint32_t cell_index = 0; cell_index < pseudo_cells.size();
+           ++cell_index) {
+        const auto pseudo_cell = pseudo_cells[cell_index];
+        const std::uint32_t bel_string = checked_lookup_string_id(
+            intern_device_string(pseudo_cell.getBel()));
+        const std::string bel = graph.string_table.strings[bel_string];
+        const auto pins = pseudo_cell.getPins();
+        for (std::uint32_t pin_index = 0; pin_index < pins.size();
+             ++pin_index) {
+          ++resource_count;
+          const std::uint32_t pin_string = checked_lookup_string_id(
+              intern_device_string(pins[pin_index]));
+          const std::string pin = graph.string_table.strings[pin_string];
+          const auto bit =
+              routing::interchange::audited_iob_pseudo_resource_bit(
+                  policy->role, bel, pin);
+          if (!bit.has_value() || *bit >= ordered_resources.size() ||
+              (resource_mask & (1U << *bit)) != 0) {
+            throw std::runtime_error(
+                "audited IOB PIP pseudo-cell signature changed");
+          }
+
+          std::optional<PseudoCellPinDirection> direction;
+          for (std::uint32_t bel_pin_index = 0;
+               bel_pin_index < primary_bel_pins.size(); ++bel_pin_index) {
+            const auto bel_pin = primary_bel_pins[bel_pin_index];
+            if (bel_pin.getBel() != pseudo_cell.getBel() ||
+                bel_pin.getName() != pins[pin_index]) {
+              continue;
+            }
+            if (direction.has_value()) {
+              throw std::runtime_error(
+                  "audited IOB pseudo-cell BEL pin is ambiguous");
+            }
+            const std::uint32_t raw_direction =
+                static_cast<std::uint32_t>(bel_pin.getDir());
+            if (raw_direction >
+                static_cast<std::uint32_t>(PseudoCellPinDirection::kInout)) {
+              throw std::runtime_error(
+                  "audited IOB pseudo-cell BEL pin direction is invalid");
+            }
+            direction = static_cast<PseudoCellPinDirection>(raw_direction);
+          }
+          if (!direction.has_value()) {
+            throw std::runtime_error(
+                "audited IOB pseudo-cell BEL pin is absent from primary type");
+          }
+          ordered_resources[*bit] = {bel_string, pin_string, *direction};
+          resource_mask |= 1U << *bit;
+        }
+      }
+      if (resource_count != ordered_resources.size() ||
+          resource_mask != 0xfU) {
+        throw std::runtime_error(
+            "audited IOB PIP pseudo-cell resources are incomplete");
+      }
+      candidate.pseudo_cell_pins.assign(ordered_resources.begin(),
+                                        ordered_resources.end());
+      std::sort(candidate.pseudo_cell_pins.begin(),
+                candidate.pseudo_cell_pins.end(),
+                [](const PseudoCellPinResource& lhs,
+                   const PseudoCellPinResource& rhs) {
+                  if (lhs.bel_string != rhs.bel_string) {
+                    return lhs.bel_string < rhs.bel_string;
+                  }
+                  if (lhs.pin_string != rhs.pin_string) {
+                    return lhs.pin_string < rhs.pin_string;
+                  }
+                  return static_cast<std::uint32_t>(lhs.direction) <
+                         static_cast<std::uint32_t>(rhs.direction);
+                });
+
+      // Attachment PipData records are intentionally not globally
+      // deduplicated. Their unique index is the sparse identity carried from
+      // this concrete site through final route reconstruction.
+      candidate.pip_data_index = graph.pip_data.size();
+      graph.pip_data.push_back(
+          {pip_template.wire0, pip_template.wire1, true});
+      attachment_candidates.push_back(std::move(candidate));
+    }
+  }
+
+  auto for_each_conventional_edge = [&](auto&& callback) {
+    for (const TileInstance& tile : tile_instances) {
+      for (PipTemplate& pip : pip_templates[tile.tile_type]) {
+        // Unsupported pseudo PIPs remain excluded. Audited IOB crossings are
+        // appended separately only after exact endpoint authorization.
+        if (!routing::interchange::include_pip_in_static_graph(
+                pip.conventional)) {
+          continue;
+        }
+        const std::optional<NodeId> node0 =
+            tile_wire_map.find(tile.tile_name, pip.wire0);
+        const std::optional<NodeId> node1 =
+            tile_wire_map.find(tile.tile_name, pip.wire1);
+        if (!node0.has_value() || !node1.has_value()) {
+          continue;
+        }
+        if (pip.forward_pip_data == kNoIndex) {
+          pip.forward_pip_data =
+              intern_pip_data(pip.wire0, pip.wire1, true);
+        }
+        callback(*node0, *node1, tile.tile_name,
+                 pip.forward_pip_data);
+        if (pip.bidirectional) {
+          if (pip.reverse_pip_data == kNoIndex) {
+            pip.reverse_pip_data =
+                intern_pip_data(pip.wire0, pip.wire1, false);
+          }
+          callback(*node1, *node0, tile.tile_name,
+                   pip.reverse_pip_data);
+        }
+      }
+    }
+  };
+
+  std::vector<AuditedEndpoint> audited_endpoints;
+  std::unordered_map<NodeId, std::vector<std::size_t>> endpoints_by_node;
+  for (const auto& endpoint : graph.site_pin_nodes) {
+    const std::string& site =
+        graph.string_table.strings[endpoint.site_string];
+    const std::string& site_type =
+        graph.string_table.strings[endpoint.site_type_string];
+    const std::string& pin =
+        graph.string_table.strings[endpoint.pin_string];
+    for (const auto role : {routing::interchange::IobAttachmentRole::kSource,
+                            routing::interchange::IobAttachmentRole::kSink}) {
+      if (!routing::interchange::is_audited_iob_endpoint(
+              role, site, site_type, pin)) {
+        continue;
+      }
+      const std::size_t index = audited_endpoints.size();
+      audited_endpoints.push_back({role, endpoint.site_string,
+                                   endpoint.site_type_string,
+                                   endpoint.pin_string, endpoint.node});
+      endpoints_by_node[endpoint.node].push_back(index);
+    }
+  }
+
+  std::unordered_map<NodeId, std::vector<std::size_t>>
+      source_candidates_by_from;
+  std::unordered_map<NodeId, std::vector<std::size_t>> sink_candidates_by_to;
+  for (std::size_t index = 0; index < attachment_candidates.size(); ++index) {
+    const auto& candidate = attachment_candidates[index];
+    if (candidate.policy_role ==
+        routing::interchange::IobAttachmentRole::kSource) {
+      source_candidates_by_from[candidate.from_node].push_back(index);
+    } else {
+      sink_candidates_by_to[candidate.to_node].push_back(index);
+    }
+  }
+
+  auto authorize_candidate = [&](std::size_t candidate_index,
+                                 const AuditedEndpoint& endpoint) {
+    AuditedAttachmentCandidate& candidate =
+        attachment_candidates[candidate_index];
+    if (candidate.policy_role != endpoint.role) {
+      return;
+    }
+    if (candidate.endpoint_node != kInvalidRouteNode) {
+      if (candidate.endpoint_node != endpoint.node ||
+          candidate.endpoint_site_string != endpoint.site_string ||
+          candidate.endpoint_site_type_string != endpoint.site_type_string ||
+          candidate.endpoint_pin_string != endpoint.pin_string) {
+        throw std::runtime_error(
+            "audited IOB attachment corridor reaches multiple endpoints");
+      }
+      return;
+    }
+    candidate.endpoint_site_string = endpoint.site_string;
+    candidate.endpoint_site_type_string = endpoint.site_type_string;
+    candidate.endpoint_pin_string = endpoint.pin_string;
+    candidate.endpoint_node = endpoint.node;
+  };
+
+  // Match only the exact conventional edge adjacent to the endpoint. This
+  // proves the fixed two-edge source/sink corridor and supplies its concrete
+  // endpoint ownership without admitting the pseudo edge as general transit.
+  for_each_conventional_edge(
+      [&](NodeId from, NodeId to, std::uint64_t, std::uint64_t) {
+        const auto source_candidates = source_candidates_by_from.find(to);
+        const auto source_endpoints = endpoints_by_node.find(from);
+        if (source_candidates != source_candidates_by_from.end() &&
+            source_endpoints != endpoints_by_node.end()) {
+          for (const std::size_t candidate : source_candidates->second) {
+            for (const std::size_t endpoint : source_endpoints->second) {
+              authorize_candidate(candidate, audited_endpoints[endpoint]);
+            }
+          }
+        }
+
+        const auto sink_candidates = sink_candidates_by_to.find(from);
+        const auto sink_endpoints = endpoints_by_node.find(to);
+        if (sink_candidates != sink_candidates_by_to.end() &&
+            sink_endpoints != endpoints_by_node.end()) {
+          for (const std::size_t candidate : sink_candidates->second) {
+            for (const std::size_t endpoint : sink_endpoints->second) {
+              authorize_candidate(candidate, audited_endpoints[endpoint]);
+            }
+          }
+        }
+      });
+
+  std::vector<std::size_t> accepted_attachment_candidates;
+  accepted_attachment_candidates.reserve(attachment_candidates.size());
+  for (std::size_t candidate_index = 0;
+       candidate_index < attachment_candidates.size(); ++candidate_index) {
+    const AuditedAttachmentCandidate& candidate =
+        attachment_candidates[candidate_index];
+    if (candidate.endpoint_node == kInvalidRouteNode) {
+      continue;
+    }
+    EndpointAttachment attachment;
+    attachment.endpoint_site_string = candidate.endpoint_site_string;
+    attachment.endpoint_site_type_string =
+        candidate.endpoint_site_type_string;
+    attachment.endpoint_pin_string = candidate.endpoint_pin_string;
+    attachment.role =
+        candidate.policy_role ==
+                routing::interchange::IobAttachmentRole::kSource
+            ? EndpointAttachmentRole::kSource
+            : EndpointAttachmentRole::kSink;
+    attachment.endpoint_node = candidate.endpoint_node;
+    attachment.from_node = candidate.from_node;
+    attachment.to_node = candidate.to_node;
+    attachment.pip_data_index = candidate.pip_data_index;
+    attachment.traversed_site_string = candidate.traversed_site_string;
+    attachment.traversed_site_type_begin =
+        graph.endpoint_attachment_traversed_site_types.size();
+    attachment.traversed_site_type_count =
+        candidate.traversed_site_type_strings.size();
+    graph.endpoint_attachment_traversed_site_types.insert(
+        graph.endpoint_attachment_traversed_site_types.end(),
+        candidate.traversed_site_type_strings.begin(),
+        candidate.traversed_site_type_strings.end());
+    attachment.pseudo_cell_pin_begin =
+        graph.endpoint_attachment_pseudo_cell_pins.size();
+    attachment.pseudo_cell_pin_count = candidate.pseudo_cell_pins.size();
+    graph.endpoint_attachment_pseudo_cell_pins.insert(
+        graph.endpoint_attachment_pseudo_cell_pins.end(),
+        candidate.pseudo_cell_pins.begin(), candidate.pseudo_cell_pins.end());
+    graph.endpoint_attachments.push_back(attachment);
+    accepted_attachment_candidates.push_back(candidate_index);
+  }
+  rebuild_endpoint_attachment_lookups(graph);
+
+  auto for_each_edge = [&](auto&& callback) {
+    for_each_conventional_edge(callback);
+    for (const std::size_t candidate_index :
+         accepted_attachment_candidates) {
+      const AuditedAttachmentCandidate& candidate =
+          attachment_candidates[candidate_index];
+      callback(candidate.from_node, candidate.to_node,
+               candidate.tile_string, candidate.pip_data_index);
+    }
+  };
+
+  std::vector<std::int64_t> row_counts(graph.node_device_ids.size(), 0);
+  for_each_edge([&](NodeId from, NodeId to, std::uint64_t,
+                    std::uint64_t) {
+    ++graph.declared_edges;
+    if (from == to) {
+      return;
+    }
+    std::int64_t& count = row_counts[static_cast<std::size_t>(from)];
+    if (count == std::numeric_limits<std::int64_t>::max()) {
+      throw std::runtime_error("device graph row degree overflows int64");
+    }
+    ++count;
+  });
+
+  graph.rowptr.resize(graph.node_device_ids.size() + 1, 0);
+  for (std::size_t row = 0; row < row_counts.size(); ++row) {
+    if (row_counts[row] > std::numeric_limits<std::int64_t>::max() -
+                               graph.rowptr[row]) {
+      throw std::runtime_error("device graph edge count overflows int64");
+    }
+    graph.rowptr[row + 1] = graph.rowptr[row] + row_counts[row];
+  }
+  result.entries.resize(static_cast<std::size_t>(graph.rowptr.back()));
+  std::vector<std::int64_t> cursor = graph.rowptr;
+  for_each_edge([&](NodeId from, NodeId to, std::uint64_t tile_string,
+                    std::uint64_t pip_data_index) {
+    if (from == to) {
+      return;
+    }
+    const std::size_t row = static_cast<std::size_t>(from);
+    const std::int64_t position = cursor[row]++;
+    const std::int64_t ordinal = position - graph.rowptr[row];
+    if (ordinal > std::numeric_limits<std::uint32_t>::max()) {
+      throw std::runtime_error("device graph row degree exceeds uint32");
+    }
+    result.entries[static_cast<std::size_t>(position)] =
+        {to, static_cast<std::uint32_t>(ordinal),
+         EdgeAttr{tile_string, pip_data_index}};
+  });
+  release_storage(cursor);
+  release_storage(row_counts);
+
+  sort_and_deduplicate_static_csr(graph.rowptr, result.entries);
+  graph.loaded_edges = result.entries.size();
+  release_storage(pip_data_by_key);
+  release_storage(pip_templates);
 
   return result;
 }
@@ -930,6 +1375,8 @@ int main(int argc, char** argv) {
               << "unique_edges: " << edge_count << '\n'
               << "typed_site_pin_aliases: "
               << result.graph.site_pin_nodes.size() << '\n'
+              << "endpoint_attachments: "
+              << result.graph.endpoint_attachments.size() << '\n'
               << "base_csr_and_attrs_mib: " << mib(compact_bytes) << '\n'
               << "wrote_device_graph: " << options.output_path << '\n';
     return 0;

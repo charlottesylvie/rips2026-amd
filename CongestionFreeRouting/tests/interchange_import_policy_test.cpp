@@ -133,6 +133,79 @@ int main() {
     require(ri::include_pip_in_static_graph(true) &&
                 !ri::include_pip_in_static_graph(false),
             "pseudo-PIP inclusion policy is unsafe");
+    const auto iob_source = ri::classify_audited_iob_attachment_pip(
+        "xcvu3p", "XIPHY_BYTE_L", "XIPHY_BITSLICE_TILE_67_RX_D_PIN",
+        "XIPHY_BITSLICE_TILE_67_RX_Q5", false, true);
+    const auto iob_sink = ri::classify_audited_iob_attachment_pip(
+        "xcvu3p", "XIPHY_BYTE_L", "XIPHY_BITSLICE_TILE_22_TX_D0",
+        "XIPHY_BITSLICE_TILE_22_TX_Q", false, true);
+    require(iob_source.has_value() &&
+                iob_source->role == ri::IobAttachmentRole::kSource &&
+                iob_source->from_site_pin == "RX_D" &&
+                iob_source->to_site_pin == "RX_Q5" &&
+                iob_sink.has_value() &&
+                iob_sink->role == ri::IobAttachmentRole::kSink &&
+                iob_sink->from_site_pin == "TX_D0" &&
+                iob_sink->to_site_pin == "TX_Q",
+            "audited xcvu3p IOB attachment PIPs were not recognized");
+    require(!ri::classify_audited_iob_attachment_pip(
+                 "xcvu3p", "XIPHY_BYTE_L",
+                 "XIPHY_BITSLICE_TILE_67_RX_Q5",
+                 "XIPHY_BITSLICE_TILE_67_RX_D_PIN", false, true)
+                 .has_value() &&
+                !ri::classify_audited_iob_attachment_pip(
+                     "xcvu3p", "XIPHY_BYTE_L",
+                     "XIPHY_BITSLICE_TILE_67_RX_D_PIN",
+                     "XIPHY_BITSLICE_TILE_68_RX_Q5", false, true)
+                     .has_value() &&
+                !ri::classify_audited_iob_attachment_pip(
+                     "xcvu3p", "XIPHY_BYTE_L",
+                     "XIPHY_BITSLICE_TILE_67_RX_D_PIN",
+                     "XIPHY_BITSLICE_TILE_67_RX_Q5", true, true)
+                     .has_value() &&
+                !ri::classify_audited_iob_attachment_pip(
+                     "xcvu3p", "XIPHY_BYTE_L",
+                     "XIPHY_BITSLICE_TILE_67_RX_D_PIN",
+                     "XIPHY_BITSLICE_TILE_67_RX_Q5", false, false)
+                     .has_value() &&
+                !ri::classify_audited_iob_attachment_pip(
+                     "xcvu3p", "CLEL_R", "A", "B", false, true)
+                     .has_value(),
+            "unsupported, reversed, or malformed pseudo PIP was admitted");
+    std::uint32_t source_resource_mask = 0;
+    for (const auto& resource :
+         std::vector<std::pair<std::string, std::string>>{
+             {"RX_Q5", "RX_Q5"},
+             {"RXTX_BITSLICE", "DATAIN"},
+             {"RXTX_BITSLICE", "Q5"},
+             {"RX_D", "RX_D"}}) {
+      const auto bit = ri::audited_iob_pseudo_resource_bit(
+          ri::IobAttachmentRole::kSource, resource.first, resource.second);
+      require(bit.has_value(), "audited source pseudo resource was rejected");
+      source_resource_mask |= 1U << *bit;
+    }
+    require(source_resource_mask == 0xfU &&
+                !ri::audited_iob_pseudo_resource_bit(
+                     ri::IobAttachmentRole::kSource, "RXTX_BITSLICE",
+                     "D0")
+                     .has_value(),
+            "source pseudo-cell signature is not exact");
+    require(ri::is_audited_iob_endpoint(
+                ri::IobAttachmentRole::kSource, "IOB_X1Y41", "HPIOB_M",
+                "I") &&
+                ri::is_audited_iob_endpoint(
+                    ri::IobAttachmentRole::kSink, "IOB_X2Y3",
+                    "HPIOB_SNGL", "OP") &&
+                !ri::is_audited_iob_endpoint(
+                    ri::IobAttachmentRole::kSource, "IOB_X1Y41",
+                    "HPIOB_M", "OP") &&
+                !ri::is_audited_iob_endpoint(
+                    ri::IobAttachmentRole::kSink, "IOB_X1Y41_suffix",
+                    "HPIOB_M", "OP") &&
+                !ri::is_audited_iob_endpoint(
+                    ri::IobAttachmentRole::kSink, "IOB_X1Y41", "SLICEL",
+                    "OP"),
+            "typed IOB endpoint admission is too broad or has wrong role");
     require(ri::physical_part_matches_device(
                 "xcvu3p", "xcvu3p-ffvc1517-2-e") &&
                 ri::physical_part_matches_device("xcvu3p", "xcvu3p") &&

@@ -156,10 +156,156 @@ ri::DeviceRoutingGraph make_graph() {
   return graph;
 }
 
+ri::DeviceRoutingGraph make_attachment_graph() {
+  ri::DeviceRoutingGraph graph;
+  graph.device_fingerprint = 0x5a17a5a17ULL;
+  graph.device_path_string =
+      graph.string_table.intern("attachment-fixture.device");
+  graph.device_name_string = graph.string_table.intern("xcvu3p");
+
+  const std::uint64_t source_tile =
+      graph.string_table.intern("HPIO_L_X71Y30");
+  const std::uint64_t source_pseudo_tile =
+      graph.string_table.intern("XIPHY_BYTE_L_X72Y45");
+  const std::uint64_t fabric_tile =
+      graph.string_table.intern("INT_X72Y45");
+  const std::uint64_t sink_pseudo_tile =
+      graph.string_table.intern("XIPHY_BYTE_L_X72Y46");
+  const std::uint64_t sink_tile =
+      graph.string_table.intern("HPIO_L_X71Y31");
+
+  std::vector<std::uint64_t> wires;
+  for (int index = 0; index < 6; ++index) {
+    wires.push_back(
+        graph.string_table.intern("ATTACH_WIRE_" + std::to_string(index)));
+  }
+
+  const std::uint32_t source_site = ri::checked_lookup_string_id(
+      graph.string_table.intern("IOB_X1Y41"));
+  const std::uint32_t source_endpoint_type = ri::checked_lookup_string_id(
+      graph.string_table.intern("HPIOB_M"));
+  const std::uint32_t source_pin = ri::checked_lookup_string_id(
+      graph.string_table.intern("I"));
+  const std::uint32_t sink_site = ri::checked_lookup_string_id(
+      graph.string_table.intern("IOB_X1Y42"));
+  const std::uint32_t sink_endpoint_type = ri::checked_lookup_string_id(
+      graph.string_table.intern("HPIOB_S"));
+  const std::uint32_t sink_pin = ri::checked_lookup_string_id(
+      graph.string_table.intern("OP"));
+  const std::uint32_t source_traversed_site = ri::checked_lookup_string_id(
+      graph.string_table.intern("BITSLICE_RX_TX_X1Y41"));
+  const std::uint32_t sink_traversed_site = ri::checked_lookup_string_id(
+      graph.string_table.intern("BITSLICE_RX_TX_X1Y42"));
+  const std::uint32_t traversed_primary_type = ri::checked_lookup_string_id(
+      graph.string_table.intern("BITSLICE_RX_TX"));
+  const std::uint32_t traversed_alt_type = ri::checked_lookup_string_id(
+      graph.string_table.intern("BITSLICE_COMPONENT_RX_TX"));
+
+  const std::uint32_t source_bel = ri::checked_lookup_string_id(
+      graph.string_table.intern("RXTX_BITSLICE"));
+  const std::uint32_t source_data_pin = ri::checked_lookup_string_id(
+      graph.string_table.intern("DATAIN"));
+  const std::uint32_t source_q_pin = ri::checked_lookup_string_id(
+      graph.string_table.intern("Q5"));
+  const std::uint32_t source_wire_bel = ri::checked_lookup_string_id(
+      graph.string_table.intern("RX_D"));
+  const std::uint32_t source_wire_pin = ri::checked_lookup_string_id(
+      graph.string_table.intern("RX_D"));
+  const std::uint32_t source_q_bel = ri::checked_lookup_string_id(
+      graph.string_table.intern("RX_Q5"));
+  const std::uint32_t source_q_bel_pin = ri::checked_lookup_string_id(
+      graph.string_table.intern("RX_Q5"));
+  const std::uint32_t sink_bel = source_bel;
+  const std::uint32_t sink_d_pin = ri::checked_lookup_string_id(
+      graph.string_table.intern("D0"));
+  const std::uint32_t sink_o_pin = ri::checked_lookup_string_id(
+      graph.string_table.intern("O"));
+  const std::uint32_t sink_wire_bel = ri::checked_lookup_string_id(
+      graph.string_table.intern("TX_D0"));
+  const std::uint32_t sink_wire_pin = ri::checked_lookup_string_id(
+      graph.string_table.intern("TX_D0"));
+  const std::uint32_t sink_q_bel = ri::checked_lookup_string_id(
+      graph.string_table.intern("TX_Q"));
+  const std::uint32_t sink_q_bel_pin = ri::checked_lookup_string_id(
+      graph.string_table.intern("TX_Q"));
+  const std::uint64_t node_tile_type =
+      graph.string_table.intern("ATTACH_TILE_TYPE");
+  const std::uint64_t node_wire_type =
+      graph.string_table.intern("ATTACH_WIRE_TYPE");
+
+  graph.bounds = {0, 100, 0, 100};
+  graph.node_bounds_mode = ri::NodeBoundsMode::kPocBaseWire;
+  graph.declared_edges = 5;
+  graph.loaded_edges = 5;
+  graph.node_device_ids = {100, 101, 102, 103, 104, 105};
+  graph.node_min_x = {71, 72, 72, 72, 72, 71};
+  graph.node_max_x = graph.node_min_x;
+  graph.node_min_y = {30, 45, 45, 46, 46, 31};
+  graph.node_max_y = graph.node_min_y;
+  graph.node_tile_type_strings.assign(6, node_tile_type);
+  graph.node_wire_type_strings.assign(6, node_wire_type);
+  graph.node_route_end_x = graph.node_min_x;
+  graph.node_route_end_y = graph.node_min_y;
+  graph.node_base_vertex_cost.assign(6, 1.0f);
+
+  graph.pip_data = {
+      {wires[0], wires[1], true},
+      {wires[1], wires[2], true},
+      {wires[2], wires[3], true},
+      {wires[3], wires[4], true},
+      {wires[4], wires[5], true},
+  };
+  graph.rowptr = {0, 1, 2, 3, 4, 5, 5};
+  graph.colind = {1, 2, 3, 4, 5};
+  graph.edge_attrs = {
+      {source_tile, 0},
+      {source_pseudo_tile, 1},
+      {fabric_tile, 2},
+      {sink_pseudo_tile, 3},
+      {sink_tile, 4},
+  };
+  graph.site_pin_nodes = {
+      {source_site, source_endpoint_type, source_pin, 0},
+      {sink_site, sink_endpoint_type, sink_pin, 5},
+  };
+  std::sort(graph.site_pin_nodes.begin(), graph.site_pin_nodes.end());
+
+  graph.endpoint_attachment_traversed_site_types = {
+      traversed_primary_type, traversed_alt_type,
+      traversed_primary_type, traversed_alt_type,
+  };
+  graph.endpoint_attachment_pseudo_cell_pins = {
+      {source_bel, source_data_pin, ri::PseudoCellPinDirection::kInput},
+      {source_bel, source_q_pin, ri::PseudoCellPinDirection::kOutput},
+      {source_wire_bel, source_wire_pin,
+       ri::PseudoCellPinDirection::kOutput},
+      {source_q_bel, source_q_bel_pin,
+       ri::PseudoCellPinDirection::kInput},
+      {sink_bel, sink_d_pin, ri::PseudoCellPinDirection::kInput},
+      {sink_bel, sink_o_pin, ri::PseudoCellPinDirection::kOutput},
+      {sink_wire_bel, sink_wire_pin, ri::PseudoCellPinDirection::kOutput},
+      {sink_q_bel, sink_q_bel_pin, ri::PseudoCellPinDirection::kInput},
+  };
+  graph.endpoint_attachments = {
+      {source_site, source_endpoint_type, source_pin,
+       ri::EndpointAttachmentRole::kSource,
+       0, 1, 2, 1, source_traversed_site,
+       0, 2, 0, 4},
+      {sink_site, sink_endpoint_type, sink_pin,
+       ri::EndpointAttachmentRole::kSink,
+       5, 3, 4, 3, sink_traversed_site,
+       2, 2, 4, 4},
+  };
+  ri::rebuild_endpoint_attachment_lookups(graph);
+  return graph;
+}
+
 void compare_graphs(const ri::DeviceRoutingGraph& expected,
                     const ri::DeviceRoutingGraph& actual,
                     bool expect_physical_node_arrays = true,
                     bool expect_routing_sidecars = true) {
+  require(actual.format_version == expected.format_version,
+          "format version changed across roundtrip");
   require(actual.device_fingerprint == expected.device_fingerprint,
           "fingerprint changed across roundtrip");
   require(actual.device_path_string == expected.device_path_string,
@@ -276,6 +422,87 @@ void compare_graphs(const ri::DeviceRoutingGraph& expected,
   require(compare_site_pin_lookups(actual.site_pin_nodes,
                                    expected.site_pin_nodes),
           "site-pin lookup changed across roundtrip");
+  require(actual.endpoint_attachments.size() ==
+              expected.endpoint_attachments.size(),
+          "endpoint attachment count changed across roundtrip");
+  for (std::size_t index = 0; index < expected.endpoint_attachments.size();
+       ++index) {
+    const ri::EndpointAttachment& lhs = actual.endpoint_attachments[index];
+    const ri::EndpointAttachment& rhs = expected.endpoint_attachments[index];
+    require(lhs.endpoint_site_string == rhs.endpoint_site_string &&
+                lhs.endpoint_site_type_string ==
+                    rhs.endpoint_site_type_string &&
+                lhs.endpoint_pin_string == rhs.endpoint_pin_string &&
+                lhs.role == rhs.role &&
+                lhs.endpoint_node == rhs.endpoint_node &&
+                lhs.from_node == rhs.from_node &&
+                lhs.to_node == rhs.to_node &&
+                lhs.pip_data_index == rhs.pip_data_index &&
+                lhs.traversed_site_string == rhs.traversed_site_string &&
+                lhs.traversed_site_type_begin ==
+                    rhs.traversed_site_type_begin &&
+                lhs.traversed_site_type_count ==
+                    rhs.traversed_site_type_count &&
+                lhs.pseudo_cell_pin_begin == rhs.pseudo_cell_pin_begin &&
+                lhs.pseudo_cell_pin_count == rhs.pseudo_cell_pin_count,
+            "endpoint attachment changed across roundtrip");
+  }
+  require(actual.endpoint_attachment_traversed_site_types ==
+              expected.endpoint_attachment_traversed_site_types,
+          "attachment traversed-site types changed across roundtrip");
+  require(actual.endpoint_attachment_pseudo_cell_pins.size() ==
+              expected.endpoint_attachment_pseudo_cell_pins.size(),
+          "attachment pseudo-cell-pin count changed across roundtrip");
+  for (std::size_t index = 0;
+       index < expected.endpoint_attachment_pseudo_cell_pins.size(); ++index) {
+    const ri::PseudoCellPinResource& lhs =
+        actual.endpoint_attachment_pseudo_cell_pins[index];
+    const ri::PseudoCellPinResource& rhs =
+        expected.endpoint_attachment_pseudo_cell_pins[index];
+    require(lhs.bel_string == rhs.bel_string &&
+                lhs.pin_string == rhs.pin_string &&
+                lhs.direction == rhs.direction,
+            "attachment pseudo-cell pin changed across roundtrip");
+  }
+  require(actual.endpoint_attachment_lookups.size() ==
+              expected.endpoint_attachment_lookups.size(),
+          "endpoint-attachment lookup count changed across roundtrip");
+  for (std::size_t index = 0;
+       index < expected.endpoint_attachment_lookups.size(); ++index) {
+    const ri::EndpointAttachmentLookup& lhs =
+        actual.endpoint_attachment_lookups[index];
+    const ri::EndpointAttachmentLookup& rhs =
+        expected.endpoint_attachment_lookups[index];
+    require(lhs.endpoint_site_string == rhs.endpoint_site_string &&
+                lhs.endpoint_site_type_string ==
+                    rhs.endpoint_site_type_string &&
+                lhs.endpoint_pin_string == rhs.endpoint_pin_string &&
+                lhs.role == rhs.role &&
+                lhs.attachment_index == rhs.attachment_index,
+            "endpoint-attachment lookup changed across roundtrip");
+  }
+}
+
+void write_legacy_v4_fixture(const std::filesystem::path& v5_path,
+                             const std::filesystem::path& v4_path) {
+  std::ifstream input(v5_path, std::ios::binary);
+  std::vector<char> bytes((std::istreambuf_iterator<char>(input)),
+                          std::istreambuf_iterator<char>());
+  require(static_cast<bool>(input) || input.eof(),
+          "could not read the version-5 device-graph fixture");
+  constexpr std::size_t kMagicBytes = 8;
+  constexpr std::size_t kEmptyV5TrailerBytes = 4 * sizeof(std::uint64_t);
+  require(bytes.size() >= kMagicBytes + sizeof(std::uint64_t) +
+                              kEmptyV5TrailerBytes,
+          "version-5 fixture is too short");
+  bytes.resize(bytes.size() - kEmptyV5TrailerBytes);
+  const std::uint64_t legacy_version = 4;
+  std::memcpy(bytes.data() + kMagicBytes, &legacy_version,
+              sizeof(legacy_version));
+  std::ofstream output(v4_path, std::ios::binary | std::ios::trunc);
+  output.write(bytes.data(), static_cast<std::streamsize>(bytes.size()));
+  require(static_cast<bool>(output),
+          "could not write the legacy version-4 fixture");
 }
 
 void write_legacy_v3_fixture(const std::filesystem::path& v4_path,
@@ -324,6 +551,7 @@ void write_legacy_v3_fixture(const std::filesystem::path& v4_path,
 ri::DeviceRoutingGraph legacy_v3_expectation(
     const ri::DeviceRoutingGraph& current) {
   ri::DeviceRoutingGraph expected = current;
+  expected.format_version = 3;
   const auto midpoint = [](std::int32_t minimum, std::int32_t maximum) {
     if (minimum == ri::kMissingRouteCoordinate &&
         maximum == ri::kMissingRouteCoordinate) {
@@ -356,6 +584,14 @@ int main() {
         ("rips-device-graph-test-" + std::to_string(nonce));
     const std::filesystem::path split_path = base.string() + ".split";
     const std::filesystem::path streamed_path = base.string() + ".streamed";
+    const std::filesystem::path attachment_path =
+        base.string() + ".attachments";
+    const std::filesystem::path attachment_streamed_path =
+        base.string() + ".attachments-streamed";
+    const std::filesystem::path stale_write_path =
+        base.string() + ".stale-write";
+    const std::filesystem::path version_four_path =
+        base.string() + ".version-four";
     const std::filesystem::path version_three_path =
         base.string() + ".version-three";
     const std::filesystem::path legacy_path = base.string() + ".legacy";
@@ -366,6 +602,10 @@ int main() {
         base.string() + ".sidecar-truncated";
     cleanup = {split_path,
                streamed_path,
+               attachment_path,
+               attachment_streamed_path,
+               stale_write_path,
+               version_four_path,
                version_three_path,
                legacy_path,
                trailing_path,
@@ -546,7 +786,33 @@ int main() {
         ri::read_device_routing_graph_for_routing(split_path);
     compare_graphs(expected, routing_projection, false, true);
 
-    write_legacy_v3_fixture(split_path, version_three_path, expected);
+    const ri::DeviceRoutingGraph attachment_expected =
+        make_attachment_graph();
+    ri::validate_device_routing_graph(attachment_expected);
+    ri::write_device_routing_graph(attachment_expected, attachment_path);
+    const ri::DeviceRoutingGraph attachment_roundtrip =
+        ri::read_device_routing_graph(attachment_path);
+    compare_graphs(attachment_expected, attachment_roundtrip);
+    const ri::DeviceRoutingGraph attachment_filtering =
+        ri::read_device_routing_graph_for_filtering(attachment_path, true);
+    compare_graphs(attachment_expected, attachment_filtering, false, false);
+    const ri::DeviceRoutingGraph attachment_routing =
+        ri::read_device_routing_graph_for_routing(attachment_path);
+    compare_graphs(attachment_expected, attachment_routing, false, true);
+
+    write_legacy_v4_fixture(split_path, version_four_path);
+    write_legacy_v3_fixture(version_four_path, version_three_path, expected);
+    ri::DeviceRoutingGraph expected_v4 = expected;
+    expected_v4.format_version = 4;
+    const ri::DeviceRoutingGraph version_four =
+        ri::read_device_routing_graph(version_four_path);
+    compare_graphs(expected_v4, version_four);
+    const ri::DeviceRoutingGraph version_four_filtering =
+        ri::read_device_routing_graph_for_filtering(version_four_path);
+    compare_graphs(expected_v4, version_four_filtering, false, false);
+    const ri::DeviceRoutingGraph version_four_routing =
+        ri::read_device_routing_graph_for_routing(version_four_path, false);
+    compare_graphs(expected_v4, version_four_routing, false, true);
     const ri::DeviceRoutingGraph expected_v3 =
         legacy_v3_expectation(expected);
     const ri::DeviceRoutingGraph version_three =
@@ -556,8 +822,42 @@ int main() {
         ri::read_device_routing_graph_for_filtering(version_three_path);
     compare_graphs(expected_v3, version_three_filtering, false, false);
     const ri::DeviceRoutingGraph version_three_routing =
-        ri::read_device_routing_graph_for_routing(version_three_path);
+        ri::read_device_routing_graph_for_routing(version_three_path, false);
     compare_graphs(expected_v3, version_three_routing, false, true);
+
+    for (const std::filesystem::path& stale_path :
+         {version_four_path, version_three_path}) {
+      bool rejected_stale_routing = false;
+      try {
+        (void)ri::read_device_routing_graph_for_routing(stale_path);
+      } catch (const std::runtime_error& error) {
+        rejected_stale_routing =
+            std::string(error.what()).find("regenerate") !=
+            std::string::npos;
+      }
+      require(rejected_stale_routing,
+              "production routing reader accepted a stale device graph");
+
+      bool rejected_stale_filtering = false;
+      try {
+        (void)ri::read_device_routing_graph_for_filtering(stale_path, true);
+      } catch (const std::runtime_error& error) {
+        rejected_stale_filtering =
+            std::string(error.what()).find("regenerate") !=
+            std::string::npos;
+      }
+      require(rejected_stale_filtering,
+              "required-v5 filtering reader accepted a stale device graph");
+    }
+    bool rejected_stale_write = false;
+    try {
+      ri::write_device_routing_graph(version_four, stale_write_path);
+    } catch (const std::runtime_error& error) {
+      rejected_stale_write =
+          std::string(error.what()).find("regenerate") != std::string::npos;
+    }
+    require(rejected_stale_write,
+            "writer silently upgraded a stale device graph to version 5");
 
     // Truncate one byte before the end of the skipped 40-byte/node block.
     // The projection must check the available file extent instead of letting
@@ -720,6 +1020,128 @@ int main() {
                  .has_value(),
             "explicit active-type miss fell back to an inactive alias");
 
+    const auto source_attachment = ri::find_endpoint_attachment_index(
+        attachment_roundtrip.endpoint_attachment_lookups,
+        attachment_roundtrip.string_table,
+        "IOB_X1Y41", "HPIOB_M", "I",
+        ri::EndpointAttachmentRole::kSource);
+    const auto sink_attachment = ri::find_endpoint_attachment_index(
+        attachment_roundtrip.endpoint_attachment_lookups,
+        attachment_roundtrip.string_table,
+        "IOB_X1Y42", "HPIOB_S", "OP",
+        ri::EndpointAttachmentRole::kSink);
+    require(source_attachment == std::optional<std::uint32_t>(0) &&
+                sink_attachment == std::optional<std::uint32_t>(1),
+            "exact typed endpoint-attachment lookup failed");
+    require(!ri::find_endpoint_attachment_index(
+                 attachment_roundtrip.endpoint_attachment_lookups,
+                 attachment_roundtrip.string_table,
+                 "IOB_X1Y41", "BITSLICE_RX_TX", "I",
+                 ri::EndpointAttachmentRole::kSource)
+                 .has_value() &&
+                !ri::find_endpoint_attachment_index(
+                 attachment_roundtrip.endpoint_attachment_lookups,
+                 attachment_roundtrip.string_table,
+                 "IOB_X1Y41", "HPIOB_M", "I",
+                 ri::EndpointAttachmentRole::kSink)
+                 .has_value(),
+            "endpoint lookup conflated endpoint/traversed type or role");
+    require(ri::endpoint_attachment_allows_traversed_site_type(
+                attachment_roundtrip, 0, "BITSLICE_RX_TX") &&
+                ri::endpoint_attachment_allows_traversed_site_type(
+                    attachment_roundtrip, 0,
+                    "BITSLICE_COMPONENT_RX_TX") &&
+                !ri::endpoint_attachment_allows_traversed_site_type(
+                    attachment_roundtrip, 0, "HPIOB_M") &&
+                !ri::endpoint_attachment_allows_traversed_site_type(
+                    attachment_roundtrip, 99, "BITSLICE_RX_TX"),
+            "traversed-site active-type authorization is wrong");
+
+    bool rejected_attachment_graph = false;
+    try {
+      ri::DeviceRoutingGraph invalid = make_attachment_graph();
+      invalid.endpoint_attachments[1].pip_data_index =
+          invalid.endpoint_attachments[0].pip_data_index;
+      ri::validate_device_routing_graph(invalid);
+    } catch (const std::runtime_error&) {
+      rejected_attachment_graph = true;
+    }
+    require(rejected_attachment_graph,
+            "validation accepted duplicate attachment PIP data IDs");
+
+    rejected_attachment_graph = false;
+    try {
+      ri::DeviceRoutingGraph invalid = make_attachment_graph();
+      std::swap(invalid.edge_attrs[1].pip_data_index,
+                invalid.edge_attrs[2].pip_data_index);
+      ri::validate_device_routing_graph(invalid);
+    } catch (const std::runtime_error&) {
+      rejected_attachment_graph = true;
+    }
+    require(rejected_attachment_graph,
+            "validation accepted an attachment PIP on the wrong directed edge");
+
+    rejected_attachment_graph = false;
+    try {
+      ri::DeviceRoutingGraph invalid = make_attachment_graph();
+      invalid.colind.insert(invalid.colind.begin() + 3, 1);
+      invalid.edge_attrs.insert(invalid.edge_attrs.begin() + 3,
+                                invalid.edge_attrs[0]);
+      for (std::size_t row = 4; row < invalid.rowptr.size(); ++row) {
+        ++invalid.rowptr[row];
+      }
+      ++invalid.loaded_edges;
+      ++invalid.declared_edges;
+      ri::validate_device_routing_graph(invalid);
+    } catch (const std::runtime_error&) {
+      rejected_attachment_graph = true;
+    }
+    require(rejected_attachment_graph,
+            "validation accepted a transit predecessor into a source corridor");
+
+    rejected_attachment_graph = false;
+    try {
+      ri::DeviceRoutingGraph invalid = make_attachment_graph();
+      invalid.colind.insert(invalid.colind.begin() + 4, 0);
+      invalid.edge_attrs.insert(invalid.edge_attrs.begin() + 4,
+                                invalid.edge_attrs[0]);
+      for (std::size_t row = 5; row < invalid.rowptr.size(); ++row) {
+        ++invalid.rowptr[row];
+      }
+      ++invalid.loaded_edges;
+      ++invalid.declared_edges;
+      ri::validate_device_routing_graph(invalid);
+    } catch (const std::runtime_error&) {
+      rejected_attachment_graph = true;
+    }
+    require(rejected_attachment_graph,
+            "validation accepted a transit successor from a sink corridor");
+
+    rejected_attachment_graph = false;
+    try {
+      ri::DeviceRoutingGraph invalid = make_attachment_graph();
+      invalid.endpoint_attachments[1].traversed_site_type_begin = 3;
+      invalid.endpoint_attachments[1].traversed_site_type_count = 1;
+      ri::validate_device_routing_graph(invalid);
+    } catch (const std::runtime_error&) {
+      rejected_attachment_graph = true;
+    }
+    require(rejected_attachment_graph,
+            "validation accepted a gap between attachment type slices");
+
+    rejected_attachment_graph = false;
+    try {
+      ri::DeviceRoutingGraph invalid = make_attachment_graph();
+      invalid.endpoint_attachments[0].endpoint_site_type_string =
+          invalid.endpoint_attachments[0].traversed_site_type_begin;
+      ri::rebuild_endpoint_attachment_lookups(invalid);
+      ri::validate_device_routing_graph(invalid);
+    } catch (const std::runtime_error&) {
+      rejected_attachment_graph = true;
+    }
+    require(rejected_attachment_graph,
+            "validation accepted an endpoint type without its typed site pin");
+
     std::vector<std::uint8_t> blocked = {0, 0, 1, 0};
     std::vector<std::uint8_t> sink_stop = {0, 1, 0, 0};
     // Destination unavailability is the union of blocked resources and
@@ -826,6 +1248,106 @@ int main() {
       }
     }
 
+    const std::vector<std::uint8_t> attachment_blocked(6, 0);
+    std::vector<std::uint8_t> attachment_sink_stops(6, 0);
+    attachment_sink_stops[5] = 1;
+    std::vector<std::uint8_t> attachment_unavailable(6, 0);
+    attachment_unavailable[0] = 1;
+    const ri::CsrGraph attachments_enabled =
+        ri::filter_device_routing_graph(
+            attachment_filtering, attachment_blocked,
+            attachment_sink_stops, attachment_unavailable, {1, 1});
+    require(attachments_enabled.colind ==
+                std::vector<std::int32_t>({1, 2, 3, 4, 5}) &&
+                reachable(attachments_enabled, 0, 5),
+            "enabled source/sink attachments did not form the directed route");
+    require(attachments_enabled.edge_attrs.size() == 5,
+            "enabled attachment filtering lost edge attributes");
+    for (std::size_t edge = 0;
+         edge < attachments_enabled.edge_attrs.size(); ++edge) {
+      require(attachments_enabled.edge_attrs[edge].pip_data_index == edge &&
+                  attachments_enabled.edge_attrs[edge].tile_string ==
+                      attachment_expected.edge_attrs[edge].tile_string,
+              "enabled attachment filtering misaligned an EdgeAttr");
+    }
+
+    const ri::CsrGraph attachments_disabled =
+        ri::filter_device_routing_graph(
+            attachment_filtering, attachment_blocked,
+            attachment_sink_stops, attachment_unavailable);
+    require(attachments_disabled.rowptr ==
+                std::vector<std::int64_t>({0, 1, 1, 2, 2, 3, 3}) &&
+                attachments_disabled.colind ==
+                    std::vector<std::int32_t>({1, 3, 5}) &&
+                !reachable(attachments_disabled, 0, 5),
+            "disabled attachment PIPs remained transit-capable");
+    require(attachments_disabled.edge_attrs.size() == 3 &&
+                attachments_disabled.edge_attrs[0].pip_data_index == 0 &&
+                attachments_disabled.edge_attrs[1].pip_data_index == 2 &&
+                attachments_disabled.edge_attrs[2].pip_data_index == 4,
+            "disabled attachment filtering changed conventional edge policy");
+
+    const ri::CsrGraph source_attachment_only =
+        ri::filter_device_routing_graph(
+            attachment_filtering, attachment_blocked,
+            attachment_sink_stops, attachment_unavailable, {1, 0});
+    require(reachable(source_attachment_only, 0, 3) &&
+                !reachable(source_attachment_only, 0, 5),
+            "source attachment was not directed away from its endpoint");
+    const ri::CsrGraph sink_attachment_only =
+        ri::filter_device_routing_graph(
+            attachment_filtering, attachment_blocked,
+            attachment_sink_stops, attachment_unavailable, {0, 1});
+    require(reachable(sink_attachment_only, 3, 5) &&
+                !reachable(sink_attachment_only, 0, 5),
+            "sink attachment was not directed toward its endpoint");
+
+    bool rejected_attachment_mask = false;
+    try {
+      (void)ri::filter_device_routing_graph(
+          attachment_filtering, attachment_blocked,
+          attachment_sink_stops, attachment_unavailable, {1});
+    } catch (const std::runtime_error&) {
+      rejected_attachment_mask = true;
+    }
+    require(rejected_attachment_mask,
+            "filter accepted a short endpoint-attachment mask");
+    rejected_attachment_mask = false;
+    try {
+      (void)ri::filter_device_routing_graph(
+          attachment_filtering, attachment_blocked,
+          attachment_sink_stops, attachment_unavailable, {2, 0});
+    } catch (const std::runtime_error&) {
+      rejected_attachment_mask = true;
+    }
+    require(rejected_attachment_mask,
+            "filter accepted a non-boolean endpoint-attachment mask");
+
+    rejected_attachment_mask = false;
+    try {
+      std::vector<std::uint8_t> unsafe = attachment_unavailable;
+      unsafe[0] = 0;
+      (void)ri::filter_device_routing_graph(
+          attachment_filtering, attachment_blocked,
+          attachment_sink_stops, unsafe, {1, 0});
+    } catch (const std::runtime_error&) {
+      rejected_attachment_mask = true;
+    }
+    require(rejected_attachment_mask,
+            "filter enabled a source attachment at a transit-capable endpoint");
+    rejected_attachment_mask = false;
+    try {
+      std::vector<std::uint8_t> unsafe = attachment_sink_stops;
+      unsafe[5] = 0;
+      (void)ri::filter_device_routing_graph(
+          attachment_filtering, attachment_blocked,
+          unsafe, attachment_unavailable, {0, 1});
+    } catch (const std::runtime_error&) {
+      rejected_attachment_mask = true;
+    }
+    require(rejected_attachment_mask,
+            "filter enabled a sink attachment at a transit-capable endpoint");
+
     ri::DeviceRoutingGraph streamed_source = make_graph();
     std::vector<ri::StaticCsrEntry> entries;
     entries.reserve(streamed_source.colind.size());
@@ -846,6 +1368,44 @@ int main() {
     const ri::DeviceRoutingGraph streamed =
         ri::read_device_routing_graph(streamed_path);
     compare_graphs(expected, streamed);
+
+    ri::DeviceRoutingGraph attachment_streamed_source =
+        make_attachment_graph();
+    std::vector<ri::StaticCsrEntry> attachment_entries;
+    for (std::size_t row = 0;
+         row < attachment_streamed_source.node_device_ids.size(); ++row) {
+      for (std::int64_t edge = attachment_streamed_source.rowptr[row];
+           edge < attachment_streamed_source.rowptr[row + 1]; ++edge) {
+        const std::size_t index = static_cast<std::size_t>(edge);
+        attachment_entries.push_back(
+            {attachment_streamed_source.colind[index],
+             static_cast<std::uint32_t>(
+                 edge - attachment_streamed_source.rowptr[row]),
+             attachment_streamed_source.edge_attrs[index]});
+      }
+    }
+    attachment_streamed_source.colind.clear();
+    attachment_streamed_source.edge_attrs.clear();
+    std::vector<ri::StaticCsrEntry> wrong_attachment_entries =
+        attachment_entries;
+    std::swap(wrong_attachment_entries[1].attr.pip_data_index,
+              wrong_attachment_entries[2].attr.pip_data_index);
+    bool rejected_bad_streamed_attachment = false;
+    try {
+      ri::write_device_routing_graph(
+          attachment_streamed_source, wrong_attachment_entries,
+          stale_write_path);
+    } catch (const std::runtime_error&) {
+      rejected_bad_streamed_attachment = true;
+    }
+    require(rejected_bad_streamed_attachment,
+            "streamed writer accepted an attachment PIP on the wrong edge");
+    ri::write_device_routing_graph(
+        attachment_streamed_source, attachment_entries,
+        attachment_streamed_path);
+    const ri::DeviceRoutingGraph attachment_streamed =
+        ri::read_device_routing_graph(attachment_streamed_path);
+    compare_graphs(attachment_expected, attachment_streamed);
 
     for (const std::filesystem::path& path : cleanup) {
       std::filesystem::remove(path);

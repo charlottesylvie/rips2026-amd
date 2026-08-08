@@ -88,17 +88,36 @@ struct PipDataDisk {
 static_assert(sizeof(PipDataDisk) == 3 * sizeof(std::uint64_t),
               "PipDataDisk metadata layout changed");
 
+// Metadata v7 sparse endpoint-owned pseudo-PIP record. Keep this layout in
+// lockstep with pathfinder.cpp and routes_to_phys.cpp.
+struct EndpointPipDisk {
+  std::uint64_t csr_edge = 0;
+  std::uint64_t from = 0;
+  std::uint64_t to = 0;
+  std::uint64_t tile_string = 0;
+  std::uint64_t wire0_string = 0;
+  std::uint64_t wire1_string = 0;
+  std::uint64_t forward = 0;
+  std::uint64_t site_string = 0;
+  std::uint64_t endpoint_node = 0;
+  std::uint64_t role = 0;
+};
+
+static_assert(sizeof(EndpointPipDisk) == 10 * sizeof(std::uint64_t),
+              "EndpointPipDisk metadata layout changed");
+
 constexpr char CSR_MAGIC[8] = {'R', 'I', 'P', 'S', 'C', 'S', 'R', '1'};
 constexpr char METADATA_MAGIC[8] = {'R', 'I', 'P', 'S', 'I', 'F', 'M', '1'};
 constexpr std::uint64_t CSR_FORMAT_VERSION = 3;
-// Version 6 keeps the node count but omits the seven 40-byte-per-node physical
-// metadata arrays. No production consumer used their contents, and retaining
-// them made every full-device conversion write more than a GiB of dead data.
-constexpr std::uint64_t METADATA_FORMAT_VERSION = 6;
+// Version 7 adds a sparse endpoint-owned pseudo-PIP table and binds each route
+// endpoint to its permitted attachment. The generic CSR stays at version 3.
+constexpr std::uint64_t METADATA_FORMAT_VERSION = 7;
 constexpr std::uint64_t OUTGOING_EDGE_ORIENTATION = 2;
 using routing::interchange::CsrGraph;
 using routing::interchange::DeviceRoutingGraph;
 using routing::interchange::EdgeAttr;
+using routing::interchange::EndpointAttachment;
+using routing::interchange::EndpointAttachmentRole;
 using routing::interchange::InterchangeArtifactPairId;
 using routing::interchange::NodeId;
 using routing::interchange::PipData;
@@ -107,6 +126,7 @@ using routing::interchange::SpatialEdgeShards;
 using routing::interchange::StringTable;
 using routing::interchange::device_routing_graph_node_count;
 using routing::interchange::filter_device_routing_graph;
+using routing::interchange::find_endpoint_attachment_index;
 using routing::interchange::find_pair_node;
 using routing::interchange::find_site_pin_candidates;
 using routing::interchange::find_site_pin_node;
@@ -152,6 +172,23 @@ struct SitePinNode {
   NodeId node = -1;
   std::uint64_t site_string = 0;
   std::uint64_t pin_string = 0;
+  // Devicegraph attachment identity during import, remapped to the sparse v7
+  // EndpointPip table after final CSR filtering.
+  std::uint64_t endpoint_attachment_index = kNoIndex;
+  std::uint64_t endpoint_pip_index = kNoIndex;
+};
+
+struct EndpointPipMetadata {
+  std::uint64_t csr_edge = 0;
+  NodeId from = kInvalidRouteNode;
+  NodeId to = kInvalidRouteNode;
+  std::uint64_t tile_string = kNoStringIndex;
+  std::uint64_t wire0_string = kNoStringIndex;
+  std::uint64_t wire1_string = kNoStringIndex;
+  bool forward = true;
+  std::uint64_t site_string = kNoStringIndex;
+  NodeId endpoint_node = kInvalidRouteNode;
+  EndpointAttachmentRole role = EndpointAttachmentRole::kSource;
 };
 
 // A design-specific route request extracted from a PhysicalNetlist. Sources
@@ -206,6 +243,7 @@ struct RoutingGraph : DeviceRoutingGraph {
     // this graph currently cannot.
     sink_node_stops.assign(node_count, 0);
     unavailable_destination_nodes.assign(node_count, 0);
+    enabled_endpoint_attachments.assign(endpoint_attachments.size(), 0);
   }
 
   std::vector<std::uint8_t> blocked_node;
@@ -215,8 +253,10 @@ struct RoutingGraph : DeviceRoutingGraph {
   // filtering, when source/sink overlap checks no longer need to distinguish
   // the two policies. The filter then needs one random destination-mask read.
   std::vector<std::uint8_t> unavailable_destination_nodes;
+  std::vector<std::uint8_t> enabled_endpoint_attachments;
   std::vector<SitePinNode> site_pin_attrs;
   std::vector<RouteRequest> route_requests;
+  std::vector<EndpointPipMetadata> endpoint_pips;
 
   std::uint64_t physical_path_string = 0;
   std::uint64_t logical_path_string = 0;
@@ -265,6 +305,186 @@ class ActiveSiteTypes {
  private:
   std::unordered_map<std::string, std::string> type_by_site_;
 };
+
+// Pseudo-cell pins are design resources, not merely graph edges. Placements
+// and fixed site routing claim an entire BEL; an attachment claims each exact
+// BEL/pin listed by DeviceResources. Different owners may not share an exact
+// pin or overlap an entire-BEL claim. This keeps the audited IOB transition
+// legal without globally enabling arbitrary site route-throughs.
+class AttachmentResourceClaims {
+ public:
+  static constexpr std::size_t kPlacementOwner =
+      std::numeric_limits<std::size_t>::max();
+
+  void claim_placement_bel(const std::string& site,
+                           const std::string& bel,
+                           const std::string& description) {
+    claim_whole_bel(site, bel, kPlacementOwner, description);
+  }
+
+  void claim_whole_bel(const std::string& site,
+                       const std::string& bel,
+                       std::size_t owner,
+                       const std::string& description) {
+    const std::string bel_key = make_key(site, bel);
+    const auto whole = whole_bel_owners_.find(bel_key);
+    if (whole != whole_bel_owners_.end() && whole->second != owner) {
+      throw std::runtime_error(description +
+                               " conflicts with an occupied BEL " + site +
+                               "/" + bel);
+    }
+    const auto pins = pin_owners_by_bel_.find(bel_key);
+    if (pins != pin_owners_by_bel_.end()) {
+      for (const std::size_t pin_owner : pins->second) {
+        if (pin_owner != owner) {
+          throw std::runtime_error(description +
+                                   " conflicts with an attachment resource " +
+                                   site + "/" + bel);
+        }
+      }
+    }
+    whole_bel_owners_.emplace(bel_key, owner);
+  }
+
+  void claim_pin(const std::string& site,
+                 const std::string& bel,
+                 const std::string& pin,
+                 std::size_t owner,
+                 const std::string& description) {
+    const std::string bel_key = make_key(site, bel);
+    const auto whole = whole_bel_owners_.find(bel_key);
+    if (whole != whole_bel_owners_.end() && whole->second != owner) {
+      throw std::runtime_error(description +
+                               " conflicts with an occupied BEL " + site +
+                               "/" + bel);
+    }
+    const std::string pin_key = make_key(bel_key, pin);
+    const auto exact = pin_owners_.find(pin_key);
+    if (exact != pin_owners_.end() && exact->second != owner) {
+      throw std::runtime_error(description +
+                               " conflicts with an owned pseudo-cell pin " +
+                               site + "/" + bel + "/" + pin);
+    }
+    pin_owners_.emplace(pin_key, owner);
+    pin_owners_by_bel_[bel_key].insert(owner);
+  }
+
+ private:
+  static std::string make_key(const std::string& first,
+                              const std::string& second) {
+    std::string key;
+    key.reserve(first.size() + second.size() + 1);
+    key.append(first);
+    key.push_back('\0');
+    key.append(second);
+    return key;
+  }
+
+  std::unordered_map<std::string, std::size_t> whole_bel_owners_;
+  std::unordered_map<std::string, std::size_t> pin_owners_;
+  std::unordered_map<std::string, std::unordered_set<std::size_t>>
+      pin_owners_by_bel_;
+};
+
+bool attachment_allows_traversed_site_type(
+    const RoutingGraph& graph,
+    const EndpointAttachment& attachment,
+    const std::string& active_site_type) {
+  const std::uint64_t end =
+      attachment.traversed_site_type_begin +
+      attachment.traversed_site_type_count;
+  if (end < attachment.traversed_site_type_begin ||
+      end > graph.endpoint_attachment_traversed_site_types.size()) {
+    throw std::runtime_error(
+        "endpoint attachment traversed-site-type slice is invalid");
+  }
+  for (std::uint64_t index = attachment.traversed_site_type_begin;
+       index < end; ++index) {
+    const std::uint32_t string_index =
+        graph.endpoint_attachment_traversed_site_types[
+            static_cast<std::size_t>(index)];
+    if (string_index >= graph.string_table.strings.size()) {
+      throw std::runtime_error(
+          "endpoint attachment references an invalid traversed site type");
+    }
+    if (graph.string_table.strings[string_index] == active_site_type) {
+      return true;
+    }
+  }
+  return false;
+}
+
+void claim_attachment_resources(
+    const RoutingGraph& graph,
+    const EndpointAttachment& attachment,
+    const ActiveSiteTypes& active_site_types,
+    AttachmentResourceClaims& resource_claims,
+    std::size_t owner,
+    const std::string& description) {
+  if (attachment.traversed_site_string >=
+      graph.string_table.strings.size()) {
+    throw std::runtime_error(
+        "endpoint attachment has an invalid traversed site string");
+  }
+  const std::string& traversed_site =
+      graph.string_table.strings[attachment.traversed_site_string];
+  const std::optional<std::string> traversed_type =
+      active_site_types.find(traversed_site);
+  if (!traversed_type.has_value() ||
+      !attachment_allows_traversed_site_type(graph, attachment,
+                                             *traversed_type)) {
+    throw std::runtime_error(
+        description + " traverses site " + traversed_site +
+        " without a compatible active PhysicalNetlist site type");
+  }
+
+  const std::uint64_t pin_end =
+      attachment.pseudo_cell_pin_begin + attachment.pseudo_cell_pin_count;
+  if (pin_end < attachment.pseudo_cell_pin_begin ||
+      pin_end > graph.endpoint_attachment_pseudo_cell_pins.size()) {
+    throw std::runtime_error(
+        "endpoint attachment pseudo-cell resource slice is invalid");
+  }
+  for (std::uint64_t index = attachment.pseudo_cell_pin_begin;
+       index < pin_end; ++index) {
+    const auto& resource = graph.endpoint_attachment_pseudo_cell_pins[
+        static_cast<std::size_t>(index)];
+    if (resource.bel_string >= graph.string_table.strings.size() ||
+        resource.pin_string >= graph.string_table.strings.size()) {
+      throw std::runtime_error(
+          "endpoint attachment references an invalid pseudo-cell resource");
+    }
+    resource_claims.claim_pin(
+        traversed_site, graph.string_table.strings[resource.bel_string],
+        graph.string_table.strings[resource.pin_string], owner,
+        description);
+  }
+}
+
+void claim_endpoint_attachment(RoutingGraph& graph,
+                               std::uint32_t attachment_index,
+                               EndpointAttachmentRole expected_role,
+                               NodeId endpoint_node,
+                               const ActiveSiteTypes& active_site_types,
+                               AttachmentResourceClaims& resource_claims,
+                               std::size_t owner,
+                               const std::string& net_name) {
+  if (attachment_index >= graph.endpoint_attachments.size()) {
+    throw std::runtime_error(
+        "endpoint attachment lookup returned an invalid index");
+  }
+  const EndpointAttachment& attachment =
+      graph.endpoint_attachments[attachment_index];
+  if (attachment.role != expected_role ||
+      attachment.endpoint_node != endpoint_node) {
+    throw std::runtime_error(
+        "typed route endpoint does not match its attachment corridor");
+  }
+  claim_attachment_resources(graph, attachment, active_site_types,
+                             resource_claims, owner,
+                             "IOB attachment on net " + net_name);
+  graph.enabled_endpoint_attachments[attachment_index] = 1;
+}
 
 // The static device graph is an explicit positional input so a benchmark can
 // never silently pay the DeviceResources build cost.
@@ -514,6 +734,22 @@ std::optional<NodeId> get_node_from_site_pin(
                             pin_name);
 }
 
+std::optional<std::uint32_t> get_endpoint_attachment(
+    const RoutingGraph& graph,
+    const ActiveSiteTypes& active_site_types,
+    const std::string& site_name,
+    const std::string& pin_name,
+    EndpointAttachmentRole role) {
+  const std::optional<std::string> active_type =
+      active_site_types.find(site_name);
+  if (!active_type.has_value()) {
+    return std::nullopt;
+  }
+  return find_endpoint_attachment_index(
+      graph.endpoint_attachment_lookups, graph.string_table, site_name,
+      *active_type, pin_name, role);
+}
+
 // Preserve every sink alias. Multiple physical site pins can intentionally
 // resolve to one routing node (for example pinbounce/alternate endpoints), so
 // silently retaining only the first name loses reconstruction metadata.
@@ -659,6 +895,77 @@ std::optional<NodeId> find_tile_wire_node(const RoutingGraph& graph,
                         wire_name);
 }
 
+std::optional<std::uint32_t> find_fixed_endpoint_attachment(
+    const RoutingGraph& graph,
+    const std::string& tile,
+    const std::string& wire0,
+    const std::string& wire1,
+    bool forward,
+    const std::string& traversed_site) {
+  std::optional<std::uint32_t> result;
+  for (std::uint32_t index = 0; index < graph.endpoint_attachments.size();
+       ++index) {
+    const EndpointAttachment& attachment = graph.endpoint_attachments[index];
+    if (attachment.pip_data_index >= graph.pip_data.size() ||
+        attachment.traversed_site_string >=
+            graph.string_table.strings.size()) {
+      throw std::runtime_error(
+          "endpoint attachment references invalid PIP/site metadata");
+    }
+    const PipData& data = graph.pip_data[
+        static_cast<std::size_t>(attachment.pip_data_index)];
+    if (data.wire0_string >= graph.string_table.strings.size() ||
+        data.wire1_string >= graph.string_table.strings.size()) {
+      throw std::runtime_error(
+          "endpoint attachment references invalid wire strings");
+    }
+    if (graph.string_table.strings[data.wire0_string] != wire0 ||
+        graph.string_table.strings[data.wire1_string] != wire1 ||
+        data.forward != forward ||
+        graph.string_table.strings[attachment.traversed_site_string] !=
+            traversed_site) {
+      continue;
+    }
+
+    if (attachment.from_node < 0 ||
+        static_cast<std::size_t>(attachment.from_node + 1) >=
+            graph.rowptr.size()) {
+      throw std::runtime_error(
+          "endpoint attachment source row is outside the device graph");
+    }
+    bool exact_edge = false;
+    for (std::int64_t edge =
+             graph.rowptr[static_cast<std::size_t>(attachment.from_node)];
+         edge < graph.rowptr[static_cast<std::size_t>(attachment.from_node) +
+                             1];
+         ++edge) {
+      const std::size_t edge_index = static_cast<std::size_t>(edge);
+      if (graph.colind[edge_index] != attachment.to_node ||
+          graph.edge_attrs[edge_index].pip_data_index !=
+              attachment.pip_data_index) {
+        continue;
+      }
+      const std::uint64_t tile_string =
+          graph.edge_attrs[edge_index].tile_string;
+      exact_edge =
+          tile_string < graph.string_table.strings.size() &&
+          graph.string_table.strings[tile_string] == tile;
+      if (exact_edge) {
+        break;
+      }
+    }
+    if (!exact_edge) {
+      continue;
+    }
+    if (result.has_value()) {
+      throw std::runtime_error(
+          "fixed site-bearing PIP matches multiple endpoint attachments");
+    }
+    result = index;
+  }
+  return result;
+}
+
 bool is_full_device_graph(const RoutingGraph& graph) {
   return graph.bounds.min_x == 0 && graph.bounds.min_y == 0 &&
          graph.bounds.max_x == std::numeric_limits<std::int32_t>::max() &&
@@ -771,6 +1078,8 @@ void preserve_route_forest(
     const ActiveSiteTypes& active_site_types,
     const RouteEndpointOwners& endpoint_owners,
     RoutingGraph& graph,
+    AttachmentResourceClaims& attachment_resource_claims,
+    std::size_t owner,
     const std::string& net_name,
     bool preserve_static_output_pair,
     PhysicalImportStats* stats,
@@ -781,7 +1090,12 @@ void preserve_route_forest(
     const PhysicalRouteBranch::Reader branch = stack.back();
     stack.pop_back();
     const auto segment = branch.getRouteSegment();
-    if (segment.isSitePin()) {
+    if (segment.isBelPin()) {
+      const auto bel_pin = segment.getBelPin();
+      attachment_resource_claims.claim_whole_bel(
+          strings.get(bel_pin.getSite()), strings.get(bel_pin.getBel()),
+          owner, "fixed BEL pin on net " + net_name);
+    } else if (segment.isSitePin()) {
       const auto site_pin = segment.getSitePin();
       const std::string& site = strings.get(site_pin.getSite());
       const std::string& pin = strings.get(site_pin.getPin());
@@ -826,6 +1140,43 @@ void preserve_route_forest(
           preserve_unowned_node(graph, endpoint_owners, *node1, net_name);
         }
       }
+      if (pip.isSite()) {
+        const std::string& site = strings.get(pip.getSite());
+        const std::optional<std::uint32_t> attachment =
+            find_fixed_endpoint_attachment(
+                graph, tile, wire0, wire1, pip.getForward(), site);
+        if (attachment.has_value()) {
+          claim_attachment_resources(
+              graph, graph.endpoint_attachments[*attachment],
+              active_site_types, attachment_resource_claims, owner,
+              "fixed IOB attachment on net " + net_name);
+        } else {
+          // Unsupported fixed pseudo route-throughs stay preserved and absent
+          // from the routable CSR. Conservatively reserve every audited
+          // attachment resource at the same traversed site so newly routed
+          // nets cannot overlap the fixed site's unknown pseudo resources.
+          for (const EndpointAttachment& candidate :
+               graph.endpoint_attachments) {
+            if (candidate.traversed_site_string >=
+                graph.string_table.strings.size()) {
+              throw std::runtime_error(
+                  "endpoint attachment traversed site is invalid");
+            }
+            if (graph.string_table.strings[
+                    candidate.traversed_site_string] == site) {
+              claim_attachment_resources(
+                  graph, candidate, active_site_types,
+                  attachment_resource_claims, owner,
+                  "fixed pseudo PIP on net " + net_name);
+            }
+          }
+        }
+      }
+    } else if (segment.isSitePIP()) {
+      const auto site_pip = segment.getSitePIP();
+      attachment_resource_claims.claim_whole_bel(
+          strings.get(site_pip.getSite()), strings.get(site_pip.getBel()),
+          owner, "fixed site PIP on net " + net_name);
     }
 
     const auto children = branch.getBranches();
@@ -841,17 +1192,19 @@ void preserve_physical_net(
     const ActiveSiteTypes& active_site_types,
     const RouteEndpointOwners& endpoint_owners,
     RoutingGraph& graph,
+    AttachmentResourceClaims& attachment_resource_claims,
+    std::size_t owner,
     const std::string& net_name,
     PhysicalImportStats* stats,
     RouteBranchStack& stack) {
   const bool is_static =
       net.getType() != PhysicalNetlist::PhysNetlist::NetType::SIGNAL;
   preserve_route_forest(net.getSources(), strings, active_site_types,
-                        endpoint_owners, graph, net_name, is_static, stats,
-                        stack);
+                        endpoint_owners, graph, attachment_resource_claims,
+                        owner, net_name, is_static, stats, stack);
   preserve_route_forest(net.getStubs(), strings, active_site_types,
-                        endpoint_owners, graph, net_name, is_static, stats,
-                        stack);
+                        endpoint_owners, graph, attachment_resource_claims,
+                        owner, net_name, is_static, stats, stack);
   const auto stub_nodes = net.getStubNodes();
   for (std::uint32_t i = 0; i < stub_nodes.size(); ++i) {
     const auto stub_node = stub_nodes[i];
@@ -1043,6 +1396,37 @@ PhysicalImportStats parse_physical_netlist(
                              strings.get(site_instance.getType()));
   }
 
+  AttachmentResourceClaims attachment_resource_claims;
+  const auto placements = netlist.getPlacements();
+  for (std::uint32_t index = 0; index < placements.size(); ++index) {
+    const auto placement = placements[index];
+    const std::string& site = strings.get(placement.getSite());
+    const std::string& bel = strings.get(placement.getBel());
+    if (!site.empty() && !bel.empty()) {
+      attachment_resource_claims.claim_placement_bel(
+          site, bel, "cell placement " + strings.get(placement.getCellName()));
+    }
+    const auto other_bels = placement.getOtherBels();
+    for (std::uint32_t other = 0; other < other_bels.size(); ++other) {
+      const std::string& other_bel = strings.get(other_bels[other]);
+      if (!site.empty() && !other_bel.empty()) {
+        attachment_resource_claims.claim_placement_bel(
+            site, other_bel,
+            "cell placement " + strings.get(placement.getCellName()));
+      }
+    }
+    const auto pin_map = placement.getPinMap();
+    for (std::uint32_t pin = 0; pin < pin_map.size(); ++pin) {
+      const std::string& mapped_bel = strings.get(pin_map[pin].getBel());
+      if (!site.empty() && !mapped_bel.empty()) {
+        attachment_resource_claims.claim_placement_bel(
+            site, mapped_bel,
+            "cell placement pin map " +
+                strings.get(placement.getCellName()));
+      }
+    }
+  }
+
   const auto phys_nets = netlist.getPhysNets();
   graph.route_requests.reserve(phys_nets.size());
   PhysicalImportStats stats;
@@ -1090,8 +1474,9 @@ PhysicalImportStats parse_physical_netlist(
     if (routing::interchange::is_reserved_used_resource_net(
             physical_net_name, facts.is_signal)) {
       preserve_physical_net(net, strings, active_site_types,
-                            endpoint_owners, graph, physical_net_name,
-                            &stats, route_branch_stack);
+                            endpoint_owners, graph,
+                            attachment_resource_claims, net_index,
+                            physical_net_name, &stats, route_branch_stack);
       ++stats.preserved_nets;
       continue;
     }
@@ -1135,8 +1520,9 @@ PhysicalImportStats parse_physical_netlist(
     if (disposition !=
         routing::interchange::PhysicalNetDisposition::kRouteSignal) {
       preserve_physical_net(net, strings, active_site_types,
-                            endpoint_owners, graph, physical_net_name,
-                            &stats, route_branch_stack);
+                            endpoint_owners, graph,
+                            attachment_resource_claims, net_index,
+                            physical_net_name, &stats, route_branch_stack);
       switch (disposition) {
         case routing::interchange::PhysicalNetDisposition::
             kPreserveCompleteOrLoadless:
@@ -1181,6 +1567,8 @@ PhysicalImportStats parse_physical_netlist(
     }
     request.sources.reserve(source_pins.size());
     request.sinks.reserve(sink_pins.size());
+    std::unordered_map<NodeId, std::uint64_t> source_attachment_by_node;
+    std::unordered_map<NodeId, std::uint64_t> sink_attachment_by_node;
     bool has_valid_source = false;
     for (const SitePinName& source_pin : source_pins) {
       SitePinNode source;
@@ -1196,6 +1584,36 @@ PhysicalImportStats parse_physical_netlist(
               " on net " + physical_net_name);
       if (source_node.has_value()) {
         source.node = *source_node;
+        const std::optional<std::uint32_t> attachment =
+            get_endpoint_attachment(
+                graph, active_site_types, source_pin.site, source_pin.pin,
+                EndpointAttachmentRole::kSource);
+        const std::optional<std::string> active_type =
+            active_site_types.find(source_pin.site);
+        if (active_type.has_value() &&
+            routing::interchange::is_audited_iob_endpoint(
+                routing::interchange::IobAttachmentRole::kSource,
+                source_pin.site, *active_type, source_pin.pin)) {
+          require_or_count_route_endpoint(
+              attachment.has_value(), graph, &stats.unresolved_endpoints,
+              "audited IOB source attachment " + source_pin.site + "/" +
+                  source_pin.pin + " on net " + physical_net_name);
+        }
+        if (attachment.has_value()) {
+          claim_endpoint_attachment(
+              graph, *attachment, EndpointAttachmentRole::kSource,
+              *source_node, active_site_types, attachment_resource_claims,
+              net_index, physical_net_name);
+          source.endpoint_attachment_index = *attachment;
+        }
+        const auto alias = source_attachment_by_node.emplace(
+            *source_node, source.endpoint_attachment_index);
+        if (!alias.second &&
+            alias.first->second != source.endpoint_attachment_index) {
+          throw std::runtime_error(
+              "source aliases on net " + physical_net_name +
+              " share a node but require different IOB attachments");
+        }
         claim_endpoint(*source_node, net_index, physical_net_name);
         routing::interchange::mark_source_exclusive(
             graph.unavailable_destination_nodes, *source_node);
@@ -1222,6 +1640,39 @@ PhysicalImportStats parse_physical_netlist(
           const bool is_source_of_same_net =
               graph.unavailable_destination_nodes[
                   static_cast<std::size_t>(*sink_node)] != 0;
+          if (!is_source_of_same_net) {
+            const std::optional<std::uint32_t> attachment =
+                get_endpoint_attachment(
+                    graph, active_site_types, sink_pin.site, sink_pin.pin,
+                    EndpointAttachmentRole::kSink);
+            const std::optional<std::string> active_type =
+                active_site_types.find(sink_pin.site);
+            if (active_type.has_value() &&
+                routing::interchange::is_audited_iob_endpoint(
+                    routing::interchange::IobAttachmentRole::kSink,
+                    sink_pin.site, *active_type, sink_pin.pin)) {
+              require_or_count_route_endpoint(
+                  attachment.has_value(), graph,
+                  &stats.unresolved_endpoints,
+                  "audited IOB sink attachment " + sink_pin.site + "/" +
+                      sink_pin.pin + " on net " + physical_net_name);
+            }
+            if (attachment.has_value()) {
+              claim_endpoint_attachment(
+                  graph, *attachment, EndpointAttachmentRole::kSink,
+                  *sink_node, active_site_types,
+                  attachment_resource_claims, net_index, physical_net_name);
+              sink.endpoint_attachment_index = *attachment;
+            }
+          }
+          const auto alias = sink_attachment_by_node.emplace(
+              *sink_node, sink.endpoint_attachment_index);
+          if (!alias.second &&
+              alias.first->second != sink.endpoint_attachment_index) {
+            throw std::runtime_error(
+                "sink aliases on net " + physical_net_name +
+                " share a node but require different IOB attachments");
+          }
           if (routing::interchange::sink_requires_terminal_row(
                   is_source_of_same_net)) {
             routing::interchange::mark_sink_terminal(
@@ -1258,7 +1709,133 @@ CsrGraph make_outgoing_csr(RoutingGraph& graph) {
   }
   CsrGraph csr = filter_device_routing_graph(
       graph, graph.blocked_node, graph.sink_node_stops,
-      graph.unavailable_destination_nodes);
+      graph.unavailable_destination_nodes,
+      graph.enabled_endpoint_attachments);
+
+  // Bind each enabled devicegraph attachment to its exact retained CSR edge.
+  // The resulting sparse table is the only attachment identity exposed to
+  // routing/reconstruction; disabled pseudo edges never enter this CSR.
+  std::unordered_map<std::uint64_t, std::uint32_t>
+      attachment_by_pip_data;
+  std::vector<std::uint64_t> endpoint_pip_by_attachment(
+      graph.endpoint_attachments.size(), kNoIndex);
+  for (std::uint32_t attachment_index = 0;
+       attachment_index < graph.endpoint_attachments.size();
+       ++attachment_index) {
+    if (graph.enabled_endpoint_attachments[attachment_index] == 0) {
+      continue;
+    }
+    const std::uint64_t pip_data_index =
+        graph.endpoint_attachments[attachment_index].pip_data_index;
+    if (!attachment_by_pip_data
+             .emplace(pip_data_index, attachment_index)
+             .second) {
+      throw std::runtime_error(
+          "enabled endpoint attachments share one PIP-data identity");
+    }
+  }
+  if (csr.edge_attrs.size() != csr.colind.size()) {
+    throw std::runtime_error(
+        "filtered CSR edge attributes are not aligned with destinations");
+  }
+  for (std::size_t row = 0; row + 1 < csr.rowptr.size(); ++row) {
+    for (std::int64_t edge = csr.rowptr[row]; edge < csr.rowptr[row + 1];
+         ++edge) {
+      if (edge < 0 || static_cast<std::size_t>(edge) >=
+                          csr.edge_attrs.size()) {
+        throw std::runtime_error("filtered CSR row points outside edge data");
+      }
+      const std::size_t edge_index = static_cast<std::size_t>(edge);
+      const EdgeAttr& attr = csr.edge_attrs[edge_index];
+      const auto found =
+          attachment_by_pip_data.find(attr.pip_data_index);
+      if (found == attachment_by_pip_data.end()) {
+        continue;
+      }
+      const std::uint32_t attachment_index = found->second;
+      const EndpointAttachment& attachment =
+          graph.endpoint_attachments[attachment_index];
+      if (row != static_cast<std::size_t>(attachment.from_node) ||
+          csr.colind[edge_index] != attachment.to_node ||
+          attr.pip_data_index >= graph.pip_data.size() ||
+          attr.tile_string >= graph.string_table.strings.size() ||
+          attachment.traversed_site_string >=
+              graph.string_table.strings.size()) {
+        throw std::runtime_error(
+            "filtered endpoint attachment edge does not match devicegraph");
+      }
+      if (endpoint_pip_by_attachment[attachment_index] != kNoIndex) {
+        throw std::runtime_error(
+            "filtered CSR contains an endpoint attachment more than once");
+      }
+      const PipData& pip = graph.pip_data[
+          static_cast<std::size_t>(attachment.pip_data_index)];
+      if (pip.wire0_string >= graph.string_table.strings.size() ||
+          pip.wire1_string >= graph.string_table.strings.size()) {
+        throw std::runtime_error(
+            "endpoint attachment PIP references invalid wire strings");
+      }
+      const std::uint64_t endpoint_pip_index = graph.endpoint_pips.size();
+      graph.endpoint_pips.push_back(
+          {static_cast<std::uint64_t>(edge_index),
+           attachment.from_node,
+           attachment.to_node,
+           attr.tile_string,
+           pip.wire0_string,
+           pip.wire1_string,
+           pip.forward,
+           attachment.traversed_site_string,
+           attachment.endpoint_node,
+           attachment.role});
+      endpoint_pip_by_attachment[attachment_index] = endpoint_pip_index;
+    }
+  }
+  for (std::uint32_t attachment_index = 0;
+       attachment_index < graph.enabled_endpoint_attachments.size();
+       ++attachment_index) {
+    if (graph.enabled_endpoint_attachments[attachment_index] != 0 &&
+        endpoint_pip_by_attachment[attachment_index] == kNoIndex) {
+      throw std::runtime_error(
+          "enabled IOB attachment was removed by design CSR filtering");
+    }
+  }
+  for (RouteRequest& request : graph.route_requests) {
+    for (SitePinNode& source : request.sources) {
+      if (source.endpoint_attachment_index == kNoIndex) {
+        continue;
+      }
+      if (source.endpoint_attachment_index >=
+          endpoint_pip_by_attachment.size()) {
+        throw std::runtime_error(
+            "route source references an invalid endpoint attachment");
+      }
+      source.endpoint_pip_index = endpoint_pip_by_attachment[
+          static_cast<std::size_t>(source.endpoint_attachment_index)];
+      if (source.endpoint_pip_index == kNoIndex ||
+          graph.endpoint_pips[source.endpoint_pip_index].role !=
+              EndpointAttachmentRole::kSource) {
+        throw std::runtime_error(
+            "route source attachment is absent or has the wrong role");
+      }
+    }
+    for (SitePinNode& sink : request.sinks) {
+      if (sink.endpoint_attachment_index == kNoIndex) {
+        continue;
+      }
+      if (sink.endpoint_attachment_index >= endpoint_pip_by_attachment.size()) {
+        throw std::runtime_error(
+            "route sink references an invalid endpoint attachment");
+      }
+      sink.endpoint_pip_index = endpoint_pip_by_attachment[
+          static_cast<std::size_t>(sink.endpoint_attachment_index)];
+      if (sink.endpoint_pip_index == kNoIndex ||
+          graph.endpoint_pips[sink.endpoint_pip_index].role !=
+              EndpointAttachmentRole::kSink) {
+        throw std::runtime_error(
+            "route sink attachment is absent or has the wrong role");
+      }
+    }
+  }
 
   // The routing projection owns only these compact node columns. Move them
   // into the design-specific CSR artifact after edge filtering rather than
@@ -1369,6 +1946,7 @@ void write_metadata(const RoutingGraph& graph,
   //   char[8] magic
   //   u64 version, orientation, artifact_pair_id_high, artifact_pair_id_low
   //   u64 string_count, node_count, edge_attr_count, pip_data_count
+  //   u64 endpoint_pip_count
   //   u64 site_pin_attr_count, route_request_count
   //   u64 blocked_node_count, sink_stop_node_count
   //   u64 logical_cell_count, logical_net_count, logical_port_instance_count
@@ -1377,9 +1955,10 @@ void write_metadata(const RoutingGraph& graph,
   //   u64 logical_design_name_string
   //   repeated strings: u64 byte_length, bytes
   //   Version 4/5 only: seven node metadata arrays totaling 40 bytes/node.
-  //   Version 6 omits them; node_count remains in the header for CSR binding.
+  //   Versions 6/7 omit them; node_count remains for CSR binding.
   //   edge_attr_count records: u64 tile_string, u64 pip_data_index
   //   pip_data_count records: u64 wire0_string, u64 wire1_string, u64 forward
+  //   endpoint_pip_count records: ten u64 fields (EndpointPipDisk)
   //   site_pin_attr_count records: u64 node, u64 site_string, u64 pin_string
   //   route requests with logical net index and variable source/sink records
   //   logical cell/net/port-instance summary records
@@ -1444,6 +2023,8 @@ void write_metadata(const RoutingGraph& graph,
             "edge attribute count");
   write_u64(out, static_cast<std::uint64_t>(graph.pip_data.size()),
             "pip data count");
+  write_u64(out, static_cast<std::uint64_t>(graph.endpoint_pips.size()),
+            "endpoint PIP count");
   write_u64(out, static_cast<std::uint64_t>(graph.site_pin_attrs.size()),
             "site pin attr count");
   write_u64(out, static_cast<std::uint64_t>(graph.route_requests.size()),
@@ -1493,6 +2074,28 @@ void write_metadata(const RoutingGraph& graph,
   }
   write_array(out, pip_data, "pip data");
 
+  std::vector<EndpointPipDisk> endpoint_pips;
+  endpoint_pips.reserve(graph.endpoint_pips.size());
+  for (const EndpointPipMetadata& endpoint_pip : graph.endpoint_pips) {
+    if (endpoint_pip.from < 0 || endpoint_pip.to < 0 ||
+        endpoint_pip.endpoint_node < 0) {
+      throw std::runtime_error(
+          "cannot serialize endpoint PIP with an invalid node");
+    }
+    endpoint_pips.push_back(
+        {endpoint_pip.csr_edge,
+         static_cast<std::uint64_t>(endpoint_pip.from),
+         static_cast<std::uint64_t>(endpoint_pip.to),
+         endpoint_pip.tile_string,
+         endpoint_pip.wire0_string,
+         endpoint_pip.wire1_string,
+         endpoint_pip.forward ? 1ULL : 0ULL,
+         endpoint_pip.site_string,
+         static_cast<std::uint64_t>(endpoint_pip.endpoint_node),
+         static_cast<std::uint64_t>(endpoint_pip.role)});
+  }
+  write_array(out, endpoint_pips, "endpoint PIPs");
+
   // Sink site-pin node attributes, matching NetworkX's node attribute "sp".
   for (const SitePinNode& attr : graph.site_pin_attrs) {
     write_u64(out, static_cast<std::uint64_t>(attr.node),
@@ -1516,6 +2119,8 @@ void write_metadata(const RoutingGraph& graph,
       write_route_node(out, source.node, "route request source node");
       write_u64(out, source.site_string, "route request source site");
       write_u64(out, source.pin_string, "route request source pin");
+      write_u64(out, source.endpoint_pip_index,
+                "route request source endpoint PIP");
     }
 
     write_u64(out, static_cast<std::uint64_t>(request.sinks.size()),
@@ -1524,6 +2129,8 @@ void write_metadata(const RoutingGraph& graph,
       write_route_node(out, sink.node, "route request sink node");
       write_u64(out, sink.site_string, "route request sink site");
       write_u64(out, sink.pin_string, "route request sink pin");
+      write_u64(out, sink.endpoint_pip_index,
+                "route request sink endpoint PIP");
     }
   }
 
@@ -1715,8 +2322,10 @@ int main(int argc, char** argv) {
     // CSR is the GPU-facing graph. Metadata is the CPU-facing FPGA context
     // needed to map CSR edges back to tile/wire PIPs and site-pin targets.
     CsrGraph csr = make_outgoing_csr(graph);
+    std::cout << "enabled_endpoint_pips: " << graph.endpoint_pips.size()
+              << "\n";
 
-    // Version 6 does not serialize the seven physical node-metadata arrays.
+    // Versions 6/7 do not serialize the seven physical node-metadata arrays.
     // The filtering reader normally projected them out before this point;
     // release them defensively if a full graph is ever supplied here.
     release_storage(graph.node_device_ids);
@@ -1733,6 +2342,11 @@ int main(int argc, char** argv) {
     release_storage(graph.colind);
     release_storage(graph.edge_attrs);
     release_storage(graph.unavailable_destination_nodes);
+    release_storage(graph.enabled_endpoint_attachments);
+    release_storage(graph.endpoint_attachments);
+    release_storage(graph.endpoint_attachment_traversed_site_types);
+    release_storage(graph.endpoint_attachment_pseudo_cell_pins);
+    release_storage(graph.endpoint_attachment_lookups);
 
     const std::uint64_t rowptr_bytes = static_cast<std::uint64_t>(
         checked_array_bytes<std::int64_t>(csr.rowptr.size(),

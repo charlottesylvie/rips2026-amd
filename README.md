@@ -423,12 +423,14 @@ machine.
 
 The two outputs are staged before publication. Separate adjacent `.publishing`
 guards are acquired for the CSR and metadata paths, so converters that share
-either output cannot race. CSR version 3 and metadata version 6 embed the same
+either output cannot race. CSR version 3 and metadata version 7 embed the same
 nonzero 128-bit pair ID; the `.generation` sidecar publishes its canonical hex
-form, and PathFinder propagates it into every route JSON record. Metadata v6
+form, and PathFinder propagates it into every route JSON record. Metadata v7
 keeps the declared node count but omits seven unused per-node columns that
 previously added 40 bytes per node to every design sidecar; readers remain
-compatible with metadata v4 and v5. Current
+compatible with metadata v4 through v6. Its sparse endpoint-PIP table binds an
+audited IOB attachment to one exact CSR edge, endpoint, role, and traversed
+site. Current
 readers sample the guards/generation around their reads and require every
 available ID to match. This rejects overlapping publication, stable old/new
 pairs, and stale route files. An interrupted process can leave a guard behind
@@ -612,6 +614,8 @@ Reconstructs a routed FPGA Interchange physical netlist:
 
 The route reconstructor validates that route entries match metadata route
 requests, inserts `pip` route branches, and adds sink `sitePin` leaves.
+Conventional PIPs explicitly select `noSite`; an authorized endpoint
+attachment selects the concrete traversed site carried by metadata v7.
 
 ### `PathFinderFile`
 
@@ -643,9 +647,9 @@ Useful wrapper options:
 | `<benchmark>_unrouted.phys` | Contest setup | Unrouted FPGA Interchange physical netlist. |
 | `<benchmark>.netlist` | Contest setup | Matching logical netlist. |
 | `xcvu3p.device` | RapidWright | FPGA Interchange device resources for the target part. |
-| `.devicegraph` | `device_to_routing_graph` | Version-4 persistent device-wide CSR, node/PIP metadata, lookup tables, representative route-end coordinates, and base vertex costs. Version 3 remains readable with synthesized midpoint coordinates and unit costs. |
+| `.devicegraph` | `device_to_routing_graph` | Version-5 persistent device-wide CSR, node/PIP metadata, lookup tables, representative route-end coordinates, base vertex costs, and sparse endpoint-owned IOB attachment metadata. Generic readers retain v3/v4 compatibility, but routing conversion requires v5 and rejects stale caches with a regeneration diagnostic. |
 | `.csrbin` | `interchange_to_csr` | Internal outgoing CSR routing graph. Version 3 embeds the pair ID plus route-end X/Y, base vertex costs, and a `uint32` post-filter edge permutation grouped by destination tile with a missing-coordinate spill shard. |
-| `.csrbin.ifmeta.bin` | `interchange_to_csr` | Version-6 metadata sidecar with the matching pair ID, declared node/edge counts, string table, PIP data, site pins, logical summaries, and route requests. Redundant device-wide node columns remain available in `.devicegraph` and are no longer copied into each design sidecar. |
+| `.csrbin.ifmeta.bin` | `interchange_to_csr` | Version-7 metadata sidecar with the matching pair ID, declared node/edge counts, string table, PIP data, sparse endpoint-PIP records, site pins, logical summaries, and route requests. Redundant device-wide node columns remain available in `.devicegraph` and are no longer copied into each design sidecar. |
 | `.csrbin.ifmeta.bin.generation` | `interchange_to_csr` | Canonical pair ID sampled around reads; must match both binary headers. |
 | `.routes.jsonl` | `pathfinder` | One pair-ID-bound JSON object per net containing sources, sinks, and selected PIP edges. |
 | `<benchmark>_PathFinderFile.phys` | `routes_to_phys` | Routed physical netlist. |
@@ -656,12 +660,14 @@ CSR orientation is outgoing-edge: row `u`, column `v` represents directed edge
 `u -> v`. Edge weights are stored as a separate `float` array aligned with
 `colind`; compact route-end coordinates and base costs are copied into CSR v3
 for BF11, while full coordinate ranges and tile/wire type metadata stay in the
-reusable `.devicegraph` instead of being duplicated in metadata v6.
+reusable `.devicegraph` instead of being duplicated in metadata v7.
 
-Device-graph format version 4 retains version 3's pseudo-PIP, typed alias,
-device-name, and ambiguity rules while adding route-end/base-cost columns.
-Version 3 remains readable; regenerate version-1 or version-2 artifacts, which
-are rejected deliberately. BF11's active-frontier path reads only CSR v3's
+Device-graph format version 5 retains version 4's route-end/base-cost columns
+and adds only the audited xcvu3p BITSLICE IOB source/sink corridors, including
+typed endpoint, concrete traversed-site, and pseudo-cell resource metadata.
+All other pseudo route-throughs remain excluded. Versions 3 and 4 remain
+available to generic readers, but the production converter requires v5;
+regenerate older artifacts. BF11's active-frontier path reads only CSR v3's
 node sidecars; the spatial edge permutation is persisted for a shard-driven
 full-edge implementation and is skipped at BF11 load time today.
 
@@ -951,7 +957,7 @@ output, and computes the benchmark score.
   fingerprint, bounds policy, and device name; conversion rejects a
   PhysicalNetlist for a different part. CSR/metadata publication is guarded
   against concurrent converters and process interruption. New CSR v3,
-  metadata v6, generation, and route records carry one pair ID and supported
+  metadata v7, generation, and route records carry one pair ID and supported
   readers require equality. CSR v2 remains readable with its pair ID, and
   coherent CSR v1/metadata v4 pairs without a generation remain readable as
   explicitly legacy/unverified input; bounded BF11 specifically requires v3

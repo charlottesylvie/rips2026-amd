@@ -52,6 +52,7 @@
 #include <stdexcept>
 #include <thread>
 #include <type_traits>
+#include <unordered_map>
 #include <unordered_set>
 #include <utility>
 
@@ -65,13 +66,30 @@ constexpr std::uint64_t PAIRED_CSR_VERSION = 2;
 constexpr std::uint64_t CURRENT_CSR_VERSION = 3;
 constexpr std::uint64_t LEGACY_METADATA_VERSION = 4;
 constexpr std::uint64_t FIRST_PAIRED_METADATA_VERSION = 5;
-constexpr std::uint64_t CURRENT_METADATA_VERSION = 6;
+constexpr std::uint64_t COMPACT_METADATA_VERSION = 6;
+constexpr std::uint64_t ENDPOINT_PIP_METADATA_VERSION = 7;
+constexpr std::uint64_t CURRENT_METADATA_VERSION = 7;
 constexpr std::uint64_t EXPECTED_OUTGOING_EDGE_ORIENTATION = 2;
 
 struct PipDataDisk {
   std::uint64_t wire0_string = 0;
   std::uint64_t wire1_string = 0;
   std::uint64_t forward = 0;
+};
+
+// Metadata v7 ABI: ten adjacent u64 fields, in declaration order.
+struct EndpointPipDisk {
+  std::uint64_t csr_edge = 0;
+  std::uint64_t from = 0;
+  std::uint64_t to = 0;
+  std::uint64_t tile_string = 0;
+  std::uint64_t wire0_string = 0;
+  std::uint64_t wire1_string = 0;
+  std::uint64_t forward = 0;
+  std::uint64_t site_string = 0;
+  std::uint64_t endpoint_node = 0;
+  // 0 = source attachment, 1 = sink attachment.
+  std::uint64_t role = 0;
 };
 
 struct SitePinNodeDisk {
@@ -88,6 +106,10 @@ static_assert(sizeof(PipDataDisk) == 3 * sizeof(std::uint64_t),
               "PipData disk layout changed");
 static_assert(std::is_trivially_copyable<PipDataDisk>::value,
               "PipData disk records must remain bulk-readable");
+static_assert(sizeof(EndpointPipDisk) == 10 * sizeof(std::uint64_t),
+              "endpoint-PIP disk layout changed");
+static_assert(std::is_trivially_copyable<EndpointPipDisk>::value,
+              "endpoint-PIP disk records must remain bulk-readable");
 static_assert(sizeof(SitePinNodeDisk) == 3 * sizeof(std::uint64_t),
               "site-pin disk layout changed");
 static_assert(std::is_trivially_copyable<SitePinNodeDisk>::value,
@@ -123,6 +145,15 @@ int route_node_from_disk(std::uint64_t raw, const char* name) {
 
 int read_route_node(std::ifstream& in, const char* name) {
   return route_node_from_disk(read_u64(in, name), name);
+}
+
+minplus_sparse::Offset route_edge_from_disk(std::uint64_t raw,
+                                            const char* name) {
+  if (raw > static_cast<std::uint64_t>(
+                std::numeric_limits<minplus_sparse::Offset>::max())) {
+    throw std::runtime_error(std::string(name) + " exceeds CSR offset range");
+  }
+  return static_cast<minplus_sparse::Offset>(raw);
 }
 
 template <typename T>
@@ -2551,6 +2582,10 @@ RoutingMetadata load_interchange_metadata(
   const std::uint64_t node_count = read_u64(in, "metadata node count");
   const std::uint64_t edge_attr_count = read_u64(in, "metadata edge attribute count");
   const std::uint64_t pip_data_count = read_u64(in, "metadata pip data count");
+  const std::uint64_t endpoint_pip_count =
+      version >= ENDPOINT_PIP_METADATA_VERSION
+          ? read_u64(in, "metadata endpoint PIP count")
+          : 0;
   const std::uint64_t site_pin_attr_count = read_u64(in, "metadata site pin attr count");
   const std::uint64_t route_request_count = read_u64(in, "metadata route request count");
   const std::uint64_t blocked_node_count = read_u64(in, "metadata blocked node count");
@@ -2568,6 +2603,7 @@ RoutingMetadata load_interchange_metadata(
   metadata.artifact_pair_id = parsed_pair_id;
   metadata.declared_node_count = node_count;
   metadata.declared_edge_attr_count = edge_attr_count;
+  metadata.declared_endpoint_pip_count = endpoint_pip_count;
   metadata.device_path_string = read_u64(in, "metadata device path string");
   metadata.physical_path_string = read_u64(in, "metadata physical path string");
   metadata.logical_path_string = read_u64(in, "metadata logical path string");
@@ -2579,7 +2615,7 @@ RoutingMetadata load_interchange_metadata(
     metadata.strings.push_back(read_string(in));
   }
 
-  const bool has_node_arrays = version < CURRENT_METADATA_VERSION;
+  const bool has_node_arrays = version < COMPACT_METADATA_VERSION;
   const bool load_node_arrays =
       mode == InterchangeMetadataLoadMode::kFull && has_node_arrays;
   if (has_node_arrays) {
@@ -2638,6 +2674,90 @@ RoutingMetadata load_interchange_metadata(
     skip_array<PipDataDisk>(in, pip_data_count, "metadata pip data");
   }
 
+  if (load_route_output_tables) {
+    std::vector<EndpointPipDisk> disk_endpoint_pips;
+    read_array(in, disk_endpoint_pips, endpoint_pip_count,
+               "metadata endpoint PIPs");
+    metadata.endpoint_pips.reserve(disk_endpoint_pips.size());
+    std::unordered_set<minplus_sparse::Offset> endpoint_pip_edges;
+    endpoint_pip_edges.reserve(disk_endpoint_pips.size());
+    for (const EndpointPipDisk& disk : disk_endpoint_pips) {
+      if (disk.csr_edge >= edge_attr_count) {
+        throw std::runtime_error(
+            "metadata endpoint PIP references an invalid CSR edge");
+      }
+      if (disk.forward > 1) {
+        throw std::runtime_error(
+            "metadata endpoint PIP has an invalid forward flag");
+      }
+      if (disk.tile_string >= string_count ||
+          disk.wire0_string >= string_count ||
+          disk.wire1_string >= string_count ||
+          disk.site_string >= string_count) {
+        throw std::runtime_error(
+            "metadata endpoint PIP references an invalid string");
+      }
+      const int from = route_node_from_disk(
+          disk.from, "metadata endpoint PIP source node");
+      const int to = route_node_from_disk(
+          disk.to, "metadata endpoint PIP destination node");
+      const int endpoint_node = route_node_from_disk(
+          disk.endpoint_node, "metadata endpoint PIP endpoint node");
+      if (from < 0 || to < 0 || endpoint_node < 0 ||
+          static_cast<std::uint64_t>(from) >= node_count ||
+          static_cast<std::uint64_t>(to) >= node_count ||
+          static_cast<std::uint64_t>(endpoint_node) >= node_count) {
+        throw std::runtime_error(
+            "metadata endpoint PIP references an invalid node");
+      }
+      EndpointPipRole role;
+      if (disk.role == static_cast<std::uint64_t>(
+                           EndpointPipRole::kSource)) {
+        role = EndpointPipRole::kSource;
+      } else if (disk.role == static_cast<std::uint64_t>(
+                                  EndpointPipRole::kSink)) {
+        role = EndpointPipRole::kSink;
+      } else {
+        throw std::runtime_error("metadata endpoint PIP has an invalid role");
+      }
+      const minplus_sparse::Offset csr_edge = route_edge_from_disk(
+          disk.csr_edge, "metadata endpoint PIP CSR edge");
+      if (!endpoint_pip_edges.insert(csr_edge).second) {
+        throw std::runtime_error(
+            "metadata contains duplicate endpoint PIPs for one CSR edge");
+      }
+      const EdgeAttr& attr = metadata.edge_attrs[
+          static_cast<std::size_t>(csr_edge)];
+      if (attr.pip_data_index >= metadata.pip_data.size()) {
+        throw std::runtime_error(
+            "metadata endpoint PIP references invalid PIP data");
+      }
+      const PipData& pip = metadata.pip_data[
+          static_cast<std::size_t>(attr.pip_data_index)];
+      if (attr.tile_string != disk.tile_string ||
+          pip.wire0_string != disk.wire0_string ||
+          pip.wire1_string != disk.wire1_string ||
+          pip.forward != (disk.forward != 0)) {
+        throw std::runtime_error(
+            "metadata endpoint PIP does not match its edge/PIP tables");
+      }
+      metadata.endpoint_pips.push_back(
+          {csr_edge,
+           from,
+           to,
+           disk.tile_string,
+           disk.wire0_string,
+           disk.wire1_string,
+           disk.forward != 0,
+           disk.site_string,
+           endpoint_node,
+           role});
+    }
+  } else {
+    skip_array<EndpointPipDisk>(in, endpoint_pip_count,
+                                "metadata endpoint PIPs");
+  }
+
   if (mode == InterchangeMetadataLoadMode::kFull) {
     std::vector<SitePinNodeDisk> disk_site_pin_attrs;
     read_array(in, disk_site_pin_attrs, site_pin_attr_count,
@@ -2671,6 +2791,26 @@ RoutingMetadata load_interchange_metadata(
       source.node = read_route_node(in, "metadata source node");
       source.site_string = read_u64(in, "metadata source site");
       source.pin_string = read_u64(in, "metadata source pin");
+      source.endpoint_pip_index =
+          version >= ENDPOINT_PIP_METADATA_VERSION
+              ? read_u64(in, "metadata source endpoint PIP index")
+              : kNoIndex;
+      if (source.endpoint_pip_index != kNoIndex &&
+          source.endpoint_pip_index >= endpoint_pip_count) {
+        throw std::runtime_error(
+            "metadata source references an invalid endpoint PIP");
+      }
+      if (source.endpoint_pip_index != kNoIndex &&
+          load_route_output_tables) {
+        const EndpointPip& endpoint_pip = metadata.endpoint_pips[
+            static_cast<std::size_t>(source.endpoint_pip_index)];
+        if (endpoint_pip.role != EndpointPipRole::kSource ||
+            endpoint_pip.endpoint_node != source.node) {
+          throw std::runtime_error(
+              "metadata source references an endpoint PIP owned by a "
+              "different endpoint or role");
+        }
+      }
     }
 
     const std::uint64_t sink_count = read_u64(in, "metadata sink count");
@@ -2682,6 +2822,26 @@ RoutingMetadata load_interchange_metadata(
       sink.node = read_route_node(in, "metadata sink node");
       sink.site_string = read_u64(in, "metadata sink site");
       sink.pin_string = read_u64(in, "metadata sink pin");
+      sink.endpoint_pip_index =
+          version >= ENDPOINT_PIP_METADATA_VERSION
+              ? read_u64(in, "metadata sink endpoint PIP index")
+              : kNoIndex;
+      if (sink.endpoint_pip_index != kNoIndex &&
+          sink.endpoint_pip_index >= endpoint_pip_count) {
+        throw std::runtime_error(
+            "metadata sink references an invalid endpoint PIP");
+      }
+      if (sink.endpoint_pip_index != kNoIndex &&
+          load_route_output_tables) {
+        const EndpointPip& endpoint_pip = metadata.endpoint_pips[
+            static_cast<std::size_t>(sink.endpoint_pip_index)];
+        if (endpoint_pip.role != EndpointPipRole::kSink ||
+            endpoint_pip.endpoint_node != sink.node) {
+          throw std::runtime_error(
+              "metadata sink references an endpoint PIP owned by a "
+              "different endpoint or role");
+        }
+      }
     }
   }
 
@@ -3462,6 +3622,242 @@ std::string string_at(const RoutingMetadata& metadata, std::uint64_t index) {
   return metadata.strings[static_cast<std::size_t>(index)];
 }
 
+using EndpointPipByCsrEdge =
+    std::unordered_map<minplus_sparse::Offset, std::uint64_t>;
+
+const EndpointPip& endpoint_pip_at(const RoutingMetadata& metadata,
+                                   std::uint64_t index,
+                                   EndpointPipRole role,
+                                   int endpoint_node,
+                                   const char* endpoint_kind) {
+  if (index == kNoIndex || index >= metadata.endpoint_pips.size()) {
+    throw std::runtime_error(std::string("route ") + endpoint_kind +
+                             " references an invalid endpoint attachment");
+  }
+  const EndpointPip& endpoint_pip =
+      metadata.endpoint_pips[static_cast<std::size_t>(index)];
+  if (endpoint_pip.role != role ||
+      endpoint_pip.endpoint_node != endpoint_node) {
+    throw std::runtime_error(std::string("route ") + endpoint_kind +
+                             " references an attachment owned by a different "
+                             "endpoint or role");
+  }
+  return endpoint_pip;
+}
+
+EndpointPipByCsrEdge validate_endpoint_pip_table(
+    const HostCsrF32& graph,
+    const RoutingMetadata& metadata) {
+  if (metadata.declared_endpoint_pip_count != 0 &&
+      metadata.declared_endpoint_pip_count != metadata.endpoint_pips.size()) {
+    throw std::runtime_error(
+        "loaded endpoint-PIP table does not match its declared count");
+  }
+
+  EndpointPipByCsrEdge endpoint_pips_by_edge;
+  endpoint_pips_by_edge.reserve(metadata.endpoint_pips.size());
+  for (std::size_t index = 0; index < metadata.endpoint_pips.size(); ++index) {
+    const EndpointPip& endpoint_pip = metadata.endpoint_pips[index];
+    if (endpoint_pip.csr_edge < 0 || endpoint_pip.csr_edge >= graph.nnz ||
+        !valid_node(endpoint_pip.from, graph.rows) ||
+        !valid_node(endpoint_pip.to, graph.rows) ||
+        !valid_node(endpoint_pip.endpoint_node, graph.rows) ||
+        endpoint_pip.from == endpoint_pip.to ||
+        endpoint_pip.endpoint_node == endpoint_pip.from ||
+        endpoint_pip.endpoint_node == endpoint_pip.to ||
+        endpoint_pip.csr_edge <
+            graph.rowptr[static_cast<std::size_t>(endpoint_pip.from)] ||
+        endpoint_pip.csr_edge >=
+            graph.rowptr[static_cast<std::size_t>(endpoint_pip.from + 1)] ||
+        graph.colind[static_cast<std::size_t>(endpoint_pip.csr_edge)] !=
+            endpoint_pip.to) {
+      throw std::runtime_error(
+          "metadata contains an invalid endpoint-PIP CSR edge");
+    }
+    switch (endpoint_pip.role) {
+      case EndpointPipRole::kSource:
+      case EndpointPipRole::kSink:
+        break;
+      default:
+        throw std::runtime_error(
+            "metadata contains an endpoint PIP with an invalid role");
+    }
+    if (endpoint_pip.tile_string >= metadata.strings.size() ||
+        endpoint_pip.wire0_string >= metadata.strings.size() ||
+        endpoint_pip.wire1_string >= metadata.strings.size() ||
+        endpoint_pip.site_string >= metadata.strings.size()) {
+      throw std::runtime_error(
+          "metadata endpoint PIP references an invalid string");
+    }
+
+    const EdgeAttr& attr =
+        metadata.edge_attrs[static_cast<std::size_t>(endpoint_pip.csr_edge)];
+    if (attr.pip_data_index >= metadata.pip_data.size()) {
+      throw std::runtime_error(
+          "metadata endpoint PIP references invalid PIP data");
+    }
+    const PipData& pip =
+        metadata.pip_data[static_cast<std::size_t>(attr.pip_data_index)];
+    if (attr.tile_string != endpoint_pip.tile_string ||
+        pip.wire0_string != endpoint_pip.wire0_string ||
+        pip.wire1_string != endpoint_pip.wire1_string ||
+        pip.forward != endpoint_pip.forward) {
+      throw std::runtime_error(
+          "metadata endpoint PIP does not match its edge/PIP tables");
+    }
+    const auto inserted = endpoint_pips_by_edge.emplace(
+        endpoint_pip.csr_edge, static_cast<std::uint64_t>(index));
+    if (!inserted.second) {
+      throw std::runtime_error(
+          "metadata contains duplicate endpoint PIPs for one CSR edge");
+    }
+  }
+  for (const RouteRequest& request : metadata.route_requests) {
+    for (const SitePinNode& source : request.sources) {
+      if (source.endpoint_pip_index != kNoIndex) {
+        (void)endpoint_pip_at(
+            metadata, source.endpoint_pip_index, EndpointPipRole::kSource,
+            source.node, "source");
+      }
+    }
+    for (const SitePinNode& sink : request.sinks) {
+      if (sink.endpoint_pip_index != kNoIndex) {
+        (void)endpoint_pip_at(
+            metadata, sink.endpoint_pip_index, EndpointPipRole::kSink,
+            sink.node, "sink");
+      }
+    }
+  }
+  return endpoint_pips_by_edge;
+}
+
+void validate_path_edge(const HostCsrF32& graph,
+                        const PathEdge& path_edge) {
+  if (path_edge.csr_edge < 0 || path_edge.csr_edge >= graph.nnz ||
+      !valid_node(path_edge.from, graph.rows) ||
+      !valid_node(path_edge.to, graph.rows) ||
+      path_edge.csr_edge <
+          graph.rowptr[static_cast<std::size_t>(path_edge.from)] ||
+      path_edge.csr_edge >=
+          graph.rowptr[static_cast<std::size_t>(path_edge.from + 1)] ||
+      graph.colind[static_cast<std::size_t>(path_edge.csr_edge)] !=
+          path_edge.to) {
+    throw std::runtime_error("pathfinder result contains an invalid path edge");
+  }
+}
+
+const SitePinNode* source_endpoint_for_node(const RouteRequest& request,
+                                            int node) {
+  const SitePinNode* found = nullptr;
+  for (const SitePinNode& source : request.sources) {
+    if (source.node != node) {
+      continue;
+    }
+    if (found != nullptr &&
+        found->endpoint_pip_index != source.endpoint_pip_index) {
+      throw std::runtime_error(
+          "route request has ambiguous source attachments for one node");
+    }
+    found = &source;
+  }
+  return found;
+}
+
+void validate_routed_sink_attachments(
+    const HostCsrF32& graph,
+    const RoutingMetadata& metadata,
+    const EndpointPipByCsrEdge& endpoint_pips_by_edge,
+    const RouteRequest& request,
+    const SitePinNode& requested_sink,
+    const RoutedSink& routed_sink) {
+  if (!routed_sink.reached) {
+    return;
+  }
+  if (routed_sink.target != requested_sink.node) {
+    throw std::runtime_error(
+        "pathfinder result sink does not match its route request");
+  }
+  if (routed_sink.edges.empty()) {
+    if (routed_sink.source != routed_sink.target) {
+      throw std::runtime_error(
+          "reached pathfinder sink has no path from its selected source");
+    }
+    return;
+  }
+
+  for (std::size_t edge_index = 0;
+       edge_index < routed_sink.edges.size(); ++edge_index) {
+    const PathEdge& edge = routed_sink.edges[edge_index];
+    validate_path_edge(graph, edge);
+    if ((edge_index == 0 && edge.from != routed_sink.source) ||
+        (edge_index != 0 &&
+         routed_sink.edges[edge_index - 1].to != edge.from) ||
+        (edge_index + 1 == routed_sink.edges.size() &&
+         edge.to != routed_sink.target)) {
+      throw std::runtime_error(
+          "pathfinder result contains a discontinuous source-to-sink path");
+    }
+  }
+
+  const SitePinNode* selected_source =
+      source_endpoint_for_node(request, routed_sink.source);
+  const std::uint64_t source_attachment =
+      selected_source == nullptr ? kNoIndex
+                                 : selected_source->endpoint_pip_index;
+  const std::uint64_t sink_attachment = requested_sink.endpoint_pip_index;
+
+  if (source_attachment != kNoIndex) {
+    const EndpointPip& endpoint_pip = endpoint_pip_at(
+        metadata, source_attachment, EndpointPipRole::kSource,
+        routed_sink.source, "source");
+    if (routed_sink.edges.size() < 2 ||
+        routed_sink.edges[0].from != endpoint_pip.endpoint_node ||
+        routed_sink.edges[0].to != endpoint_pip.from ||
+        routed_sink.edges[1].csr_edge != endpoint_pip.csr_edge ||
+        endpoint_pips_by_edge.count(routed_sink.edges[0].csr_edge) != 0) {
+      throw std::runtime_error(
+          "authorized source attachment is not in its endpoint corridor");
+    }
+  }
+
+  if (sink_attachment != kNoIndex) {
+    const EndpointPip& endpoint_pip = endpoint_pip_at(
+        metadata, sink_attachment, EndpointPipRole::kSink,
+        requested_sink.node, "sink");
+    if (routed_sink.edges.size() < 2) {
+      throw std::runtime_error(
+          "authorized sink attachment is not in its endpoint corridor");
+    }
+    const std::size_t attachment_position = routed_sink.edges.size() - 2;
+    if (routed_sink.edges[attachment_position].csr_edge !=
+            endpoint_pip.csr_edge ||
+        routed_sink.edges.back().from != endpoint_pip.to ||
+        routed_sink.edges.back().to != endpoint_pip.endpoint_node ||
+        endpoint_pips_by_edge.count(routed_sink.edges.back().csr_edge) != 0) {
+      throw std::runtime_error(
+          "authorized sink attachment is not in its endpoint corridor");
+    }
+  }
+
+  for (std::size_t edge_index = 0;
+       edge_index < routed_sink.edges.size(); ++edge_index) {
+    const auto found = endpoint_pips_by_edge.find(
+        routed_sink.edges[edge_index].csr_edge);
+    if (found == endpoint_pips_by_edge.end()) {
+      continue;
+    }
+    const bool authorized_source =
+        found->second == source_attachment && edge_index == 1;
+    const bool authorized_sink =
+        found->second == sink_attachment &&
+        edge_index + 2 == routed_sink.edges.size();
+    if (!authorized_source && !authorized_sink) {
+      throw std::runtime_error(
+          "endpoint attachment appears as an unauthorized transit edge");
+    }
+  }
+}
+
 void write_routes_jsonl_impl(const std::filesystem::path& path,
                              const HostCsrF32& graph,
                              const RoutingMetadata& metadata,
@@ -3478,6 +3874,8 @@ void write_routes_jsonl_impl(const std::filesystem::path& path,
   if (result.nets.size() > metadata.route_requests.size()) {
     throw std::runtime_error("pathfinder result has more nets than metadata requests");
   }
+  const EndpointPipByCsrEdge endpoint_pips_by_edge =
+      validate_endpoint_pip_table(graph, metadata);
   if (path.has_parent_path()) {
     std::filesystem::create_directories(path.parent_path());
   }
@@ -3490,6 +3888,16 @@ void write_routes_jsonl_impl(const std::filesystem::path& path,
   for (std::size_t net_index = 0; net_index < result.nets.size(); ++net_index) {
     const RouteRequest& request = metadata.route_requests[net_index];
     const RoutedNet& net = result.nets[net_index];
+    if (net.sinks.size() > request.sinks.size()) {
+      throw std::runtime_error(
+          "pathfinder result has more sinks than its route request");
+    }
+    for (std::size_t sink_index = 0; sink_index < net.sinks.size();
+         ++sink_index) {
+      validate_routed_sink_attachments(
+          graph, metadata, endpoint_pips_by_edge, request,
+          request.sinks[sink_index], net.sinks[sink_index]);
+    }
 
     out << '{';
     if (metadata.artifact_pair_id.has_value()) {
@@ -3548,15 +3956,7 @@ void write_routes_jsonl_impl(const std::filesystem::path& path,
         continue;
       }
       for (const PathEdge& path_edge : sink.edges) {
-        if (path_edge.csr_edge < 0 ||
-            path_edge.csr_edge >= graph.nnz ||
-            !valid_node(path_edge.from, graph.rows) ||
-            !valid_node(path_edge.to, graph.rows) ||
-            path_edge.csr_edge < graph.rowptr[static_cast<std::size_t>(path_edge.from)] ||
-            path_edge.csr_edge >= graph.rowptr[static_cast<std::size_t>(path_edge.from + 1)] ||
-            graph.colind[static_cast<std::size_t>(path_edge.csr_edge)] != path_edge.to) {
-          throw std::runtime_error("pathfinder result contains an invalid path edge");
-        }
+        validate_path_edge(graph, path_edge);
         if (!seen_edges.insert(edge_key(path_edge.from, path_edge.to)).second) {
           continue;
         }
@@ -3582,7 +3982,22 @@ void write_routes_jsonl_impl(const std::filesystem::path& path,
         write_json_string(out, string_at(metadata, pip.wire0_string));
         out << ",\"wire1\":";
         write_json_string(out, string_at(metadata, pip.wire1_string));
-        out << ",\"forward\":" << (pip.forward ? "true" : "false") << '}';
+        out << ",\"forward\":" << (pip.forward ? "true" : "false");
+        const auto attachment =
+            endpoint_pips_by_edge.find(path_edge.csr_edge);
+        out << ",\"attachment\":";
+        if (attachment == endpoint_pips_by_edge.end()) {
+          out << "null,\"site\":null";
+        } else {
+          out << attachment->second << ",\"site\":";
+          write_json_string(
+              out,
+              string_at(metadata,
+                        metadata.endpoint_pips[static_cast<std::size_t>(
+                            attachment->second)]
+                            .site_string));
+        }
+        out << '}';
       }
     }
     out << "]}\n";

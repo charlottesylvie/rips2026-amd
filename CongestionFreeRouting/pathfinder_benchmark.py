@@ -43,12 +43,55 @@ import subprocess
 import sys
 import tempfile
 from collections import defaultdict
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 
 _SCHEMA_CACHE: dict[Path, Any] = {}
 _SCHEMA_CACHE_BY_ID: dict[str, tuple[Path, str, Any]] = {}
+_METADATA_MAGIC = b"RIPSIFM1"
+_NO_ENDPOINT_PIP = 2**64 - 1
+_ENDPOINT_PIP_METADATA_VERSION = 7
+
+
+@dataclass(frozen=True)
+class MetadataEndpointPip:
+    csr_edge: int
+    from_node: int
+    to_node: int
+    tile: str
+    wire0: str
+    wire1: str
+    forward: bool
+    site: str
+    endpoint_node: int
+    role: int
+
+
+@dataclass(frozen=True)
+class MetadataSitePin:
+    node: int
+    site: str
+    pin: str
+    endpoint_pip_index: int = _NO_ENDPOINT_PIP
+
+
+@dataclass(frozen=True)
+class MetadataRouteRequest:
+    net: str
+    sources: tuple[MetadataSitePin, ...]
+    sinks: tuple[MetadataSitePin, ...]
+
+
+@dataclass(frozen=True)
+class RoutingMetadataSummary:
+    version: int
+    artifact_pair_id: str | None
+    node_count: int
+    edge_attr_count: int
+    endpoint_pips: tuple[MetadataEndpointPip, ...]
+    route_requests: tuple[MetadataRouteRequest, ...]
 
 
 def infer_logical_netlist(unrouted_phys: Path) -> Path:
@@ -531,7 +574,7 @@ def read_metadata_artifact_pair_id(metadata_path: Path) -> str | None:
         )
     with metadata_path.open("rb") as metadata_file:
         prefix = metadata_file.read(24)
-        if len(prefix) != 24 or prefix[:8] != b"RIPSIFM1":
+        if len(prefix) != 24 or prefix[:8] != _METADATA_MAGIC:
             raise ValueError(f"{metadata_path} is not RIPS interchange metadata")
         version = int.from_bytes(prefix[8:16], byteorder=sys.byteorder)
         orientation = int.from_bytes(prefix[16:24], byteorder=sys.byteorder)
@@ -539,7 +582,7 @@ def read_metadata_artifact_pair_id(metadata_path: Path) -> str | None:
             raise ValueError(f"{metadata_path} does not use outgoing CSR orientation")
         if version == 4:
             pair_id = None
-        elif version in (5, 6):
+        elif version in (5, 6, 7):
             raw_id = metadata_file.read(16)
             if len(raw_id) != 16:
                 raise ValueError(f"{metadata_path} has a truncated artifact pair id")
@@ -573,9 +616,311 @@ def read_metadata_artifact_pair_id(metadata_path: Path) -> str | None:
     return pair_id
 
 
+def _read_metadata_exact(metadata_file, byte_count: int, label: str) -> bytes:
+    if byte_count < 0:
+        raise ValueError(f"negative byte count while reading {label}")
+    data = metadata_file.read(byte_count)
+    if len(data) != byte_count:
+        raise ValueError(f"metadata is truncated while reading {label}")
+    return data
+
+
+def _read_metadata_u64(metadata_file, label: str) -> int:
+    return int.from_bytes(
+        _read_metadata_exact(metadata_file, 8, label),
+        byteorder=sys.byteorder,
+    )
+
+
+def _skip_metadata_bytes(metadata_file, byte_count: int, label: str) -> None:
+    if byte_count < 0:
+        raise ValueError(f"negative byte count while skipping {label}")
+    current = metadata_file.tell()
+    metadata_file.seek(0, os.SEEK_END)
+    end = metadata_file.tell()
+    if end - current < byte_count:
+        raise ValueError(f"metadata is truncated while skipping {label}")
+    metadata_file.seek(current + byte_count)
+
+
+def _metadata_route_node(raw: int, label: str) -> int:
+    if raw == _NO_ENDPOINT_PIP:
+        return -1
+    if raw > 2**31 - 1:
+        raise ValueError(f"{label} exceeds the C++ node-id range")
+    return raw
+
+
+def read_metadata_summary(metadata_path: Path) -> RoutingMetadataSummary:
+    """Read the sparse reconstruction subset of RIPS metadata v4-v7.
+
+    EdgeAttr and PipData are deliberately seek-skipped: on a full device those
+    tables dominate memory, while each v7 EndpointPip repeats the exact tuple
+    needed to authenticate and reconstruct an endpoint attachment.
+    """
+
+    initial_pair_id = read_metadata_artifact_pair_id(metadata_path)
+    with metadata_path.open("rb") as metadata_file:
+        magic = _read_metadata_exact(metadata_file, 8, "metadata magic")
+        if magic != _METADATA_MAGIC:
+            raise ValueError(f"{metadata_path} is not RIPS interchange metadata")
+        version = _read_metadata_u64(metadata_file, "metadata version")
+        orientation = _read_metadata_u64(metadata_file, "metadata orientation")
+        if version < 4 or version > 7:
+            raise ValueError(
+                f"{metadata_path} has unsupported metadata version {version}"
+            )
+        if orientation != 2:
+            raise ValueError(f"{metadata_path} does not use outgoing CSR orientation")
+
+        if version >= 5:
+            high = _read_metadata_u64(metadata_file, "artifact pair id high")
+            low = _read_metadata_u64(metadata_file, "artifact pair id low")
+            if high == 0 and low == 0:
+                raise ValueError(f"{metadata_path} has a zero artifact pair id")
+            pair_id = f"{high:016x}{low:016x}"
+        else:
+            pair_id = None
+        if pair_id != initial_pair_id:
+            raise ValueError("metadata artifact pair id changed while it was read")
+
+        string_count = _read_metadata_u64(metadata_file, "string count")
+        node_count = _read_metadata_u64(metadata_file, "node count")
+        edge_attr_count = _read_metadata_u64(metadata_file, "edge attr count")
+        pip_data_count = _read_metadata_u64(metadata_file, "PIP data count")
+        endpoint_pip_count = (
+            _read_metadata_u64(metadata_file, "endpoint PIP count")
+            if version >= _ENDPOINT_PIP_METADATA_VERSION
+            else 0
+        )
+        site_pin_attr_count = _read_metadata_u64(
+            metadata_file, "site-pin attr count"
+        )
+        route_request_count = _read_metadata_u64(
+            metadata_file, "route request count"
+        )
+        blocked_node_count = _read_metadata_u64(
+            metadata_file, "blocked node count"
+        )
+        sink_stop_node_count = _read_metadata_u64(
+            metadata_file, "sink-stop node count"
+        )
+        logical_cell_count = _read_metadata_u64(
+            metadata_file, "logical cell count"
+        )
+        logical_net_count = _read_metadata_u64(
+            metadata_file, "logical net count"
+        )
+        logical_port_instance_count = _read_metadata_u64(
+            metadata_file, "logical port-instance count"
+        )
+        physical_byte_count = _read_metadata_u64(
+            metadata_file, "physical netlist byte count"
+        )
+        logical_byte_count = _read_metadata_u64(
+            metadata_file, "logical netlist byte count"
+        )
+        for label in (
+            "device path string",
+            "physical path string",
+            "logical path string",
+            "logical design name string",
+        ):
+            _read_metadata_u64(metadata_file, label)
+
+        strings: list[str] = []
+        for _ in range(string_count):
+            size = _read_metadata_u64(metadata_file, "metadata string length")
+            raw = _read_metadata_exact(metadata_file, size, "metadata string")
+            try:
+                strings.append(raw.decode("utf-8"))
+            except UnicodeDecodeError as exc:
+                raise ValueError("metadata contains invalid UTF-8") from exc
+
+        def metadata_string(index: int, label: str) -> str:
+            if index >= len(strings):
+                raise ValueError(f"{label} references an invalid string")
+            return strings[index]
+
+        if version < 6:
+            _skip_metadata_bytes(
+                metadata_file, node_count * 40, "legacy node metadata"
+            )
+        _skip_metadata_bytes(
+            metadata_file, edge_attr_count * 16, "edge attributes"
+        )
+        _skip_metadata_bytes(metadata_file, pip_data_count * 24, "PIP data")
+
+        endpoint_pips: list[MetadataEndpointPip] = []
+        endpoint_edges: set[int] = set()
+        for _ in range(endpoint_pip_count):
+            raw = [
+                _read_metadata_u64(metadata_file, "endpoint PIP field")
+                for _ in range(10)
+            ]
+            (
+                csr_edge,
+                from_node,
+                to_node,
+                tile_string,
+                wire0_string,
+                wire1_string,
+                forward,
+                site_string,
+                endpoint_node,
+                role,
+            ) = raw
+            if csr_edge >= edge_attr_count:
+                raise ValueError("endpoint PIP references an invalid CSR edge")
+            if csr_edge in endpoint_edges:
+                raise ValueError("duplicate endpoint PIPs reference one CSR edge")
+            endpoint_edges.add(csr_edge)
+            from_node = _metadata_route_node(from_node, "endpoint PIP from")
+            to_node = _metadata_route_node(to_node, "endpoint PIP to")
+            endpoint_node = _metadata_route_node(
+                endpoint_node, "endpoint PIP endpoint node"
+            )
+            if (
+                from_node < 0
+                or to_node < 0
+                or endpoint_node < 0
+                or from_node >= node_count
+                or to_node >= node_count
+                or endpoint_node >= node_count
+                or from_node == to_node
+                or endpoint_node in (from_node, to_node)
+            ):
+                raise ValueError("endpoint PIP has invalid endpoint alignment")
+            if forward not in (0, 1):
+                raise ValueError("endpoint PIP has an invalid forward flag")
+            if role not in (0, 1):
+                raise ValueError("endpoint PIP has an invalid role")
+            concrete_site = metadata_string(site_string, "endpoint PIP site")
+            if not concrete_site:
+                raise ValueError("endpoint PIP has an empty concrete site")
+            endpoint_pips.append(
+                MetadataEndpointPip(
+                    csr_edge=csr_edge,
+                    from_node=from_node,
+                    to_node=to_node,
+                    tile=metadata_string(tile_string, "endpoint PIP tile"),
+                    wire0=metadata_string(wire0_string, "endpoint PIP wire0"),
+                    wire1=metadata_string(wire1_string, "endpoint PIP wire1"),
+                    forward=bool(forward),
+                    site=concrete_site,
+                    endpoint_node=endpoint_node,
+                    role=role,
+                )
+            )
+
+        _skip_metadata_bytes(
+            metadata_file, site_pin_attr_count * 24, "site-pin attributes"
+        )
+
+        requests: list[MetadataRouteRequest] = []
+        for _ in range(route_request_count):
+            net = metadata_string(
+                _read_metadata_u64(metadata_file, "route request net"),
+                "route request net",
+            )
+            _read_metadata_u64(metadata_file, "route request logical net")
+
+            def read_site_pins(role: int, label: str) -> tuple[MetadataSitePin, ...]:
+                count = _read_metadata_u64(metadata_file, f"{label} count")
+                pins: list[MetadataSitePin] = []
+                for _ in range(count):
+                    node = _metadata_route_node(
+                        _read_metadata_u64(metadata_file, f"{label} node"),
+                        f"metadata {label} node",
+                    )
+                    site = metadata_string(
+                        _read_metadata_u64(metadata_file, f"{label} site"),
+                        f"metadata {label} site",
+                    )
+                    pin = metadata_string(
+                        _read_metadata_u64(metadata_file, f"{label} pin"),
+                        f"metadata {label} pin",
+                    )
+                    endpoint_index = (
+                        _read_metadata_u64(
+                            metadata_file, f"{label} endpoint PIP index"
+                        )
+                        if version >= _ENDPOINT_PIP_METADATA_VERSION
+                        else _NO_ENDPOINT_PIP
+                    )
+                    if endpoint_index != _NO_ENDPOINT_PIP:
+                        if endpoint_index >= len(endpoint_pips):
+                            raise ValueError(
+                                f"metadata {label} references an invalid endpoint PIP"
+                            )
+                        endpoint = endpoint_pips[endpoint_index]
+                        if (
+                            endpoint.role != role
+                            or endpoint.endpoint_node != node
+                        ):
+                            raise ValueError(
+                                f"metadata {label} references an endpoint PIP "
+                                "owned by a different endpoint or role"
+                            )
+                    pins.append(
+                        MetadataSitePin(node, site, pin, endpoint_index)
+                    )
+                return tuple(pins)
+
+            sources = read_site_pins(0, "source")
+            sinks = read_site_pins(1, "sink")
+            requests.append(MetadataRouteRequest(net, sources, sinks))
+
+        _skip_metadata_bytes(
+            metadata_file, logical_cell_count * 24, "logical cells"
+        )
+        _skip_metadata_bytes(
+            metadata_file, logical_net_count * 32, "logical nets"
+        )
+        _skip_metadata_bytes(
+            metadata_file,
+            logical_port_instance_count * 56,
+            "logical port instances",
+        )
+        _skip_metadata_bytes(
+            metadata_file, blocked_node_count * 8, "blocked nodes"
+        )
+        _skip_metadata_bytes(
+            metadata_file, sink_stop_node_count * 8, "sink-stop nodes"
+        )
+        _skip_metadata_bytes(
+            metadata_file, physical_byte_count, "physical netlist bytes"
+        )
+        _skip_metadata_bytes(
+            metadata_file, logical_byte_count, "logical netlist bytes"
+        )
+        if metadata_file.read(1):
+            raise ValueError("metadata has trailing bytes")
+
+    if read_metadata_artifact_pair_id(metadata_path) != pair_id:
+        raise ValueError("metadata publication changed while it was read")
+    return RoutingMetadataSummary(
+        version=version,
+        artifact_pair_id=pair_id,
+        node_count=node_count,
+        edge_attr_count=edge_attr_count,
+        endpoint_pips=tuple(endpoint_pips),
+        route_requests=tuple(requests),
+    )
+
+
 def read_routes_jsonl(
-    path: Path, expected_artifact_pair_id: str | None = None
+    path: Path,
+    expected_artifact_pair_id: str | None = None,
+    metadata_summary: RoutingMetadataSummary | None = None,
 ) -> dict[str, dict[str, Any]]:
+    if metadata_summary is not None:
+        if (
+            expected_artifact_pair_id is not None
+            and expected_artifact_pair_id != metadata_summary.artifact_pair_id
+        ):
+            raise ValueError("metadata summary artifact pair id is inconsistent")
+        expected_artifact_pair_id = metadata_summary.artifact_pair_id
     routes: dict[str, dict[str, Any]] = {}
     with path.open("r", encoding="utf-8") as route_file:
         for line_no, line in enumerate(route_file, 1):
@@ -586,7 +931,7 @@ def read_routes_jsonl(
             net_name = route.get("net")
             if not isinstance(net_name, str) or not net_name:
                 raise ValueError(f"{path}:{line_no}: route entry has no net name")
-            if not route.get("routed", False):
+            if route.get("routed") is not True:
                 raise ValueError(f"{path}:{line_no}: net {net_name} is not fully routed")
             route_pair_id = route.get("artifact_pair_id")
             if route_pair_id != expected_artifact_pair_id:
@@ -598,6 +943,7 @@ def read_routes_jsonl(
             routes[net_name] = route
     if not routes:
         raise ValueError(f"no routed nets were written to {path}")
+    validate_routes_against_metadata(routes, metadata_summary)
     return routes
 
 
@@ -623,6 +969,292 @@ def route_int(value: Any, field: str) -> int:
     if value < -(2**31) or value > 2**31 - 1:
         raise ValueError(f"route field {field} exceeds the C++ node-id range")
     return value
+
+
+def route_u64(value: Any, field: str) -> int:
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, int)
+        or value < 0
+        or value > 2**64 - 1
+    ):
+        raise ValueError(f"route field {field} is not an unsigned 64-bit integer")
+    return value
+
+
+def _route_string(value: Any, field: str) -> str:
+    if not isinstance(value, str):
+        raise ValueError(f"route field {field} is not a string")
+    return value
+
+
+def _route_attachment(value: Any, field: str) -> int | None:
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise ValueError(f"route field {field} is not a nonnegative integer or null")
+    if value > _NO_ENDPOINT_PIP:
+        raise ValueError(f"route field {field} exceeds the metadata index range")
+    return value
+
+
+def validate_routes_against_metadata(
+    routes: dict[str, dict[str, Any]],
+    metadata: RoutingMetadataSummary | None,
+) -> None:
+    requests_by_net: dict[str, MetadataRouteRequest] = {}
+    endpoint_by_csr_edge: dict[int, int] = {}
+    if metadata is not None:
+        for request in metadata.route_requests:
+            if request.net in requests_by_net:
+                raise ValueError(
+                    f"metadata contains duplicate route request {request.net}"
+                )
+            requests_by_net[request.net] = request
+        for index, endpoint in enumerate(metadata.endpoint_pips):
+            if endpoint.csr_edge in endpoint_by_csr_edge:
+                raise ValueError("metadata contains duplicate endpoint-PIP CSR edges")
+            endpoint_by_csr_edge[endpoint.csr_edge] = index
+
+    for net_name, route in routes.items():
+        raw_sources = route.get("sources")
+        raw_sinks = route.get("sinks")
+        raw_edges = route.get("edges")
+        if not isinstance(raw_sources, list) or not isinstance(raw_sinks, list):
+            raise ValueError(f"net {net_name} has invalid source/sink arrays")
+        if not isinstance(raw_edges, list):
+            raise ValueError(f"net {net_name} has an invalid edge array")
+
+        request = requests_by_net.get(net_name) if metadata is not None else None
+        if metadata is not None and request is None:
+            raise ValueError(f"route net {net_name} is not present in metadata")
+        if request is not None:
+            if len(raw_sources) != len(request.sources):
+                raise ValueError(f"route source count does not match metadata for {net_name}")
+            if len(raw_sinks) != len(request.sinks):
+                raise ValueError(f"route sink count does not match metadata for {net_name}")
+
+        sources: list[tuple[int, str, str]] = []
+        for index, source in enumerate(raw_sources):
+            if not isinstance(source, dict):
+                raise ValueError(f"net {net_name} source {index} is not an object")
+            actual = (
+                route_int(source.get("node"), "source.node"),
+                _route_string(source.get("site"), "source.site"),
+                _route_string(source.get("pin"), "source.pin"),
+            )
+            if request is not None:
+                expected = request.sources[index]
+                if actual != (expected.node, expected.site, expected.pin):
+                    raise ValueError(
+                        f"route source {index} does not match metadata for {net_name}"
+                    )
+            sources.append(actual)
+
+        sinks: list[tuple[int, str, str, bool]] = []
+        for index, sink in enumerate(raw_sinks):
+            if not isinstance(sink, dict):
+                raise ValueError(f"net {net_name} sink {index} is not an object")
+            reached = sink.get("reached")
+            if not isinstance(reached, bool):
+                raise ValueError(f"net {net_name} sink {index} has invalid reached")
+            actual = (
+                route_int(sink.get("node"), "sink.node"),
+                _route_string(sink.get("site"), "sink.site"),
+                _route_string(sink.get("pin"), "sink.pin"),
+                reached,
+            )
+            if request is not None:
+                expected = request.sinks[index]
+                if actual[:3] != (expected.node, expected.site, expected.pin):
+                    raise ValueError(
+                        f"route sink {index} does not match metadata for {net_name}"
+                    )
+            sinks.append(actual)
+
+        authorized_sources: set[int] = set()
+        authorized_reached_sinks: set[int] = set()
+        source_attachment_by_node: dict[int, int] = {}
+        source_nodes = {source[0] for source in sources}
+        if request is not None:
+            for source in request.sources:
+                endpoint_index = source.endpoint_pip_index
+                if endpoint_index == _NO_ENDPOINT_PIP:
+                    continue
+                authorized_sources.add(endpoint_index)
+                previous = source_attachment_by_node.setdefault(
+                    source.node, endpoint_index
+                )
+                if previous != endpoint_index:
+                    raise ValueError(
+                        f"metadata has ambiguous source attachments for {net_name}"
+                    )
+            for index, sink in enumerate(request.sinks):
+                if sinks[index][3] and sink.endpoint_pip_index != _NO_ENDPOINT_PIP:
+                    authorized_reached_sinks.add(sink.endpoint_pip_index)
+
+        incoming: dict[int, dict[str, Any]] = {}
+        outgoing: dict[int, list[dict[str, Any]]] = defaultdict(list)
+        seen_pairs: set[tuple[int, int]] = set()
+        seen_csr_edges: set[int] = set()
+        used_attachments: dict[int, dict[str, Any]] = {}
+
+        for edge_index, edge in enumerate(raw_edges):
+            if not isinstance(edge, dict):
+                raise ValueError(f"net {net_name} edge {edge_index} is not an object")
+            parent = route_int(edge.get("from"), "edge.from")
+            child = route_int(edge.get("to"), "edge.to")
+            csr_edge = route_u64(edge.get("csr_edge"), "edge.csr_edge")
+            if parent < 0 or child < 0 or parent == child:
+                raise ValueError(f"net {net_name} contains an invalid route edge")
+            if metadata is not None and (
+                parent >= metadata.node_count or child >= metadata.node_count
+            ):
+                raise ValueError(f"net {net_name} references an invalid route node")
+            if metadata is not None and csr_edge >= metadata.edge_attr_count:
+                raise ValueError(f"net {net_name} references an invalid CSR edge")
+            pair = (parent, child)
+            if pair in seen_pairs or csr_edge in seen_csr_edges:
+                raise ValueError(f"net {net_name} contains a duplicate route edge")
+            seen_pairs.add(pair)
+            seen_csr_edges.add(csr_edge)
+            if child in incoming and route_int(
+                incoming[child].get("from"), "edge.from"
+            ) != parent:
+                raise ValueError(
+                    f"net {net_name} drives node {child} from multiple parents"
+                )
+            incoming[child] = edge
+            outgoing[parent].append(edge)
+
+            tile = _route_string(edge.get("tile"), "edge.tile")
+            wire0 = _route_string(edge.get("wire0"), "edge.wire0")
+            wire1 = _route_string(edge.get("wire1"), "edge.wire1")
+            forward = edge.get("forward")
+            if not isinstance(forward, bool):
+                raise ValueError(f"net {net_name} edge.forward is not a bool")
+
+            if (
+                metadata is not None
+                and metadata.version >= _ENDPOINT_PIP_METADATA_VERSION
+                and ("attachment" not in edge or "site" not in edge)
+            ):
+                raise ValueError(
+                    f"v7 route edge is missing attachment/site fields for {net_name}"
+                )
+            attachment = _route_attachment(
+                edge.get("attachment"), "edge.attachment"
+            )
+            site_value = edge.get("site")
+            if site_value is not None and not isinstance(site_value, str):
+                raise ValueError(f"route field edge.site is not a string or null")
+            if (attachment is None) != (site_value is None):
+                raise ValueError(
+                    f"net {net_name} edge must pair attachment and site"
+                )
+
+            expected_index = endpoint_by_csr_edge.get(csr_edge)
+            if expected_index is None:
+                if attachment is not None or site_value is not None:
+                    raise ValueError(
+                        f"conventional route edge carries attachment/site for {net_name}"
+                    )
+                continue
+            if attachment is None or site_value is None:
+                raise ValueError(
+                    f"endpoint attachment is encoded as conventional for {net_name}"
+                )
+            if attachment != expected_index:
+                raise ValueError(
+                    f"attachment index does not match its CSR edge for {net_name}"
+                )
+            if attachment in used_attachments:
+                raise ValueError(f"net {net_name} reuses an endpoint attachment")
+
+            endpoint = metadata.endpoint_pips[expected_index]
+            if (
+                parent != endpoint.from_node
+                or child != endpoint.to_node
+                or tile != endpoint.tile
+                or wire0 != endpoint.wire0
+                or wire1 != endpoint.wire1
+                or forward != endpoint.forward
+                or site_value != endpoint.site
+            ):
+                raise ValueError(
+                    f"route attachment does not exactly match sparse metadata for {net_name}"
+                )
+            if endpoint.role == 0:
+                if attachment not in authorized_sources:
+                    raise ValueError(
+                        f"source attachment belongs to another endpoint for {net_name}"
+                    )
+            elif attachment not in authorized_reached_sinks:
+                raise ValueError(
+                    f"sink attachment belongs to another endpoint for {net_name}"
+                )
+            used_attachments[attachment] = edge
+
+        if metadata is not None:
+            for endpoint_index, attachment_edge in used_attachments.items():
+                endpoint = metadata.endpoint_pips[endpoint_index]
+                if endpoint.role == 0:
+                    corridor = incoming.get(endpoint.from_node)
+                    children = outgoing.get(endpoint.from_node, [])
+                    root_children = outgoing.get(endpoint.endpoint_node, [])
+                    if (
+                        corridor is None
+                        or route_int(corridor.get("from"), "edge.from")
+                        != endpoint.endpoint_node
+                        or corridor.get("attachment") is not None
+                        or len(root_children) != 1
+                        or root_children[0] is not corridor
+                        or len(children) != 1
+                        or children[0] is not attachment_edge
+                        or endpoint.endpoint_node in incoming
+                    ):
+                        raise ValueError(
+                            f"source attachment is outside its endpoint corridor "
+                            f"or used for transit in {net_name}"
+                        )
+                else:
+                    corridor_edges = outgoing.get(endpoint.to_node, [])
+                    if (
+                        len(corridor_edges) != 1
+                        or route_int(corridor_edges[0].get("to"), "edge.to")
+                        != endpoint.endpoint_node
+                        or corridor_edges[0].get("attachment") is not None
+                        or endpoint.endpoint_node in outgoing
+                    ):
+                        raise ValueError(
+                            f"sink attachment is outside its endpoint corridor "
+                            f"or used for transit in {net_name}"
+                        )
+
+            assert request is not None
+            for source in request.sources:
+                endpoint_index = source.endpoint_pip_index
+                if (
+                    endpoint_index != _NO_ENDPOINT_PIP
+                    and source.node in outgoing
+                    and endpoint_index not in used_attachments
+                ):
+                    raise ValueError(
+                        f"routed source omitted its endpoint attachment for {net_name}"
+                    )
+            for index, sink in enumerate(request.sinks):
+                endpoint_index = sink.endpoint_pip_index
+                if (
+                    not sinks[index][3]
+                    or endpoint_index == _NO_ENDPOINT_PIP
+                    or endpoint_index in used_attachments
+                ):
+                    continue
+                zero_length = sink.node in source_nodes and sink.node not in incoming
+                if not zero_length:
+                    raise ValueError(
+                        f"reached sink omitted its endpoint attachment for {net_name}"
+                    )
 
 
 def build_route_tables(route: dict[str, Any]):
@@ -726,7 +1358,15 @@ def insert_route_tree(
             pip.tile = get_string_index(str(edge["tile"]), string_to_index)
             pip.wire0 = get_string_index(str(edge["wire0"]), string_to_index)
             pip.wire1 = get_string_index(str(edge["wire1"]), string_to_index)
+            pip.isFixed = False
             pip.forward = bool(edge["forward"])
+            attachment = edge.get("attachment")
+            if attachment is None:
+                # Explicitly select the conventional-PIP union arm.
+                pip.noSite = None
+            else:
+                # Sparse metadata validation guarantees a concrete site here.
+                pip.site = get_string_index(str(edge["site"]), string_to_index)
             stack.append(
                 (next_branch, route_int(edge["to"], "edge.to"), next_ancestors)
             )
@@ -768,9 +1408,12 @@ def write_routed_physical_netlist(
     routes_path: Path,
     allow_unrouted_stubs: bool,
     expected_artifact_pair_id: str | None = None,
+    metadata_summary: RoutingMetadataSummary | None = None,
 ) -> None:
     schema = load_physical_schema(schema_dir)
-    routes_by_net = read_routes_jsonl(routes_path, expected_artifact_pair_id)
+    routes_by_net = read_routes_jsonl(
+        routes_path, expected_artifact_pair_id, metadata_summary
+    )
     data = read_gzip_or_plain(input_phys)
 
     with schema.PhysNetlist.from_bytes(
@@ -964,14 +1607,15 @@ def main(argv: list[str]) -> int:
             "run CSR PathFinder",
         )
 
-        artifact_pair_id = read_metadata_artifact_pair_id(metadata_path)
+        metadata_summary = read_metadata_summary(metadata_path)
         write_routed_physical_netlist(
             input_phys,
             output_phys,
             schema_dir,
             routes_path,
             args.allow_unrouted_stubs,
-            artifact_pair_id,
+            metadata_summary.artifact_pair_id,
+            metadata_summary,
         )
         return 0
     finally:

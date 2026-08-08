@@ -318,6 +318,7 @@ enum class MetadataFixtureTruncation {
   kLegacyNodeArrays,
   kEdgeAttrs,
   kPipData,
+  kEndpointPips,
 };
 
 void write_metadata_loader_fixture(
@@ -325,8 +326,9 @@ void write_metadata_loader_fixture(
     std::uint64_t version,
     const routing::interchange::InterchangeArtifactPairId& id,
     MetadataFixtureTruncation truncation = MetadataFixtureTruncation::kNone) {
-  if (version < 4 || version > 6) {
-    throw std::invalid_argument("metadata loader fixture requires v4, v5, or v6");
+  if (version < 4 || version > 7) {
+    throw std::invalid_argument(
+        "metadata loader fixture requires v4, v5, v6, or v7");
   }
 
   std::ofstream out(path, std::ios::binary | std::ios::trunc);
@@ -343,6 +345,7 @@ void write_metadata_loader_fixture(
   constexpr std::uint64_t kNodeCount = 3;
   constexpr std::uint64_t kEdgeAttrCount = 4;
   constexpr std::uint64_t kPipDataCount = 2;
+  const std::uint64_t endpoint_pip_count = version >= 7 ? 1 : 0;
   constexpr std::uint64_t kSitePinAttrCount = 1;
   constexpr std::uint64_t kRouteRequestCount = 1;
   constexpr std::uint64_t kBlockedNodeCount = 1;
@@ -352,20 +355,29 @@ void write_metadata_loader_fixture(
   constexpr std::uint64_t kLogicalPortInstanceCount = 1;
   constexpr std::uint64_t kPhysicalBytes = 3;
   constexpr std::uint64_t kLogicalBytes = 2;
-  for (const std::uint64_t count :
-       {kStringCount,
-        kNodeCount,
-        kEdgeAttrCount,
-        kPipDataCount,
-        kSitePinAttrCount,
-        kRouteRequestCount,
-        kBlockedNodeCount,
-        kSinkStopNodeCount,
-        kLogicalCellCount,
-        kLogicalNetCount,
-        kLogicalPortInstanceCount,
-        kPhysicalBytes,
-        kLogicalBytes}) {
+  std::vector<std::uint64_t> header_counts = {
+      kStringCount,
+      kNodeCount,
+      kEdgeAttrCount,
+      kPipDataCount,
+  };
+  if (version >= 7) {
+    header_counts.push_back(endpoint_pip_count);
+  }
+  const std::vector<std::uint64_t> trailing_header_counts = {
+      kSitePinAttrCount,
+      kRouteRequestCount,
+      kBlockedNodeCount,
+      kSinkStopNodeCount,
+      kLogicalCellCount,
+      kLogicalNetCount,
+      kLogicalPortInstanceCount,
+      kPhysicalBytes,
+      kLogicalBytes,
+  };
+  header_counts.insert(header_counts.end(), trailing_header_counts.begin(),
+                       trailing_header_counts.end());
+  for (const std::uint64_t count : header_counts) {
     write_fixture_u64(out, count);
   }
 
@@ -431,6 +443,20 @@ void write_metadata_loader_fixture(
     write_fixture_u64(out, pip_data[index][2]);
   }
 
+  if (version >= 7) {
+    // EndpointPipDisk: csr_edge, from, to, tile, wire0, wire1, forward,
+    // traversed site, exact endpoint node, role (0 = source, 1 = sink).
+    const std::uint64_t endpoint_pip[10] = {
+        0, 0, 1, 4, 5, 6, 1, 8, 2, 0};
+    for (std::size_t field = 0; field < 10; ++field) {
+      write_fixture_u64(out, endpoint_pip[field]);
+      if (truncation == MetadataFixtureTruncation::kEndpointPips &&
+          field == 4) {
+        return;
+      }
+    }
+  }
+
   write_fixture_u64(out, 1);  // site-pin node
   write_fixture_u64(out, 8);  // site
   write_fixture_u64(out, 5);  // pin
@@ -441,18 +467,22 @@ void write_metadata_loader_fixture(
   write_fixture_u64(out, 0);
   write_fixture_u64(out, 8);
   write_fixture_u64(out, 5);
+  if (version >= 7) write_fixture_u64(out, routing::kNoIndex);
   write_fixture_u64(out, 2);
   write_fixture_u64(out, 8);
   write_fixture_u64(out, 6);
+  if (version >= 7) write_fixture_u64(out, 0);
   write_fixture_u64(out, 2);  // sink count
   write_fixture_u64(out, 1);
   write_fixture_u64(out, 8);
   write_fixture_u64(out, 6);
+  if (version >= 7) write_fixture_u64(out, routing::kNoIndex);
   write_fixture_u64(out, routing::kNoIndex);  // unresolved sink
   write_fixture_u64(out, 8);
   write_fixture_u64(out, 5);
+  if (version >= 7) write_fixture_u64(out, routing::kNoIndex);
 
-  // The remaining v5/v6 sections are not needed by routing, but keeping them
+  // The remaining v5-v7 sections are not needed by routing, but keeping them
   // nonempty verifies that the loader lands on every following table exactly.
   write_fixture_u64(out, 3);  // logical cell declaration
   write_fixture_u64(out, 0);  // logical net begin
@@ -542,7 +572,8 @@ void write_minimal_metadata_fixture(
     write_fixture_u64(out, value.high);
     write_fixture_u64(out, value.low);
   }
-  for (int count = 0; count < 13; ++count) {
+  const int header_count = version >= 7 ? 14 : 13;
+  for (int count = 0; count < header_count; ++count) {
     write_fixture_u64(out, 0);
   }
   for (int string_index = 0; string_index < 4; ++string_index) {
@@ -683,11 +714,14 @@ void require_metadata_loader_fixture(
     const std::optional<routing::interchange::InterchangeArtifactPairId>& pair,
     bool expects_legacy_node_arrays,
     bool expects_route_output_tables,
-    bool expects_auxiliary_tables) {
+    bool expects_auxiliary_tables,
+    bool expects_v7_endpoint_records) {
   require(metadata.artifact_pair_id == pair,
           "metadata loader lost the artifact pair id");
   require(metadata.declared_node_count == 3 &&
-              metadata.declared_edge_attr_count == 4,
+              metadata.declared_edge_attr_count == 4 &&
+              metadata.declared_endpoint_pip_count ==
+                  (expects_v7_endpoint_records ? 1 : 0),
           "metadata loader lost routing-only declared graph counts");
   require(metadata.strings ==
               std::vector<std::string>({"device", "physical", "logical",
@@ -746,8 +780,26 @@ void require_metadata_loader_fixture(
                 metadata.pip_data[1].wire1_string == 5 &&
                 !metadata.pip_data[1].forward,
             "bulk PIP-data loading changed record order or direction");
+    if (expects_v7_endpoint_records) {
+      require(metadata.endpoint_pips.size() == 1,
+              "v7 metadata loader changed the endpoint-PIP count");
+      const routing::EndpointPip& endpoint_pip =
+          metadata.endpoint_pips.front();
+      require(endpoint_pip.csr_edge == 0 && endpoint_pip.from == 0 &&
+                  endpoint_pip.to == 1 && endpoint_pip.tile_string == 4 &&
+                  endpoint_pip.wire0_string == 5 &&
+                  endpoint_pip.wire1_string == 6 && endpoint_pip.forward &&
+                  endpoint_pip.site_string == 8 &&
+                  endpoint_pip.endpoint_node == 2 &&
+                  endpoint_pip.role == routing::EndpointPipRole::kSource,
+              "v7 metadata loader changed an endpoint-PIP field");
+    } else {
+      require(metadata.endpoint_pips.empty(),
+              "legacy metadata loader fabricated endpoint PIPs");
+    }
   } else {
-    require(metadata.edge_attrs.empty() && metadata.pip_data.empty(),
+    require(metadata.edge_attrs.empty() && metadata.pip_data.empty() &&
+                metadata.endpoint_pips.empty(),
             "routing-only metadata loader retained edge/PIP tables");
   }
   if (expects_auxiliary_tables) {
@@ -770,16 +822,21 @@ void require_metadata_loader_fixture(
   require(request.sources[0].node == 0 &&
               request.sources[0].site_string == 8 &&
               request.sources[0].pin_string == 5 &&
+              request.sources[0].endpoint_pip_index == routing::kNoIndex &&
               request.sources[1].node == 2 &&
               request.sources[1].site_string == 8 &&
-              request.sources[1].pin_string == 6,
+              request.sources[1].pin_string == 6 &&
+              request.sources[1].endpoint_pip_index ==
+                  (expects_v7_endpoint_records ? 0 : routing::kNoIndex),
           "metadata loader changed source endpoint records");
   require(request.sinks[0].node == 1 &&
               request.sinks[0].site_string == 8 &&
               request.sinks[0].pin_string == 6 &&
+              request.sinks[0].endpoint_pip_index == routing::kNoIndex &&
               request.sinks[1].node == -1 &&
               request.sinks[1].site_string == 8 &&
-              request.sinks[1].pin_string == 5,
+              request.sinks[1].pin_string == 5 &&
+              request.sinks[1].endpoint_pip_index == routing::kNoIndex,
           "metadata loader changed sink endpoint records");
   if (expects_auxiliary_tables) {
     require(metadata.blocked_nodes == std::vector<std::uint64_t>({2}) &&
@@ -813,9 +870,11 @@ void test_compact_metadata_loader() {
   const std::filesystem::path v4_path = directory / "metadata-v4.ifmeta.bin";
   const std::filesystem::path v5_path = directory / "metadata-v5.ifmeta.bin";
   const std::filesystem::path v6_path = directory / "metadata-v6.ifmeta.bin";
+  const std::filesystem::path v7_path = directory / "metadata-v7.ifmeta.bin";
   write_metadata_loader_fixture(v4_path, 4, pair);
   write_metadata_loader_fixture(v5_path, 5, pair);
   write_metadata_loader_fixture(v6_path, 6, pair);
+  write_metadata_loader_fixture(v7_path, 7, pair);
 
   const routing::RoutingMetadata v5_full =
       routing::load_interchange_metadata(
@@ -823,8 +882,12 @@ void test_compact_metadata_loader() {
   const routing::RoutingMetadata v6_full =
       routing::load_interchange_metadata(
           v6_path, routing::InterchangeMetadataLoadMode::kFull);
-  require_metadata_loader_fixture(v5_full, pair, true, true, true);
-  require_metadata_loader_fixture(v6_full, pair, false, true, true);
+  const routing::RoutingMetadata v7_full =
+      routing::load_interchange_metadata(
+          v7_path, routing::InterchangeMetadataLoadMode::kFull);
+  require_metadata_loader_fixture(v5_full, pair, true, true, true, false);
+  require_metadata_loader_fixture(v6_full, pair, false, true, true, false);
+  require_metadata_loader_fixture(v7_full, pair, false, true, true, true);
 
   const routing::RoutingMetadata v5_routing =
       routing::load_interchange_metadata(
@@ -832,22 +895,36 @@ void test_compact_metadata_loader() {
   const routing::RoutingMetadata v6_routing =
       routing::load_interchange_metadata(
           v6_path, routing::InterchangeMetadataLoadMode::kRoutingOnly);
-  require_metadata_loader_fixture(v5_routing, pair, false, false, false);
-  require_metadata_loader_fixture(v6_routing, pair, false, false, false);
+  const routing::RoutingMetadata v7_routing =
+      routing::load_interchange_metadata(
+          v7_path, routing::InterchangeMetadataLoadMode::kRoutingOnly);
+  require_metadata_loader_fixture(v5_routing, pair, false, false, false,
+                                  false);
+  require_metadata_loader_fixture(v6_routing, pair, false, false, false,
+                                  false);
+  require_metadata_loader_fixture(v7_routing, pair, false, false, false,
+                                  true);
 
   const routing::RoutingMetadata v4_route_output =
       routing::load_interchange_metadata(
           v4_path,
           routing::InterchangeMetadataLoadMode::kRoutingWithRouteOutput);
   require_metadata_loader_fixture(
-      v4_route_output, std::nullopt, false, true, false);
+      v4_route_output, std::nullopt, false, true, false, false);
 
   const routing::RoutingMetadata v6_route_output =
       routing::load_interchange_metadata(
           v6_path,
           routing::InterchangeMetadataLoadMode::kRoutingWithRouteOutput);
   require_metadata_loader_fixture(
-      v6_route_output, pair, false, true, false);
+      v6_route_output, pair, false, true, false, false);
+
+  const routing::RoutingMetadata v7_route_output =
+      routing::load_interchange_metadata(
+          v7_path,
+          routing::InterchangeMetadataLoadMode::kRoutingWithRouteOutput);
+  require_metadata_loader_fixture(
+      v7_route_output, pair, false, true, false, true);
 
   const auto require_truncated_failure =
       [&](std::uint64_t version,
@@ -883,6 +960,135 @@ void test_compact_metadata_loader() {
       6,
       MetadataFixtureTruncation::kPipData,
       "v6 metadata truncated inside bulk PIP data was accepted");
+  require_truncated_failure(
+      7,
+      MetadataFixtureTruncation::kEndpointPips,
+      "v7 metadata truncated inside endpoint-PIP data was accepted");
+}
+
+void test_endpoint_pip_route_output() {
+  HostCsrF32 graph;
+  graph.rows = 7;
+  graph.cols = 7;
+  graph.nnz = 6;
+  graph.rowptr = {0, 1, 2, 3, 4, 5, 6, 6};
+  graph.colind = {1, 2, 3, 4, 5, 6};
+  graph.values.assign(6, 1.0f);
+
+  routing::RoutingMetadata metadata;
+  metadata.strings = {
+      "endpoint-net", "SRC_SITE", "SRC_PIN", "SINK_SITE", "SINK_PIN",
+      "XIPHY_TILE", "C0_A", "C0_B", "SOURCE_PIN", "SOURCE_Q",
+      "C2_A", "C2_B", "C3_A", "C3_B", "SINK_D", "SINK_Q",
+      "C5_A", "C5_B", "SOURCE_TRAVERSED_SITE", "SINK_TRAVERSED_SITE"};
+  metadata.edge_attrs = {
+      {5, 0}, {5, 1}, {5, 2}, {5, 3}, {5, 4}, {5, 5}};
+  metadata.pip_data = {
+      {6, 7, true},   {8, 9, true},   {10, 11, true},
+      {12, 13, true}, {14, 15, true}, {16, 17, true}};
+  metadata.endpoint_pips = {
+      {1, 1, 2, 5, 8, 9, true, 18, 0,
+       routing::EndpointPipRole::kSource},
+      {4, 4, 5, 5, 14, 15, true, 19, 6,
+       routing::EndpointPipRole::kSink}};
+  metadata.declared_endpoint_pip_count = 2;
+
+  routing::RouteRequest request;
+  request.net_string = 0;
+  request.sources.push_back({0, 1, 2, 0});
+  request.sinks.push_back({6, 3, 4, 1});
+  metadata.route_requests.push_back(request);
+
+  routing::RoutedSink sink;
+  sink.source = 0;
+  sink.target = 6;
+  sink.distance = 6.0f;
+  sink.reached = true;
+  sink.nodes = {0, 1, 2, 3, 4, 5, 6};
+  for (int edge = 0; edge < 6; ++edge) {
+    sink.edges.push_back({edge, edge + 1, edge, 1.0f});
+  }
+  routing::RoutedNet net;
+  net.net_string = 0;
+  net.reached_all_sinks = true;
+  net.sinks.push_back(sink);
+  net.unique_nodes = sink.nodes;
+  routing::PathfinderResult result;
+  result.routed = true;
+  result.all_sinks_reached = true;
+  result.nets.push_back(net);
+
+  const std::filesystem::path output =
+      std::filesystem::temp_directory_path() /
+      "pathfinder_endpoint_pip_routes.jsonl";
+  routing::write_routes_jsonl(output, graph, metadata, result);
+  std::ifstream route_file(output);
+  const std::string json((std::istreambuf_iterator<char>(route_file)),
+                         std::istreambuf_iterator<char>());
+  require(json.find(
+              "\"attachment\":0,\"site\":\"SOURCE_TRAVERSED_SITE\"") !=
+              std::string::npos,
+          "source attachment lost its table index or traversed site");
+  require(json.find(
+              "\"attachment\":1,\"site\":\"SINK_TRAVERSED_SITE\"") !=
+              std::string::npos,
+          "sink attachment lost its table index or traversed site");
+  require(json.find("\"attachment\":null,\"site\":null") !=
+              std::string::npos,
+          "conventional route edge did not explicitly omit attachment/site");
+
+  const auto require_rejected = [&](const routing::RoutingMetadata& candidate,
+                                    const char* message) {
+    bool rejected = false;
+    try {
+      routing::write_routes_jsonl(output, graph, candidate, result);
+    } catch (const std::exception&) {
+      rejected = true;
+    }
+    require(rejected, message);
+  };
+
+  routing::RoutingMetadata transit = metadata;
+  transit.route_requests[0].sources[0].endpoint_pip_index = routing::kNoIndex;
+  require_rejected(
+      transit,
+      "endpoint pseudo-PIP was accepted as unauthorized source-side transit");
+
+  routing::RoutingMetadata sink_transit = metadata;
+  sink_transit.route_requests[0].sinks[0].endpoint_pip_index =
+      routing::kNoIndex;
+  require_rejected(
+      sink_transit,
+      "endpoint pseudo-PIP was accepted as unauthorized sink-side transit");
+
+  routing::RoutingMetadata late_source = metadata;
+  late_source.endpoint_pips[0] =
+      {3, 3, 4, 5, 12, 13, true, 18, 0,
+       routing::EndpointPipRole::kSource};
+  require_rejected(
+      late_source,
+      "source attachment was accepted after ordinary fabric transit");
+
+  routing::RoutingMetadata mismatched = metadata;
+  mismatched.endpoint_pips[0].wire0_string = 10;
+  require_rejected(
+      mismatched,
+      "endpoint pseudo-PIP that disagrees with its CSR PIP was accepted");
+
+  routing::RoutingMetadata wrong_direction = metadata;
+  wrong_direction.endpoint_pips[0].forward = false;
+  require_rejected(
+      wrong_direction,
+      "endpoint pseudo-PIP with mismatched direction was accepted");
+
+  routing::RoutingMetadata wrong_role = metadata;
+  wrong_role.endpoint_pips[1].role = routing::EndpointPipRole::kSource;
+  require_rejected(
+      wrong_role,
+      "sink endpoint accepted an attachment with the source role");
+
+  std::error_code ignored;
+  std::filesystem::remove(output, ignored);
 }
 
 void populate_stub_delta_telemetry(
@@ -1968,6 +2174,7 @@ UnitBfsCsrResult UnitBfsCsrWorkspace::run(
 int main() {
   test_interchange_artifact_pair_loaders();
   test_compact_metadata_loader();
+  test_endpoint_pip_route_output();
 
   {
     const routing::RoutingMetadata empty_metadata;

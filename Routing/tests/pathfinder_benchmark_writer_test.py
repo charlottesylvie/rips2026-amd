@@ -1,13 +1,17 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
+import copy
 import gzip
 import json
+import struct
 import sys
 import tempfile
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+sys.path.insert(
+    0, str(Path(__file__).resolve().parents[2] / "CongestionFreeRouting")
+)
 
 import pathfinder_benchmark as benchmark
 
@@ -53,6 +57,11 @@ struct PhysNetlist {
     wire0 @1 :UInt32;
     wire1 @2 :UInt32;
     forward @3 :Bool;
+    isFixed @4 :Bool;
+    union {
+      noSite @5 :Void;
+      site @6 :UInt32;
+    }
   }
 }
 """
@@ -100,6 +109,7 @@ def assert_routed_output(schema, output_phys: Path) -> None:
         assert strings[pip.wire0] == "WIRE_0"
         assert strings[pip.wire1] == "WIRE_1"
         assert pip.forward is True
+        assert pip.which() == "noSite"
         assert len(pip_branch.branches) == 1
         sink_branch = pip_branch.branches[0]
         assert sink_branch.routeSegment.which() == "sitePin"
@@ -158,6 +168,135 @@ def assert_duplicate_endpoint_output(schema, output_phys: Path) -> None:
         )
 
 
+def make_legacy_metadata(path: Path) -> None:
+    strings = [
+        "net0",
+        "SRC_SITE",
+        "SRC_PIN",
+        "SINK_SITE",
+        "SINK_PIN",
+        "TILE_A",
+        "WIRE_0",
+        "WIRE_1",
+    ]
+    words = [
+        4,  # version
+        2,  # outgoing CSR orientation
+        len(strings),
+        2,  # node count
+        1,  # edge attr count
+        1,  # PIP data count
+        0,  # site-pin attr count
+        1,  # route request count
+        0,  # blocked nodes
+        0,  # sink-stop nodes
+        0,  # logical cells
+        0,  # logical nets
+        0,  # logical port instances
+        0,  # physical bytes
+        0,  # logical bytes
+        0,
+        0,
+        0,
+        0,
+    ]
+    payload = bytearray(b"RIPSIFM1")
+    payload.extend(struct.pack(f"={len(words)}Q", *words))
+    for text in strings:
+        encoded = text.encode()
+        payload.extend(struct.pack("=Q", len(encoded)))
+        payload.extend(encoded)
+    payload.extend(b"\0" * 80)  # seven legacy arrays, 40 bytes/node
+    payload.extend(struct.pack("=2Q", 5, 0))
+    payload.extend(struct.pack("=3Q", 6, 7, 1))
+    payload.extend(struct.pack("=3Q", 0, 2**64 - 1, 1))
+    payload.extend(struct.pack("=3Q", 0, 1, 2))
+    payload.extend(struct.pack("=Q", 1))
+    payload.extend(struct.pack("=3Q", 1, 3, 4))
+    path.write_bytes(payload)
+
+
+def make_attachment_case():
+    pair_id = "00000000000000010000000000000002"
+    endpoints = (
+        benchmark.MetadataEndpointPip(
+            1, 1, 2, "SRC_TILE", "SRC_W0", "SRC_W1", False,
+            "TRAVERSED_SRC", 0, 0,
+        ),
+        benchmark.MetadataEndpointPip(
+            3, 3, 4, "SINK_TILE", "SINK_W0", "SINK_W1", True,
+            "TRAVERSED_SINK", 5, 1,
+        ),
+    )
+    request = benchmark.MetadataRouteRequest(
+        "net0",
+        (benchmark.MetadataSitePin(0, "SRC_SITE", "SRC_PIN", 0),),
+        (benchmark.MetadataSitePin(5, "SINK_SITE", "SINK_PIN", 1),),
+    )
+    metadata = benchmark.RoutingMetadataSummary(
+        version=7,
+        artifact_pair_id=pair_id,
+        node_count=7,
+        edge_attr_count=6,
+        endpoint_pips=endpoints,
+        route_requests=(request,),
+    )
+    route = {
+        "artifact_pair_id": pair_id,
+        "net": "net0",
+        "routed": True,
+        "sources": [{"node": 0, "site": "SRC_SITE", "pin": "SRC_PIN"}],
+        "sinks": [{
+            "node": 5,
+            "site": "SINK_SITE",
+            "pin": "SINK_PIN",
+            "reached": True,
+            "source": 0,
+        }],
+        "edges": [
+            {"from": 0, "to": 1, "csr_edge": 0, "tile": "C0_TILE",
+             "wire0": "C0_W0", "wire1": "C0_W1", "forward": True,
+             "attachment": None, "site": None},
+            {"from": 1, "to": 2, "csr_edge": 1, "tile": "SRC_TILE",
+             "wire0": "SRC_W0", "wire1": "SRC_W1", "forward": False,
+             "attachment": 0, "site": "TRAVERSED_SRC"},
+            {"from": 2, "to": 3, "csr_edge": 2, "tile": "C2_TILE",
+             "wire0": "C2_W0", "wire1": "C2_W1", "forward": True,
+             "attachment": None, "site": None},
+            {"from": 3, "to": 4, "csr_edge": 3, "tile": "SINK_TILE",
+             "wire0": "SINK_W0", "wire1": "SINK_W1", "forward": True,
+             "attachment": 1, "site": "TRAVERSED_SINK"},
+            {"from": 4, "to": 5, "csr_edge": 4, "tile": "C4_TILE",
+             "wire0": "C4_W0", "wire1": "C4_W1", "forward": False,
+             "attachment": None, "site": None},
+        ],
+    }
+    return metadata, route
+
+
+def assert_attachment_output(schema, output_phys: Path) -> None:
+    expected_sites = [None, "TRAVERSED_SRC", None, "TRAVERSED_SINK", None]
+    expected_forward = [True, False, True, True, False]
+    with schema.PhysNetlist.from_bytes(
+        gzip.decompress(output_phys.read_bytes()),
+        traversal_limit_in_words=sys.maxsize,
+        nesting_limit=2**16,
+    ) as routed:
+        strings = routed.strList
+        branch = routed.physNets[0].sources[0]
+        for expected_site, forward in zip(expected_sites, expected_forward):
+            assert len(branch.branches) == 1
+            branch = branch.branches[0]
+            pip = branch.routeSegment.pip
+            assert pip.forward is forward
+            if expected_site is None:
+                assert pip.which() == "noSite"
+            else:
+                assert pip.which() == "site"
+                assert strings[pip.site] == expected_site
+        assert branch.branches[0].routeSegment.which() == "sitePin"
+
+
 def main() -> int:
     with tempfile.TemporaryDirectory() as tmp:
         tmp_path = Path(tmp)
@@ -193,6 +332,8 @@ def main() -> int:
                     "wire0": "WIRE_0",
                     "wire1": "WIRE_1",
                     "forward": True,
+                    "attachment": None,
+                    "site": None,
                 }
             ],
         }
@@ -206,6 +347,50 @@ def main() -> int:
             allow_unrouted_stubs=False,
         )
         assert_routed_output(schema, output_phys)
+
+        attachment_metadata, attachment_route = make_attachment_case()
+        attachment_routes = tmp_path / "attachment_routes.jsonl"
+        attachment_output = tmp_path / "attachment_output.phys"
+        attachment_routes.write_text(
+            json.dumps(attachment_route) + "\n", encoding="utf-8"
+        )
+        benchmark.write_routed_physical_netlist(
+            input_phys,
+            attachment_output,
+            schema_dir,
+            attachment_routes,
+            allow_unrouted_stubs=False,
+            metadata_summary=attachment_metadata,
+        )
+        assert_attachment_output(schema, attachment_output)
+
+        malformed_cases = []
+        conventional_site = copy.deepcopy(attachment_route)
+        conventional_site["edges"][0]["attachment"] = 0
+        conventional_site["edges"][0]["site"] = "TRAVERSED_SRC"
+        malformed_cases.append((conventional_site, "conventional"))
+        wrong_direction = copy.deepcopy(attachment_route)
+        wrong_direction["edges"][1]["forward"] = True
+        malformed_cases.append((wrong_direction, "exactly match"))
+        wrong_index = copy.deepcopy(attachment_route)
+        wrong_index["edges"][1]["attachment"] = 1
+        malformed_cases.append((wrong_index, "index"))
+        source_transit = copy.deepcopy(attachment_route)
+        source_transit["edges"].append(
+            {"from": 0, "to": 6, "csr_edge": 5, "tile": "TRANSIT",
+             "wire0": "T0", "wire1": "T1", "forward": True,
+             "attachment": None, "site": None}
+        )
+        malformed_cases.append((source_transit, "transit"))
+        for malformed, expected_error in malformed_cases:
+            try:
+                benchmark.validate_routes_against_metadata(
+                    {"net0": malformed}, attachment_metadata
+                )
+            except ValueError as exc:
+                assert expected_error in str(exc)
+            else:
+                raise AssertionError(f"malformed attachment route accepted: {malformed}")
 
         detached_routes = tmp_path / "detached_routes.jsonl"
         detached_routes.write_text(
@@ -277,14 +462,16 @@ def main() -> int:
         logical_netlist.write_bytes(b"logical")
         device = tmp_path / "xcvu3p.device"
         device.write_bytes(b"device")
+        metadata_fixture = tmp_path / "legacy.ifmeta.bin"
+        make_legacy_metadata(metadata_fixture)
 
         fake_converter = tmp_path / "fake_interchange_to_csr.py"
         fake_converter.write_text(
-            """#!/usr/bin/env python3
+            f"""#!/usr/bin/env python3
 from pathlib import Path
 import sys
-Path(sys.argv[3]).write_bytes(b"csr")
-Path(sys.argv[sys.argv.index("--metadata") + 1]).write_bytes(b"metadata")
+Path(sys.argv[4]).write_bytes(b"csr")
+Path(sys.argv[sys.argv.index("--metadata") + 1]).write_bytes(Path({str(metadata_fixture)!r}).read_bytes())
 """,
             encoding="utf-8",
         )

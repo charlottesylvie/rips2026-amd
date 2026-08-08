@@ -42,7 +42,7 @@ def require_current_metadata_pair_versions() -> None:
     low = 0x0FEDCBA987654321
     expected = f"{high:016x}{low:016x}"
     with tempfile.TemporaryDirectory() as directory:
-        for version in (5, 6):
+        for version in (5, 6, 7):
             metadata = Path(directory) / f"metadata-v{version}.ifmeta.bin"
             metadata.write_bytes(
                 b"RIPSIFM1"
