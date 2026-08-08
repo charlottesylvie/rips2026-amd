@@ -1426,10 +1426,24 @@ class EndpointAttachmentCorridorValidator {
         throw std::runtime_error(
             "endpoint attachment PIP must identify exactly one CSR edge");
       }
-      if (corridor_edge_count_[index] != 1 ||
-          boundary_edge_count_[index] != 1) {
-        const EndpointAttachment& attachment =
-            graph_.endpoint_attachments[index];
+      const EndpointAttachment& attachment =
+          graph_.endpoint_attachments[index];
+      if (corridor_edge_count_[index] != 1) {
+        throw std::runtime_error(
+            attachment.role == EndpointAttachmentRole::kSource
+                ? "source attachment corridor edge is missing or duplicated"
+                : "sink attachment corridor edge is missing or duplicated");
+      }
+      if (attachment.endpoint_pin_string >=
+          graph_.string_table.strings.size()) {
+        throw std::runtime_error(
+            "endpoint attachment has an invalid endpoint pin string");
+      }
+      const bool is_guarded_tsp_sink =
+          attachment.role == EndpointAttachmentRole::kSink &&
+          graph_.string_table.strings[attachment.endpoint_pin_string] ==
+              "TSP";
+      if (boundary_edge_count_[index] != 1 && !is_guarded_tsp_sink) {
         throw std::runtime_error(
             attachment.role == EndpointAttachmentRole::kSource
                 ? "source attachment corridor has an unrelated incoming edge"
@@ -2045,9 +2059,15 @@ CsrGraph filter_device_routing_graph(
         graph.endpoint_attachments[index];
     const std::size_t endpoint =
         static_cast<std::size_t>(attachment.endpoint_node);
-    if (endpoint >= node_count || blocked_node[endpoint]) {
+    if (endpoint >= node_count || attachment.from_node < 0 ||
+        attachment.to_node < 0 ||
+        static_cast<std::size_t>(attachment.from_node) >= node_count ||
+        static_cast<std::size_t>(attachment.to_node) >= node_count ||
+        attachment.endpoint_pin_string >=
+            graph.string_table.strings.size() ||
+        blocked_node[endpoint]) {
       throw std::runtime_error(
-          "enabled endpoint attachment names a blocked or invalid endpoint");
+          "enabled endpoint attachment names an invalid or blocked corridor");
     }
     if (attachment.role == EndpointAttachmentRole::kSource) {
       if (sink_node_stops[endpoint] ||
@@ -2069,6 +2089,38 @@ CsrGraph filter_device_routing_graph(
     }
   }
 
+  // Some xcvu3p TSP attachment midpoints are also ordinary LOGIC_OUT nodes.
+  // Their conventional fabric fanout must remain in the reusable graph when
+  // the attachment is unused. Once a concrete sink attachment is enabled,
+  // however, that midpoint is endpoint-only: retain only its exact
+  // conventional edge to the owning IOB/TSP endpoint. Sparse records avoid a
+  // device-sized attachment side table. Sorting the guarded rows also avoids
+  // a hash lookup for every edge in the multi-gigabyte base CSR.
+  std::vector<std::pair<NodeId, std::size_t>> enabled_sink_boundaries;
+  enabled_sink_boundaries.reserve(enabled_endpoint_attachments.size());
+  for (std::size_t index = 0;
+       index < enabled_endpoint_attachments.size(); ++index) {
+    if (!enabled_endpoint_attachments[index]) {
+      continue;
+    }
+    const EndpointAttachment& attachment =
+        graph.endpoint_attachments[index];
+    if (attachment.role == EndpointAttachmentRole::kSink &&
+        graph.string_table.strings[attachment.endpoint_pin_string] ==
+            "TSP") {
+      enabled_sink_boundaries.emplace_back(attachment.to_node, index);
+    }
+  }
+  std::sort(enabled_sink_boundaries.begin(),
+            enabled_sink_boundaries.end());
+  for (std::size_t index = 1; index < enabled_sink_boundaries.size(); ++index) {
+    if (enabled_sink_boundaries[index - 1].first ==
+        enabled_sink_boundaries[index].first) {
+      throw std::runtime_error(
+          "enabled endpoint attachments share a corridor boundary");
+    }
+  }
+
   CsrGraph csr;
   csr.rows = static_cast<std::int64_t>(node_count);
   csr.cols = csr.rows;
@@ -2078,6 +2130,7 @@ CsrGraph filter_device_routing_graph(
   csr.colind.reserve(graph.colind.size());
   csr.edge_attrs.reserve(graph.edge_attrs.size());
   EndpointAttachmentCorridorValidator attachment_validator(graph);
+  std::size_t guarded_sink_cursor = 0;
 
   // Validate and compact in one pass. Contest masks are sparse, so reserving
   // the base edge count avoids reallocations without value-initializing a
@@ -2098,6 +2151,18 @@ CsrGraph filter_device_routing_graph(
     }
     const bool source_is_active =
         !blocked_node[row] && !sink_node_stops[row];
+    while (guarded_sink_cursor < enabled_sink_boundaries.size() &&
+           enabled_sink_boundaries[guarded_sink_cursor].first <
+               static_cast<NodeId>(row)) {
+      ++guarded_sink_cursor;
+    }
+    const std::optional<std::size_t> guarded_sink =
+        guarded_sink_cursor < enabled_sink_boundaries.size() &&
+                enabled_sink_boundaries[guarded_sink_cursor].first ==
+                    static_cast<NodeId>(row)
+            ? std::optional<std::size_t>(
+                  enabled_sink_boundaries[guarded_sink_cursor].second)
+            : std::nullopt;
     for (std::int64_t edge = begin; edge < end; ++edge) {
       const std::size_t input_edge = static_cast<std::size_t>(edge);
       const std::int32_t col = graph.colind[input_edge];
@@ -2117,8 +2182,19 @@ CsrGraph filter_device_routing_graph(
           !attachment_index.has_value() ||
           (!enabled_endpoint_attachments.empty() &&
            enabled_endpoint_attachments[*attachment_index] != 0);
-      if (attachment_is_enabled && source_is_active &&
-          !unavailable_destination_nodes[static_cast<std::size_t>(col)]) {
+      bool permitted_by_sink_attachment = true;
+      if (guarded_sink.has_value()) {
+        const EndpointAttachment& attachment =
+            graph.endpoint_attachments[*guarded_sink];
+        permitted_by_sink_attachment =
+            col == attachment.endpoint_node &&
+            !attachment_index.has_value();
+      }
+      const bool retain =
+          attachment_is_enabled && permitted_by_sink_attachment &&
+          source_is_active &&
+          !unavailable_destination_nodes[static_cast<std::size_t>(col)];
+      if (retain) {
         csr.colind.push_back(col);
         csr.edge_attrs.push_back(attr);
       }
@@ -2130,6 +2206,54 @@ CsrGraph filter_device_routing_graph(
     csr.rowptr[row + 1] = static_cast<std::int64_t>(csr.colind.size());
   }
   attachment_validator.finish();
+
+  const auto retained_edge_matches =
+      [&](NodeId row, NodeId col,
+          std::optional<std::uint64_t> pip_data_index) {
+        if (row < 0 || col < 0 ||
+            static_cast<std::size_t>(row) >= node_count) {
+          return false;
+        }
+        const std::size_t begin =
+            static_cast<std::size_t>(csr.rowptr[static_cast<std::size_t>(row)]);
+        const std::size_t end = static_cast<std::size_t>(
+            csr.rowptr[static_cast<std::size_t>(row) + 1]);
+        const auto found = std::lower_bound(
+            csr.colind.begin() + static_cast<std::ptrdiff_t>(begin),
+            csr.colind.begin() + static_cast<std::ptrdiff_t>(end), col);
+        if (found ==
+                csr.colind.begin() + static_cast<std::ptrdiff_t>(end) ||
+            *found != col) {
+          return false;
+        }
+        if (!pip_data_index.has_value()) {
+          return true;
+        }
+        const std::size_t edge =
+            static_cast<std::size_t>(found - csr.colind.begin());
+        return csr.edge_attrs[edge].pip_data_index == *pip_data_index;
+      };
+  for (std::size_t index = 0;
+       index < enabled_endpoint_attachments.size(); ++index) {
+    if (!enabled_endpoint_attachments[index]) {
+      continue;
+    }
+    const EndpointAttachment& attachment =
+        graph.endpoint_attachments[index];
+    const bool retained_attachment = retained_edge_matches(
+        attachment.from_node, attachment.to_node,
+        attachment.pip_data_index);
+    const bool retained_corridor =
+        attachment.role == EndpointAttachmentRole::kSource
+            ? retained_edge_matches(attachment.endpoint_node,
+                                    attachment.from_node, std::nullopt)
+            : retained_edge_matches(attachment.to_node,
+                                    attachment.endpoint_node, std::nullopt);
+    if (!retained_attachment || !retained_corridor) {
+      throw std::runtime_error(
+          "enabled endpoint attachment is not in its retained corridor");
+    }
+  }
 
   csr.values.assign(csr.colind.size(), 1.0f);
   return csr;

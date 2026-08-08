@@ -1145,23 +1145,60 @@ int main() {
     require(rejected_attachment_graph,
             "validation accepted a transit predecessor into a source corridor");
 
+    // xcvu3p TSP sink midpoints are also ordinary LOGIC_OUT nodes. The
+    // reusable graph must retain that conventional fanout; design filtering
+    // makes it endpoint-only only when the corresponding attachment is
+    // enabled.
+    ri::DeviceRoutingGraph branched_sink_graph = make_attachment_graph();
+    const std::uint32_t tsp_pin = ri::checked_lookup_string_id(
+        branched_sink_graph.string_table.intern("TSP"));
+    branched_sink_graph.endpoint_attachments[1].endpoint_pin_string =
+        tsp_pin;
+    for (ri::SitePinNodeLookup& site_pin :
+         branched_sink_graph.site_pin_nodes) {
+      if (site_pin.node ==
+          branched_sink_graph.endpoint_attachments[1].endpoint_node) {
+        site_pin.pin_string = tsp_pin;
+      }
+    }
+    std::sort(branched_sink_graph.site_pin_nodes.begin(),
+              branched_sink_graph.site_pin_nodes.end());
+    ri::rebuild_endpoint_attachment_lookups(branched_sink_graph);
+    branched_sink_graph.pip_data.push_back(
+        branched_sink_graph.pip_data[2]);
+    ri::EdgeAttr branch_attr = branched_sink_graph.edge_attrs[2];
+    branch_attr.pip_data_index = branched_sink_graph.pip_data.size() - 1;
+    branched_sink_graph.colind.insert(
+        branched_sink_graph.colind.begin() + 4, 2);
+    branched_sink_graph.edge_attrs.insert(
+        branched_sink_graph.edge_attrs.begin() + 4,
+        branch_attr);
+    for (std::size_t row = 5; row < branched_sink_graph.rowptr.size(); ++row) {
+      ++branched_sink_graph.rowptr[row];
+    }
+    ++branched_sink_graph.loaded_edges;
+    ++branched_sink_graph.declared_edges;
+    ri::validate_device_routing_graph(branched_sink_graph);
+
     rejected_attachment_graph = false;
     try {
-      ri::DeviceRoutingGraph invalid = make_attachment_graph();
-      invalid.colind.insert(invalid.colind.begin() + 4, 0);
-      invalid.edge_attrs.insert(invalid.edge_attrs.begin() + 4,
-                                invalid.edge_attrs[0]);
-      for (std::size_t row = 5; row < invalid.rowptr.size(); ++row) {
-        ++invalid.rowptr[row];
+      ri::DeviceRoutingGraph invalid = branched_sink_graph;
+      const std::uint32_t op_pin = ri::checked_lookup_string_id(
+          invalid.string_table.intern("OP"));
+      invalid.endpoint_attachments[1].endpoint_pin_string = op_pin;
+      for (ri::SitePinNodeLookup& site_pin : invalid.site_pin_nodes) {
+        if (site_pin.node == invalid.endpoint_attachments[1].endpoint_node) {
+          site_pin.pin_string = op_pin;
+        }
       }
-      ++invalid.loaded_edges;
-      ++invalid.declared_edges;
+      std::sort(invalid.site_pin_nodes.begin(), invalid.site_pin_nodes.end());
+      ri::rebuild_endpoint_attachment_lookups(invalid);
       ri::validate_device_routing_graph(invalid);
     } catch (const std::runtime_error&) {
       rejected_attachment_graph = true;
     }
     require(rejected_attachment_graph,
-            "validation accepted a transit successor from a sink corridor");
+            "non-TSP sink attachment accepted unrelated midpoint fanout");
 
     rejected_attachment_graph = false;
     try {
@@ -1333,6 +1370,25 @@ int main() {
                 attachments_disabled.edge_attrs[2].pip_data_index == 4,
             "disabled attachment filtering changed conventional edge policy");
 
+    const ri::CsrGraph branched_sink_disabled =
+        ri::filter_device_routing_graph(
+            branched_sink_graph, attachment_blocked,
+            attachment_sink_stops, attachment_unavailable);
+    require(branched_sink_disabled.rowptr ==
+                std::vector<std::int64_t>({0, 1, 1, 2, 2, 4, 4}) &&
+                branched_sink_disabled.colind ==
+                    std::vector<std::int32_t>({1, 3, 2, 5}),
+            "disabled sink attachment lost ordinary midpoint fanout");
+    const ri::CsrGraph branched_sink_enabled =
+        ri::filter_device_routing_graph(
+            branched_sink_graph, attachment_blocked,
+            attachment_sink_stops, attachment_unavailable, {1, 1});
+    require(branched_sink_enabled.colind ==
+                std::vector<std::int32_t>({1, 2, 3, 4, 5}) &&
+                reachable(branched_sink_enabled, 0, 5) &&
+                !reachable(branched_sink_enabled, 4, 2),
+            "enabled sink attachment retained unrelated midpoint transit");
+
     const ri::CsrGraph source_attachment_only =
         ri::filter_device_routing_graph(
             attachment_filtering, attachment_blocked,
@@ -1394,6 +1450,44 @@ int main() {
     require(rejected_attachment_mask,
             "filter enabled a sink attachment at a transit-capable endpoint");
 
+    rejected_attachment_mask = false;
+    try {
+      std::vector<std::uint8_t> unsafe = attachment_unavailable;
+      unsafe[1] = 1;
+      (void)ri::filter_device_routing_graph(
+          attachment_filtering, attachment_blocked,
+          attachment_sink_stops, unsafe, {1, 0});
+    } catch (const std::runtime_error&) {
+      rejected_attachment_mask = true;
+    }
+    require(rejected_attachment_mask,
+            "filter retained a source attachment without its corridor");
+    rejected_attachment_mask = false;
+    try {
+      std::vector<std::uint8_t> unsafe = attachment_sink_stops;
+      unsafe[4] = 1;
+      (void)ri::filter_device_routing_graph(
+          attachment_filtering, attachment_blocked,
+          unsafe, attachment_unavailable, {0, 1});
+    } catch (const std::runtime_error&) {
+      rejected_attachment_mask = true;
+    }
+    require(rejected_attachment_mask,
+            "filter retained a sink attachment without its corridor");
+    rejected_attachment_mask = false;
+    try {
+      ri::DeviceRoutingGraph invalid = attachment_filtering;
+      invalid.endpoint_attachments[1].endpoint_pin_string =
+          static_cast<std::uint32_t>(invalid.string_table.strings.size());
+      (void)ri::filter_device_routing_graph(
+          invalid, attachment_blocked, attachment_sink_stops,
+          attachment_unavailable);
+    } catch (const std::runtime_error&) {
+      rejected_attachment_mask = true;
+    }
+    require(rejected_attachment_mask,
+            "filter accepted an invalid disabled attachment pin string");
+
     ri::DeviceRoutingGraph streamed_source = make_graph();
     std::vector<ri::StaticCsrEntry> entries;
     entries.reserve(streamed_source.colind.size());
@@ -1416,7 +1510,7 @@ int main() {
     compare_graphs(expected, streamed);
 
     ri::DeviceRoutingGraph attachment_streamed_source =
-        make_attachment_graph();
+        branched_sink_graph;
     std::vector<ri::StaticCsrEntry> attachment_entries;
     for (std::size_t row = 0;
          row < attachment_streamed_source.node_device_ids.size(); ++row) {
@@ -1451,7 +1545,7 @@ int main() {
         attachment_streamed_path);
     const ri::DeviceRoutingGraph attachment_streamed =
         ri::read_device_routing_graph(attachment_streamed_path);
-    compare_graphs(attachment_expected, attachment_streamed);
+    compare_graphs(branched_sink_graph, attachment_streamed);
 
     for (const std::filesystem::path& path : cleanup) {
       std::filesystem::remove(path);
