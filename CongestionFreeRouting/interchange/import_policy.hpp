@@ -76,6 +76,16 @@ constexpr bool include_pip_in_static_graph(bool conventional) {
   return conventional;
 }
 
+// PhysicalNetlist.siteInsts describes sites with a declared active type; it is
+// not a device-wide inventory.  An omitted traversed site is therefore
+// available to an audited attachment, while an explicitly active site type
+// must be one of the types proved compatible by DeviceResources.
+constexpr bool attachment_traversed_site_type_is_compatible(
+    bool has_active_site_type,
+    bool active_site_type_is_allowed) {
+  return !has_active_site_type || active_site_type_is_allowed;
+}
+
 // The xcvu3p IOB does not connect directly to ordinary inter-site routing.
 // Two directional XIPHY pseudo PIPs cross a BITSLICE site at the boundary:
 // RX_D_PIN -> RX_Q5 for an IOB/I source and TX_D0 -> TX_Q for an IOB/OP

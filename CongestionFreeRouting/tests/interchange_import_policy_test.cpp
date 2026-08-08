@@ -133,6 +133,11 @@ int main() {
     require(ri::include_pip_in_static_graph(true) &&
                 !ri::include_pip_in_static_graph(false),
             "pseudo-PIP inclusion policy is unsafe");
+    require(ri::attachment_traversed_site_type_is_compatible(false, false) &&
+                ri::attachment_traversed_site_type_is_compatible(false, true) &&
+                ri::attachment_traversed_site_type_is_compatible(true, true) &&
+                !ri::attachment_traversed_site_type_is_compatible(true, false),
+            "missing or incompatible traversed-site type policy is wrong");
     const auto iob_source = ri::classify_audited_iob_attachment_pip(
         "xcvu3p", "XIPHY_BYTE_L", "XIPHY_BITSLICE_TILE_67_RX_D_PIN",
         "XIPHY_BITSLICE_TILE_67_RX_Q5", false, true);

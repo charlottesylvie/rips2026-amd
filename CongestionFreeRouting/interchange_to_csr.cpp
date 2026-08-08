@@ -124,6 +124,7 @@ using routing::interchange::PipData;
 using routing::interchange::RoutingCsrSidecars;
 using routing::interchange::SpatialEdgeShards;
 using routing::interchange::StringTable;
+using routing::interchange::attachment_traversed_site_type_is_compatible;
 using routing::interchange::device_routing_graph_node_count;
 using routing::interchange::filter_device_routing_graph;
 using routing::interchange::find_endpoint_attachment_index;
@@ -435,9 +436,12 @@ void claim_attachment_resources(
       graph.string_table.strings[attachment.traversed_site_string];
   const std::optional<std::string> traversed_type =
       active_site_types.find(traversed_site);
-  if (!traversed_type.has_value() ||
-      !attachment_allows_traversed_site_type(graph, attachment,
-                                             *traversed_type)) {
+  const bool active_type_is_allowed =
+      traversed_type.has_value() &&
+      attachment_allows_traversed_site_type(graph, attachment,
+                                            *traversed_type);
+  if (!attachment_traversed_site_type_is_compatible(
+          traversed_type.has_value(), active_type_is_allowed)) {
     throw std::runtime_error(
         description + " traverses site " + traversed_site +
         " without a compatible active PhysicalNetlist site type");
