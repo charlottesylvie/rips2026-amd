@@ -3746,114 +3746,168 @@ void validate_path_edge(const HostCsrF32& graph,
   }
 }
 
-const SitePinNode* source_endpoint_for_node(const RouteRequest& request,
-                                            int node) {
-  const SitePinNode* found = nullptr;
-  for (const SitePinNode& source : request.sources) {
-    if (source.node != node) {
-      continue;
-    }
-    if (found != nullptr &&
-        found->endpoint_pip_index != source.endpoint_pip_index) {
-      throw std::runtime_error(
-          "route request has ambiguous source attachments for one node");
-    }
-    found = &source;
-  }
-  return found;
-}
-
-void validate_routed_sink_attachments(
+void validate_routed_net_attachments(
     const HostCsrF32& graph,
     const RoutingMetadata& metadata,
     const EndpointPipByCsrEdge& endpoint_pips_by_edge,
     const RouteRequest& request,
-    const SitePinNode& requested_sink,
-    const RoutedSink& routed_sink) {
-  if (!routed_sink.reached) {
-    return;
-  }
-  if (routed_sink.target != requested_sink.node) {
-    throw std::runtime_error(
-        "pathfinder result sink does not match its route request");
-  }
-  if (routed_sink.edges.empty()) {
-    if (routed_sink.source != routed_sink.target) {
-      throw std::runtime_error(
-          "reached pathfinder sink has no path from its selected source");
-    }
-    return;
-  }
-
-  for (std::size_t edge_index = 0;
-       edge_index < routed_sink.edges.size(); ++edge_index) {
-    const PathEdge& edge = routed_sink.edges[edge_index];
-    validate_path_edge(graph, edge);
-    if ((edge_index == 0 && edge.from != routed_sink.source) ||
-        (edge_index != 0 &&
-         routed_sink.edges[edge_index - 1].to != edge.from) ||
-        (edge_index + 1 == routed_sink.edges.size() &&
-         edge.to != routed_sink.target)) {
-      throw std::runtime_error(
-          "pathfinder result contains a discontinuous source-to-sink path");
+    const RoutedNet& net) {
+  std::unordered_set<std::uint64_t> authorized_source_attachments;
+  std::unordered_set<std::uint64_t> authorized_reached_sink_attachments;
+  std::unordered_set<int> source_nodes;
+  for (const SitePinNode& source : request.sources) {
+    source_nodes.insert(source.node);
+    if (source.endpoint_pip_index != kNoIndex) {
+      authorized_source_attachments.insert(source.endpoint_pip_index);
     }
   }
 
-  const SitePinNode* selected_source =
-      source_endpoint_for_node(request, routed_sink.source);
-  const std::uint64_t source_attachment =
-      selected_source == nullptr ? kNoIndex
-                                 : selected_source->endpoint_pip_index;
-  const std::uint64_t sink_attachment = requested_sink.endpoint_pip_index;
-
-  if (source_attachment != kNoIndex) {
-    const EndpointPip& endpoint_pip = endpoint_pip_at(
-        metadata, source_attachment, EndpointPipRole::kSource,
-        routed_sink.source, "source");
-    if (routed_sink.edges.size() < 2 ||
-        routed_sink.edges[0].from != endpoint_pip.endpoint_node ||
-        routed_sink.edges[0].to != endpoint_pip.from ||
-        routed_sink.edges[1].csr_edge != endpoint_pip.csr_edge ||
-        endpoint_pips_by_edge.count(routed_sink.edges[0].csr_edge) != 0) {
-      throw std::runtime_error(
-          "authorized source attachment is not in its endpoint corridor");
-    }
-  }
-
-  if (sink_attachment != kNoIndex) {
-    const EndpointPip& endpoint_pip = endpoint_pip_at(
-        metadata, sink_attachment, EndpointPipRole::kSink,
-        requested_sink.node, "sink");
-    if (routed_sink.edges.size() < 2) {
-      throw std::runtime_error(
-          "authorized sink attachment is not in its endpoint corridor");
-    }
-    const std::size_t attachment_position = routed_sink.edges.size() - 2;
-    if (routed_sink.edges[attachment_position].csr_edge !=
-            endpoint_pip.csr_edge ||
-        routed_sink.edges.back().from != endpoint_pip.to ||
-        routed_sink.edges.back().to != endpoint_pip.endpoint_node ||
-        endpoint_pips_by_edge.count(routed_sink.edges.back().csr_edge) != 0) {
-      throw std::runtime_error(
-          "authorized sink attachment is not in its endpoint corridor");
-    }
-  }
-
-  for (std::size_t edge_index = 0;
-       edge_index < routed_sink.edges.size(); ++edge_index) {
-    const auto found = endpoint_pips_by_edge.find(
-        routed_sink.edges[edge_index].csr_edge);
-    if (found == endpoint_pips_by_edge.end()) {
+  std::size_t route_edge_count = 0;
+  for (std::size_t sink_index = 0; sink_index < net.sinks.size();
+       ++sink_index) {
+    const RoutedSink& routed_sink = net.sinks[sink_index];
+    if (!routed_sink.reached) {
       continue;
     }
-    const bool authorized_source =
-        found->second == source_attachment && edge_index == 1;
-    const bool authorized_sink =
-        found->second == sink_attachment &&
-        edge_index + 2 == routed_sink.edges.size();
-    if (!authorized_source && !authorized_sink) {
+    const SitePinNode& requested_sink = request.sinks[sink_index];
+    if (routed_sink.target != requested_sink.node) {
+      throw std::runtime_error(
+          "pathfinder result sink does not match its route request");
+    }
+    if (requested_sink.endpoint_pip_index != kNoIndex) {
+      authorized_reached_sink_attachments.insert(
+          requested_sink.endpoint_pip_index);
+    }
+    if (routed_sink.edges.empty()) {
+      if (routed_sink.source != routed_sink.target) {
+        throw std::runtime_error(
+            "reached pathfinder sink has no path from its selected source");
+      }
+      continue;
+    }
+    route_edge_count += routed_sink.edges.size();
+    for (std::size_t edge_index = 0;
+         edge_index < routed_sink.edges.size(); ++edge_index) {
+      const PathEdge& edge = routed_sink.edges[edge_index];
+      validate_path_edge(graph, edge);
+      if ((edge_index == 0 && edge.from != routed_sink.source) ||
+          (edge_index != 0 &&
+           routed_sink.edges[edge_index - 1].to != edge.from) ||
+          (edge_index + 1 == routed_sink.edges.size() &&
+           edge.to != routed_sink.target)) {
+        throw std::runtime_error(
+            "pathfinder result contains a discontinuous source-to-sink path");
+      }
+    }
+  }
+
+  std::unordered_map<std::uint64_t, const PathEdge*> route_edges;
+  route_edges.reserve(route_edge_count);
+  for (const RoutedSink& routed_sink : net.sinks) {
+    if (!routed_sink.reached) {
+      continue;
+    }
+    for (const PathEdge& edge : routed_sink.edges) {
+      const auto inserted = route_edges.emplace(edge_key(edge.from, edge.to),
+                                                &edge);
+      if (!inserted.second &&
+          inserted.first->second->csr_edge != edge.csr_edge) {
+        throw std::runtime_error(
+            "pathfinder result uses different CSR edges for one route-tree "
+            "arc");
+      }
+    }
+  }
+
+  std::unordered_map<int, const PathEdge*> incoming_by_node;
+  std::unordered_map<int, std::vector<const PathEdge*>> outgoing_by_node;
+  std::unordered_set<std::uint64_t> used_attachments;
+  incoming_by_node.reserve(route_edges.size());
+  outgoing_by_node.reserve(route_edges.size());
+  used_attachments.reserve(endpoint_pips_by_edge.size());
+  for (const auto& entry : route_edges) {
+    const PathEdge& edge = *entry.second;
+    const auto incoming = incoming_by_node.emplace(edge.to, &edge);
+    if (!incoming.second && incoming.first->second->from != edge.from) {
+      throw std::runtime_error(
+          "pathfinder result drives one route-tree node from multiple parents");
+    }
+    outgoing_by_node[edge.from].push_back(&edge);
+
+    const auto attachment = endpoint_pips_by_edge.find(edge.csr_edge);
+    if (attachment == endpoint_pips_by_edge.end()) {
+      continue;
+    }
+    const std::uint64_t attachment_index = attachment->second;
+    if (!used_attachments.insert(attachment_index).second) {
+      throw std::runtime_error(
+          "pathfinder result reuses one endpoint attachment");
+    }
+    const EndpointPip& endpoint_pip =
+        metadata.endpoint_pips[static_cast<std::size_t>(attachment_index)];
+    const bool authorized =
+        endpoint_pip.role == EndpointPipRole::kSource
+            ? authorized_source_attachments.count(attachment_index) != 0
+            : authorized_reached_sink_attachments.count(attachment_index) != 0;
+    if (!authorized) {
       throw std::runtime_error(
           "endpoint attachment appears as an unauthorized transit edge");
+    }
+  }
+
+  // RoutedSink stores the branch added to a shared route tree, not necessarily
+  // a complete endpoint-to-sink path.  Validate endpoint-only attachment
+  // topology against the completed union.  An endpoint record authorizes its
+  // pseudo edge; it does not require that edge when the CSR offers a wholly
+  // conventional route from/to the same physical endpoint.
+  for (const std::uint64_t attachment_index : used_attachments) {
+    const EndpointPip& endpoint_pip =
+        metadata.endpoint_pips[static_cast<std::size_t>(attachment_index)];
+    if (endpoint_pip.role == EndpointPipRole::kSource) {
+      const auto corridor = incoming_by_node.find(endpoint_pip.from);
+      const auto root_children =
+          outgoing_by_node.find(endpoint_pip.endpoint_node);
+      const auto attachment_children =
+          outgoing_by_node.find(endpoint_pip.from);
+      if (corridor == incoming_by_node.end() ||
+          corridor->second->from != endpoint_pip.endpoint_node ||
+          endpoint_pips_by_edge.count(corridor->second->csr_edge) != 0 ||
+          root_children == outgoing_by_node.end() ||
+          root_children->second.size() != 1 ||
+          root_children->second.front() != corridor->second ||
+          attachment_children == outgoing_by_node.end() ||
+          attachment_children->second.size() != 1 ||
+          attachment_children->second.front()->csr_edge !=
+              endpoint_pip.csr_edge ||
+          incoming_by_node.count(endpoint_pip.endpoint_node) != 0) {
+        throw std::runtime_error(
+            "source attachment is outside its endpoint corridor or used for "
+            "transit");
+      }
+    } else {
+      const auto corridor = outgoing_by_node.find(endpoint_pip.to);
+      if (corridor == outgoing_by_node.end() ||
+          corridor->second.size() != 1 ||
+          corridor->second.front()->to != endpoint_pip.endpoint_node ||
+          endpoint_pips_by_edge.count(corridor->second.front()->csr_edge) != 0 ||
+          outgoing_by_node.count(endpoint_pip.endpoint_node) != 0) {
+        throw std::runtime_error(
+            "sink attachment is outside its endpoint corridor or used for "
+            "transit");
+      }
+    }
+  }
+
+  // Every emitted component must still be rooted at one of the net's physical
+  // sources.  This catches a malformed collection of trimmed branch suffixes
+  // whose shared prefix was never retained in the union.
+  for (const auto& entry : route_edges) {
+    const PathEdge& edge = *entry.second;
+    if (incoming_by_node.count(edge.from) == 0 &&
+        source_nodes.count(edge.from) == 0) {
+      throw std::runtime_error(
+          "pathfinder result contains a route-tree component detached from "
+          "its requested sources");
     }
   }
 }
@@ -3892,12 +3946,8 @@ void write_routes_jsonl_impl(const std::filesystem::path& path,
       throw std::runtime_error(
           "pathfinder result has more sinks than its route request");
     }
-    for (std::size_t sink_index = 0; sink_index < net.sinks.size();
-         ++sink_index) {
-      validate_routed_sink_attachments(
-          graph, metadata, endpoint_pips_by_edge, request,
-          request.sinks[sink_index], net.sinks[sink_index]);
-    }
+    validate_routed_net_attachments(
+        graph, metadata, endpoint_pips_by_edge, request, net);
 
     out << '{';
     if (metadata.artifact_pair_id.has_value()) {

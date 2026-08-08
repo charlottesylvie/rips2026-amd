@@ -364,6 +364,19 @@ def main() -> int:
         )
         assert_attachment_output(schema, attachment_output)
 
+        conventional_attachment_route = copy.deepcopy(attachment_route)
+        conventional_attachment_route["edges"] = [
+            {"from": 0, "to": 6, "csr_edge": 0, "tile": "CONV_0",
+             "wire0": "CW0", "wire1": "CW1", "forward": True,
+             "attachment": None, "site": None},
+            {"from": 6, "to": 5, "csr_edge": 2, "tile": "CONV_1",
+             "wire0": "CW2", "wire1": "CW3", "forward": True,
+             "attachment": None, "site": None},
+        ]
+        benchmark.validate_routes_against_metadata(
+            {"net0": conventional_attachment_route}, attachment_metadata
+        )
+
         malformed_cases = []
         conventional_site = copy.deepcopy(attachment_route)
         conventional_site["edges"][0]["attachment"] = 0

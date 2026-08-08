@@ -1075,7 +1075,6 @@ def validate_routes_against_metadata(
         authorized_sources: set[int] = set()
         authorized_reached_sinks: set[int] = set()
         source_attachment_by_node: dict[int, int] = {}
-        source_nodes = {source[0] for source in sources}
         if request is not None:
             for source in request.sources:
                 endpoint_index = source.endpoint_pip_index
@@ -1230,32 +1229,6 @@ def validate_routes_against_metadata(
                             f"sink attachment is outside its endpoint corridor "
                             f"or used for transit in {net_name}"
                         )
-
-            assert request is not None
-            for source in request.sources:
-                endpoint_index = source.endpoint_pip_index
-                if (
-                    endpoint_index != _NO_ENDPOINT_PIP
-                    and source.node in outgoing
-                    and endpoint_index not in used_attachments
-                ):
-                    raise ValueError(
-                        f"routed source omitted its endpoint attachment for {net_name}"
-                    )
-            for index, sink in enumerate(request.sinks):
-                endpoint_index = sink.endpoint_pip_index
-                if (
-                    not sinks[index][3]
-                    or endpoint_index == _NO_ENDPOINT_PIP
-                    or endpoint_index in used_attachments
-                ):
-                    continue
-                zero_length = sink.node in source_nodes and sink.node not in incoming
-                if not zero_length:
-                    raise ValueError(
-                        f"reached sink omitted its endpoint attachment for {net_name}"
-                    )
-
 
 def build_route_tables(route: dict[str, Any]):
     adjacency: dict[int, list[dict[str, Any]]] = defaultdict(list)

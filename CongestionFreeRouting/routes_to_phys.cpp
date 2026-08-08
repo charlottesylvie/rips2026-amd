@@ -973,11 +973,9 @@ void validate_routes_against_metadata(
 
     std::set<std::uint64_t> authorized_source_attachments;
     std::set<std::uint64_t> authorized_reached_sink_attachments;
-    std::set<int> source_nodes;
     std::map<int, std::uint64_t> source_attachment_by_node;
     for (std::size_t index = 0; index < request.sources.size(); ++index) {
       const RouteSitePin& source = request.sources[index];
-      source_nodes.insert(source.node);
       if (source.endpoint_pip_index == kNoEndpointPip) {
         continue;
       }
@@ -1132,29 +1130,11 @@ void validate_routes_against_metadata(
       }
     }
 
-    for (const RouteSitePin& source : request.sources) {
-      if (source.endpoint_pip_index != kNoEndpointPip &&
-          outgoing_by_node.count(source.node) != 0 &&
-          used_attachments.count(source.endpoint_pip_index) == 0) {
-        throw std::runtime_error(
-            "routed source omitted its endpoint attachment for net " + net);
-      }
-    }
-    for (std::size_t index = 0; index < request.sinks.size(); ++index) {
-      const RouteSitePin& sink = request.sinks[index];
-      if (!route.sinks[index].reached ||
-          sink.endpoint_pip_index == kNoEndpointPip ||
-          used_attachments.count(sink.endpoint_pip_index) != 0) {
-        continue;
-      }
-      const bool zero_length_route =
-          source_nodes.count(sink.node) != 0 &&
-          incoming_by_node.count(sink.node) == 0;
-      if (!zero_length_route) {
-        throw std::runtime_error(
-            "reached sink omitted its endpoint attachment for net " + net);
-      }
-    }
+    // Endpoint metadata authorizes an audited pseudo-PIP when a route needs
+    // that BITSLICE crossing.  A route that stays entirely on conventional CSR
+    // edges is already represented exactly and need not consume the optional
+    // attachment.  Used attachments remain subject to the strict corridor and
+    // no-transit checks above.
   }
 }
 

@@ -1087,6 +1087,101 @@ void test_endpoint_pip_route_output() {
       wrong_role,
       "sink endpoint accepted an attachment with the source role");
 
+  // Authorization permits this exact pseudo-PIP if the route uses it; it does
+  // not require every route from the endpoint to use it.  Keep a conventional
+  // endpoint branch alongside the attachment corridor to exercise both cases.
+  HostCsrF32 branched_graph;
+  branched_graph.rows = 4;
+  branched_graph.cols = 4;
+  branched_graph.nnz = 3;
+  branched_graph.rowptr = {0, 2, 3, 3, 3};
+  branched_graph.colind = {1, 3, 2};
+  branched_graph.values.assign(3, 1.0f);
+
+  routing::RoutingMetadata branched_metadata;
+  branched_metadata.strings = {
+      "branched-endpoint-net", "BRANCH_SRC_SITE", "BRANCH_SRC_PIN",
+      "BRANCH_TILE", "CORRIDOR_A", "CORRIDOR_B", "BYPASS_A",
+      "BYPASS_B", "ATTACH_A", "ATTACH_B", "BRANCH_TRAVERSED_SITE",
+      "ATTACH_SINK_SITE", "ATTACH_SINK_PIN", "BYPASS_SINK_SITE",
+      "BYPASS_SINK_PIN"};
+  branched_metadata.edge_attrs = {{3, 0}, {3, 1}, {3, 2}};
+  branched_metadata.pip_data = {
+      {4, 5, true}, {6, 7, true}, {8, 9, true}};
+  branched_metadata.endpoint_pips = {
+      {2, 1, 2, 3, 8, 9, true, 10, 0,
+       routing::EndpointPipRole::kSource}};
+  branched_metadata.declared_endpoint_pip_count = 1;
+
+  routing::RouteRequest conventional_request;
+  conventional_request.net_string = 0;
+  conventional_request.sources.push_back({0, 1, 2, 0});
+  conventional_request.sinks.push_back(
+      {3, 13, 14, routing::kNoIndex});
+  branched_metadata.route_requests.push_back(conventional_request);
+
+  routing::RoutedSink conventional_sink;
+  conventional_sink.source = 0;
+  conventional_sink.target = 3;
+  conventional_sink.distance = 1.0f;
+  conventional_sink.reached = true;
+  conventional_sink.nodes = {0, 3};
+  conventional_sink.edges = {{0, 3, 1, 1.0f}};
+  routing::RoutedNet conventional_net;
+  conventional_net.net_string = 0;
+  conventional_net.reached_all_sinks = true;
+  conventional_net.sinks.push_back(conventional_sink);
+  conventional_net.unique_nodes = conventional_sink.nodes;
+  routing::PathfinderResult conventional_result;
+  conventional_result.routed = true;
+  conventional_result.all_sinks_reached = true;
+  conventional_result.nets.push_back(conventional_net);
+
+  routing::write_routes_jsonl(
+      output, branched_graph, branched_metadata, conventional_result);
+  std::ifstream conventional_route_file(output);
+  const std::string conventional_json(
+      (std::istreambuf_iterator<char>(conventional_route_file)),
+      std::istreambuf_iterator<char>());
+  require(conventional_json.find("\"attachment\":0") == std::string::npos &&
+              conventional_json.find("\"attachment\":null,\"site\":null") !=
+                  std::string::npos,
+          "unused authorized source attachment was emitted or rejected on a "
+          "wholly conventional route");
+
+  routing::RoutingMetadata transit_branch_metadata = branched_metadata;
+  transit_branch_metadata.route_requests[0].sinks.insert(
+      transit_branch_metadata.route_requests[0].sinks.begin(),
+      {2, 11, 12, routing::kNoIndex});
+  routing::RoutedSink attachment_sink;
+  attachment_sink.source = 0;
+  attachment_sink.target = 2;
+  attachment_sink.distance = 2.0f;
+  attachment_sink.reached = true;
+  attachment_sink.nodes = {0, 1, 2};
+  attachment_sink.edges = {{0, 1, 0, 1.0f}, {1, 2, 2, 1.0f}};
+  routing::RoutedNet transit_branch_net;
+  transit_branch_net.net_string = 0;
+  transit_branch_net.reached_all_sinks = true;
+  transit_branch_net.sinks = {attachment_sink, conventional_sink};
+  transit_branch_net.unique_nodes = {0, 1, 2, 3};
+  routing::PathfinderResult transit_branch_result;
+  transit_branch_result.routed = true;
+  transit_branch_result.all_sinks_reached = true;
+  transit_branch_result.nets.push_back(transit_branch_net);
+
+  bool transit_branch_rejected = false;
+  try {
+    routing::write_routes_jsonl(output, branched_graph,
+                                transit_branch_metadata,
+                                transit_branch_result);
+  } catch (const std::exception&) {
+    transit_branch_rejected = true;
+  }
+  require(transit_branch_rejected,
+          "used source attachment was accepted with a second conventional "
+          "branch from its endpoint");
+
   std::error_code ignored;
   std::filesystem::remove(output, ignored);
 }
