@@ -1035,7 +1035,7 @@ BuildResult build_device_routing_graph(const Options& options) {
           const std::string pin = graph.string_table.strings[pin_string];
           const auto bit =
               routing::interchange::audited_iob_pseudo_resource_bit(
-                  policy->role, bel, pin);
+                  policy->kind, bel, pin);
           if (!bit.has_value() || *bit >= ordered_resources.size() ||
               (resource_mask & (1U << *bit)) != 0) {
             throw std::runtime_error(

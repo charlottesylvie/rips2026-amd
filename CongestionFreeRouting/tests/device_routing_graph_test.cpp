@@ -483,19 +483,39 @@ void compare_graphs(const ri::DeviceRoutingGraph& expected,
   }
 }
 
-void write_legacy_v4_fixture(const std::filesystem::path& v5_path,
-                             const std::filesystem::path& v4_path) {
-  std::ifstream input(v5_path, std::ios::binary);
+void write_legacy_v5_fixture(const std::filesystem::path& v6_path,
+                             const std::filesystem::path& v5_path) {
+  std::ifstream input(v6_path, std::ios::binary);
   std::vector<char> bytes((std::istreambuf_iterator<char>(input)),
                           std::istreambuf_iterator<char>());
   require(static_cast<bool>(input) || input.eof(),
-          "could not read the version-5 device-graph fixture");
+          "could not read the version-6 device-graph fixture");
   constexpr std::size_t kMagicBytes = 8;
-  constexpr std::size_t kEmptyV5TrailerBytes = 4 * sizeof(std::uint64_t);
+  require(bytes.size() >= kMagicBytes + sizeof(std::uint64_t),
+          "version-6 fixture is too short");
+  const std::uint64_t legacy_version = 5;
+  std::memcpy(bytes.data() + kMagicBytes, &legacy_version,
+              sizeof(legacy_version));
+  std::ofstream output(v5_path, std::ios::binary | std::ios::trunc);
+  output.write(bytes.data(), static_cast<std::streamsize>(bytes.size()));
+  require(static_cast<bool>(output),
+          "could not write the legacy version-5 fixture");
+}
+
+void write_legacy_v4_fixture(const std::filesystem::path& v6_path,
+                             const std::filesystem::path& v4_path) {
+  std::ifstream input(v6_path, std::ios::binary);
+  std::vector<char> bytes((std::istreambuf_iterator<char>(input)),
+                          std::istreambuf_iterator<char>());
+  require(static_cast<bool>(input) || input.eof(),
+          "could not read the version-6 device-graph fixture");
+  constexpr std::size_t kMagicBytes = 8;
+  constexpr std::size_t kEmptyAttachmentTrailerBytes =
+      4 * sizeof(std::uint64_t);
   require(bytes.size() >= kMagicBytes + sizeof(std::uint64_t) +
-                              kEmptyV5TrailerBytes,
-          "version-5 fixture is too short");
-  bytes.resize(bytes.size() - kEmptyV5TrailerBytes);
+                              kEmptyAttachmentTrailerBytes,
+          "version-6 fixture is too short");
+  bytes.resize(bytes.size() - kEmptyAttachmentTrailerBytes);
   const std::uint64_t legacy_version = 4;
   std::memcpy(bytes.data() + kMagicBytes, &legacy_version,
               sizeof(legacy_version));
@@ -590,6 +610,8 @@ int main() {
         base.string() + ".attachments-streamed";
     const std::filesystem::path stale_write_path =
         base.string() + ".stale-write";
+    const std::filesystem::path version_five_path =
+        base.string() + ".version-five";
     const std::filesystem::path version_four_path =
         base.string() + ".version-four";
     const std::filesystem::path version_three_path =
@@ -605,6 +627,7 @@ int main() {
                attachment_path,
                attachment_streamed_path,
                stale_write_path,
+               version_five_path,
                version_four_path,
                version_three_path,
                legacy_path,
@@ -789,6 +812,7 @@ int main() {
     const ri::DeviceRoutingGraph attachment_expected =
         make_attachment_graph();
     ri::validate_device_routing_graph(attachment_expected);
+    ri::require_endpoint_attachment_device_graph(attachment_expected);
     ri::write_device_routing_graph(attachment_expected, attachment_path);
     const ri::DeviceRoutingGraph attachment_roundtrip =
         ri::read_device_routing_graph(attachment_path);
@@ -799,6 +823,28 @@ int main() {
     const ri::DeviceRoutingGraph attachment_routing =
         ri::read_device_routing_graph_for_routing(attachment_path);
     compare_graphs(attachment_expected, attachment_routing, false, true);
+
+    write_legacy_v5_fixture(attachment_path, version_five_path);
+    ri::DeviceRoutingGraph expected_v5 = attachment_expected;
+    expected_v5.format_version = 5;
+    const ri::DeviceRoutingGraph version_five =
+        ri::read_device_routing_graph(version_five_path);
+    compare_graphs(expected_v5, version_five);
+    bool rejected_v5_semantics = false;
+    try {
+      ri::require_endpoint_attachment_device_graph(version_five);
+    } catch (const std::runtime_error& error) {
+      rejected_v5_semantics =
+          std::string(error.what()).find("regenerate") != std::string::npos;
+    }
+    require(rejected_v5_semantics,
+            "semantic version gate accepted a stale version-5 graph");
+    const ri::DeviceRoutingGraph version_five_filtering =
+        ri::read_device_routing_graph_for_filtering(version_five_path);
+    compare_graphs(expected_v5, version_five_filtering, false, false);
+    const ri::DeviceRoutingGraph version_five_routing =
+        ri::read_device_routing_graph_for_routing(version_five_path, false);
+    compare_graphs(expected_v5, version_five_routing, false, true);
 
     write_legacy_v4_fixture(split_path, version_four_path);
     write_legacy_v3_fixture(version_four_path, version_three_path, expected);
@@ -826,7 +872,7 @@ int main() {
     compare_graphs(expected_v3, version_three_routing, false, true);
 
     for (const std::filesystem::path& stale_path :
-         {version_four_path, version_three_path}) {
+         {version_five_path, version_four_path, version_three_path}) {
       bool rejected_stale_routing = false;
       try {
         (void)ri::read_device_routing_graph_for_routing(stale_path);
@@ -847,17 +893,17 @@ int main() {
             std::string::npos;
       }
       require(rejected_stale_filtering,
-              "required-v5 filtering reader accepted a stale device graph");
+              "required-v6 filtering reader accepted a stale device graph");
     }
     bool rejected_stale_write = false;
     try {
-      ri::write_device_routing_graph(version_four, stale_write_path);
+      ri::write_device_routing_graph(version_five, stale_write_path);
     } catch (const std::runtime_error& error) {
       rejected_stale_write =
           std::string(error.what()).find("regenerate") != std::string::npos;
     }
     require(rejected_stale_write,
-            "writer silently upgraded a stale device graph to version 5");
+            "writer silently upgraded a stale device graph to version 6");
 
     // Truncate one byte before the end of the skipped 40-byte/node block.
     // The projection must check the available file extent instead of letting

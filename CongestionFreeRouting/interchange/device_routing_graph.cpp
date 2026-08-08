@@ -20,8 +20,9 @@ constexpr char DEVICE_GRAPH_MAGIC[8] = {'R', 'I', 'P', 'S', 'D', 'R', 'G', '1'};
 // Version 3 changed graph-builder semantics and the lookup layout. Version 4
 // appended compact route-end X/Y and base-cost columns. Version 5 appends
 // sparse, concrete endpoint-attachment metadata after the legacy static
-// suffix. Generic readers retain v3/v4 compatibility; production routing can
-// require v5 explicitly.
+// suffix. Version 6 retains that layout and completes the xcvu3p I/OP/TSP
+// endpoint policy. Generic readers retain v3-v5 compatibility; production
+// routing requires v6 explicitly.
 
 static_assert(sizeof(std::int64_t) == 8, "int64_t must be 8 bytes");
 static_assert(sizeof(std::int32_t) == 4, "int32_t must be 4 bytes");
@@ -806,7 +807,7 @@ void write_static_suffix(std::ofstream& out,
   write_array(out, graph.tile_wire_nodes, "tile-wire lookup");
   write_array(out, graph.site_pin_nodes, "site-pin lookup");
 
-  // Version-5 extension trailer. Keeping this after the complete v4 suffix
+  // Version-5+ extension trailer. Keeping this after the complete v4 suffix
   // makes legacy inspection straightforward and prevents an old reader from
   // silently accepting attachment-aware topology as conventional-only data.
   write_u64(out,
@@ -1326,9 +1327,9 @@ bool endpoint_attachment_allows_traversed_site_type(
 void require_endpoint_attachment_device_graph(
     const DeviceRoutingGraph& graph) {
   if (graph.format_version <
-      kEndpointAttachmentDeviceRoutingGraphVersion) {
+      kCompleteIobAttachmentDeviceRoutingGraphVersion) {
     throw std::runtime_error(
-        "device-routing graph predates endpoint-attachment metadata; "
+        "device-routing graph predates complete IOB endpoint attachments; "
         "regenerate it with device_to_routing_graph");
   }
 }
@@ -1580,9 +1581,9 @@ DeviceRoutingGraph read_device_routing_graph_impl(
     throw std::runtime_error("unsupported device-routing graph version");
   }
   if (require_endpoint_attachments &&
-      version < kEndpointAttachmentDeviceRoutingGraphVersion) {
+      version < kCompleteIobAttachmentDeviceRoutingGraphVersion) {
     throw std::runtime_error(
-        "device-routing graph predates endpoint-attachment metadata; "
+        "device-routing graph predates complete IOB endpoint attachments; "
         "regenerate it with device_to_routing_graph");
   }
 
@@ -1848,7 +1849,7 @@ void write_device_routing_graph(const DeviceRoutingGraph& graph,
                                 const std::filesystem::path& path) {
   if (graph.format_version != kCurrentDeviceRoutingGraphVersion) {
     throw std::runtime_error(
-        "refusing to write a stale device graph as version 5; regenerate it "
+        "refusing to write a stale device graph as version 6; regenerate it "
         "with device_to_routing_graph");
   }
   validate_string_table_index(graph.string_table);
@@ -1872,7 +1873,7 @@ void write_device_routing_graph(
     const std::filesystem::path& path) {
   if (graph.format_version != kCurrentDeviceRoutingGraphVersion) {
     throw std::runtime_error(
-        "refusing to write a stale device graph as version 5; regenerate it "
+        "refusing to write a stale device graph as version 6; regenerate it "
         "with device_to_routing_graph");
   }
   validate_string_table_index(graph.string_table);

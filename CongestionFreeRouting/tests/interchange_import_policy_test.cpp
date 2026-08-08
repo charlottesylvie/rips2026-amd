@@ -144,14 +144,25 @@ int main() {
     const auto iob_sink = ri::classify_audited_iob_attachment_pip(
         "xcvu3p", "XIPHY_BYTE_L", "XIPHY_BITSLICE_TILE_22_TX_D0",
         "XIPHY_BITSLICE_TILE_22_TX_Q", false, true);
+    const auto iob_tristate = ri::classify_audited_iob_attachment_pip(
+        "xcvu3p", "XIPHY_BYTE_L", "XIPHY_BITSLICE_TILE_37_TX_D1",
+        "XIPHY_BITSLICE_TILE_37_TX_T_OUT", false, true);
     require(iob_source.has_value() &&
                 iob_source->role == ri::IobAttachmentRole::kSource &&
+                iob_source->kind == ri::IobAttachmentKind::kInputData &&
                 iob_source->from_site_pin == "RX_D" &&
                 iob_source->to_site_pin == "RX_Q5" &&
                 iob_sink.has_value() &&
                 iob_sink->role == ri::IobAttachmentRole::kSink &&
+                iob_sink->kind == ri::IobAttachmentKind::kOutputData &&
                 iob_sink->from_site_pin == "TX_D0" &&
-                iob_sink->to_site_pin == "TX_Q",
+                iob_sink->to_site_pin == "TX_Q" &&
+                iob_tristate.has_value() &&
+                iob_tristate->role == ri::IobAttachmentRole::kSink &&
+                iob_tristate->kind ==
+                    ri::IobAttachmentKind::kOutputTristate &&
+                iob_tristate->from_site_pin == "TX_D1" &&
+                iob_tristate->to_site_pin == "TX_T_OUT",
             "audited xcvu3p IOB attachment PIPs were not recognized");
     require(!ri::classify_audited_iob_attachment_pip(
                  "xcvu3p", "XIPHY_BYTE_L",
@@ -175,6 +186,21 @@ int main() {
                      .has_value() &&
                 !ri::classify_audited_iob_attachment_pip(
                      "xcvu3p", "CLEL_R", "A", "B", false, true)
+                     .has_value() &&
+                !ri::classify_audited_iob_attachment_pip(
+                     "xcvu3p", "XIPHY_BYTE_L",
+                     "XIPHY_BITSLICE_TILE_37_TX_T_OUT",
+                     "XIPHY_BITSLICE_TILE_37_TX_D1", false, true)
+                     .has_value() &&
+                !ri::classify_audited_iob_attachment_pip(
+                     "xcvu3p", "XIPHY_BYTE_L",
+                     "XIPHY_BITSLICE_TILE_37_TX_D1",
+                     "XIPHY_BITSLICE_TILE_38_TX_T_OUT", false, true)
+                     .has_value() &&
+                !ri::classify_audited_iob_attachment_pip(
+                     "xcvu3p", "XIPHY_BYTE_L",
+                     "XIPHY_BITSLICE_TILE_37_TX_D1",
+                     "XIPHY_BITSLICE_TILE_37_TX_Q", false, true)
                      .has_value(),
             "unsupported, reversed, or malformed pseudo PIP was admitted");
     std::uint32_t source_resource_mask = 0;
@@ -185,31 +211,81 @@ int main() {
              {"RXTX_BITSLICE", "Q5"},
              {"RX_D", "RX_D"}}) {
       const auto bit = ri::audited_iob_pseudo_resource_bit(
-          ri::IobAttachmentRole::kSource, resource.first, resource.second);
+          ri::IobAttachmentKind::kInputData,
+          resource.first, resource.second);
       require(bit.has_value(), "audited source pseudo resource was rejected");
       source_resource_mask |= 1U << *bit;
     }
     require(source_resource_mask == 0xfU &&
                 !ri::audited_iob_pseudo_resource_bit(
-                     ri::IobAttachmentRole::kSource, "RXTX_BITSLICE",
+                     ri::IobAttachmentKind::kInputData, "RXTX_BITSLICE",
                      "D0")
                      .has_value(),
             "source pseudo-cell signature is not exact");
+    std::uint32_t output_resource_mask = 0;
+    for (const auto& resource :
+         std::vector<std::pair<std::string, std::string>>{
+             {"RXTX_BITSLICE", "D0"},
+             {"RXTX_BITSLICE", "O"},
+             {"TX_Q", "TX_Q"},
+             {"TX_D0", "TX_D0"}}) {
+      const auto bit = ri::audited_iob_pseudo_resource_bit(
+          ri::IobAttachmentKind::kOutputData,
+          resource.first, resource.second);
+      require(bit.has_value(),
+              "audited output-data pseudo resource was rejected");
+      output_resource_mask |= 1U << *bit;
+    }
+    require(output_resource_mask == 0xfU &&
+                !ri::audited_iob_pseudo_resource_bit(
+                     ri::IobAttachmentKind::kOutputData,
+                     "RXTX_BITSLICE", "D1")
+                     .has_value(),
+            "output-data pseudo-cell signature is not exact");
+    std::uint32_t tristate_resource_mask = 0;
+    for (const auto& resource :
+         std::vector<std::pair<std::string, std::string>>{
+             {"RXTX_BITSLICE", "D1"},
+             {"RXTX_BITSLICE", "T_OUT"},
+             {"TX_T_OUT", "TX_T_OUT"},
+             {"TX_D1", "TX_D1"}}) {
+      const auto bit = ri::audited_iob_pseudo_resource_bit(
+          ri::IobAttachmentKind::kOutputTristate,
+          resource.first, resource.second);
+      require(bit.has_value(),
+              "audited tristate pseudo resource was rejected");
+      tristate_resource_mask |= 1U << *bit;
+    }
+    require(tristate_resource_mask == 0xfU &&
+                !ri::audited_iob_pseudo_resource_bit(
+                     ri::IobAttachmentKind::kOutputTristate,
+                     "RXTX_BITSLICE", "D0")
+                     .has_value(),
+            "tristate pseudo-cell signature is not exact");
     require(ri::is_audited_iob_endpoint(
                 ri::IobAttachmentRole::kSource, "IOB_X1Y41", "HPIOB_M",
                 "I") &&
                 ri::is_audited_iob_endpoint(
                     ri::IobAttachmentRole::kSink, "IOB_X2Y3",
                     "HPIOB_SNGL", "OP") &&
+                ri::is_audited_iob_endpoint(
+                    ri::IobAttachmentRole::kSink, "IOB_X0Y48",
+                    "HPIOB_S", "TSP") &&
                 !ri::is_audited_iob_endpoint(
                     ri::IobAttachmentRole::kSource, "IOB_X1Y41",
                     "HPIOB_M", "OP") &&
+                !ri::is_audited_iob_endpoint(
+                    ri::IobAttachmentRole::kSource, "IOB_X1Y41",
+                    "HPIOB_M", "TSP") &&
                 !ri::is_audited_iob_endpoint(
                     ri::IobAttachmentRole::kSink, "IOB_X1Y41_suffix",
                     "HPIOB_M", "OP") &&
                 !ri::is_audited_iob_endpoint(
                     ri::IobAttachmentRole::kSink, "IOB_X1Y41", "SLICEL",
-                    "OP"),
+                    "OP") &&
+                !ri::is_audited_iob_endpoint(
+                    ri::IobAttachmentRole::kSink, "IOB_X1Y41",
+                    "HPIOB_M", "TSTATE"),
             "typed IOB endpoint admission is too broad or has wrong role");
     require(ri::physical_part_matches_device(
                 "xcvu3p", "xcvu3p-ffvc1517-2-e") &&

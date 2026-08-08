@@ -647,7 +647,7 @@ Useful wrapper options:
 | `<benchmark>_unrouted.phys` | Contest setup | Unrouted FPGA Interchange physical netlist. |
 | `<benchmark>.netlist` | Contest setup | Matching logical netlist. |
 | `xcvu3p.device` | RapidWright | FPGA Interchange device resources for the target part. |
-| `.devicegraph` | `device_to_routing_graph` | Version-5 persistent device-wide CSR, node/PIP metadata, lookup tables, representative route-end coordinates, base vertex costs, and sparse endpoint-owned IOB attachment metadata. Generic readers retain v3/v4 compatibility, but routing conversion requires v5 and rejects stale caches with a regeneration diagnostic. |
+| `.devicegraph` | `device_to_routing_graph` | Version-6 persistent device-wide CSR, node/PIP metadata, lookup tables, representative route-end coordinates, base vertex costs, and sparse endpoint-owned IOB attachment metadata. Generic readers retain v3-v5 compatibility, but routing conversion requires v6 and rejects stale caches with a regeneration diagnostic. |
 | `.csrbin` | `interchange_to_csr` | Internal outgoing CSR routing graph. Version 3 embeds the pair ID plus route-end X/Y, base vertex costs, and a `uint32` post-filter edge permutation grouped by destination tile with a missing-coordinate spill shard. |
 | `.csrbin.ifmeta.bin` | `interchange_to_csr` | Version-7 metadata sidecar with the matching pair ID, declared node/edge counts, string table, PIP data, sparse endpoint-PIP records, site pins, logical summaries, and route requests. Redundant device-wide node columns remain available in `.devicegraph` and are no longer copied into each design sidecar. |
 | `.csrbin.ifmeta.bin.generation` | `interchange_to_csr` | Canonical pair ID sampled around reads; must match both binary headers. |
@@ -662,12 +662,13 @@ CSR orientation is outgoing-edge: row `u`, column `v` represents directed edge
 for BF11, while full coordinate ranges and tile/wire type metadata stay in the
 reusable `.devicegraph` instead of being duplicated in metadata v7.
 
-Device-graph format version 5 retains version 4's route-end/base-cost columns
-and adds only the audited xcvu3p BITSLICE IOB source/sink corridors, including
-typed endpoint, concrete traversed-site, and pseudo-cell resource metadata.
-All other pseudo route-throughs remain excluded. Versions 3 and 4 remain
-available to generic readers, but the production converter requires v5;
-regenerate older artifacts. BF11's active-frontier path reads only CSR v3's
+Device-graph format version 5 added the sparse endpoint-attachment trailer;
+version 6 completes the audited xcvu3p BITSLICE IOB/I, IOB/OP, and IOB/TSP
+corridors without changing that layout. The records retain the typed endpoint,
+concrete traversed site, and pseudo-cell resources. All other pseudo
+route-throughs remain excluded. Versions 3 through 5 remain available to
+generic readers, but the production converter requires v6; regenerate older
+artifacts. BF11's active-frontier path reads only CSR v3's
 node sidecars; the spatial edge permutation is persisted for a shard-driven
 full-edge implementation and is skipped at BF11 load time today.
 

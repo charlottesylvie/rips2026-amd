@@ -87,18 +87,26 @@ constexpr bool attachment_traversed_site_type_is_compatible(
 }
 
 // The xcvu3p IOB does not connect directly to ordinary inter-site routing.
-// Two directional XIPHY pseudo PIPs cross a BITSLICE site at the boundary:
-// RX_D_PIN -> RX_Q5 for an IOB/I source and TX_D0 -> TX_Q for an IOB/OP
-// sink.  They are not general route-throughs.  The reusable device graph may
-// describe only these audited signatures, and the design-specific projection
-// must still authorize each concrete edge from an exact typed endpoint.
+// Three directional XIPHY pseudo PIPs cross a BITSLICE site at the boundary:
+// RX_D_PIN -> RX_Q5 for an IOB/I source, TX_D0 -> TX_Q for an IOB/OP sink,
+// and TX_D1 -> TX_T_OUT for an IOB/TSP tristate-control sink. They are not
+// general route-throughs. The reusable device graph may describe only these
+// audited signatures, and the design-specific projection must still authorize
+// each concrete edge from an exact typed endpoint.
 enum class IobAttachmentRole : std::uint32_t {
   kSource = 0,
   kSink = 1,
 };
 
+enum class IobAttachmentKind : std::uint32_t {
+  kInputData = 0,
+  kOutputData = 1,
+  kOutputTristate = 2,
+};
+
 struct AuditedIobAttachmentPip {
   IobAttachmentRole role = IobAttachmentRole::kSource;
+  IobAttachmentKind kind = IobAttachmentKind::kInputData;
   std::string_view from_site_pin;
   std::string_view to_site_pin;
 };
@@ -143,8 +151,9 @@ classify_audited_iob_attachment_pip(std::string_view device_name,
       xiphy_bitslice_wire_instance(wire1, "_RX_Q5");
   if (source_instance0.has_value() && source_instance1.has_value() &&
       *source_instance0 == *source_instance1) {
-    return AuditedIobAttachmentPip{IobAttachmentRole::kSource, "RX_D",
-                                   "RX_Q5"};
+    return AuditedIobAttachmentPip{
+        IobAttachmentRole::kSource, IobAttachmentKind::kInputData,
+        "RX_D", "RX_Q5"};
   }
 
   const auto sink_instance0 =
@@ -153,8 +162,20 @@ classify_audited_iob_attachment_pip(std::string_view device_name,
       xiphy_bitslice_wire_instance(wire1, "_TX_Q");
   if (sink_instance0.has_value() && sink_instance1.has_value() &&
       *sink_instance0 == *sink_instance1) {
-    return AuditedIobAttachmentPip{IobAttachmentRole::kSink, "TX_D0",
-                                   "TX_Q"};
+    return AuditedIobAttachmentPip{
+        IobAttachmentRole::kSink, IobAttachmentKind::kOutputData,
+        "TX_D0", "TX_Q"};
+  }
+
+  const auto tristate_instance0 =
+      xiphy_bitslice_wire_instance(wire0, "_TX_D1");
+  const auto tristate_instance1 =
+      xiphy_bitslice_wire_instance(wire1, "_TX_T_OUT");
+  if (tristate_instance0.has_value() && tristate_instance1.has_value() &&
+      *tristate_instance0 == *tristate_instance1) {
+    return AuditedIobAttachmentPip{
+        IobAttachmentRole::kSink, IobAttachmentKind::kOutputTristate,
+        "TX_D1", "TX_T_OUT"};
   }
   return std::nullopt;
 }
@@ -164,20 +185,29 @@ classify_audited_iob_attachment_pip(std::string_view device_name,
 // and exactly three pseudo cells, so a similarly named or partially described
 // route-through cannot be admitted accidentally.
 inline std::optional<std::uint32_t> audited_iob_pseudo_resource_bit(
-    IobAttachmentRole role,
+    IobAttachmentKind kind,
     std::string_view bel,
     std::string_view pin) {
-  if (role == IobAttachmentRole::kSource) {
+  if (kind == IobAttachmentKind::kInputData) {
     if (bel == "RX_Q5" && pin == "RX_Q5") return 0;
     if (bel == "RXTX_BITSLICE" && pin == "DATAIN") return 1;
     if (bel == "RXTX_BITSLICE" && pin == "Q5") return 2;
     if (bel == "RX_D" && pin == "RX_D") return 3;
     return std::nullopt;
   }
-  if (bel == "RXTX_BITSLICE" && pin == "D0") return 0;
-  if (bel == "RXTX_BITSLICE" && pin == "O") return 1;
-  if (bel == "TX_Q" && pin == "TX_Q") return 2;
-  if (bel == "TX_D0" && pin == "TX_D0") return 3;
+  if (kind == IobAttachmentKind::kOutputData) {
+    if (bel == "RXTX_BITSLICE" && pin == "D0") return 0;
+    if (bel == "RXTX_BITSLICE" && pin == "O") return 1;
+    if (bel == "TX_Q" && pin == "TX_Q") return 2;
+    if (bel == "TX_D0" && pin == "TX_D0") return 3;
+    return std::nullopt;
+  }
+  if (kind == IobAttachmentKind::kOutputTristate) {
+    if (bel == "RXTX_BITSLICE" && pin == "D1") return 0;
+    if (bel == "RXTX_BITSLICE" && pin == "T_OUT") return 1;
+    if (bel == "TX_T_OUT" && pin == "TX_T_OUT") return 2;
+    if (bel == "TX_D1" && pin == "TX_D1") return 3;
+  }
   return std::nullopt;
 }
 
@@ -216,7 +246,8 @@ inline bool is_audited_iob_endpoint(IobAttachmentRole role,
   return is_audited_iob_site_name(site) &&
          is_audited_iob_site_type(site_type) &&
          ((role == IobAttachmentRole::kSource && pin == "I") ||
-          (role == IobAttachmentRole::kSink && pin == "OP"));
+          (role == IobAttachmentRole::kSink &&
+           (pin == "OP" || pin == "TSP")));
 }
 
 inline bool physical_part_matches_device(const std::string& device_name,

@@ -21,8 +21,12 @@ constexpr std::uint64_t kNoIndex =
 constexpr std::uint64_t kNoLogicalNetIndex = kNoIndex;
 constexpr std::uint64_t kNoStringIndex = kNoIndex;
 constexpr std::uint64_t kMinimumDeviceRoutingGraphVersion = 3;
+// Version 5 introduced the endpoint-attachment trailer layout. Version 6
+// keeps that layout but requires the complete xcvu3p I/OP/TSP endpoint policy;
+// production conversion must reject v5 graphs generated without TSP sinks.
 constexpr std::uint64_t kEndpointAttachmentDeviceRoutingGraphVersion = 5;
-constexpr std::uint64_t kCurrentDeviceRoutingGraphVersion = 5;
+constexpr std::uint64_t kCompleteIobAttachmentDeviceRoutingGraphVersion = 6;
+constexpr std::uint64_t kCurrentDeviceRoutingGraphVersion = 6;
 
 enum class NodeBoundsMode : std::uint64_t {
   kPocBaseWire = 0,
@@ -232,7 +236,7 @@ struct DeviceRoutingGraph {
   std::vector<PairNodeLookup> tile_wire_nodes;
   std::vector<SitePinNodeLookup> site_pin_nodes;
 
-  // Sparse v5 endpoint-attachment metadata. Allowed active types of the
+  // Sparse v5+ endpoint-attachment metadata. Allowed active types of the
   // concrete traversed site are compact string IDs sliced by
   // EndpointAttachment. Pseudo-cell BEL/pin resources use that same site.
   std::vector<EndpointAttachment> endpoint_attachments;
@@ -314,7 +318,8 @@ bool endpoint_attachment_allows_traversed_site_type(
     const std::string& traversed_site_type);
 
 // Fail with an explicit regeneration diagnostic when a production path needs
-// endpoint-attachment semantics but was given a legacy v3/v4 cache.
+// complete I/OP/TSP endpoint-attachment semantics but was given a stale
+// v3-v5 cache.
 void require_endpoint_attachment_device_graph(
     const DeviceRoutingGraph& graph);
 
@@ -335,7 +340,7 @@ DeviceRoutingGraph read_device_routing_graph_for_filtering(
 // Per-design filtering needs the immutable CSR/lookups plus BF11's compact
 // route-end/cost columns, but not the legacy 40-byte physical-node columns.
 // Version-3 artifacts synthesize representative coordinates from node extents
-// and unit base costs; versions 4/5 read the authored sidecars directly.
+// and unit base costs; versions 4+ read the authored sidecars directly.
 DeviceRoutingGraph read_device_routing_graph_for_routing(
     const std::filesystem::path& path,
     bool require_endpoint_attachments = true);
