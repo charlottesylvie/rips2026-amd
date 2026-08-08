@@ -313,13 +313,18 @@ class ActiveSiteTypes {
 // legal without globally enabling arbitrary site route-throughs.
 class AttachmentResourceClaims {
  public:
-  static constexpr std::size_t kPlacementOwner =
+  // Placements and their already-routed fixed BEL/site-PIP segments describe
+  // one pre-existing design occupancy state and may legitimately overlap.
+  // Keep them under one sentinel owner; newly enabled attachments retain
+  // their physical-net owner so they still conflict with existing occupancy
+  // and with attachments belonging to other nets.
+  static constexpr std::size_t kExistingOccupancyOwner =
       std::numeric_limits<std::size_t>::max();
 
   void claim_placement_bel(const std::string& site,
                            const std::string& bel,
                            const std::string& description) {
-    claim_whole_bel(site, bel, kPlacementOwner, description);
+    claim_whole_bel(site, bel, kExistingOccupancyOwner, description);
   }
 
   void claim_whole_bel(const std::string& site,
@@ -1475,7 +1480,8 @@ PhysicalImportStats parse_physical_netlist(
             physical_net_name, facts.is_signal)) {
       preserve_physical_net(net, strings, active_site_types,
                             endpoint_owners, graph,
-                            attachment_resource_claims, net_index,
+                            attachment_resource_claims,
+                            AttachmentResourceClaims::kExistingOccupancyOwner,
                             physical_net_name, &stats, route_branch_stack);
       ++stats.preserved_nets;
       continue;
@@ -1521,7 +1527,8 @@ PhysicalImportStats parse_physical_netlist(
         routing::interchange::PhysicalNetDisposition::kRouteSignal) {
       preserve_physical_net(net, strings, active_site_types,
                             endpoint_owners, graph,
-                            attachment_resource_claims, net_index,
+                            attachment_resource_claims,
+                            AttachmentResourceClaims::kExistingOccupancyOwner,
                             physical_net_name, &stats, route_branch_stack);
       switch (disposition) {
         case routing::interchange::PhysicalNetDisposition::
