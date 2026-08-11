@@ -815,6 +815,28 @@ Repeat that build with `-DBF11_FORCE_CAS_ATOMIC_LOAD` to compile and execute
 the compatibility control that uses the proven coherent CAS load instead of
 the relaxed agent-scope HIP atomic-load intrinsic.
 
+Unbounded production BF11 versus delta-stepping SSSP baseline (requires an AMD
+HIP system). Graph construction, device upload, workspace allocation, warmup,
+and result validation are outside the measured region:
+
+```bash
+hipcc -std=c++17 -O3 -pthread -x hip -DBF11_NO_MAIN \
+  -I HIP_kernel/bellman_ford/src \
+  -I CongestionFreeRouting/bellman_ford \
+  -I CongestionFreeRouting/delta_stepping \
+  CongestionFreeRouting/tests/bf11_vs_delta_unbounded_benchmark.cpp \
+  CongestionFreeRouting/bellman_ford/bf11.cpp \
+  CongestionFreeRouting/delta_stepping/delta_stepping_hip_CSR.cpp \
+  -o /tmp/bf11_vs_delta_unbounded_benchmark
+
+/tmp/bf11_vs_delta_unbounded_benchmark 100000 8 4 2 10 32 123
+```
+
+The positional arguments are vertices, average out degree, delta, warmup query
+sets, measured query-set repetitions, queries per set, and random seed. The
+benchmark reports per-query HIP-event and end-to-end wall latency and rejects
+any paired BF11/Delta target-distance mismatch.
+
 Host-only BF11 automatic-worker policy, exact retained-layout accounting, and
 conservative allocation-peak estimator test:
 
