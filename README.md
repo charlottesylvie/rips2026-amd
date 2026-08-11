@@ -834,7 +834,10 @@ hipcc -std=c++17 -O2 -pthread -x hip \
 Bounded/dynamic BF11 regression test (requires an AMD HIP system):
 
 ```bash
+TARGET_ARCH=${TARGET_ARCH:-gfx1151}
 hipcc -std=c++17 -O2 -pthread -x hip -DBF11_NO_MAIN \
+  -DBF11_ENABLE_HIP_GRAPHS \
+  "--offload-arch=$TARGET_ARCH" \
   -I HIP_kernel/bellman_ford/src \
   -I CongestionFreeRouting/bellman_ford \
   CongestionFreeRouting/tests/bf11_bounded_dynamic_hip_test.cpp \
@@ -847,6 +850,18 @@ hipcc -std=c++17 -O2 -pthread -x hip -DBF11_NO_MAIN \
 Repeat that build with `-DBF11_FORCE_CAS_ATOMIC_LOAD` to compile and execute
 the compatibility control that uses the proven coherent CAS load instead of
 the relaxed agent-scope HIP atomic-load intrinsic.
+
+The host-only HIP Graph lifecycle policy test injects begin, captured-enqueue,
+end/invalidation, instantiation, pre-submit launch, and partial-submit cached
+launch failures; it also checks sticky reuse, concurrent first use, complete
+query restart, and exact partial-object destruction:
+
+```bash
+g++ -std=c++17 -O2 -pthread -Wall -Wextra -Wpedantic -Werror \
+  CongestionFreeRouting/tests/bf11_graph_execution_policy_test.cpp \
+  -o /tmp/bf11_graph_execution_policy_test
+/tmp/bf11_graph_execution_policy_test
+```
 
 Host-only BF11 automatic-worker policy, exact retained-layout accounting, and
 conservative allocation-peak estimator test:

@@ -45,6 +45,91 @@ production builds may omit it, while the profiling build below enables it
 explicitly. Runtime `on` still falls back to direct enqueue if the compiled or
 runtime capability is unavailable.
 
+### HIP Graph recovery
+
+The high-confidence source-level explanation for the reported error is
+cross-worker invalidation of `hipStreamCaptureModeGlobal`; confirmation on the
+original ROCm target is still pending. AMD CLR registers Global captures in a
+process-wide list, and its unsafe-call checks can invalidate captures from
+other threads. ThreadLocal captures remain in the owning thread's capture list.
+Each BF11 workspace begins and ends capture synchronously in the same worker,
+so BF11 now uses `hipStreamCaptureModeThreadLocal`, retaining same-thread unsafe
+call checking without cross-worker registration. See AMD's official
+[`hip_graph.cpp`](https://github.com/ROCm/clr/blob/develop/hipamd/src/hip_graph.cpp),
+[`hip_stream.cpp`](https://github.com/ROCm/clr/blob/develop/hipamd/src/hip_stream.cpp),
+and [HIP Graph API](https://rocm.docs.amd.com/projects/HIP/en/latest/reference/hip_runtime_api/modules/graph_management.html).
+
+Begin, enqueue, end, and instantiation failures terminate capture, release
+every partially returned object, record one sticky fallback per workspace, and
+then enqueue the same segment directly. A captured-kernel error is recoverable
+only when its typed status is capture-specific; invalid kernel configuration,
+invalid device function, and device errors are propagated. Cleanup failures
+are also surfaced rather than losing resource ownership silently. A
+pre-existing or different asynchronous error is never cleared as a Graph
+fallback.
+
+A real `hipGraphLaunch` error is treated more conservatively because AMD may
+have submitted a prefix of graph nodes before returning it. BF11 quiesces the
+stream, destroys the cached graph, resets and seeds the whole query again, and
+then runs sticky-direct. If quiescence itself reports an asynchronous device
+failure, the query is not replayed. For deterministic policy validation,
+`begin`, `end`, `instantiate`, and `launch` in
+`BF11_TEST_HIP_GRAPH_FAILURE_STAGE` are synthetic stage failures. `enqueue`
+calls a capture-prohibited synchronous stream wait while capture is active,
+forcing the runtime's real invalidation/error path; EndCapture must then return
+the stream to non-capturing state before direct fallback.
+`launch-after-submit` performs a real graph launch, then deliberately enters
+the quiesce and whole-query restart path so target tests cover the
+non-atomic-launch recovery integration.
+
+### Packed-state and latency-hiding audit
+
+The proposed three logical relaxation fields are already represented without a
+third graph-sized array. `best_state[V]` atomically packs float distance bits
+and predecessor edge into one aligned 64-bit word; infinity-to-finite ownership
+derives discovery, and `(0, no-predecessor)` derives a source root. The old
+source mask is absent. `next_marks[V]` remains separate because its generation
+lifetime and write frequency differ from labels; combining it would require a
+larger atomic word or pull an otherwise cold mark into every failed relaxation.
+The implementation now has explicit predecessor unpacking and alignment
+assertions, with no change to the 24-byte-per-vertex identity workspace.
+
+The segmented relaxation hot path has the following logical global accesses;
+physical transactions depend on wave coalescing and cache residency and must
+not be counted one-for-one with source-level loads:
+
+| Scope | Unconditional access | Conditional access and locality |
+| --- | --- | --- |
+| Frontier item | 4-byte contiguous `current[item]`; coherent 8-byte `best_state[from]`; two adjacent 4-byte `rowptr[from/from+1]` reads | Source indices make state/row lookups irregular across a wave, although repeated sources can hit cache. |
+| Examined edge | 4-byte `to[edge]`; coherent 8-byte destination state | CSR edge ranges are sequential within a vertex but different lanes can occupy disjoint ranges; destination state is irregular. |
+| Bounds/cost | Bounded mode reads two 4-byte SoA coordinates; static mode reads one sequential 4-byte edge cost; dynamic mode adds one irregular 4-byte vertex multiplier; constant-one reads neither cost array | Coordinates are always paired only for bounded queries. Packing them is plausible but still 8 bytes/vertex and needs target transaction evidence before changing layout. |
+| Strict improvement | One or more 8-byte state CAS operations; 4-byte generation-mark load and possible CAS; queue/touched writes | First publications are block-compacted to one tail reservation per block batch; overflow publications use direct atomics. |
+
+HIP allocations provide the base alignment required by the naturally aligned
+8-byte packed state, while consecutive words preserve it. A 32-lane GFX11
+wave therefore can coalesce contiguous queue/CSR traffic into aligned memory
+transactions, but destination-indexed state and degree-skewed CSR ranges remain
+irregular. SoA remains preferable: unbounded and constant-one queries avoid
+coordinates and cost arrays entirely, and failed relaxations do not fetch the
+cold generation mark. Folding `next_marks` into state would require a wider
+atomic object (or an extra word fetched on every edge), increase contention,
+and complicate generation rollover without reducing the 24-byte identity
+workspace.
+
+The segmented grid is at most 256 blocks of 256 threads: eight 32-lane waves
+per block on GFX11 and up to 65,536 vertex lanes per query. The grid is sized
+from `V`, while useful blocks in a round are bounded by the current frontier;
+`F <= 256` therefore uses only one block, and `F > 65,536` grid-strides. One
+lane serially walks a vertex's entire edge range, so a skewed high-degree
+vertex can hold its block at the publication barriers. The visible LDS footprint
+is small, but VGPR-limited occupancy is unknown without target compilation.
+Three independent worker streams already expose separate query frontiers and
+were the smallest measured plateau point. A wave-per-vertex mapping, batched
+mutable query state, or persistent multi-query queue would be an unmeasured
+scheduling, memory, exception-recovery, and determinism change. No such
+redesign is enabled without gfx1151 occupancy, register, LDS, queue-overlap,
+and memory-stall measurements.
+
 ## Telemetry
 
 Pass `--bf11-telemetry` to emit one `bf11_telemetry` JSON record after all
@@ -120,8 +205,7 @@ The exact profiling configuration requested for K=8 plus HIP Graph replay is:
   --parallel-net-workers 3 \
   --bf11-segment-rounds 8 \
   --bf11-hip-graph on \
-  --bf11-adaptive-reset-threshold 0.25 \
-  --allow-unrouted
+  --bf11-adaptive-reset-threshold 0.25
 ```
 
 Run the full controller matrix with telemetry omitted for one warm-up and five
@@ -129,6 +213,7 @@ wall-time samples. Worker four is a contention control, not an automatic-policy
 candidate. Graph `on` at K=1 must remain a direct/fallback compatibility case:
 
 ```bash
+set -euo pipefail
 GRAPH=/absolute/path/design.csrbin
 META=/absolute/path/design.csrbin.ifmeta.bin
 OUT=/tmp/bf11-preprofile
@@ -146,7 +231,6 @@ for MODE in optimized cas-control; do
             --bf11-segment-rounds "$K" \
             --bf11-hip-graph "$HIP_GRAPH" \
             --bf11-adaptive-reset-threshold 0.25 \
-            --allow-unrouted \
             >"$OUT/$MODE-w$WORKERS-k$K-g$HIP_GRAPH-r$REP.log" 2>&1
         done
       done
@@ -159,6 +243,7 @@ Collect telemetry in separate runs so event and counter overhead cannot affect
 the five-run medians:
 
 ```bash
+set -euo pipefail
 for WORKERS in 1 3 4; do
   for K in 1 2 4 8 16; do
     for HIP_GRAPH in off on auto; do
@@ -169,7 +254,6 @@ for WORKERS in 1 3 4; do
         --bf11-hip-graph "$HIP_GRAPH" \
         --bf11-adaptive-reset-threshold 0.25 \
         --bf11-telemetry \
-        --allow-unrouted \
         >"$OUT/telemetry-w$WORKERS-k$K-g$HIP_GRAPH.log" 2>&1
     done
   done
@@ -183,7 +267,15 @@ same source tree. The control isolates this optimization without mixing in a
 different graph, worker policy, or telemetry implementation:
 
 ```bash
+set -euo pipefail
+TARGET_ARCH=${TARGET_ARCH:-gfx1151}
+git rev-parse HEAD
+git diff --check
+hipcc --version
+rocminfo > /tmp/bf11-rocminfo.txt
+grep -m1 -E 'Name:.*gfx' /tmp/bf11-rocminfo.txt
 COMMON_FLAGS=(-std=c++17 -O3 -x hip -DBF10_NO_MAIN -DBF11_NO_MAIN \
+  "--offload-arch=$TARGET_ARCH" \
   -I HIP_kernel/bellman_ford/src \
   -I CongestionFreeRouting/bellman_ford \
   -I CongestionFreeRouting/delta_stepping \
@@ -197,6 +289,16 @@ COMMON_SOURCES=(CongestionFreeRouting/pathfinder.cpp \
 hipcc "${COMMON_FLAGS[@]}" -DBF11_ENABLE_HIP_GRAPHS \
   "${COMMON_SOURCES[@]}" -pthread \
   -o /tmp/pathfinder-bf11-optimized
+test /tmp/pathfinder-bf11-optimized -nt \
+  CongestionFreeRouting/bellman_ford/bf11.cpp
+test /tmp/pathfinder-bf11-optimized -nt \
+  CongestionFreeRouting/pathfinder.cpp
+test /tmp/pathfinder-bf11-optimized -nt \
+  CongestionFreeRouting/bellman_ford/bf11_graph_execution_policy.hpp
+stat /tmp/pathfinder-bf11-optimized \
+  CongestionFreeRouting/bellman_ford/bf11.cpp \
+  CongestionFreeRouting/pathfinder.cpp \
+  CongestionFreeRouting/bellman_ford/bf11_graph_execution_policy.hpp
 hipcc "${COMMON_FLAGS[@]}" -DBF11_ENABLE_HIP_GRAPHS \
   -DBF11_FORCE_CAS_ATOMIC_LOAD \
   "${COMMON_SOURCES[@]}" -pthread -o /tmp/pathfinder-bf11-cas-control
@@ -224,6 +326,7 @@ following K=1, Graph-off run isolates the relaxed atomic load from its CAS
 control with one warm-up and five measured repetitions:
 
 ```bash
+set -euo pipefail
 GRAPH=/absolute/path/design.csrbin
 META=/absolute/path/design.csrbin.ifmeta.bin
 OUT=/tmp/bf11-cas-control
@@ -238,7 +341,6 @@ for MODE in optimized cas-control; do
         --parallel-net-workers "$WORKERS" \
         --bf11-segment-rounds 1 \
         --bf11-hip-graph off \
-        --allow-unrouted \
         >"$OUT/$MODE-w$WORKERS-r$REP.log" 2>&1
     done
   done
@@ -249,11 +351,11 @@ Record the pre-change three-worker BF11 baseline with the same graph, one
 warm-up, five measured repetitions, and telemetry disabled:
 
 ```bash
+set -euo pipefail
 for REP in 0 1 2 3 4 5; do
   /tmp/pathfinder-bf11-baseline "$GRAPH" "$META" \
     --sssp-engine bf11 \
     --parallel-net-workers 3 \
-    --allow-unrouted \
     >"$OUT/baseline-w3-r$REP.log" 2>&1
   /tmp/pathfinder-bf11-optimized "$GRAPH" "$META" \
     --sssp-engine bf11 \
@@ -261,7 +363,6 @@ for REP in 0 1 2 3 4 5; do
     --bf11-segment-rounds 8 \
     --bf11-hip-graph on \
     --bf11-adaptive-reset-threshold 0.25 \
-    --allow-unrouted \
     >"$OUT/candidate-w3-k8-graph-on-r$REP.log" 2>&1
 done
 ```
@@ -318,6 +419,7 @@ Collect phase and memory telemetry separately so event overhead is not mixed
 into the disabled-telemetry acceptance result:
 
 ```bash
+set -euo pipefail
 for WORKERS in 1 3 4; do
   for REP in 1 2 3 4 5; do
     /tmp/pathfinder-bf11-optimized "$GRAPH" "$META" \
@@ -326,7 +428,6 @@ for WORKERS in 1 3 4; do
       --bf11-segment-rounds 1 \
       --bf11-hip-graph off \
       --bf11-telemetry \
-      --allow-unrouted \
       >"$OUT/telemetry-w$WORKERS-r$REP.log" 2>&1
   done
 done
@@ -340,8 +441,15 @@ long and wide frontiers, multiple sources/targets, missing coordinates,
 unreachable targets, `max_iters=0`, reuse, and exceptional recovery:
 
 ```bash
+set -euo pipefail
+c++ -std=c++17 -O2 -pthread -Wall -Wextra -Wpedantic -Werror \
+  CongestionFreeRouting/tests/bf11_graph_execution_policy_test.cpp \
+  -o /tmp/bf11_graph_execution_policy_test
+/tmp/bf11_graph_execution_policy_test
+
 hipcc -std=c++17 -O2 -pthread -x hip -DBF11_NO_MAIN \
   -DBF11_ENABLE_HIP_GRAPHS \
+  "--offload-arch=${TARGET_ARCH:-gfx1151}" \
   -I HIP_kernel/bellman_ford/src \
   -I CongestionFreeRouting/bellman_ford \
   CongestionFreeRouting/tests/bf11_bounded_dynamic_hip_test.cpp \
@@ -352,6 +460,7 @@ hipcc -std=c++17 -O2 -pthread -x hip -DBF11_NO_MAIN \
 hipcc -std=c++17 -O2 -pthread -x hip -DBF11_NO_MAIN \
   -DBF11_ENABLE_HIP_GRAPHS \
   -DBF11_FORCE_CAS_ATOMIC_LOAD \
+  "--offload-arch=${TARGET_ARCH:-gfx1151}" \
   -I HIP_kernel/bellman_ford/src \
   -I CongestionFreeRouting/bellman_ford \
   CongestionFreeRouting/tests/bf11_bounded_dynamic_hip_test.cpp \
@@ -360,25 +469,134 @@ hipcc -std=c++17 -O2 -pthread -x hip -DBF11_NO_MAIN \
 /tmp/bf11_bounded_dynamic_hip_test_cas
 ```
 
-For deterministic PathFinder output hashes, run the same weighted CSR through
-every segment/Graph combination with `--routes-out`, then compare each file to
-the K=1, Graph-off control. The HIP regression above is the independent CPU
-Dijkstra oracle and includes constant-one, general-static, dynamic-cost,
-bounded, unbounded, fallback, zero-weight, multi-source, and multi-target cases:
+Run the requested strict PathFinder matrix below. Strict routing is the direct
+binary's default: deliberately do **not** pass `--allow-unrouted`. Set
+`RUN_W4=1` only when target memory permits. The HIP regression above is the
+independent CPU Dijkstra oracle and includes constant-one, general-static,
+dynamic-cost, bounded, unbounded, fallback, zero-weight, multi-source, and
+multi-target cases.
 
 ```bash
-for K in 1 2 4 8 16; do
-  for HIP_GRAPH in off on auto; do
-    /tmp/pathfinder-bf11-optimized "$GRAPH" "$META" \
-      --sssp-engine bf11 \
-      --parallel-net-workers 1 \
-      --bf11-segment-rounds "$K" \
-      --bf11-hip-graph "$HIP_GRAPH" \
-      --routes-out "$OUT/routes-k$K-g$HIP_GRAPH.jsonl" \
-      --allow-unrouted
-  done
+set -euo pipefail
+STRICT_OUT=${STRICT_OUT:-/tmp/bf11-strict-matrix}
+RUN_W4=${RUN_W4:-0}
+export RUN_W4
+mkdir -p "$STRICT_OUT"
+CONFIGS=(
+  "control 1 1 off"
+  "w1-k8-off 1 8 off"
+  "w1-k8-on 1 8 on"
+  "w3-k8-off 3 8 off"
+  "w3-k8-auto 3 8 auto"
+  "w3-k8-on 3 8 on"
+)
+if [ "${RUN_W4:-0}" = 1 ]; then
+  CONFIGS+=("w4-k8-off 4 8 off" "w4-k8-auto 4 8 auto" \
+            "w4-k8-on 4 8 on")
+fi
+
+for SPEC in "${CONFIGS[@]}"; do
+  read -r LABEL WORKERS K HIP_GRAPH <<<"$SPEC"
+  /tmp/pathfinder-bf11-optimized "$GRAPH" "$META" \
+    --sssp-engine bf11 \
+    --parallel-net-workers "$WORKERS" \
+    --bf11-segment-rounds "$K" \
+    --bf11-hip-graph "$HIP_GRAPH" \
+    --bf11-adaptive-reset-threshold 0.25 \
+    --bf11-telemetry \
+    --routes-out "$STRICT_OUT/$LABEL.routes.jsonl" \
+    >"$STRICT_OUT/$LABEL.log" 2>&1
 done
-sha256sum "$OUT"/routes-k*-g*.jsonl
+
+python3 - "$STRICT_OUT" <<'PY'
+import hashlib, json, os, pathlib, re, sys
+root = pathlib.Path(sys.argv[1])
+control = (root / "control.routes.jsonl").read_bytes()
+labels = ["control", "w1-k8-off", "w1-k8-on", "w3-k8-off",
+          "w3-k8-auto", "w3-k8-on"]
+if os.environ.get("RUN_W4", "0") == "1":
+    labels += ["w4-k8-off", "w4-k8-auto", "w4-k8-on"]
+for label in labels:
+    routes_path = root / f"{label}.routes.jsonl"
+    assert routes_path.is_file(), routes_path
+    rows = [json.loads(line) for line in routes_path.read_text().splitlines()]
+    reached = sum(sink.get("reached") is True
+                  for row in rows for sink in row["sinks"])
+    total = sum(len(row["sinks"]) for row in rows)
+    assert total > 0 and reached == total, (routes_path.name, reached, total)
+    assert all(row.get("routed") is True for row in rows), routes_path.name
+    data = routes_path.read_bytes()
+    assert data == control, f"route mismatch: {routes_path.name}"
+    records = [json.loads(line)
+               for line in (root / f"{label}.log").read_text().splitlines()
+               if line.startswith("{")]
+    runtime = next(row for row in records
+                   if row.get("type") == "bf11_runtime_stats")
+    telemetry = next(row for row in records
+                     if row.get("type") == "bf11_telemetry")
+    expected = (1, 1, "off") if label == "control" else (
+        lambda match: (int(match.group(1)), int(match.group(2)), match.group(3))
+    )(re.fullmatch(r"w(\d+)-k(\d+)-(off|auto|on)", label))
+    workers, rounds, graph_mode = expected
+    assert runtime["requested_workers"] == workers, label
+    assert runtime["effective_workers"] == workers, label
+    assert runtime["segment_rounds"] == rounds, label
+    assert runtime["hip_graph"] == graph_mode, label
+    assert telemetry["requested_workers"] == workers, label
+    assert telemetry["effective_workers"] == workers, label
+    assert telemetry["configuration"]["segment_rounds"] == rounds, label
+    assert telemetry["configuration"]["hip_graph"] == graph_mode, label
+    assert telemetry["queries"] > 0, label
+    assert telemetry["queries"] == telemetry["completed_queries"], label
+    work = telemetry["work"]
+    assert work["direct_segments"] + work["hip_graph_segments"] == work["segments"], label
+    if runtime["hip_graph"] == "off":
+        assert work["direct_segments"] == work["segments"], label
+        assert work["hip_graph_segments"] == 0 and work["graph_fallbacks"] == 0, label
+    elif runtime["segment_rounds"] > 1:
+        assert work["hip_graph_segments"] > 0 or work["graph_fallbacks"] > 0, label
+        if work["hip_graph_segments"] == 0:
+            assert work["direct_segments"] == work["segments"], label
+    print(label, hashlib.sha256(data).hexdigest(),
+          f"reached={reached}/{total}", runtime,
+          {"queries": telemetry["queries"], "work": work})
+PY
+```
+
+Force active-capture invalidation, require a successful sticky-direct run, and
+compare its route output with the K=1 Graph-off control. The concurrent K=8 HIP
+regression separately tests actual cross-worker first capture and reuse:
+
+```bash
+set -euo pipefail
+BF11_TEST_HIP_GRAPH_FAILURE_STAGE=enqueue \
+  /tmp/pathfinder-bf11-optimized "$GRAPH" "$META" \
+    --sssp-engine bf11 \
+    --parallel-net-workers 3 \
+    --bf11-segment-rounds 8 \
+    --bf11-hip-graph on \
+    --bf11-telemetry \
+    --routes-out "$STRICT_OUT/forced-enqueue.routes.jsonl" \
+    >"$STRICT_OUT/forced-enqueue.log" 2>&1
+cmp "$STRICT_OUT/control.routes.jsonl" \
+  "$STRICT_OUT/forced-enqueue.routes.jsonl"
+python3 - "$STRICT_OUT/forced-enqueue.log" <<'PY'
+import json, pathlib, sys
+rows = [json.loads(line)
+        for line in pathlib.Path(sys.argv[1]).read_text().splitlines()
+        if line.startswith("{")]
+runtime = next(row for row in rows if row.get("type") == "bf11_runtime_stats")
+telemetry = next(row for row in rows if row.get("type") == "bf11_telemetry")
+work = telemetry["work"]
+assert telemetry["queries"] > 0
+assert telemetry["queries"] == telemetry["completed_queries"]
+assert work["segments"] > 0 and work["direct_segments"] == work["segments"]
+assert work["hip_graph_segments"] == 0 and work["graph_fallbacks"] >= 1
+assert work["stream_synchronizations"] >= (
+    work["segments"] + telemetry["queries"] + work["graph_fallbacks"])
+print(runtime)
+print(telemetry)
+PY
 ```
 
 Collect HIP API counts for K=1 and K=8 with the same one-worker query prefix.
@@ -386,6 +604,7 @@ The K=8 trace must show status-copy and stream-synchronization counts reduced to
 approximately `ceil(rounds / 8)` without changing the output hash:
 
 ```bash
+set -euo pipefail
 for K in 1 8; do
   rocprofv3 --runtime-trace --stats \
     --output-directory "$OUT/rocprof-k$K" -- \
@@ -395,8 +614,10 @@ for K in 1 8; do
       --bf11-segment-rounds "$K" \
       --bf11-hip-graph off \
       --net-limit 100 \
-      --allow-unrouted
+      --routes-out "$OUT/rocprof-k$K.routes.jsonl"
 done
+cmp "$OUT/rocprof-k1.routes.jsonl" "$OUT/rocprof-k8.routes.jsonl"
+sha256sum "$OUT"/rocprof-k*.routes.jsonl
 ```
 
 Run the contest wrapper/checker/wirelength/score pipeline once each for the

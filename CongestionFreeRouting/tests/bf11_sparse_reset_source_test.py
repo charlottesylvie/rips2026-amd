@@ -38,16 +38,55 @@ def main() -> None:
         "BF11 production code no longer includes its host-tested policy",
     )
     require(
+        '#include "bf11_graph_execution_policy.hpp"' in source,
+        "BF11 production code bypasses its host-tested graph lifecycle policy",
+    )
+    require(
         "workspace.stream == nullptr" in source
         and "retain_default_cooperative_path" in source
         and "workspace_options.segment_rounds == 1" in source,
         "explicit BF11 streams can still enter the full-residency controller",
     )
-    graph_enqueue = braced_region(source, "bool enqueue_graph_segment(")
+    graph_enqueue = braced_region(source, "enqueue_graph_segment(")
+    graph_backend = braced_region(source, "class HipGraphSegmentBackend")
     require(
         "same_bounds(workspace.graph_bounds, options.bounds)" in graph_enqueue
-        and "workspace.graph_bounds = options.bounds" in graph_enqueue,
+        and "workspace_.graph_bounds = options_.bounds" in graph_backend,
         "BF11 HIP Graph replay can reuse kernel arguments from another box",
+    )
+    require(
+        "hipStreamCaptureModeThreadLocal" in graph_backend
+        and "hipStreamCaptureModeGlobal" not in graph_backend,
+        "BF11 worker captures are not isolated to their owning host thread",
+    )
+    require(
+        "hipPeekAtLastError" in graph_backend
+        and "hipStreamIsCapturing" in graph_backend
+        and "hipStreamCaptureStatusNone" in graph_backend,
+        "BF11 graph fallback does not preserve prior errors or verify capture cleanup",
+    )
+    require(
+        "try_enqueue_direct_segment" in graph_backend
+        and "is_recoverable_capture_enqueue_error" in graph_backend
+        and "hipErrorStreamCaptureUnsupported" in graph_backend
+        and "hipErrorStreamCaptureWrongThread" in graph_backend
+        and "record_consumed_unrecoverable_failure" in graph_backend,
+        "captured enqueue errors no longer distinguish capture fallback from "
+        "unrelated kernel/device failure",
+    )
+    require(
+        "wait_for_bf11_graph_capture_barrier" in graph_backend
+        and "hipStreamSynchronize(workspace_.stream)" in graph_backend,
+        "BF11 lost deterministic concurrent-capture or real invalidation "
+        "target-test hooks",
+    )
+    require(
+        "launch_failure_requires_restart" in graph_backend
+        and "prepare_launch_failure" in graph_backend
+        and "hipStreamSynchronize" in graph_backend
+        and "kLaunchAfterSubmit" in graph_backend
+        and "restart_query_direct" in source,
+        "a partial HIP Graph launch can be replayed directly without a full query restart",
     )
     require(
         "Index* touched_nodes" in source and "int* touched_count" in source,

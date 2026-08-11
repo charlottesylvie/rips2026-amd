@@ -17,6 +17,9 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
 SOURCE = ROOT / "CongestionFreeRouting/bellman_ford/bf11.cpp"
+HIP_REGRESSION = (
+    ROOT / "CongestionFreeRouting/tests/bf11_bounded_dynamic_hip_test.cpp"
+)
 FAKE_HIP = ROOT / "Routing/tests/fake_hip"
 
 
@@ -85,6 +88,11 @@ def main() -> None:
         "hipStreamBeginCapture" in source_text and "hipGraphLaunch" in source_text,
         "BF11 fake-HIP graph build would not exercise graph capture/replay code",
     )
+    require(
+        "hipStreamCaptureModeThreadLocal" in source_text
+        and "hipStreamCaptureModeGlobal" not in source_text,
+        "BF11 independent worker streams do not use thread-local capture",
+    )
 
     common = [
         compiler,
@@ -126,6 +134,49 @@ def main() -> None:
             )
             require(output.is_file(), f"{name} did not produce an object file")
             print(f"BF11 fake-HIP build passed: {name}")
+
+        # Also type-check and link the AMD regression in both macro modes. The
+        # fake allocator and kernels remain compile-only, so these executables
+        # are intentionally never run.
+        integration_common = [
+            compiler,
+            "-std=c++17",
+            "-O0",
+            "-pthread",
+            "-Wall",
+            "-Wextra",
+            "-Wpedantic",
+            "-Werror",
+            "-DBF11_NO_MAIN",
+            "-D__HIP_PLATFORM_AMD__=1",
+            "-I",
+            str(FAKE_HIP),
+            "-I",
+            str(ROOT / "HIP_kernel/bellman_ford/src"),
+            "-I",
+            str(ROOT / "CongestionFreeRouting/bellman_ford"),
+        ]
+        integration_cases = (
+            ("bounded-regression_graph-off", []),
+            (
+                "bounded-regression_graph-fake",
+                ["-DBF11_ENABLE_HIP_GRAPHS", "-DBF11_FAKE_HIP_ENABLE_GRAPHS"],
+            ),
+        )
+        for name, definitions in integration_cases:
+            output = output_root / name
+            run_checked(
+                [
+                    *integration_common,
+                    *definitions,
+                    str(HIP_REGRESSION),
+                    str(SOURCE),
+                    "-o",
+                    str(output),
+                ]
+            )
+            require(output.is_file(), f"{name} did not link")
+            print(f"BF11 fake-HIP integration build passed: {name}")
 
 
 if __name__ == "__main__":

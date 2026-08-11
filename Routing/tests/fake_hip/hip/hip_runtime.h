@@ -30,6 +30,9 @@ struct hipDeviceProp_t {
 };
 
 constexpr hipError_t hipSuccess = 0;
+constexpr hipError_t hipErrorStreamCaptureUnsupported = 900;
+constexpr hipError_t hipErrorStreamCaptureInvalidated = 901;
+constexpr hipError_t hipErrorStreamCaptureWrongThread = 908;
 constexpr unsigned int hipStreamNonBlocking = 1;
 constexpr unsigned int hipHostMallocDefault = 0;
 
@@ -145,6 +148,10 @@ inline hipError_t hipGetLastError() {
   return hipSuccess;
 }
 
+inline hipError_t hipPeekAtLastError() {
+  return hipSuccess;
+}
+
 inline hipError_t hipGetDevice(int* device) {
   *device = 0;
   return hipSuccess;
@@ -257,6 +264,13 @@ using hipGraphExec_t = void*;
 
 enum hipStreamCaptureMode {
   hipStreamCaptureModeGlobal = 0,
+  hipStreamCaptureModeThreadLocal = 1,
+};
+
+enum hipStreamCaptureStatus {
+  hipStreamCaptureStatusNone = 0,
+  hipStreamCaptureStatusActive = 1,
+  hipStreamCaptureStatusInvalidated = 2,
 };
 
 inline hipError_t hipStreamBeginCapture(hipStream_t, hipStreamCaptureMode) {
@@ -266,6 +280,12 @@ inline hipError_t hipStreamBeginCapture(hipStream_t, hipStreamCaptureMode) {
 inline hipError_t hipStreamEndCapture(hipStream_t, hipGraph_t* graph) {
   static int graph_token = 0;
   *graph = &graph_token;
+  return hipSuccess;
+}
+
+inline hipError_t hipStreamIsCapturing(hipStream_t,
+                                       hipStreamCaptureStatus* status) {
+  *status = hipStreamCaptureStatusNone;
   return hipSuccess;
 }
 

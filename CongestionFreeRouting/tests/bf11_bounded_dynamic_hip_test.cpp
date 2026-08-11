@@ -1,6 +1,7 @@
 // BF11 bounded/dynamic/true-multi-source regression test (AMD HIP GPU).
 // Build from the repository root:
 //   hipcc -std=c++17 -O2 -pthread -x hip -DBF11_NO_MAIN \
+//     -DBF11_ENABLE_HIP_GRAPHS \
 //     -I HIP_kernel/bellman_ford/src \
 //     -I CongestionFreeRouting/bellman_ford \
 //     CongestionFreeRouting/tests/bf11_bounded_dynamic_hip_test.cpp \
@@ -15,6 +16,8 @@
 #include <condition_variable>
 #include <cmath>
 #include <cstdint>
+#include <cstdlib>
+#include <cstring>
 #include <exception>
 #include <functional>
 #include <iostream>
@@ -37,6 +40,7 @@ extern "C" std::uint64_t bf11_internal_sparse_state_reset_count();
 extern "C" std::uint64_t bf11_internal_dense_state_reset_count();
 extern "C" void bf11_internal_set_mark_generation_limit(
     std::uint64_t limit);
+extern "C" void bf11_internal_set_graph_capture_barrier(int participants);
 
 namespace ri = routing::interchange;
 using Offset = minplus_sparse::Offset;
@@ -73,6 +77,35 @@ class HipStream {
 
  private:
   hipStream_t stream_ = nullptr;
+};
+
+class ScopedGraphFailureStage {
+ public:
+  explicit ScopedGraphFailureStage(const char* stage) {
+    const char* previous = std::getenv("BF11_TEST_HIP_GRAPH_FAILURE_STAGE");
+    if (previous != nullptr) {
+      had_previous_ = true;
+      previous_ = previous;
+    }
+    if (setenv("BF11_TEST_HIP_GRAPH_FAILURE_STAGE", stage, 1) != 0) {
+      throw std::runtime_error("set BF11 HIP Graph failure stage failed");
+    }
+  }
+
+  ~ScopedGraphFailureStage() {
+    if (had_previous_) {
+      (void)setenv("BF11_TEST_HIP_GRAPH_FAILURE_STAGE", previous_.c_str(), 1);
+    } else {
+      (void)unsetenv("BF11_TEST_HIP_GRAPH_FAILURE_STAGE");
+    }
+  }
+
+  ScopedGraphFailureStage(const ScopedGraphFailureStage&) = delete;
+  ScopedGraphFailureStage& operator=(const ScopedGraphFailureStage&) = delete;
+
+ private:
+  bool had_previous_ = false;
+  std::string previous_;
 };
 
 class ScopedMarkGenerationLimit {
@@ -1701,7 +1734,7 @@ void test_hip_graph_modes_and_exact_fallback() {
                 stats.hip_graph_segments == 0 &&
                 stats.graph_fallbacks ==
                     (mode == BellmanFord11HipGraphMode::kOn
-                         ? stats.segments
+                         ? 1
                          : 0),
             "BF11 graph-compiled-out fallback accounting is inconsistent");
 #endif
@@ -1727,6 +1760,213 @@ void test_hip_graph_modes_and_exact_fallback() {
               k1_stats.hip_graph_segments == 0 &&
               k1_stats.graph_fallbacks == 0,
           "BF11 K=1 control path attempted HIP Graph replay");
+}
+
+void test_hip_graph_non_unit_cost_modes_and_updates() {
+  const HostCsrF32 graph = make_graph(
+      4, {{0, 1, 0.5f}, {0, 2, 2.0f}, {1, 3, 1.0f}, {2, 3, 0.25f}});
+  const ri::RoutingCsrSidecars sidecars =
+      make_sidecars({0, 1, 1, 2}, {0, 0, 1, 0});
+  auto shared_graph =
+      std::make_shared<BellmanFord11CsrGraph>(graph, sidecars, nullptr);
+  const std::vector<float> identity(4, 1.0f);
+  const std::vector<float> dynamic_heavy = {1.0f, 10.0f, 1.0f, 1.0f};
+  const std::vector<float> dynamic_light = {1.0f, 2.0f, 1.0f, 1.0f};
+  SsspQueryCapacityHints hints;
+  hints.max_sources = 1;
+  hints.max_targets = 1;
+
+  BellmanFord11WorkspaceOptions control_options;
+  control_options.segment_rounds = 1;
+  control_options.hip_graph_mode = BellmanFord11HipGraphMode::kOff;
+  HipStream control_stream;
+  BellmanFord11CsrWorkspace static_control_workspace(
+      shared_graph, control_stream.get(), control_options, hints);
+  const BellmanFordCsrResult static_control =
+      static_control_workspace.run(std::vector<int>{0}, std::vector<int>{3},
+                                   1.0f, -1,
+                                   control_stream.get(), nullptr, nullptr);
+
+  HipStream dynamic_control_stream;
+  BellmanFord11CsrWorkspace dynamic_control_workspace(
+      shared_graph, dynamic_control_stream.get(), control_options, hints);
+  dynamic_control_workspace.update_vertex_costs(
+      dynamic_heavy, dynamic_control_stream.get());
+  const BellmanFordCsrResult dynamic_heavy_control =
+      dynamic_control_workspace.run(std::vector<int>{0}, std::vector<int>{3},
+                                    1.0f, -1,
+                                    dynamic_control_stream.get(), nullptr,
+                                    nullptr);
+  dynamic_control_workspace.update_vertex_costs(
+      dynamic_light, dynamic_control_stream.get());
+  const BellmanFordCsrResult dynamic_light_control =
+      dynamic_control_workspace.run(std::vector<int>{0}, std::vector<int>{3},
+                                    1.0f, -1,
+                                    dynamic_control_stream.get(), nullptr,
+                                    nullptr);
+  validate_paths("BF11 static Graph control", graph, sidecars, identity,
+                 {0}, {3}, static_control);
+  validate_paths("BF11 dynamic-heavy Graph control", graph, sidecars,
+                 dynamic_heavy, {0}, {3}, dynamic_heavy_control);
+  validate_paths("BF11 dynamic-light Graph control", graph, sidecars,
+                 dynamic_light, {0}, {3}, dynamic_light_control);
+  require(static_control.target_path_nodes == std::vector<int>({0, 1, 3}) &&
+              dynamic_heavy_control.target_path_nodes ==
+                  std::vector<int>({0, 2, 3}) &&
+              dynamic_light_control.target_path_nodes ==
+                  std::vector<int>({0, 1, 3}),
+          "BF11 non-unit Graph controls do not exercise different weighted "
+          "frontiers");
+
+  BellmanFord11WorkspaceOptions graph_options;
+  graph_options.telemetry = true;
+  graph_options.segment_rounds = 2;
+  graph_options.hip_graph_mode = BellmanFord11HipGraphMode::kOn;
+
+  // Non-unit static first capture and cached replay.
+  {
+    HipStream stream;
+    BellmanFord11CsrWorkspace workspace(shared_graph, stream.get(),
+                                        graph_options, hints);
+    reset_bellman_ford11_runtime_stats();
+    for (int replay = 0; replay < 2; ++replay) {
+      require_same_result(
+          "BF11 non-unit static Graph first-use/replay", static_control,
+          workspace.run(std::vector<int>{0}, std::vector<int>{3}, 1.0f, -1,
+                        stream.get(), nullptr, nullptr));
+    }
+    const BellmanFord11RuntimeStats stats =
+        bellman_ford11_runtime_stats();
+    require(stats.static_cost_queries == 2 &&
+                stats.constant_one_queries == 0 &&
+                stats.dynamic_cost_queries == 0 && stats.segments == 2 &&
+                stats.direct_segments + stats.hip_graph_segments == 2 &&
+                stats.graph_fallbacks <= 1,
+            "BF11 non-unit static Graph lifecycle accounting is wrong");
+  }
+
+  // Stay in dynamic mode across an update so cached replay must read the new
+  // non-unit multiplier values and may change the winning frontier/path.
+  {
+    HipStream stream;
+    BellmanFord11CsrWorkspace workspace(shared_graph, stream.get(),
+                                        graph_options, hints);
+    workspace.update_vertex_costs(dynamic_heavy, stream.get());
+    reset_bellman_ford11_runtime_stats();
+    require_same_result(
+        "BF11 dynamic Graph first use", dynamic_heavy_control,
+        workspace.run(std::vector<int>{0}, std::vector<int>{3}, 1.0f, -1,
+                      stream.get(), nullptr, nullptr));
+    workspace.update_vertex_costs(dynamic_light, stream.get());
+    require_same_result(
+        "BF11 dynamic Graph replay after update_vertex_costs",
+        dynamic_light_control,
+        workspace.run(std::vector<int>{0}, std::vector<int>{3}, 1.0f, -1,
+                      stream.get(), nullptr, nullptr));
+    const BellmanFord11RuntimeStats stats =
+        bellman_ford11_runtime_stats();
+    require(stats.dynamic_cost_queries == 2 &&
+                stats.constant_one_queries == 0 &&
+                stats.static_cost_queries == 0 && stats.segments == 2 &&
+                stats.direct_segments + stats.hip_graph_segments == 2 &&
+                stats.graph_fallbacks <= 1,
+            "BF11 dynamic Graph update/replay accounting is wrong");
+  }
+
+  // Force real active-capture invalidation once in each non-unit mode, then
+  // reuse the sticky-direct workspace and compare with the graph-off oracle.
+  for (const bool dynamic : {false, true}) {
+    ScopedGraphFailureStage failure("enqueue");
+    HipStream stream;
+    BellmanFord11CsrWorkspace workspace(shared_graph, stream.get(),
+                                        graph_options, hints);
+    if (dynamic) workspace.update_vertex_costs(dynamic_heavy, stream.get());
+    reset_bellman_ford11_runtime_stats();
+    for (int reuse = 0; reuse < 2; ++reuse) {
+      require_same_result(
+          dynamic ? "BF11 dynamic Graph invalidation fallback"
+                  : "BF11 static Graph invalidation fallback",
+          dynamic ? dynamic_heavy_control : static_control,
+          workspace.run(std::vector<int>{0}, std::vector<int>{3}, 1.0f, -1,
+                        stream.get(), nullptr, nullptr));
+    }
+    const BellmanFord11RuntimeStats stats =
+        bellman_ford11_runtime_stats();
+    require(stats.telemetry_queries == 2 &&
+                stats.telemetry_completed_queries == 2 &&
+                stats.segments == 2 && stats.direct_segments == 2 &&
+                stats.hip_graph_segments == 0 &&
+                stats.graph_fallbacks == 1 &&
+                (stats.stream_synchronizations == 4 ||
+                 stats.stream_synchronizations == 5) &&
+                (dynamic ? stats.dynamic_cost_queries == 2
+                         : stats.static_cost_queries == 2),
+            "BF11 non-unit Graph invalidation was not exact sticky direct");
+  }
+}
+
+void test_forced_hip_graph_failures_and_workspace_reuse() {
+  constexpr int kVertices = 8;
+  std::vector<EdgeSpec> edges;
+  for (int node = 0; node + 1 < kVertices; ++node) {
+    edges.push_back({node, node + 1, 1.0f});
+  }
+  const HostCsrF32 graph = make_graph(kVertices, edges);
+  const ri::RoutingCsrSidecars sidecars = make_sidecars(
+      {0, 1, 2, 3, 4, 5, 6, 7}, {0, 0, 0, 0, 0, 0, 0, 0});
+  auto shared_graph =
+      std::make_shared<BellmanFord11CsrGraph>(graph, sidecars, nullptr);
+  SsspQueryCapacityHints hints;
+  hints.max_sources = 1;
+  hints.max_targets = 1;
+
+  HipStream control_stream;
+  BellmanFord11WorkspaceOptions control_options;
+  control_options.segment_rounds = 4;
+  control_options.hip_graph_mode = BellmanFord11HipGraphMode::kOff;
+  BellmanFord11CsrWorkspace control_workspace(
+      shared_graph, control_stream.get(), control_options, hints);
+  const BellmanFordCsrResult control = control_workspace.run(
+      std::vector<int>{0}, std::vector<int>{6}, 1.0f, -1,
+      control_stream.get(), nullptr, nullptr);
+
+  for (const char* stage :
+       {"begin", "enqueue", "end", "instantiate", "launch",
+        "launch-after-submit"}) {
+    ScopedGraphFailureStage failure(stage);
+    HipStream stream;
+    BellmanFord11WorkspaceOptions options;
+    options.telemetry = true;
+    options.segment_rounds = 4;
+    options.hip_graph_mode = BellmanFord11HipGraphMode::kOn;
+    BellmanFord11CsrWorkspace workspace(shared_graph, stream.get(), options,
+                                        hints);
+    reset_bellman_ford11_runtime_stats();
+    for (int reuse = 0; reuse < 2; ++reuse) {
+      const BellmanFordCsrResult result = workspace.run(
+          std::vector<int>{0}, std::vector<int>{6}, 1.0f, -1,
+          stream.get(), nullptr, nullptr);
+      require_same_result(std::string("BF11 forced graph ") + stage +
+                              " fallback reuse",
+                          control, result);
+    }
+    const BellmanFord11RuntimeStats stats =
+        bellman_ford11_runtime_stats();
+    const bool stage_can_add_synchronization =
+        std::strcmp(stage, "enqueue") == 0 ||
+        std::strcmp(stage, "launch-after-submit") == 0;
+    require(stats.telemetry_queries == 2 &&
+                stats.telemetry_completed_queries == 2 &&
+                stats.rounds == 12 && stats.segments == 4 &&
+                stats.status_copies == 4 && stats.direct_segments == 4 &&
+                stats.hip_graph_segments == 0 &&
+                stats.graph_fallbacks == 1 &&
+                (stats.stream_synchronizations == 6 ||
+                 (stage_can_add_synchronization &&
+                  stats.stream_synchronizations == 7)),
+            std::string("BF11 forced graph ") + stage +
+                " failure was not an exact sticky direct fallback");
+  }
 }
 
 void test_hip_graph_bounds_cache_and_auto_fallback_reuse() {
@@ -1841,7 +2081,7 @@ void test_hip_graph_bounds_cache_and_auto_fallback_reuse() {
   }
 #else
   require(stats.direct_segments == 4 && stats.hip_graph_segments == 0 &&
-              stats.graph_fallbacks == 4,
+              stats.graph_fallbacks == 1,
           "BF11 graph-bounds compiled-out fallback accounting is inconsistent");
 #endif
 }
@@ -1850,7 +2090,12 @@ std::vector<BellmanFordCsrResult> run_explicit_stream_workers(
     const std::shared_ptr<BellmanFord11CsrGraph>& shared_graph,
     const std::vector<float>& dynamic_cost,
     const std::vector<WorkerCountQuery>& queries,
-    std::size_t worker_count) {
+    std::size_t worker_count,
+    int segment_rounds = 1,
+    BellmanFord11HipGraphMode graph_mode =
+        BellmanFord11HipGraphMode::kAuto,
+    BellmanFord11RuntimeStats* stats_out = nullptr,
+    bool synchronize_first_capture = false) {
   require(worker_count > 0 && worker_count <= queries.size(),
           "invalid BF11 worker-count test configuration");
 
@@ -1858,6 +2103,8 @@ std::vector<BellmanFordCsrResult> run_explicit_stream_workers(
   std::vector<std::unique_ptr<BellmanFord11CsrWorkspace>> workspaces;
   BellmanFord11WorkspaceOptions worker_options;
   worker_options.telemetry = true;
+  worker_options.segment_rounds = segment_rounds;
+  worker_options.hip_graph_mode = graph_mode;
   streams.reserve(worker_count);
   workspaces.reserve(worker_count);
   for (std::size_t worker = 0; worker < worker_count; ++worker) {
@@ -1871,11 +2118,24 @@ std::vector<BellmanFordCsrResult> run_explicit_stream_workers(
   int device = 0;
   check_hip(hipGetDevice(&device), "get worker-count HIP device");
   std::vector<BellmanFordCsrResult> results(queries.size());
+  std::vector<BellmanFordCsrResult> first_use_results(worker_count);
   std::vector<std::exception_ptr> errors(worker_count);
   std::mutex start_mutex;
   std::condition_variable start_condition;
   std::size_t ready_workers = 0;
   bool start_workers = false;
+  std::size_t completed_first_use = 0;
+  bool release_first_use = !synchronize_first_capture;
+
+  struct CaptureBarrierReset {
+    ~CaptureBarrierReset() {
+      bf11_internal_set_graph_capture_barrier(0);
+    }
+  } capture_barrier_reset;
+  if (synchronize_first_capture) {
+    bf11_internal_set_graph_capture_barrier(
+        static_cast<int>(worker_count));
+  }
 
   auto worker = [&](std::size_t worker_index) {
     try {
@@ -1887,6 +2147,24 @@ std::vector<BellmanFordCsrResult> run_explicit_stream_workers(
       }
       check_hip(hipSetDevice(device), "select worker-count HIP device");
       BellmanFord11RunOptions run_options;
+      if (synchronize_first_capture) {
+        const WorkerCountQuery& first = queries.front();
+        first_use_results[worker_index] = workspaces[worker_index]->run(
+            first.sources, first.targets, 1.0f, first.max_iters, run_options,
+            streams[worker_index]->get(), nullptr, nullptr);
+        std::unique_lock<std::mutex> lock(start_mutex);
+        ++completed_first_use;
+        if (completed_first_use == worker_count) {
+          // Every workspace has left its first capture/run. Disable the
+          // production-side test barrier before varied reuse queries can
+          // invalidate a cache due to target-capacity growth.
+          bf11_internal_set_graph_capture_barrier(0);
+          release_first_use = true;
+          start_condition.notify_all();
+        } else {
+          start_condition.wait(lock, [&] { return release_first_use; });
+        }
+      }
       for (std::size_t query_index = worker_index;
            query_index < queries.size(); query_index += worker_count) {
         const WorkerCountQuery& query = queries[query_index];
@@ -1896,6 +2174,12 @@ std::vector<BellmanFordCsrResult> run_explicit_stream_workers(
       }
     } catch (...) {
       errors[worker_index] = std::current_exception();
+      if (synchronize_first_capture) {
+        std::lock_guard<std::mutex> lock(start_mutex);
+        bf11_internal_set_graph_capture_barrier(0);
+        release_first_use = true;
+        start_condition.notify_all();
+      }
     }
   };
 
@@ -1920,11 +2204,20 @@ std::vector<BellmanFordCsrResult> run_explicit_stream_workers(
 
   const BellmanFord11RuntimeStats worker_stats =
       bellman_ford11_runtime_stats();
+  if (stats_out != nullptr) *stats_out = worker_stats;
+  const std::size_t expected_queries =
+      queries.size() + (synchronize_first_capture ? worker_count : 0);
+  if (synchronize_first_capture) {
+    for (std::size_t worker = 0; worker < worker_count; ++worker) {
+      require_same_result("BF11 concurrent identical first capture",
+                          results.front(), first_use_results[worker]);
+    }
+  }
   require(bf11_internal_gpu_controller_launch_count() == 0 &&
-              bf11_internal_controller_fallback_count() == queries.size() &&
+              bf11_internal_controller_fallback_count() == expected_queries &&
               worker_stats.sparse_state_resets +
                       worker_stats.adaptive_dense_state_resets ==
-                  queries.size() &&
+                  expected_queries &&
               bf11_internal_dense_state_reset_count() == 0,
           "BF11 worker-count stress left the explicit-stream controller/reset policy");
   return results;
@@ -2015,6 +2308,53 @@ void test_explicit_stream_worker_count_invariance() {
       sequential_results = std::move(results);
     }
   }
+
+  // Exercise the reported failure shape on a real HIP runtime: independent
+  // nonblocking streams and workspaces enter their first K=8 capture from
+  // separate host threads at the same barrier. Every workspace is then reused
+  // for several queries. A runtime without Graph support may fall back, but it
+  // must do so once per workspace and remain bit-for-bit equivalent to K=1.
+  for (const BellmanFord11HipGraphMode graph_mode :
+       {BellmanFord11HipGraphMode::kOn,
+        BellmanFord11HipGraphMode::kAuto}) {
+    for (const std::size_t worker_count : {3u, 4u}) {
+      BellmanFord11RuntimeStats stats;
+      const std::vector<BellmanFordCsrResult> results =
+          run_explicit_stream_workers(shared_graph, dynamic_cost, queries,
+                                      worker_count, 8, graph_mode, &stats,
+                                      true);
+      for (std::size_t query_index = 0; query_index < queries.size();
+           ++query_index) {
+        require_same_result(
+            "BF11 concurrent K=8 graph first-use/reuse",
+            sequential_results[query_index], results[query_index]);
+      }
+      const std::size_t expected_queries = queries.size() + worker_count;
+      require(stats.telemetry_queries == expected_queries &&
+                  stats.telemetry_completed_queries == expected_queries &&
+                  stats.host_controller_runs == expected_queries &&
+                  stats.segments > 0 &&
+                  stats.direct_segments + stats.hip_graph_segments ==
+                      stats.segments &&
+                  stats.graph_fallbacks <= worker_count,
+              "BF11 concurrent K=8 graph accounting or sticky fallback is "
+              "inconsistent");
+#if !defined(BF11_ENABLE_HIP_GRAPHS)
+      if (graph_mode == BellmanFord11HipGraphMode::kOn) {
+        require(stats.hip_graph_segments == 0 &&
+                    stats.direct_segments == stats.segments &&
+                    stats.graph_fallbacks == worker_count,
+                "BF11 compiled-out concurrent graph-on fallback is not "
+                "sticky per workspace");
+      }
+#else
+      require(stats.hip_graph_segments > 0 ||
+                  stats.graph_fallbacks == worker_count,
+              "BF11 concurrent K=8 graph mode neither replayed nor recorded "
+              "one sticky runtime fallback per workspace");
+#endif
+    }
+  }
 }
 
 }  // namespace
@@ -2035,6 +2375,8 @@ int main() {
     test_parallel_explicit_stream_segmented_controller();
     test_segmented_explicit_stream_equivalence_and_boundaries();
     test_hip_graph_modes_and_exact_fallback();
+    test_hip_graph_non_unit_cost_modes_and_updates();
+    test_forced_hip_graph_failures_and_workspace_reuse();
     test_hip_graph_bounds_cache_and_auto_fallback_reuse();
     test_explicit_stream_worker_count_invariance();
     std::cout << "BF11 bounded dynamic HIP tests passed\n";

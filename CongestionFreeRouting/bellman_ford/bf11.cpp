@@ -7,6 +7,7 @@
 
 #include "bf11.hpp"
 #include "bf11_execution_policy.hpp"
+#include "bf11_graph_execution_policy.hpp"
 #include "bf11_worker_policy.hpp"
 
 #include "../profiling/roctx_ranges.hpp"
@@ -18,6 +19,7 @@
 #include <atomic>
 #include <chrono>
 #include <cmath>
+#include <condition_variable>
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
@@ -93,6 +95,43 @@ std::atomic<std::uint64_t> g_bf11_constructed_workers{0};
 // Production retains the full nonzero uint32 token range.
 std::atomic<std::uint64_t> g_bf11_mark_generation_limit{
     std::numeric_limits<std::uint32_t>::max()};
+
+#if defined(BF11_ENABLE_HIP_GRAPHS)
+// Test-only rendezvous. A zero participant count is the production default and
+// takes only the atomic fast path on a workspace's first capture. The AMD
+// regression enables it so every worker has actually begun capture before any
+// captured kernel is enqueued, deterministically exercising concurrent first
+// use rather than relying on host scheduling luck.
+std::mutex g_bf11_graph_capture_barrier_mutex;
+std::condition_variable g_bf11_graph_capture_barrier_condition;
+std::atomic<int> g_bf11_graph_capture_barrier_participants{0};
+int g_bf11_graph_capture_barrier_arrived = 0;
+std::uint64_t g_bf11_graph_capture_barrier_generation = 0;
+
+void wait_for_bf11_graph_capture_barrier() {
+  if (g_bf11_graph_capture_barrier_participants.load(
+          std::memory_order_acquire) <= 1) {
+    return;
+  }
+  std::unique_lock<std::mutex> lock(g_bf11_graph_capture_barrier_mutex);
+  const int participants =
+      g_bf11_graph_capture_barrier_participants.load(
+          std::memory_order_relaxed);
+  if (participants <= 1) return;
+  const std::uint64_t generation =
+      g_bf11_graph_capture_barrier_generation;
+  ++g_bf11_graph_capture_barrier_arrived;
+  if (g_bf11_graph_capture_barrier_arrived == participants) {
+    g_bf11_graph_capture_barrier_arrived = 0;
+    ++g_bf11_graph_capture_barrier_generation;
+    g_bf11_graph_capture_barrier_condition.notify_all();
+    return;
+  }
+  g_bf11_graph_capture_barrier_condition.wait(lock, [&] {
+    return g_bf11_graph_capture_barrier_generation != generation;
+  });
+}
+#endif
 
 void atomic_max(std::atomic<std::uint64_t>& destination,
                 std::uint64_t value) {
@@ -339,6 +378,19 @@ extern "C" void bf11_internal_set_mark_generation_limit(
       std::memory_order_relaxed);
 }
 
+extern "C" void bf11_internal_set_graph_capture_barrier(int participants) {
+#if defined(BF11_ENABLE_HIP_GRAPHS)
+  std::lock_guard<std::mutex> lock(g_bf11_graph_capture_barrier_mutex);
+  g_bf11_graph_capture_barrier_participants.store(
+      std::max(0, participants), std::memory_order_release);
+  g_bf11_graph_capture_barrier_arrived = 0;
+  ++g_bf11_graph_capture_barrier_generation;
+  g_bf11_graph_capture_barrier_condition.notify_all();
+#else
+  (void)participants;
+#endif
+}
+
 namespace rips_sssp_bf11 {
 
 using Offset = minplus_sparse::Offset;
@@ -357,6 +409,8 @@ static_assert(sizeof(float) == 4 && sizeof(unsigned int) == 4 &&
               "BF11 packed distance ordering requires IEEE-754 float32");
 static_assert(sizeof(unsigned long long) == 2 * sizeof(unsigned int),
               "BF11 packed predecessor state requires a 64-bit CAS word");
+static_assert(alignof(unsigned long long) >= 8,
+              "BF11 packed state requires naturally aligned 64-bit atomics");
 
 struct DeviceGraph {
   Offset rows = 0;
@@ -569,13 +623,30 @@ struct DeviceWorkspace {
   TelemetryEventPair target_prefix_events;
   TelemetryEventPair reconstruction_events;
   TelemetryEventPair output_transfer_events;
+  // Once graph setup/replay is known unavailable, every later segment in this
+  // workspace goes direct. Keep this outside the compile guard so a graph-on
+  // request in a graph-disabled binary also records only one sticky fallback.
+  bool graph_disabled = false;
 #if defined(BF11_ENABLE_HIP_GRAPHS)
+  enum class GraphFailureInjection {
+    kNone,
+    kBeginCapture,
+    kCapturedEnqueue,
+    kEndCapture,
+    kInstantiate,
+    kLaunch,
+    // Launch the real cached graph successfully, then exercise the same
+    // quiesce + whole-query restart path used for a non-atomic launch error.
+    // This is a target-only recovery hook, not an emulated HIP failure.
+    kLaunchAfterSubmit,
+  };
   hipGraph_t segment_graph = nullptr;
   hipGraphExec_t segment_graph_exec = nullptr;
   int graph_segment_rounds = 0;
   int graph_cost_mode = -1;
   BellmanFord11BoundingBox graph_bounds{};
-  bool graph_disabled = false;
+  GraphFailureInjection graph_failure_injection =
+      GraphFailureInjection::kNone;
 #endif
 };
 
@@ -898,6 +969,11 @@ __host__ __device__ __forceinline__ unsigned long long pack_state(
 __host__ __device__ __forceinline__ unsigned int state_distance_bits(
     unsigned long long state) {
   return static_cast<unsigned int>(state >> 32);
+}
+
+__host__ __device__ __forceinline__ DeviceOffset state_predecessor_edge(
+    unsigned long long state) {
+  return static_cast<DeviceOffset>(state);
 }
 
 __device__ __forceinline__ float state_distance(unsigned long long state) {
@@ -1719,7 +1795,7 @@ __global__ void summarize_target_paths_kernel(
   unsigned long long edge_count = 0;
   for (Offset guard = 0; guard <= rows; ++guard) {
     const unsigned long long state = best_state[current];
-    const DeviceOffset edge = static_cast<DeviceOffset>(state);
+    const DeviceOffset edge = state_predecessor_edge(state);
     if (edge == kNoPredecessor) {
       // Sources are initialized to (distance=0,no predecessor). With frozen
       // nonnegative costs and strict-only relaxation, no source can ever
@@ -1838,8 +1914,7 @@ __global__ void materialize_target_paths_kernel(
   compact_nodes[node_base + summary.edge_count] = current;
   for (unsigned long long remaining = summary.edge_count; remaining > 0;
        --remaining) {
-    const DeviceOffset edge =
-        static_cast<DeviceOffset>(best_state[current]);
+    const DeviceOffset edge = state_predecessor_edge(best_state[current]);
     if (edge == kNoPredecessor || static_cast<Offset>(edge) >= nnz ||
         to[edge] != current) {
       return;
@@ -2052,6 +2127,31 @@ DeviceWorkspace make_workspace(Offset rows,
   workspace.rows = rows;
   workspace.stream = stream;
   workspace.telemetry_enabled = telemetry_enabled;
+#if defined(BF11_ENABLE_HIP_GRAPHS)
+  const char* graph_failure =
+      std::getenv("BF11_TEST_HIP_GRAPH_FAILURE_STAGE");
+  if (graph_failure != nullptr && graph_failure[0] != '\0' &&
+      std::strcmp(graph_failure, "none") != 0) {
+    using Injection = DeviceWorkspace::GraphFailureInjection;
+    if (std::strcmp(graph_failure, "begin") == 0) {
+      workspace.graph_failure_injection = Injection::kBeginCapture;
+    } else if (std::strcmp(graph_failure, "enqueue") == 0) {
+      workspace.graph_failure_injection = Injection::kCapturedEnqueue;
+    } else if (std::strcmp(graph_failure, "end") == 0) {
+      workspace.graph_failure_injection = Injection::kEndCapture;
+    } else if (std::strcmp(graph_failure, "instantiate") == 0) {
+      workspace.graph_failure_injection = Injection::kInstantiate;
+    } else if (std::strcmp(graph_failure, "launch") == 0) {
+      workspace.graph_failure_injection = Injection::kLaunch;
+    } else if (std::strcmp(graph_failure, "launch-after-submit") == 0) {
+      workspace.graph_failure_injection = Injection::kLaunchAfterSubmit;
+    } else {
+      throw std::invalid_argument(
+          "BF11_TEST_HIP_GRAPH_FAILURE_STAGE must be begin, enqueue, end, "
+          "instantiate, launch, launch-after-submit, or none");
+    }
+  }
+#endif
   try {
     const std::size_t count = static_cast<std::size_t>(rows);
     workspace.best_state = device_allocate<unsigned long long>(
@@ -2257,17 +2357,29 @@ Offset geometric_capacity(Offset current, Offset required, Offset limit) {
   return result;
 }
 
-void invalidate_segment_graph(DeviceWorkspace& workspace) noexcept {
+void invalidate_segment_graph(DeviceWorkspace& workspace) {
 #if defined(BF11_ENABLE_HIP_GRAPHS)
-  if (workspace.segment_graph_exec) {
-    (void)hipGraphExecDestroy(workspace.segment_graph_exec);
-  }
-  if (workspace.segment_graph) (void)hipGraphDestroy(workspace.segment_graph);
+  const hipGraphExec_t executable = workspace.segment_graph_exec;
+  const hipGraph_t graph = workspace.segment_graph;
   workspace.segment_graph_exec = nullptr;
   workspace.segment_graph = nullptr;
   workspace.graph_segment_rounds = 0;
   workspace.graph_cost_mode = -1;
   workspace.graph_bounds = {};
+
+  // Attempt both releases exactly once even if the first reports an error.
+  // A cleanup error is not a recoverable graph-capability failure: surface it
+  // instead of silently losing the only handle and continuing direct.
+  hipError_t first_error = hipSuccess;
+  if (executable != nullptr) {
+    const hipError_t status = hipGraphExecDestroy(executable);
+    if (status != hipSuccess) first_error = status;
+  }
+  if (graph != nullptr) {
+    const hipError_t status = hipGraphDestroy(graph);
+    if (status != hipSuccess && first_error == hipSuccess) first_error = status;
+  }
+  check_hip(first_error, "destroy cached BF11 HIP Graph resources");
 #else
   (void)workspace;
 #endif
@@ -2319,7 +2431,13 @@ void ensure_target_capacity(DeviceWorkspace& workspace, Offset required) {
     if (host_replacement) (void)hipHostFree(host_replacement);
     throw;
   }
-  invalidate_segment_graph(workspace);
+  try {
+    invalidate_segment_graph(workspace);
+  } catch (...) {
+    if (replacement) (void)hipFree(replacement);
+    if (host_replacement) (void)hipHostFree(host_replacement);
+    throw;
+  }
   if (workspace.target_nodes) (void)hipFree(workspace.target_nodes);
   if (workspace.host_target_nodes) (void)hipHostFree(workspace.host_target_nodes);
   workspace.target_nodes = replacement;
@@ -2634,14 +2752,23 @@ void prepare_query_controller(const DeviceGraph& graph,
   end_telemetry_event(workspace, workspace.reset_seed_events);
 }
 
+struct SegmentEnqueueResult {
+  hipError_t status = hipSuccess;
+  const char* operation = nullptr;
+};
+
 template <DeviceCostMode CostMode, bool CollectTelemetry>
-void enqueue_one_segment_round(const DeviceGraph& graph,
-                               DeviceWorkspace& workspace,
-                               const BellmanFord11RunOptions& options) {
+SegmentEnqueueResult try_enqueue_one_segment_round(
+    const DeviceGraph& graph,
+    DeviceWorkspace& workspace,
+    const BellmanFord11RunOptions& options) {
   hipLaunchKernelGGL((begin_segment_round_kernel<CollectTelemetry>), dim3(1),
                      dim3(1), 0, workspace.stream, workspace.controller,
                      workspace.telemetry_counters);
-  check_hip(hipGetLastError(), "begin BF11 segmented round");
+  hipError_t status = hipGetLastError();
+  if (status != hipSuccess) {
+    return {status, "begin BF11 segmented round"};
+  }
   hipLaunchKernelGGL(
       (segmented_frontier_relax_kernel<CostMode, CollectTelemetry>),
       segmented_controller_grid(graph.rows), dim3(kBlockSize), 0,
@@ -2649,18 +2776,74 @@ void enqueue_one_segment_round(const DeviceGraph& graph,
       workspace.best_state, workspace.frontier, workspace.next_frontier,
       workspace.next_marks, workspace.touched_nodes, workspace.touched_count,
       workspace.controller, workspace.telemetry_counters);
-  check_hip(hipGetLastError(), "launch BF11 segmented relaxation");
+  status = hipGetLastError();
+  if (status != hipSuccess) {
+    return {status, "launch BF11 segmented relaxation"};
+  }
   hipLaunchKernelGGL(
       (update_target_status_kernel<CollectTelemetry>),
       segmented_controller_grid(graph.rows),
       dim3(kBlockSize), 0, workspace.stream, workspace.best_state,
       workspace.target_nodes, workspace.controller,
       workspace.telemetry_counters);
-  check_hip(hipGetLastError(), "launch BF11 segmented target check");
+  status = hipGetLastError();
+  if (status != hipSuccess) {
+    return {status, "launch BF11 segmented target check"};
+  }
   hipLaunchKernelGGL((finalize_segment_round_kernel<CollectTelemetry>),
                      dim3(1), dim3(1), 0, workspace.stream,
                      workspace.controller, workspace.telemetry_counters);
-  check_hip(hipGetLastError(), "finalize BF11 segmented round");
+  status = hipGetLastError();
+  return {status, status == hipSuccess ? nullptr
+                                      : "finalize BF11 segmented round"};
+}
+
+SegmentEnqueueResult try_enqueue_direct_segment(
+    const DeviceGraph& graph,
+    DeviceWorkspace& workspace,
+    const BellmanFord11RunOptions& options,
+    int segment_rounds,
+    DeviceCostMode cost_mode) {
+  for (int round = 0; round < segment_rounds; ++round) {
+    SegmentEnqueueResult result;
+    if (workspace.telemetry_enabled) {
+      switch (cost_mode) {
+        case DeviceCostMode::kConstantOne:
+          result = try_enqueue_one_segment_round<
+              DeviceCostMode::kConstantOne, true>(graph, workspace, options);
+          break;
+        case DeviceCostMode::kStatic:
+          result = try_enqueue_one_segment_round<DeviceCostMode::kStatic,
+                                                  true>(
+              graph, workspace, options);
+          break;
+        case DeviceCostMode::kDynamic:
+          result = try_enqueue_one_segment_round<DeviceCostMode::kDynamic,
+                                                  true>(
+              graph, workspace, options);
+          break;
+      }
+    } else {
+      switch (cost_mode) {
+        case DeviceCostMode::kConstantOne:
+          result = try_enqueue_one_segment_round<
+              DeviceCostMode::kConstantOne, false>(graph, workspace, options);
+          break;
+        case DeviceCostMode::kStatic:
+          result = try_enqueue_one_segment_round<DeviceCostMode::kStatic,
+                                                  false>(
+              graph, workspace, options);
+          break;
+        case DeviceCostMode::kDynamic:
+          result = try_enqueue_one_segment_round<DeviceCostMode::kDynamic,
+                                                  false>(
+              graph, workspace, options);
+          break;
+      }
+    }
+    if (result.status != hipSuccess) return result;
+  }
+  return {};
 }
 
 void enqueue_direct_segment(const DeviceGraph& graph,
@@ -2668,126 +2851,300 @@ void enqueue_direct_segment(const DeviceGraph& graph,
                             const BellmanFord11RunOptions& options,
                             int segment_rounds,
                             DeviceCostMode cost_mode) {
-  for (int round = 0; round < segment_rounds; ++round) {
-    if (workspace.telemetry_enabled) {
-      switch (cost_mode) {
-        case DeviceCostMode::kConstantOne:
-          enqueue_one_segment_round<DeviceCostMode::kConstantOne, true>(
-              graph, workspace, options);
-          break;
-        case DeviceCostMode::kStatic:
-          enqueue_one_segment_round<DeviceCostMode::kStatic, true>(
-              graph, workspace, options);
-          break;
-        case DeviceCostMode::kDynamic:
-          enqueue_one_segment_round<DeviceCostMode::kDynamic, true>(
-              graph, workspace, options);
-          break;
-      }
-    } else {
-      switch (cost_mode) {
-        case DeviceCostMode::kConstantOne:
-          enqueue_one_segment_round<DeviceCostMode::kConstantOne, false>(
-              graph, workspace, options);
-          break;
-        case DeviceCostMode::kStatic:
-          enqueue_one_segment_round<DeviceCostMode::kStatic, false>(
-              graph, workspace, options);
-          break;
-        case DeviceCostMode::kDynamic:
-          enqueue_one_segment_round<DeviceCostMode::kDynamic, false>(
-              graph, workspace, options);
-          break;
-      }
-    }
+  const SegmentEnqueueResult result = try_enqueue_direct_segment(
+      graph, workspace, options, segment_rounds, cost_mode);
+  if (result.status != hipSuccess) {
+    check_hip(result.status, result.operation);
   }
 }
 
-bool enqueue_graph_segment(const DeviceGraph& graph,
-                           DeviceWorkspace& workspace,
-                           const BellmanFord11RunOptions& options,
-                           int segment_rounds,
-                           DeviceCostMode cost_mode,
-                           BellmanFord11HipGraphMode graph_mode) {
+#if defined(BF11_ENABLE_HIP_GRAPHS)
+class HipGraphSegmentBackend {
+ public:
+  using Graph = hipGraph_t;
+  using Executable = hipGraphExec_t;
+
+  HipGraphSegmentBackend(const DeviceGraph& graph,
+                         DeviceWorkspace& workspace,
+                         const BellmanFord11RunOptions& options,
+                         int segment_rounds,
+                         DeviceCostMode cost_mode)
+      : graph_(graph),
+        workspace_(workspace),
+        options_(options),
+        segment_rounds_(segment_rounds),
+        cost_mode_(cost_mode) {}
+
+  bool disabled() const { return workspace_.graph_disabled; }
+  bool has_cached_executable() const {
+    return workspace_.segment_graph_exec != nullptr;
+  }
+  Graph null_graph() const { return nullptr; }
+  Executable null_executable() const { return nullptr; }
+  bool valid_graph(Graph graph) const { return graph != nullptr; }
+  bool valid_executable(Executable executable) const {
+    return executable != nullptr;
+  }
+
+  bool begin_capture() {
+    // A stale error predating capture is not a recoverable Graph failure. It
+    // must be surfaced before the fallback path is allowed to consume only
+    // the status produced by a Graph API operation.
+    check_hip(hipPeekAtLastError(),
+              "check BF11 HIP Graph capture precondition");
+    if (injected(DeviceWorkspace::GraphFailureInjection::kBeginCapture)) {
+      return false;
+    }
+    const hipError_t status = hipStreamBeginCapture(
+        workspace_.stream, hipStreamCaptureModeThreadLocal);
+    // The production fast path is a no-op. The AMD regression holds every
+    // successfully begun capture here until all configured workspaces have
+    // called BeginCapture, guaranteeing overlap at first use.
+    wait_for_bf11_graph_capture_barrier();
+    if (status != hipSuccess) {
+      record_explicit_failure(status);
+      (void)verify_not_capturing();
+    }
+    return status == hipSuccess;
+  }
+
+  bool enqueue_captured_segment() {
+    if (injected(DeviceWorkspace::GraphFailureInjection::kCapturedEnqueue)) {
+      // Force the runtime's real active-capture invalidation path. A
+      // synchronous stream wait is prohibited during non-relaxed capture;
+      // EndCapture below must still terminate the invalidated capture before
+      // direct fallback uses the stream.
+      const hipError_t status = synchronize_graph_stream();
+      if (status != hipSuccess) record_explicit_failure(status);
+      return false;
+    }
+    const SegmentEnqueueResult result = try_enqueue_direct_segment(
+        graph_, workspace_, options_, segment_rounds_, cost_mode_);
+    // Kernel launch status is obtained through hipGetLastError above, so it
+    // has already been consumed and must not be cleared a second time here.
+    // Only capture-specific launch statuses are safe graph fallbacks. A bad
+    // kernel configuration, invalid device function, or device-side fault
+    // would also fail on the direct path and must remain fatal.
+    if (result.status != hipSuccess &&
+        !is_recoverable_capture_enqueue_error(result.status)) {
+      record_consumed_unrecoverable_failure(result.status);
+    }
+    return result.status == hipSuccess;
+  }
+
+  bool end_capture(Graph* captured) {
+    const hipError_t status = hipStreamEndCapture(workspace_.stream, captured);
+    if (status != hipSuccess) record_explicit_failure(status);
+    const bool capture_terminated = verify_not_capturing();
+    return capture_terminated && status == hipSuccess &&
+           !injected(DeviceWorkspace::GraphFailureInjection::kEndCapture);
+  }
+
+  bool instantiate(Executable* executable, Graph graph) {
+    const hipError_t status =
+        hipGraphInstantiate(executable, graph, nullptr, nullptr, 0);
+    if (status != hipSuccess) record_explicit_failure(status);
+    return status == hipSuccess &&
+           !injected(DeviceWorkspace::GraphFailureInjection::kInstantiate);
+  }
+
+  void adopt(Graph graph, Executable executable) {
+    workspace_.segment_graph = graph;
+    workspace_.segment_graph_exec = executable;
+    workspace_.graph_segment_rounds = segment_rounds_;
+    workspace_.graph_cost_mode = static_cast<int>(cost_mode_);
+    workspace_.graph_bounds = options_.bounds;
+  }
+
+  bool launch_cached() {
+    if (injected(DeviceWorkspace::GraphFailureInjection::kLaunch)) {
+      real_launch_attempted_ = false;
+      return false;
+    }
+    const hipError_t preflight = hipPeekAtLastError();
+    if (preflight != hipSuccess) {
+      real_launch_attempted_ = false;
+      record_unrecoverable_failure(preflight);
+      return false;
+    }
+    real_launch_attempted_ = true;
+    const hipError_t status =
+        hipGraphLaunch(workspace_.segment_graph_exec, workspace_.stream);
+    if (status != hipSuccess) record_explicit_failure(status);
+    return status == hipSuccess &&
+           !injected(
+               DeviceWorkspace::GraphFailureInjection::kLaunchAfterSubmit);
+  }
+
+  bool launch_failure_requires_restart() const {
+    return real_launch_attempted_;
+  }
+
+  void prepare_launch_failure() {
+    if (!real_launch_attempted_) return;
+    const hipError_t status = synchronize_graph_stream();
+    if (status != hipSuccess) record_unrecoverable_failure(status);
+  }
+
+  void destroy_graph(Graph graph) {
+    if (graph == nullptr) return;
+    const hipError_t status = hipGraphDestroy(graph);
+    if (status != hipSuccess) record_unrecoverable_failure(status);
+  }
+
+  void destroy_executable(Executable executable) {
+    if (executable == nullptr) return;
+    const hipError_t status = hipGraphExecDestroy(executable);
+    if (status != hipSuccess) record_unrecoverable_failure(status);
+  }
+
+  void invalidate_cached() {
+    const Executable executable = workspace_.segment_graph_exec;
+    const Graph graph = workspace_.segment_graph;
+    workspace_.segment_graph_exec = nullptr;
+    workspace_.segment_graph = nullptr;
+    workspace_.graph_segment_rounds = 0;
+    workspace_.graph_cost_mode = -1;
+    workspace_.graph_bounds = {};
+    destroy_executable(executable);
+    destroy_graph(graph);
+  }
+
+  void disable(bf11_graph_execution_policy::FailureStage) {
+    workspace_.graph_disabled = true;
+    if (workspace_.telemetry_enabled) {
+      g_bf11_graph_fallbacks.fetch_add(1, std::memory_order_relaxed);
+    }
+  }
+
+  void finish_failure() {
+    const hipError_t unexpected = unexpected_error_;
+    unexpected_error_ = hipSuccess;
+    if (capture_not_terminated_) {
+      capture_not_terminated_ = false;
+      throw std::runtime_error(
+          "BF11 HIP Graph capture did not return the stream to non-capturing "
+          "state");
+    }
+    if (unexpected != hipSuccess) {
+      check_hip(unexpected,
+                "BF11 HIP Graph fallback observed an unrelated HIP error");
+    }
+  }
+
+ private:
+  hipError_t synchronize_graph_stream() {
+    const auto begin = std::chrono::steady_clock::now();
+    const hipError_t status = hipStreamSynchronize(workspace_.stream);
+    const auto end = std::chrono::steady_clock::now();
+    if (workspace_.telemetry_enabled) {
+      g_bf11_stream_synchronizations.fetch_add(1,
+                                                std::memory_order_relaxed);
+      g_bf11_stream_sync_cpu_nanoseconds.fetch_add(
+          static_cast<std::uint64_t>(
+              std::chrono::duration_cast<std::chrono::nanoseconds>(end - begin)
+                  .count()),
+          std::memory_order_relaxed);
+    }
+    return status;
+  }
+
+  static bool is_recoverable_capture_enqueue_error(hipError_t status) {
+    const int code = static_cast<int>(status);
+    return code >= static_cast<int>(hipErrorStreamCaptureUnsupported) &&
+           code <= static_cast<int>(hipErrorStreamCaptureWrongThread);
+  }
+
+  bool injected(DeviceWorkspace::GraphFailureInjection stage) const {
+    return workspace_.graph_failure_injection == stage;
+  }
+
+  bool verify_not_capturing() {
+    hipStreamCaptureStatus capture_status = hipStreamCaptureStatusNone;
+    const hipError_t query_status =
+        hipStreamIsCapturing(workspace_.stream, &capture_status);
+    if (query_status != hipSuccess) {
+      record_unrecoverable_failure(query_status);
+      return false;
+    }
+    if (capture_status != hipStreamCaptureStatusNone) {
+      capture_not_terminated_ = true;
+      return false;
+    }
+    return true;
+  }
+
+  void record_explicit_failure(hipError_t expected) {
+    // Explicit HIP API calls return their own status, but some runtimes also
+    // leave it as the thread's last error. Consume that exact duplicate so a
+    // direct kernel launch cannot inherit it. Preserve correctness by saving
+    // any different (for example asynchronous) error for finish_failure().
+    const hipError_t observed = hipGetLastError();
+    if (observed != hipSuccess && observed != expected &&
+        unexpected_error_ == hipSuccess) {
+      unexpected_error_ = observed;
+    }
+  }
+
+  void record_unrecoverable_failure(hipError_t status) {
+    const hipError_t observed = hipGetLastError();
+    if (unexpected_error_ == hipSuccess) {
+      unexpected_error_ =
+          observed != hipSuccess && observed != status ? observed : status;
+    }
+  }
+
+  void record_consumed_unrecoverable_failure(hipError_t status) {
+    if (unexpected_error_ == hipSuccess) unexpected_error_ = status;
+  }
+
+  const DeviceGraph& graph_;
+  DeviceWorkspace& workspace_;
+  const BellmanFord11RunOptions& options_;
+  int segment_rounds_ = 1;
+  DeviceCostMode cost_mode_ = DeviceCostMode::kStatic;
+  hipError_t unexpected_error_ = hipSuccess;
+  bool capture_not_terminated_ = false;
+  bool real_launch_attempted_ = false;
+};
+#endif
+
+bf11_graph_execution_policy::AttemptResult enqueue_graph_segment(
+    const DeviceGraph& graph,
+    DeviceWorkspace& workspace,
+    const BellmanFord11RunOptions& options,
+    int segment_rounds,
+    DeviceCostMode cost_mode,
+    BellmanFord11HipGraphMode graph_mode) {
   if (segment_rounds <= 1 ||
       graph_mode == BellmanFord11HipGraphMode::kOff) {
-    return false;
+    return bf11_graph_execution_policy::AttemptResult::kDirectFallback;
+  }
+  if (workspace.graph_disabled) {
+    return bf11_graph_execution_policy::AttemptResult::kDirectFallback;
   }
 #if defined(BF11_ENABLE_HIP_GRAPHS)
-  if (workspace.graph_disabled) return false;
   if (workspace.segment_graph_exec &&
       (workspace.graph_segment_rounds != segment_rounds ||
        workspace.graph_cost_mode != static_cast<int>(cost_mode) ||
        !same_bounds(workspace.graph_bounds, options.bounds))) {
     invalidate_segment_graph(workspace);
   }
-  if (!workspace.segment_graph_exec) {
-    hipGraph_t captured = nullptr;
-    hipError_t status = hipStreamBeginCapture(
-        workspace.stream, hipStreamCaptureModeGlobal);
-    if (status == hipSuccess) {
-      try {
-        enqueue_direct_segment(graph, workspace, options, segment_rounds,
-                               cost_mode);
-        status = hipStreamEndCapture(workspace.stream, &captured);
-      } catch (...) {
-        (void)hipStreamEndCapture(workspace.stream, &captured);
-        if (captured) (void)hipGraphDestroy(captured);
-        workspace.graph_disabled = true;
-        if (workspace.telemetry_enabled) {
-          g_bf11_graph_fallbacks.fetch_add(1, std::memory_order_relaxed);
-        }
-        (void)hipGetLastError();
-        return false;
-      }
-    }
-    if (status != hipSuccess || !captured) {
-      if (captured) (void)hipGraphDestroy(captured);
-      workspace.graph_disabled = true;
-      if (workspace.telemetry_enabled) {
-        g_bf11_graph_fallbacks.fetch_add(1, std::memory_order_relaxed);
-      }
-      (void)hipGetLastError();
-      return false;
-    }
-    hipGraphExec_t executable = nullptr;
-    status = hipGraphInstantiate(&executable, captured, nullptr, nullptr, 0);
-    if (status != hipSuccess || !executable) {
-      (void)hipGraphDestroy(captured);
-      workspace.graph_disabled = true;
-      if (workspace.telemetry_enabled) {
-        g_bf11_graph_fallbacks.fetch_add(1, std::memory_order_relaxed);
-      }
-      (void)hipGetLastError();
-      return false;
-    }
-    workspace.segment_graph = captured;
-    workspace.segment_graph_exec = executable;
-    workspace.graph_segment_rounds = segment_rounds;
-    workspace.graph_cost_mode = static_cast<int>(cost_mode);
-    workspace.graph_bounds = options.bounds;
-  }
-  const hipError_t launch =
-      hipGraphLaunch(workspace.segment_graph_exec, workspace.stream);
-  if (launch == hipSuccess) return true;
-  invalidate_segment_graph(workspace);
-  workspace.graph_disabled = true;
-  if (workspace.telemetry_enabled) {
-    g_bf11_graph_fallbacks.fetch_add(1, std::memory_order_relaxed);
-  }
-  (void)hipGetLastError();
-  return false;
+  HipGraphSegmentBackend backend(graph, workspace, options, segment_rounds,
+                                 cost_mode);
+  return bf11_graph_execution_policy::try_launch(&backend);
 #else
   (void)graph;
   (void)workspace;
   (void)options;
   (void)cost_mode;
   if (graph_mode == BellmanFord11HipGraphMode::kOn) {
+    workspace.graph_disabled = true;
     if (workspace.telemetry_enabled) {
       g_bf11_graph_fallbacks.fetch_add(1, std::memory_order_relaxed);
     }
   }
-  return false;
+  return bf11_graph_execution_policy::AttemptResult::kDirectFallback;
 #endif
 }
 
@@ -2945,7 +3302,12 @@ SsspStatus run_gpu_controller(const DeviceGraph& graph,
           descriptor.all_targets_reached != 0};
 }
 
-SsspStatus run_segmented_controller(
+struct SegmentedControllerRunResult {
+  SsspStatus status{};
+  bool restart_query_direct = false;
+};
+
+SegmentedControllerRunResult run_segmented_controller(
     const DeviceGraph& graph,
     DeviceWorkspace& workspace,
     int max_iters,
@@ -2954,18 +3316,22 @@ SsspStatus run_segmented_controller(
     BellmanFord11HipGraphMode graph_mode,
     DeviceCostMode cost_mode) {
   PATHFINDER_PROFILE_RANGE("bf11.segmented_controller");
-  if (workspace.telemetry_enabled) {
-    g_bf11_controller_fallbacks.fetch_add(1, std::memory_order_relaxed);
-  }
   ControllerDescriptor descriptor{};
   if (max_iters == 0) {
     descriptor = copy_controller_to_host(
         workspace, "synchronize BF11 zero-round controller");
   } else {
     do {
-      const bool graph_launched = enqueue_graph_segment(
-          graph, workspace, options, segment_rounds, cost_mode, graph_mode);
-      if (graph_launched) {
+      const bf11_graph_execution_policy::AttemptResult graph_result =
+          enqueue_graph_segment(
+              graph, workspace, options, segment_rounds, cost_mode,
+              graph_mode);
+      if (graph_result ==
+          bf11_graph_execution_policy::AttemptResult::kRestartQueryDirect) {
+        return {{}, true};
+      }
+      if (graph_result ==
+          bf11_graph_execution_policy::AttemptResult::kGraphLaunched) {
         if (workspace.telemetry_enabled) {
           g_bf11_hip_graph_segments.fetch_add(1, std::memory_order_relaxed);
         }
@@ -2989,9 +3355,10 @@ SsspStatus run_segmented_controller(
   }
   record_controller_result(graph, descriptor, max_iters,
                            workspace.telemetry_enabled);
-  return {descriptor.iterations_used, descriptor.converged != 0,
-          descriptor.early_stopped != 0, descriptor.hit_max_iters != 0,
-          descriptor.all_targets_reached != 0};
+  return {{descriptor.iterations_used, descriptor.converged != 0,
+           descriptor.early_stopped != 0, descriptor.hit_max_iters != 0,
+           descriptor.all_targets_reached != 0},
+          false};
 }
 
 SsspStatus run_sssp(const DeviceGraph& graph,
@@ -3028,15 +3395,37 @@ SsspStatus run_sssp(const DeviceGraph& graph,
   const int blocks = retain_default_cooperative_path
                          ? cooperative_block_count(workspace)
                          : 0;
-  SsspStatus result =
-      blocks > 0 && max_iters != 0
-          ? run_gpu_controller(graph, workspace, max_iters, options, blocks,
-                               cost_mode)
-          : run_segmented_controller(
-                graph, workspace, max_iters, options,
-                workspace_options.segment_rounds,
-                workspace_options.hip_graph_mode, cost_mode);
-  return result;
+  if (blocks > 0 && max_iters != 0) {
+    return run_gpu_controller(graph, workspace, max_iters, options, blocks,
+                              cost_mode);
+  }
+  if (workspace.telemetry_enabled) {
+    // This is a per-query controller choice. A non-atomic graph-launch error
+    // can run the segmented loop twice after a full reset, but it remains one
+    // host-controller query.
+    g_bf11_controller_fallbacks.fetch_add(1, std::memory_order_relaxed);
+  }
+  SegmentedControllerRunResult segmented = run_segmented_controller(
+      graph, workspace, max_iters, options, workspace_options.segment_rounds,
+      workspace_options.hip_graph_mode, cost_mode);
+  if (!segmented.restart_query_direct) return segmented.status;
+
+  // hipGraphLaunch is not submission-atomic on every HIP runtime. The graph
+  // backend quiesced a possibly submitted prefix before requesting this
+  // restart. Reset/seed the complete query and use the now-sticky direct path;
+  // continuing from a partially executed segment could duplicate rounds.
+  prepare_query_controller(graph, workspace, source_count, target_count,
+                           max_iters, options,
+                           workspace_options.adaptive_reset_threshold,
+                           cost_mode);
+  segmented = run_segmented_controller(
+      graph, workspace, max_iters, options, workspace_options.segment_rounds,
+      workspace_options.hip_graph_mode, cost_mode);
+  if (segmented.restart_query_direct) {
+    throw std::runtime_error(
+        "BF11 HIP Graph direct restart unexpectedly requested another restart");
+  }
+  return segmented.status;
 }
 
 std::vector<int> deduplicate_nodes(const std::vector<int>& input,
