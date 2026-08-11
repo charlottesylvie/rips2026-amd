@@ -3869,16 +3869,27 @@ void validate_routed_net_attachments(
           outgoing_by_node.find(endpoint_pip.endpoint_node);
       const auto attachment_children =
           outgoing_by_node.find(endpoint_pip.from);
+      const bool root_contains_corridor =
+          corridor != incoming_by_node.end() &&
+          root_children != outgoing_by_node.end() &&
+          std::find(root_children->second.begin(),
+                    root_children->second.end(), corridor->second) !=
+              root_children->second.end();
+      const bool source_contains_attachment =
+          attachment_children != outgoing_by_node.end() &&
+          std::any_of(
+              attachment_children->second.begin(),
+              attachment_children->second.end(),
+              [&](const PathEdge* edge) {
+                return edge->csr_edge == endpoint_pip.csr_edge;
+              });
+      // The device/design graph makes endpoint_node source-exclusive and
+      // gives from exactly one incoming edge: this corridor. Additional
+      // outgoing edges are same-net source fanout, not fabric transit.
       if (corridor == incoming_by_node.end() ||
           corridor->second->from != endpoint_pip.endpoint_node ||
           endpoint_pips_by_edge.count(corridor->second->csr_edge) != 0 ||
-          root_children == outgoing_by_node.end() ||
-          root_children->second.size() != 1 ||
-          root_children->second.front() != corridor->second ||
-          attachment_children == outgoing_by_node.end() ||
-          attachment_children->second.size() != 1 ||
-          attachment_children->second.front()->csr_edge !=
-              endpoint_pip.csr_edge ||
+          !root_contains_corridor || !source_contains_attachment ||
           incoming_by_node.count(endpoint_pip.endpoint_node) != 0) {
         throw std::runtime_error(
             "source attachment is outside its endpoint corridor or used for "

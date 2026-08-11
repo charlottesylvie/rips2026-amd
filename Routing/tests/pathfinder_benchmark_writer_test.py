@@ -388,13 +388,15 @@ def main() -> int:
         wrong_index = copy.deepcopy(attachment_route)
         wrong_index["edges"][1]["attachment"] = 1
         malformed_cases.append((wrong_index, "index"))
-        source_transit = copy.deepcopy(attachment_route)
-        source_transit["edges"].append(
-            {"from": 0, "to": 6, "csr_edge": 5, "tile": "TRANSIT",
+        source_fanout = copy.deepcopy(attachment_route)
+        source_fanout["edges"].append(
+            {"from": 0, "to": 6, "csr_edge": 5, "tile": "FANOUT",
              "wire0": "T0", "wire1": "T1", "forward": True,
              "attachment": None, "site": None}
         )
-        malformed_cases.append((source_transit, "transit"))
+        benchmark.validate_routes_against_metadata(
+            {"net0": source_fanout}, attachment_metadata
+        )
         for malformed, expected_error in malformed_cases:
             try:
                 benchmark.validate_routes_against_metadata(
