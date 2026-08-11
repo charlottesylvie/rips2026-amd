@@ -200,10 +200,15 @@ void require_matching_results(const BellmanFordCsrResult& bf11,
   if (bf11.target_distances.size() != 1 ||
       delta.target_distances.size() != 1) {
     throw std::runtime_error("query " + std::to_string(query_index) +
-                             " did not return one target distance");
+                             " did not return one compact target distance");
   }
   const float left = bf11.target_distances.front();
   const float right = delta.target_distances.front();
+  if (bf11.target_reached != std::isfinite(left) ||
+      delta.target_reached != std::isfinite(right)) {
+    throw std::runtime_error("query " + std::to_string(query_index) +
+                             " has an inconsistent reachability field");
+  }
   if (std::isinf(left) || std::isinf(right)) {
     if (!(std::isinf(left) && std::isinf(right))) {
       throw std::runtime_error("query " + std::to_string(query_index) +
@@ -320,10 +325,12 @@ int main(int argc, char** argv) {
 
     for (int warmup = 0; warmup < warmups; ++warmup) {
       for (const Query& query : queries) {
-        (void)bf11.run(query.source, query.target, delta_value, -1,
-                       stream.get(), nullptr, nullptr);
-        (void)delta.run(query.source, query.target, delta_value, -1,
-                        stream.get(), nullptr, nullptr);
+        const std::vector<int> sources{query.source};
+        const std::vector<int> targets{query.target};
+        (void)bf11.run(sources, targets, delta_value, -1, stream.get(),
+                       nullptr, nullptr);
+        (void)delta.run(sources, targets, delta_value, -1, stream.get(),
+                        nullptr, nullptr);
       }
     }
 
@@ -342,6 +349,11 @@ int main(int argc, char** argv) {
       for (std::size_t query_index = 0; query_index < queries.size();
            ++query_index) {
         const Query query = queries[query_index];
+        // Build the common one-source/one-target request outside timing. The
+        // scalar overloads have intentionally different result shapes: Delta
+        // copies the full distance vector while BF11 uses compact targets.
+        const std::vector<int> sources{query.source};
+        const std::vector<int> targets{query.target};
         BellmanFordCsrResult bf11_result;
         DeltaSteppingCsrResult delta_result;
         Timing bf11_timing;
@@ -350,27 +362,27 @@ int main(int argc, char** argv) {
         // Alternate order to reduce systematic thermal/clock bias.
         if ((repetition + static_cast<int>(query_index)) % 2 == 0) {
           auto measured_bf11 = time_call(stream.get(), start, stop, [&] {
-            return bf11.run(query.source, query.target, delta_value, -1,
-                            stream.get(), nullptr, nullptr);
+            return bf11.run(sources, targets, delta_value, -1, stream.get(),
+                            nullptr, nullptr);
           });
           bf11_result = std::move(measured_bf11.first);
           bf11_timing = measured_bf11.second;
           auto measured_delta = time_call(stream.get(), start, stop, [&] {
-            return delta.run(query.source, query.target, delta_value, -1,
-                             stream.get(), nullptr, nullptr);
+            return delta.run(sources, targets, delta_value, -1, stream.get(),
+                             nullptr, nullptr);
           });
           delta_result = std::move(measured_delta.first);
           delta_timing = measured_delta.second;
         } else {
           auto measured_delta = time_call(stream.get(), start, stop, [&] {
-            return delta.run(query.source, query.target, delta_value, -1,
-                             stream.get(), nullptr, nullptr);
+            return delta.run(sources, targets, delta_value, -1, stream.get(),
+                             nullptr, nullptr);
           });
           delta_result = std::move(measured_delta.first);
           delta_timing = measured_delta.second;
           auto measured_bf11 = time_call(stream.get(), start, stop, [&] {
-            return bf11.run(query.source, query.target, delta_value, -1,
-                            stream.get(), nullptr, nullptr);
+            return bf11.run(sources, targets, delta_value, -1, stream.get(),
+                            nullptr, nullptr);
           });
           bf11_result = std::move(measured_bf11.first);
           bf11_timing = measured_bf11.second;
