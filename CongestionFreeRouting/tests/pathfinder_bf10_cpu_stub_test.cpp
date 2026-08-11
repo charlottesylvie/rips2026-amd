@@ -1575,9 +1575,9 @@ void test_endpoint_pip_route_output() {
           "unused authorized source attachment was emitted or rejected on a "
           "wholly conventional route");
 
-  routing::RoutingMetadata transit_branch_metadata = branched_metadata;
-  transit_branch_metadata.route_requests[0].sinks.insert(
-      transit_branch_metadata.route_requests[0].sinks.begin(),
+  routing::RoutingMetadata fanout_metadata = branched_metadata;
+  fanout_metadata.route_requests[0].sinks.insert(
+      fanout_metadata.route_requests[0].sinks.begin(),
       {2, 11, 12, routing::kNoIndex});
   routing::RoutedSink attachment_sink;
   attachment_sink.source = 0;
@@ -1586,27 +1586,27 @@ void test_endpoint_pip_route_output() {
   attachment_sink.reached = true;
   attachment_sink.nodes = {0, 1, 2};
   attachment_sink.edges = {{0, 1, 0, 1.0f}, {1, 2, 2, 1.0f}};
-  routing::RoutedNet transit_branch_net;
-  transit_branch_net.net_string = 0;
-  transit_branch_net.reached_all_sinks = true;
-  transit_branch_net.sinks = {attachment_sink, conventional_sink};
-  transit_branch_net.unique_nodes = {0, 1, 2, 3};
-  routing::PathfinderResult transit_branch_result;
-  transit_branch_result.routed = true;
-  transit_branch_result.all_sinks_reached = true;
-  transit_branch_result.nets.push_back(transit_branch_net);
+  routing::RoutedNet fanout_net;
+  fanout_net.net_string = 0;
+  fanout_net.reached_all_sinks = true;
+  fanout_net.sinks = {attachment_sink, conventional_sink};
+  fanout_net.unique_nodes = {0, 1, 2, 3};
+  routing::PathfinderResult fanout_result;
+  fanout_result.routed = true;
+  fanout_result.all_sinks_reached = true;
+  fanout_result.nets.push_back(fanout_net);
 
-  bool transit_branch_rejected = false;
-  try {
-    routing::write_routes_jsonl(output, branched_graph,
-                                transit_branch_metadata,
-                                transit_branch_result);
-  } catch (const std::exception&) {
-    transit_branch_rejected = true;
-  }
-  require(transit_branch_rejected,
-          "used source attachment was accepted with a second conventional "
-          "branch from its endpoint");
+  routing::write_routes_jsonl(
+      output, branched_graph, fanout_metadata, fanout_result);
+  std::ifstream fanout_route_file(output);
+  const std::string fanout_json(
+      (std::istreambuf_iterator<char>(fanout_route_file)),
+      std::istreambuf_iterator<char>());
+  require(fanout_json.find("\"attachment\":0") != std::string::npos &&
+              fanout_json.find("\"from\":0,\"to\":3") !=
+                  std::string::npos,
+          "source attachment fanout lost its attachment or conventional "
+          "endpoint branch");
 
   std::error_code ignored;
   std::filesystem::remove(output, ignored);

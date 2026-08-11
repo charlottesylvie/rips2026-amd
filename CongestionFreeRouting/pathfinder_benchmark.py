@@ -1262,10 +1262,8 @@ def validate_routes_against_metadata(
                         or route_int(corridor.get("from"), "edge.from")
                         != endpoint.endpoint_node
                         or corridor.get("attachment") is not None
-                        or len(root_children) != 1
-                        or root_children[0] is not corridor
-                        or len(children) != 1
-                        or children[0] is not attachment_edge
+                        or not any(child is corridor for child in root_children)
+                        or not any(child is attachment_edge for child in children)
                         or endpoint.endpoint_node in incoming
                     ):
                         raise ValueError(
