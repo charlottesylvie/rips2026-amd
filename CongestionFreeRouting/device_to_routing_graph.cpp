@@ -162,10 +162,18 @@ Options parse_options(int argc, char** argv) {
 }
 
 struct DevicePayload {
-  std::vector<capnp::word> words;
+  // Recent Cap'n Proto releases make capnp::word non-movable, so a growable
+  // std::vector<capnp::word> cannot resize. uint64_t provides the same checked
+  // word size/alignment while retaining the one-buffer streaming decode.
+  std::vector<std::uint64_t> words;
   std::size_t decoded_bytes = 0;
   std::uint64_t fingerprint = 1469598103934665603ULL;
 };
+
+static_assert(sizeof(std::uint64_t) == sizeof(capnp::word),
+              "Cap'n Proto words must be 64 bits");
+static_assert(alignof(std::uint64_t) >= alignof(capnp::word),
+              "uint64_t storage must satisfy Cap'n Proto alignment");
 
 // Read directly into Cap'n Proto-aligned storage. The old converter first
 // retained a byte vector and then copied the entire decompressed device into a
@@ -271,6 +279,15 @@ std::optional<std::pair<std::int32_t, std::int32_t>> parse_tile_xy(
 
 std::uint64_t pair_key(std::uint32_t first, std::uint32_t second) {
   return (static_cast<std::uint64_t>(first) << 32) | second;
+}
+
+std::uint32_t checked_pip_data_id(std::uint64_t id) {
+  if (id >= static_cast<std::uint64_t>(
+                std::numeric_limits<std::uint32_t>::max())) {
+    throw std::runtime_error(
+        "device graph PIP index exceeds the compact uint32 range");
+  }
+  return static_cast<std::uint32_t>(id);
 }
 
 std::uint64_t mix_key(std::uint64_t value) {
@@ -430,7 +447,10 @@ BuildResult build_device_routing_graph(const Options& options) {
       std::numeric_limits<std::uint64_t>::max();
   reader_options.nestingLimit = 1 << 20;
   capnp::FlatArrayMessageReader reader(
-      kj::arrayPtr(payload.words.data(), payload.words.size()), reader_options);
+      kj::arrayPtr(
+          reinterpret_cast<const capnp::word*>(payload.words.data()),
+          payload.words.size()),
+      reader_options);
   const auto device = reader.getRoot<DeviceResources::Device>();
   const auto device_strings = device.getStrList();
 
@@ -678,6 +698,12 @@ BuildResult build_device_routing_graph(const Options& options) {
     const auto found = pip_data_by_key.find(key);
     if (found != pip_data_by_key.end()) {
       return found->second;
+    }
+    if (graph.pip_data.size() >=
+        static_cast<std::size_t>(
+            std::numeric_limits<std::uint32_t>::max())) {
+      throw std::runtime_error(
+          "device graph PIP count would exceed UINT32_MAX");
     }
     const std::uint64_t index = graph.pip_data.size();
     graph.pip_data.push_back({wire0, wire1, forward});
@@ -1095,6 +1121,12 @@ BuildResult build_device_routing_graph(const Options& options) {
       // Attachment PipData records are intentionally not globally
       // deduplicated. Their unique index is the sparse identity carried from
       // this concrete site through final route reconstruction.
+      if (graph.pip_data.size() >=
+          static_cast<std::size_t>(
+              std::numeric_limits<std::uint32_t>::max())) {
+        throw std::runtime_error(
+            "device graph PIP count would exceed UINT32_MAX");
+      }
       candidate.pip_data_index = graph.pip_data.size();
       graph.pip_data.push_back(
           {pip_template.wire0, pip_template.wire1, true});
@@ -1314,13 +1346,20 @@ BuildResult build_device_routing_graph(const Options& options) {
     }
     result.entries[static_cast<std::size_t>(position)] =
         {to, static_cast<std::uint32_t>(ordinal),
-         EdgeAttr{tile_string, pip_data_index}};
+         EdgeAttr{checked_lookup_string_id(tile_string),
+                  checked_pip_data_id(pip_data_index)}};
   });
   release_storage(cursor);
   release_storage(row_counts);
 
   sort_and_deduplicate_static_csr(graph.rowptr, result.entries);
   graph.loaded_edges = result.entries.size();
+  if (graph.string_table.strings.size() >
+      static_cast<std::size_t>(
+          std::numeric_limits<std::uint32_t>::max())) {
+    throw std::runtime_error(
+        "device graph string count exceeds UINT32_MAX");
+  }
   release_storage(pip_data_by_key);
   release_storage(pip_templates);
 

@@ -1615,19 +1615,89 @@ using DeviceOffset = rips_sssp_bf10::DeviceOffset;
 constexpr char CSR_MAGIC[8] = {'R', 'I', 'P', 'S', 'C', 'S', 'R', '1'};
 constexpr char METADATA_MAGIC[8] = {'R', 'I', 'P', 'S', 'I', 'F', 'M', '1'};
 constexpr std::uint64_t MIN_CSR_VERSION = 1;
-constexpr std::uint64_t CURRENT_CSR_VERSION = 3;
 constexpr std::uint64_t ARTIFACT_PAIR_CSR_VERSION = 2;
 constexpr std::uint64_t ROUTING_SIDECAR_CSR_VERSION = 3;
+constexpr std::uint64_t IMPLICIT_UNIT_CSR_VERSION = 4;
+constexpr std::uint64_t CURRENT_CSR_VERSION = IMPLICIT_UNIT_CSR_VERSION;
 constexpr std::uint64_t MIN_METADATA_VERSION = 3;
-constexpr std::uint64_t CURRENT_METADATA_VERSION = 7;
 constexpr std::uint64_t NODE_PHYSICAL_METADATA_VERSION = 4;
 constexpr std::uint64_t ARTIFACT_PAIR_METADATA_VERSION = 5;
 constexpr std::uint64_t COMPACT_METADATA_VERSION = 6;
 constexpr std::uint64_t ENDPOINT_PIP_METADATA_VERSION = 7;
+constexpr std::uint64_t COMPACT_EDGE_PIP_METADATA_VERSION = 8;
+constexpr std::uint64_t CURRENT_METADATA_VERSION =
+    COMPACT_EDGE_PIP_METADATA_VERSION;
+static_assert(CURRENT_METADATA_VERSION == COMPACT_EDGE_PIP_METADATA_VERSION,
+              "current metadata version must name the v8 feature layout");
 constexpr std::uint64_t EXPECTED_OUTGOING_EDGE_ORIENTATION = 2;
 constexpr unsigned int kPackedNoPredEdge = 0xffffffffu;
 constexpr std::uint64_t kNoIndex = std::numeric_limits<std::uint64_t>::max();
 constexpr std::uint64_t kNoLogicalNetIndex = kNoIndex;
+
+constexpr bool csr_has_artifact_pair(std::uint64_t version) {
+  return version == ARTIFACT_PAIR_CSR_VERSION ||
+         version == ROUTING_SIDECAR_CSR_VERSION ||
+         version == IMPLICIT_UNIT_CSR_VERSION;
+}
+
+constexpr bool csr_has_routing_node_sidecars(std::uint64_t version) {
+  return version == ROUTING_SIDECAR_CSR_VERSION ||
+         version == IMPLICIT_UNIT_CSR_VERSION;
+}
+
+constexpr bool csr_has_explicit_values(std::uint64_t version) {
+  return version == MIN_CSR_VERSION ||
+         version == ARTIFACT_PAIR_CSR_VERSION ||
+         version == ROUTING_SIDECAR_CSR_VERSION;
+}
+
+constexpr bool csr_has_spatial_edge_shards(std::uint64_t version) {
+  return version == ROUTING_SIDECAR_CSR_VERSION;
+}
+
+constexpr bool csr_has_implicit_unit_values(std::uint64_t version) {
+  return version == IMPLICIT_UNIT_CSR_VERSION;
+}
+
+constexpr bool is_supported_metadata_version(std::uint64_t version) {
+  return version == MIN_METADATA_VERSION ||
+         version == NODE_PHYSICAL_METADATA_VERSION ||
+         version == ARTIFACT_PAIR_METADATA_VERSION ||
+         version == COMPACT_METADATA_VERSION ||
+         version == ENDPOINT_PIP_METADATA_VERSION ||
+         version == COMPACT_EDGE_PIP_METADATA_VERSION;
+}
+
+constexpr bool metadata_has_artifact_pair(std::uint64_t version) {
+  return version == ARTIFACT_PAIR_METADATA_VERSION ||
+         version == COMPACT_METADATA_VERSION ||
+         version == ENDPOINT_PIP_METADATA_VERSION ||
+         version == COMPACT_EDGE_PIP_METADATA_VERSION;
+}
+
+constexpr bool metadata_has_legacy_node_arrays(std::uint64_t version) {
+  return version == MIN_METADATA_VERSION ||
+         version == NODE_PHYSICAL_METADATA_VERSION ||
+         version == ARTIFACT_PAIR_METADATA_VERSION;
+}
+
+constexpr bool metadata_has_node_physical_arrays(std::uint64_t version) {
+  return version == NODE_PHYSICAL_METADATA_VERSION ||
+         version == ARTIFACT_PAIR_METADATA_VERSION;
+}
+
+constexpr bool metadata_has_endpoint_pips(std::uint64_t version) {
+  return version == ENDPOINT_PIP_METADATA_VERSION ||
+         version == COMPACT_EDGE_PIP_METADATA_VERSION;
+}
+
+constexpr bool metadata_has_compact_edge_pip_records(std::uint64_t version) {
+  return version == COMPACT_EDGE_PIP_METADATA_VERSION;
+}
+
+constexpr bool metadata_has_flat_logical_net_names(std::uint64_t version) {
+  return version == COMPACT_EDGE_PIP_METADATA_VERSION;
+}
 
 struct HostOutgoingCsrF32 {
   Offset rows = 0;
@@ -1783,6 +1853,21 @@ void skip_bytes(std::ifstream& in, std::uint64_t count, const char* name) {
   }
 }
 
+void require_end_of_file(std::ifstream& in, const char* name) {
+  const std::streampos current = in.tellg();
+  if (current == std::streampos(-1)) {
+    throw std::runtime_error(std::string("failed while locating ") + name);
+  }
+  in.seekg(0, std::ios::end);
+  const std::streampos end = in.tellg();
+  if (!in || end == std::streampos(-1) || current > end) {
+    throw std::runtime_error(std::string(name) + " is truncated");
+  }
+  if (current != end) {
+    throw std::runtime_error(std::string(name) + " contains trailing bytes");
+  }
+}
+
 // CPU helper. Inputs: binary stream. Output: one length-prefixed metadata string.
 // Purpose: keep net names for JSONL path records.
 std::string read_string(std::ifstream& in) {
@@ -1925,7 +2010,7 @@ HostOutgoingCsrF32 load_outgoing_csrbin(const std::filesystem::path& path) {
   const std::uint64_t orientation = read_u64(in, "outgoing CSR orientation");
   if (version < MIN_CSR_VERSION || version > CURRENT_CSR_VERSION) {
     throw std::runtime_error(
-        "unsupported RIPSCSR1 format version (expected version 1, 2, or 3)");
+        "unsupported RIPSCSR1 format version (expected version 1, 2, 3, or 4)");
   }
   if (orientation != EXPECTED_OUTGOING_EDGE_ORIENTATION) {
     throw std::runtime_error(
@@ -1934,7 +2019,7 @@ HostOutgoingCsrF32 load_outgoing_csrbin(const std::filesystem::path& path) {
 
   std::optional<routing::interchange::InterchangeArtifactPairId>
       artifact_pair_id;
-  if (version >= ARTIFACT_PAIR_CSR_VERSION) {
+  if (csr_has_artifact_pair(version)) {
     routing::interchange::InterchangeArtifactPairId id{
         read_u64(in, "outgoing CSR artifact pair id high"),
         read_u64(in, "outgoing CSR artifact pair id low")};
@@ -1964,7 +2049,7 @@ HostOutgoingCsrF32 load_outgoing_csrbin(const std::filesystem::path& path) {
   std::uint64_t spatial_height = 0;
   std::uint64_t spatial_offset_count = 0;
   std::uint64_t spatial_edge_id_count = 0;
-  if (version >= ROUTING_SIDECAR_CSR_VERSION) {
+  if (csr_has_routing_node_sidecars(version)) {
     route_end_x_count = read_u64(in, "outgoing CSR route-end X count");
     route_end_y_count = read_u64(in, "outgoing CSR route-end Y count");
     base_vertex_cost_count =
@@ -1995,14 +2080,26 @@ HostOutgoingCsrF32 load_outgoing_csrbin(const std::filesystem::path& path) {
     throw std::runtime_error(
         "outgoing CSR declared/loaded/nnz edge counts are inconsistent");
   }
-  if (rowptr_count != rows + 1 || colind_count != nnz ||
-      values_count != nnz) {
+  if (rowptr_count != rows + 1 || colind_count != nnz) {
     throw std::runtime_error(
-        "outgoing CSR rowptr/colind/values counts are inconsistent");
+        "outgoing CSR rowptr/colind counts are inconsistent");
   }
-  if (version >= ROUTING_SIDECAR_CSR_VERSION) {
+  if (csr_has_explicit_values(version) && values_count != nnz) {
+    throw std::runtime_error(
+        "outgoing CSR explicit values count is inconsistent");
+  }
+  if (csr_has_implicit_unit_values(version) && values_count != 0) {
+    throw std::runtime_error("outgoing CSR v4 values count must be zero");
+  }
+  if (csr_has_routing_node_sidecars(version)) {
     if (route_end_x_count != rows || route_end_y_count != rows ||
-        base_vertex_cost_count != rows || spatial_edge_id_count != nnz) {
+        base_vertex_cost_count != rows) {
+      throw std::runtime_error(
+          "outgoing CSR routing sidecar counts are inconsistent");
+    }
+  }
+  if (csr_has_spatial_edge_shards(version)) {
+    if (spatial_edge_id_count != nnz) {
       throw std::runtime_error(
           "outgoing CSR routing sidecar counts are inconsistent");
     }
@@ -2020,6 +2117,12 @@ HostOutgoingCsrF32 load_outgoing_csrbin(const std::filesystem::path& path) {
           "outgoing CSR spatial shard offset count is inconsistent");
     }
   }
+  if (csr_has_implicit_unit_values(version) &&
+      (spatial_width != 0 || spatial_height != 0 ||
+       spatial_offset_count != 0 || spatial_edge_id_count != 0)) {
+    throw std::runtime_error(
+        "outgoing CSR v4 spatial shard fields must be zero");
+  }
 
   HostOutgoingCsrF32 graph;
   graph.rows = static_cast<Offset>(rows);
@@ -2028,9 +2131,21 @@ HostOutgoingCsrF32 load_outgoing_csrbin(const std::filesystem::path& path) {
   graph.artifact_pair_id = artifact_pair_id;
   read_array(in, graph.rowptr, rowptr_count, "outgoing CSR rowptr");
   read_array(in, graph.to, colind_count, "outgoing CSR colind destinations");
-  read_array(in, graph.values, values_count, "outgoing CSR values");
+  if (csr_has_explicit_values(version)) {
+    read_array(in, graph.values, values_count, "outgoing CSR values");
+  } else {
+    const std::size_t implicit_value_count =
+        checked_size(nnz, "outgoing CSR implicit unit values");
+    (void)checked_byte_count(nnz, sizeof(float),
+                             "outgoing CSR implicit unit values");
+    if (implicit_value_count > graph.values.max_size()) {
+      throw std::runtime_error(
+          "outgoing CSR implicit unit values exceed vector capacity");
+    }
+    graph.values.assign(implicit_value_count, 1.0f);
+  }
 
-  if (version >= ROUTING_SIDECAR_CSR_VERSION) {
+  if (csr_has_routing_node_sidecars(version)) {
     skip_bytes(in,
                checked_byte_count(route_end_x_count, sizeof(std::int32_t),
                                   "outgoing CSR route-end X values"),
@@ -2043,16 +2158,20 @@ HostOutgoingCsrF32 load_outgoing_csrbin(const std::filesystem::path& path) {
                checked_byte_count(base_vertex_cost_count, sizeof(float),
                                   "outgoing CSR base vertex costs"),
                "outgoing CSR base vertex costs");
-    skip_bytes(in,
-               checked_byte_count(spatial_offset_count, sizeof(std::uint64_t),
-                                  "outgoing CSR spatial shard offsets"),
-               "outgoing CSR spatial shard offsets");
-    skip_bytes(in,
-               checked_byte_count(spatial_edge_id_count,
-                                  sizeof(std::uint32_t),
-                                  "outgoing CSR spatial shard edge IDs"),
-               "outgoing CSR spatial shard edge IDs");
+    if (csr_has_spatial_edge_shards(version)) {
+      skip_bytes(in,
+                 checked_byte_count(spatial_offset_count,
+                                    sizeof(std::uint64_t),
+                                    "outgoing CSR spatial shard offsets"),
+                 "outgoing CSR spatial shard offsets");
+      skip_bytes(in,
+                 checked_byte_count(spatial_edge_id_count,
+                                    sizeof(std::uint32_t),
+                                    "outgoing CSR spatial shard edge IDs"),
+                 "outgoing CSR spatial shard edge IDs");
+    }
   }
+  require_end_of_file(in, "outgoing CSR payload");
 
   if (graph.rowptr.front() != 0 || graph.rowptr.back() != graph.nnz) {
     throw std::runtime_error(
@@ -2257,9 +2376,9 @@ RoutingMetadata load_routing_metadata(const std::filesystem::path& path,
 
   const std::uint64_t version = read_u64(in, "metadata format version");
   const std::uint64_t orientation = read_u64(in, "metadata orientation");
-  if (version < MIN_METADATA_VERSION || version > CURRENT_METADATA_VERSION) {
+  if (!is_supported_metadata_version(version)) {
     throw std::runtime_error(
-        "unsupported RIPSIFM1 metadata version (expected version 3, 4, 5, 6, or 7)");
+        "unsupported RIPSIFM1 metadata version (expected version 3, 4, 5, 6, 7, or 8); regenerate metadata with interchange_to_csr");
   }
   if (orientation != EXPECTED_OUTGOING_EDGE_ORIENTATION) {
     throw std::runtime_error(
@@ -2268,7 +2387,7 @@ RoutingMetadata load_routing_metadata(const std::filesystem::path& path,
 
   std::optional<routing::interchange::InterchangeArtifactPairId>
       artifact_pair_id;
-  if (version >= ARTIFACT_PAIR_METADATA_VERSION) {
+  if (metadata_has_artifact_pair(version)) {
     routing::interchange::InterchangeArtifactPairId id{
         read_u64(in, "metadata artifact pair id high"),
         read_u64(in, "metadata artifact pair id low")};
@@ -2288,7 +2407,7 @@ RoutingMetadata load_routing_metadata(const std::filesystem::path& path,
   }
   const std::uint64_t pip_data_count = read_u64(in, "metadata pip data count");
   const std::uint64_t endpoint_pip_count =
-      version >= ENDPOINT_PIP_METADATA_VERSION
+      metadata_has_endpoint_pips(version)
           ? read_u64(in, "metadata endpoint PIP count")
           : 0;
   const std::uint64_t site_pin_attr_count = read_u64(in, "metadata site pin attr count");
@@ -2303,6 +2422,19 @@ RoutingMetadata load_routing_metadata(const std::filesystem::path& path,
       read_u64(in, "metadata physical byte count");
   const std::uint64_t logical_netlist_byte_count =
       read_u64(in, "metadata logical byte count");
+  if (metadata_has_compact_edge_pip_records(version) &&
+      (string_count > std::numeric_limits<std::uint32_t>::max() ||
+       pip_data_count > std::numeric_limits<std::uint32_t>::max())) {
+    throw std::runtime_error(
+        "metadata v8 string/PIP counts exceed compact uint32 limits");
+  }
+  if (metadata_has_flat_logical_net_names(version) &&
+      (logical_cell_count != 0 || logical_port_instance_count != 0 ||
+       physical_netlist_byte_count != 0 ||
+       logical_netlist_byte_count != 0)) {
+    throw std::runtime_error(
+        "metadata v8 omitted logical summary/netlist counts must be zero");
+  }
 
   (void)read_u64(in, "metadata device path string");
   (void)read_u64(in, "metadata physical path string");
@@ -2318,12 +2450,12 @@ RoutingMetadata load_routing_metadata(const std::filesystem::path& path,
     metadata.strings.push_back(read_string(in));
   }
 
-  if (version < COMPACT_METADATA_VERSION) {
+  if (metadata_has_legacy_node_arrays(version)) {
     skip_bytes(in,
                checked_byte_count(node_count, sizeof(std::uint64_t),
                                   "metadata device node ids"),
                "metadata device node ids");
-    if (version >= NODE_PHYSICAL_METADATA_VERSION) {
+    if (metadata_has_node_physical_arrays(version)) {
       skip_bytes(in,
                  checked_byte_count(node_count, sizeof(std::int32_t),
                                     "metadata node min x coordinates"),
@@ -2350,11 +2482,21 @@ RoutingMetadata load_routing_metadata(const std::filesystem::path& path,
                  "metadata node wire type strings");
     }
   }
+  const std::uint64_t edge_attr_record_bytes =
+      metadata_has_compact_edge_pip_records(version)
+          ? 2 * sizeof(std::uint32_t)
+          : 2 * sizeof(std::uint64_t);
   skip_bytes(in,
-             checked_byte_count(edge_attr_count, 2 * sizeof(std::uint64_t), "metadata edge attrs"),
+             checked_byte_count(edge_attr_count, edge_attr_record_bytes,
+                                "metadata edge attrs"),
              "metadata edge attrs");
+  const std::uint64_t pip_data_record_bytes =
+      metadata_has_compact_edge_pip_records(version)
+          ? 3 * sizeof(std::uint32_t)
+          : 3 * sizeof(std::uint64_t);
   skip_bytes(in,
-             checked_byte_count(pip_data_count, 3 * sizeof(std::uint64_t), "metadata pip data"),
+             checked_byte_count(pip_data_count, pip_data_record_bytes,
+                                "metadata pip data"),
              "metadata pip data");
   skip_bytes(in,
              checked_byte_count(endpoint_pip_count,
@@ -2378,7 +2520,7 @@ RoutingMetadata load_routing_metadata(const std::filesystem::path& path,
       source.site_string = read_u64(in, "metadata source site");
       source.pin_string = read_u64(in, "metadata source pin");
       source.endpoint_pip_index =
-          version >= ENDPOINT_PIP_METADATA_VERSION
+          metadata_has_endpoint_pips(version)
               ? read_u64(in, "metadata source endpoint PIP index")
               : kNoIndex;
       if (source.endpoint_pip_index != kNoIndex &&
@@ -2395,7 +2537,7 @@ RoutingMetadata load_routing_metadata(const std::filesystem::path& path,
       sink.site_string = read_u64(in, "metadata sink site");
       sink.pin_string = read_u64(in, "metadata sink pin");
       sink.endpoint_pip_index =
-          version >= ENDPOINT_PIP_METADATA_VERSION
+          metadata_has_endpoint_pips(version)
               ? read_u64(in, "metadata sink endpoint PIP index")
               : kNoIndex;
       if (sink.endpoint_pip_index != kNoIndex &&
@@ -2406,21 +2548,59 @@ RoutingMetadata load_routing_metadata(const std::filesystem::path& path,
     }
   }
 
-  skip_bytes(in,
-             checked_byte_count(logical_cell_count,
-                                3 * sizeof(std::uint64_t),
-                                "metadata logical cells"),
-             "metadata logical cells");
-  skip_bytes(in,
-             checked_byte_count(logical_net_count,
-                                4 * sizeof(std::uint64_t),
-                                "metadata logical nets"),
-             "metadata logical nets");
-  skip_bytes(in,
-             checked_byte_count(logical_port_instance_count,
-                                7 * sizeof(std::uint64_t),
-                                "metadata logical port instances"),
-             "metadata logical port instances");
+  if (metadata_has_flat_logical_net_names(version)) {
+    (void)checked_byte_count(logical_net_count, sizeof(std::uint64_t),
+                             "metadata logical net name strings");
+    const std::size_t host_logical_net_count =
+        checked_size(logical_net_count, "metadata logical net name");
+    std::vector<std::uint64_t> logical_net_name_strings;
+    if (host_logical_net_count > logical_net_name_strings.max_size()) {
+      throw std::runtime_error(
+          "metadata logical net name count exceeds vector capacity");
+    }
+    logical_net_name_strings.resize(host_logical_net_count);
+    for (std::uint64_t& name_string : logical_net_name_strings) {
+      name_string = read_u64(in, "metadata logical net name string");
+      if (name_string >= metadata.strings.size()) {
+        throw std::runtime_error(
+            "metadata v8 logical net references an invalid string");
+      }
+    }
+    for (const RouteRequest& request : metadata.route_requests) {
+      if (request.net_string >= metadata.strings.size()) {
+        throw std::runtime_error(
+            "metadata v8 route request references an invalid net string");
+      }
+      if (request.logical_net_index == kNoLogicalNetIndex) {
+        continue;
+      }
+      if (request.logical_net_index >= logical_net_name_strings.size()) {
+        throw std::runtime_error(
+            "metadata v8 route request references an invalid logical net");
+      }
+      if (logical_net_name_strings[static_cast<std::size_t>(
+              request.logical_net_index)] != request.net_string) {
+        throw std::runtime_error(
+            "metadata v8 physical/logical net-name correlation mismatch");
+      }
+    }
+  } else {
+    skip_bytes(in,
+               checked_byte_count(logical_cell_count,
+                                  3 * sizeof(std::uint64_t),
+                                  "metadata logical cells"),
+               "metadata logical cells");
+    skip_bytes(in,
+               checked_byte_count(logical_net_count,
+                                  4 * sizeof(std::uint64_t),
+                                  "metadata logical nets"),
+               "metadata logical nets");
+    skip_bytes(in,
+               checked_byte_count(logical_port_instance_count,
+                                  7 * sizeof(std::uint64_t),
+                                  "metadata logical port instances"),
+               "metadata logical port instances");
+  }
   skip_bytes(in,
              checked_byte_count(blocked_node_count, sizeof(std::uint64_t), "metadata blocked nodes"),
              "metadata blocked nodes");
@@ -2431,6 +2611,7 @@ RoutingMetadata load_routing_metadata(const std::filesystem::path& path,
              "metadata sink stop nodes");
   skip_bytes(in, physical_netlist_byte_count, "metadata physical bytes");
   skip_bytes(in, logical_netlist_byte_count, "metadata logical bytes");
+  require_end_of_file(in, "metadata payload");
   return metadata;
 }
 

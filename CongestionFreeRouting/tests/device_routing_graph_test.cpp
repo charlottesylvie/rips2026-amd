@@ -8,6 +8,7 @@
 #include <fstream>
 #include <iostream>
 #include <iterator>
+#include <limits>
 #include <optional>
 #include <stdexcept>
 #include <string>
@@ -15,12 +16,26 @@
 
 namespace ri = routing::interchange;
 
+static_assert(sizeof(ri::EdgeAttr) == 2 * sizeof(std::uint32_t),
+              "devicegraph v7 EdgeAttr must remain compact");
+
 namespace {
 
 void require(bool condition, const std::string& message) {
   if (!condition) {
     throw std::runtime_error(message);
   }
+}
+
+template <typename Function>
+void require_throws(Function&& function, const std::string& message) {
+  bool threw = false;
+  try {
+    function();
+  } catch (const std::runtime_error&) {
+    threw = true;
+  }
+  require(threw, message);
 }
 
 bool reachable(const ri::CsrGraph& graph, std::int32_t source,
@@ -74,7 +89,6 @@ ri::CsrGraph reference_filter_with_separate_destination_masks(
     filtered.rowptr[row + 1] =
         static_cast<std::int64_t>(filtered.colind.size());
   }
-  filtered.values.assign(filtered.colind.size(), 1.0f);
   return filtered;
 }
 
@@ -82,7 +96,7 @@ bool same_csr(const ri::CsrGraph& lhs, const ri::CsrGraph& rhs) {
   if (lhs.rows != rhs.rows || lhs.cols != rhs.cols ||
       lhs.declared_edges != rhs.declared_edges ||
       lhs.loaded_edges != rhs.loaded_edges || lhs.rowptr != rhs.rowptr ||
-      lhs.colind != rhs.colind || lhs.values != rhs.values ||
+      lhs.colind != rhs.colind ||
       lhs.edge_attrs.size() != rhs.edge_attrs.size()) {
     return false;
   }
@@ -102,8 +116,10 @@ ri::DeviceRoutingGraph make_graph() {
   graph.device_fingerprint = 0x123456789abcdef0ULL;
   graph.device_path_string = graph.string_table.intern("fixture.device");
   graph.device_name_string = graph.string_table.intern("xcvu3p");
-  const std::uint64_t tile0 = graph.string_table.intern("TILE_X0Y0");
-  const std::uint64_t tile1 = graph.string_table.intern("TILE_X1Y0");
+  const std::uint32_t tile0 = ri::checked_lookup_string_id(
+      graph.string_table.intern("TILE_X0Y0"));
+  const std::uint32_t tile1 = ri::checked_lookup_string_id(
+      graph.string_table.intern("TILE_X1Y0"));
   const std::uint64_t wire0 = graph.string_table.intern("WIRE0");
   const std::uint64_t wire1 = graph.string_table.intern("WIRE1");
   const std::uint64_t site0 = graph.string_table.intern("SITE0");
@@ -163,16 +179,16 @@ ri::DeviceRoutingGraph make_attachment_graph() {
       graph.string_table.intern("attachment-fixture.device");
   graph.device_name_string = graph.string_table.intern("xcvu3p");
 
-  const std::uint64_t source_tile =
-      graph.string_table.intern("HPIO_L_X71Y30");
-  const std::uint64_t source_pseudo_tile =
-      graph.string_table.intern("XIPHY_BYTE_L_X72Y45");
-  const std::uint64_t fabric_tile =
-      graph.string_table.intern("INT_X72Y45");
-  const std::uint64_t sink_pseudo_tile =
-      graph.string_table.intern("XIPHY_BYTE_L_X72Y46");
-  const std::uint64_t sink_tile =
-      graph.string_table.intern("HPIO_L_X71Y31");
+  const std::uint32_t source_tile = ri::checked_lookup_string_id(
+      graph.string_table.intern("HPIO_L_X71Y30"));
+  const std::uint32_t source_pseudo_tile = ri::checked_lookup_string_id(
+      graph.string_table.intern("XIPHY_BYTE_L_X72Y45"));
+  const std::uint32_t fabric_tile = ri::checked_lookup_string_id(
+      graph.string_table.intern("INT_X72Y45"));
+  const std::uint32_t sink_pseudo_tile = ri::checked_lookup_string_id(
+      graph.string_table.intern("XIPHY_BYTE_L_X72Y46"));
+  const std::uint32_t sink_tile = ri::checked_lookup_string_id(
+      graph.string_table.intern("HPIO_L_X71Y31"));
 
   std::vector<std::uint64_t> wires;
   for (int index = 0; index < 6; ++index) {
@@ -483,32 +499,196 @@ void compare_graphs(const ri::DeviceRoutingGraph& expected,
   }
 }
 
-void write_legacy_v5_fixture(const std::filesystem::path& v6_path,
-                             const std::filesystem::path& v5_path) {
-  std::ifstream input(v6_path, std::ios::binary);
+std::size_t checked_fixture_add(std::size_t lhs,
+                                std::size_t rhs,
+                                const char* name) {
+  require(rhs <= std::numeric_limits<std::size_t>::max() - lhs,
+          std::string(name) + " size overflows");
+  return lhs + rhs;
+}
+
+std::size_t checked_fixture_multiply(std::size_t lhs,
+                                     std::size_t rhs,
+                                     const char* name) {
+  require(lhs == 0 || rhs <= std::numeric_limits<std::size_t>::max() / lhs,
+          std::string(name) + " size overflows");
+  return lhs * rhs;
+}
+
+struct DeviceGraphV7Offsets {
+  std::size_t edge_attrs_begin = 0;
+  std::size_t pip_data_begin = 0;
+  std::size_t static_suffix_begin = 0;
+};
+
+DeviceGraphV7Offsets device_graph_v7_offsets(
+    const ri::DeviceRoutingGraph& graph) {
+  constexpr std::size_t kMagicBytes = 8;
+  constexpr std::size_t kFixedHeaderBytes =
+      kMagicBytes + 17 * sizeof(std::uint64_t);
+  constexpr std::size_t kPhysicalNodeBytes =
+      3 * sizeof(std::uint64_t) + 4 * sizeof(std::int32_t);
+  constexpr std::size_t kRoutingSidecarBytes =
+      2 * sizeof(std::int32_t) + sizeof(float);
+
+  std::size_t offset = kFixedHeaderBytes;
+  for (const std::string& text : graph.string_table.strings) {
+    offset = checked_fixture_add(offset, sizeof(std::uint64_t),
+                                 "string table");
+    offset = checked_fixture_add(offset, text.size(), "string table");
+  }
+  const std::size_t node_count = graph.node_device_ids.size();
+  offset = checked_fixture_add(
+      offset,
+      checked_fixture_multiply(
+          node_count, kPhysicalNodeBytes + kRoutingSidecarBytes,
+          "node arrays"),
+      "node arrays");
+  offset = checked_fixture_add(
+      offset,
+      checked_fixture_multiply(node_count + 1, sizeof(std::int64_t),
+                               "row pointers"),
+      "row pointers");
+  offset = checked_fixture_add(
+      offset,
+      checked_fixture_multiply(graph.colind.size(), sizeof(std::int32_t),
+                               "columns"),
+      "columns");
+
+  DeviceGraphV7Offsets result;
+  result.edge_attrs_begin = offset;
+  result.pip_data_begin = checked_fixture_add(
+      result.edge_attrs_begin,
+      checked_fixture_multiply(graph.edge_attrs.size(),
+                               2 * sizeof(std::uint32_t),
+                               "compact edge attributes"),
+      "compact edge attributes");
+  result.static_suffix_begin = checked_fixture_add(
+      result.pip_data_begin,
+      checked_fixture_multiply(graph.pip_data.size(),
+                               3 * sizeof(std::uint32_t),
+                               "compact PIP data"),
+      "compact PIP data");
+  return result;
+}
+
+std::vector<char> read_fixture_bytes(const std::filesystem::path& path,
+                                     const char* name) {
+  std::ifstream input(path, std::ios::binary);
   std::vector<char> bytes((std::istreambuf_iterator<char>(input)),
                           std::istreambuf_iterator<char>());
   require(static_cast<bool>(input) || input.eof(),
-          "could not read the version-6 device-graph fixture");
+          std::string("could not read ") + name);
+  return bytes;
+}
+
+void write_fixture_bytes(const std::filesystem::path& path,
+                         const std::vector<char>& bytes,
+                         const char* name) {
+  std::ofstream output(path, std::ios::binary | std::ios::trunc);
+  output.write(bytes.data(), static_cast<std::streamsize>(bytes.size()));
+  require(static_cast<bool>(output),
+          std::string("could not write ") + name);
+}
+
+template <typename T>
+void overwrite_fixture_value(const std::filesystem::path& path,
+                             std::size_t offset,
+                             T value,
+                             const char* name) {
+  std::fstream file(path,
+                    std::ios::binary | std::ios::in | std::ios::out);
+  require(static_cast<bool>(file), std::string("could not open ") + name);
+  require(offset <= static_cast<std::size_t>(
+                        std::numeric_limits<std::streamoff>::max()),
+          std::string(name) + " offset exceeds streamoff");
+  file.seekp(static_cast<std::streamoff>(offset));
+  file.write(reinterpret_cast<const char*>(&value), sizeof(value));
+  file.close();
+  require(static_cast<bool>(file), std::string("could not modify ") + name);
+}
+
+void append_fixture_u64(std::vector<char>& bytes, std::uint64_t value) {
+  const std::size_t begin = bytes.size();
+  bytes.resize(checked_fixture_add(begin, sizeof(value), "fixture record"));
+  std::memcpy(bytes.data() + begin, &value, sizeof(value));
+}
+
+void write_legacy_v6_fixture(const std::filesystem::path& v7_path,
+                             const std::filesystem::path& v6_path,
+                             const ri::DeviceRoutingGraph& graph) {
+  const std::vector<char> compact =
+      read_fixture_bytes(v7_path, "version-7 device-graph fixture");
+  constexpr std::size_t kMagicBytes = 8;
+  const DeviceGraphV7Offsets offsets = device_graph_v7_offsets(graph);
+  require(offsets.static_suffix_begin <= compact.size(),
+          "version-7 fixture is truncated before its static suffix");
+
+  std::vector<char> legacy;
+  const std::size_t extra_edge_bytes = checked_fixture_multiply(
+      graph.edge_attrs.size(), 2 * sizeof(std::uint32_t),
+      "legacy edge expansion");
+  const std::size_t extra_pip_bytes = checked_fixture_multiply(
+      graph.pip_data.size(), 3 * sizeof(std::uint32_t),
+      "legacy PIP expansion");
+  legacy.reserve(checked_fixture_add(
+      compact.size(), checked_fixture_add(extra_edge_bytes, extra_pip_bytes,
+                                          "legacy record expansion"),
+      "legacy device graph"));
+  legacy.insert(legacy.end(), compact.begin(),
+                compact.begin() +
+                    static_cast<std::ptrdiff_t>(offsets.edge_attrs_begin));
+
+  for (std::size_t edge = 0; edge < graph.edge_attrs.size(); ++edge) {
+    const std::size_t record = offsets.edge_attrs_begin +
+                               edge * 2 * sizeof(std::uint32_t);
+    std::uint32_t tile = 0;
+    std::uint32_t pip = 0;
+    std::memcpy(&tile, compact.data() + record, sizeof(tile));
+    std::memcpy(&pip, compact.data() + record + sizeof(tile), sizeof(pip));
+    append_fixture_u64(legacy, tile);
+    append_fixture_u64(legacy, pip);
+  }
+  for (std::size_t index = 0; index < graph.pip_data.size(); ++index) {
+    const std::size_t record = offsets.pip_data_begin +
+                               index * 3 * sizeof(std::uint32_t);
+    for (std::size_t field = 0; field < 3; ++field) {
+      std::uint32_t value = 0;
+      std::memcpy(&value,
+                  compact.data() + record + field * sizeof(value),
+                  sizeof(value));
+      append_fixture_u64(legacy, value);
+    }
+  }
+  legacy.insert(
+      legacy.end(),
+      compact.begin() +
+          static_cast<std::ptrdiff_t>(offsets.static_suffix_begin),
+      compact.end());
+  require(legacy.size() >= kMagicBytes + sizeof(std::uint64_t),
+          "expanded version-6 fixture is too short");
+  const std::uint64_t version = 6;
+  std::memcpy(legacy.data() + kMagicBytes, &version, sizeof(version));
+  write_fixture_bytes(v6_path, legacy, "legacy version-6 fixture");
+}
+
+void write_legacy_v5_fixture(const std::filesystem::path& v6_path,
+                             const std::filesystem::path& v5_path) {
+  std::vector<char> bytes =
+      read_fixture_bytes(v6_path, "version-6 device-graph fixture");
   constexpr std::size_t kMagicBytes = 8;
   require(bytes.size() >= kMagicBytes + sizeof(std::uint64_t),
           "version-6 fixture is too short");
   const std::uint64_t legacy_version = 5;
   std::memcpy(bytes.data() + kMagicBytes, &legacy_version,
               sizeof(legacy_version));
-  std::ofstream output(v5_path, std::ios::binary | std::ios::trunc);
-  output.write(bytes.data(), static_cast<std::streamsize>(bytes.size()));
-  require(static_cast<bool>(output),
-          "could not write the legacy version-5 fixture");
+  write_fixture_bytes(v5_path, bytes, "legacy version-5 fixture");
 }
 
 void write_legacy_v4_fixture(const std::filesystem::path& v6_path,
                              const std::filesystem::path& v4_path) {
-  std::ifstream input(v6_path, std::ios::binary);
-  std::vector<char> bytes((std::istreambuf_iterator<char>(input)),
-                          std::istreambuf_iterator<char>());
-  require(static_cast<bool>(input) || input.eof(),
-          "could not read the version-6 device-graph fixture");
+  std::vector<char> bytes =
+      read_fixture_bytes(v6_path, "version-6 device-graph fixture");
   constexpr std::size_t kMagicBytes = 8;
   constexpr std::size_t kEmptyAttachmentTrailerBytes =
       4 * sizeof(std::uint64_t);
@@ -519,10 +699,7 @@ void write_legacy_v4_fixture(const std::filesystem::path& v6_path,
   const std::uint64_t legacy_version = 4;
   std::memcpy(bytes.data() + kMagicBytes, &legacy_version,
               sizeof(legacy_version));
-  std::ofstream output(v4_path, std::ios::binary | std::ios::trunc);
-  output.write(bytes.data(), static_cast<std::streamsize>(bytes.size()));
-  require(static_cast<bool>(output),
-          "could not write the legacy version-4 fixture");
+  write_fixture_bytes(v4_path, bytes, "legacy version-4 fixture");
 }
 
 void write_legacy_v3_fixture(const std::filesystem::path& v4_path,
@@ -610,6 +787,10 @@ int main() {
         base.string() + ".attachments-streamed";
     const std::filesystem::path stale_write_path =
         base.string() + ".stale-write";
+    const std::filesystem::path version_six_path =
+        base.string() + ".version-six";
+    const std::filesystem::path split_version_six_path =
+        base.string() + ".split-version-six";
     const std::filesystem::path version_five_path =
         base.string() + ".version-five";
     const std::filesystem::path version_four_path =
@@ -622,18 +803,41 @@ int main() {
         base.string() + ".projected-truncated";
     const std::filesystem::path sidecar_truncated_path =
         base.string() + ".sidecar-truncated";
+    const std::filesystem::path compact_attr_truncated_path =
+        base.string() + ".compact-attr-truncated";
+    const std::filesystem::path compact_pip_truncated_path =
+        base.string() + ".compact-pip-truncated";
+    const std::filesystem::path invalid_compact_attr_path =
+        base.string() + ".invalid-compact-attr";
+    const std::filesystem::path invalid_compact_pip_path =
+        base.string() + ".invalid-compact-pip";
+    const std::filesystem::path oversized_string_count_path =
+        base.string() + ".oversized-string-count";
+    const std::filesystem::path oversized_pip_count_path =
+        base.string() + ".oversized-pip-count";
+    const std::filesystem::path invalid_legacy_attr_path =
+        base.string() + ".invalid-legacy-attr";
     cleanup = {split_path,
                streamed_path,
                attachment_path,
                attachment_streamed_path,
                stale_write_path,
+               version_six_path,
+               split_version_six_path,
                version_five_path,
                version_four_path,
                version_three_path,
                legacy_path,
                trailing_path,
                projected_truncated_path,
-               sidecar_truncated_path};
+               sidecar_truncated_path,
+               compact_attr_truncated_path,
+               compact_pip_truncated_path,
+               invalid_compact_attr_path,
+               invalid_compact_pip_path,
+               oversized_string_count_path,
+               oversized_pip_count_path,
+               invalid_legacy_attr_path};
 
     const std::filesystem::path staged_one =
         ri::create_unique_staging_path(base.string() + ".output");
@@ -809,6 +1013,104 @@ int main() {
         ri::read_device_routing_graph_for_routing(split_path);
     compare_graphs(expected, routing_projection, false, true);
 
+    const DeviceGraphV7Offsets compact_offsets =
+        device_graph_v7_offsets(expected);
+    require(compact_offsets.edge_attrs_begin < compact_offsets.pip_data_begin &&
+                compact_offsets.pip_data_begin <
+                    compact_offsets.static_suffix_begin,
+            "compact fixture does not contain edge/PIP records");
+    const auto require_graph_read_failure =
+        [&](const std::filesystem::path& path, const char* message) {
+          bool rejected = false;
+          try {
+            (void)ri::read_device_routing_graph(path);
+          } catch (const std::runtime_error&) {
+            rejected = true;
+          }
+          require(rejected, message);
+        };
+
+    std::filesystem::copy_file(
+        split_path, compact_attr_truncated_path,
+        std::filesystem::copy_options::overwrite_existing);
+    std::filesystem::resize_file(compact_attr_truncated_path,
+                                 compact_offsets.pip_data_begin - 1);
+    require_graph_read_failure(
+        compact_attr_truncated_path,
+        "device graph accepted a truncated compact EdgeAttr array");
+
+    std::filesystem::copy_file(
+        split_path, compact_pip_truncated_path,
+        std::filesystem::copy_options::overwrite_existing);
+    std::filesystem::resize_file(compact_pip_truncated_path,
+                                 compact_offsets.static_suffix_begin - 1);
+    require_graph_read_failure(
+        compact_pip_truncated_path,
+        "device graph accepted a truncated compact PIP array");
+
+    std::filesystem::copy_file(
+        split_path, invalid_compact_attr_path,
+        std::filesystem::copy_options::overwrite_existing);
+    overwrite_fixture_value(
+        invalid_compact_attr_path, compact_offsets.edge_attrs_begin,
+        static_cast<std::uint32_t>(expected.string_table.strings.size()),
+        "invalid compact EdgeAttr tile string");
+    require_graph_read_failure(
+        invalid_compact_attr_path,
+        "device graph accepted an invalid compact EdgeAttr string ID");
+    std::filesystem::copy_file(
+        split_path, invalid_compact_attr_path,
+        std::filesystem::copy_options::overwrite_existing);
+    overwrite_fixture_value(
+        invalid_compact_attr_path,
+        compact_offsets.edge_attrs_begin + sizeof(std::uint32_t),
+        static_cast<std::uint32_t>(expected.pip_data.size()),
+        "invalid compact EdgeAttr PIP index");
+    require_graph_read_failure(
+        invalid_compact_attr_path,
+        "device graph accepted an invalid compact EdgeAttr PIP index");
+
+    std::filesystem::copy_file(
+        split_path, invalid_compact_pip_path,
+        std::filesystem::copy_options::overwrite_existing);
+    overwrite_fixture_value(
+        invalid_compact_pip_path,
+        compact_offsets.pip_data_begin + 2 * sizeof(std::uint32_t),
+        std::uint32_t{2}, "invalid compact PIP direction");
+    require_graph_read_failure(
+        invalid_compact_pip_path,
+        "device graph accepted an invalid compact PIP direction");
+
+    constexpr std::size_t kHeaderWordsBegin = 8;
+    constexpr std::size_t kStringCountHeaderWord = 7;
+    constexpr std::size_t kPipCountHeaderWord = 10;
+    const std::uint64_t beyond_u32 =
+        static_cast<std::uint64_t>(
+            std::numeric_limits<std::uint32_t>::max()) +
+        1;
+    std::filesystem::copy_file(
+        split_path, oversized_string_count_path,
+        std::filesystem::copy_options::overwrite_existing);
+    overwrite_fixture_value(
+        oversized_string_count_path,
+        kHeaderWordsBegin +
+            kStringCountHeaderWord * sizeof(std::uint64_t),
+        beyond_u32, "oversized v7 string count");
+    require_graph_read_failure(
+        oversized_string_count_path,
+        "device graph accepted a v7 string count beyond UINT32_MAX");
+
+    std::filesystem::copy_file(
+        split_path, oversized_pip_count_path,
+        std::filesystem::copy_options::overwrite_existing);
+    overwrite_fixture_value(
+        oversized_pip_count_path,
+        kHeaderWordsBegin + kPipCountHeaderWord * sizeof(std::uint64_t),
+        beyond_u32, "oversized v7 PIP count");
+    require_graph_read_failure(
+        oversized_pip_count_path,
+        "device graph accepted a v7 PIP count beyond UINT32_MAX");
+
     const ri::DeviceRoutingGraph attachment_expected =
         make_attachment_graph();
     ri::validate_device_routing_graph(attachment_expected);
@@ -824,7 +1126,43 @@ int main() {
         ri::read_device_routing_graph_for_routing(attachment_path);
     compare_graphs(attachment_expected, attachment_routing, false, true);
 
-    write_legacy_v5_fixture(attachment_path, version_five_path);
+    write_legacy_v6_fixture(
+        attachment_path, version_six_path, attachment_expected);
+    ri::DeviceRoutingGraph expected_v6 = attachment_expected;
+    expected_v6.format_version = 6;
+    const ri::DeviceRoutingGraph version_six =
+        ri::read_device_routing_graph(version_six_path);
+    compare_graphs(expected_v6, version_six);
+    const ri::DeviceRoutingGraph version_six_filtering =
+        ri::read_device_routing_graph_for_filtering(version_six_path);
+    compare_graphs(expected_v6, version_six_filtering, false, false);
+    const ri::DeviceRoutingGraph version_six_routing =
+        ri::read_device_routing_graph_for_routing(version_six_path, false);
+    compare_graphs(expected_v6, version_six_routing, false, true);
+    bool rejected_v6_production_semantics = false;
+    try {
+      ri::require_endpoint_attachment_device_graph(version_six);
+    } catch (const std::runtime_error& error) {
+      rejected_v6_production_semantics =
+          std::string(error.what()).find("regenerate") != std::string::npos;
+    }
+    require(rejected_v6_production_semantics,
+            "production semantic gate accepted a stale version-6 graph");
+
+    std::filesystem::copy_file(
+        version_six_path, invalid_legacy_attr_path,
+        std::filesystem::copy_options::overwrite_existing);
+    const DeviceGraphV7Offsets attachment_offsets =
+        device_graph_v7_offsets(attachment_expected);
+    overwrite_fixture_value(
+        invalid_legacy_attr_path, attachment_offsets.edge_attrs_begin,
+        beyond_u32, "oversized legacy EdgeAttr field");
+    require_graph_read_failure(
+        invalid_legacy_attr_path,
+        "legacy device graph EdgeAttr narrowing accepted a field beyond "
+        "UINT32_MAX");
+
+    write_legacy_v5_fixture(version_six_path, version_five_path);
     ri::DeviceRoutingGraph expected_v5 = attachment_expected;
     expected_v5.format_version = 5;
     const ri::DeviceRoutingGraph version_five =
@@ -846,7 +1184,19 @@ int main() {
         ri::read_device_routing_graph_for_routing(version_five_path, false);
     compare_graphs(expected_v5, version_five_routing, false, true);
 
-    write_legacy_v4_fixture(split_path, version_four_path);
+    write_legacy_v6_fixture(split_path, split_version_six_path, expected);
+    const std::uintmax_t compact_fixture_bytes =
+        std::filesystem::file_size(split_path);
+    const std::uintmax_t legacy_fixture_bytes =
+        std::filesystem::file_size(split_version_six_path);
+    const std::uintmax_t expected_compaction =
+        expected.edge_attrs.size() * 2 * sizeof(std::uint32_t) +
+        expected.pip_data.size() * 3 * sizeof(std::uint32_t);
+    require(legacy_fixture_bytes >= compact_fixture_bytes &&
+                legacy_fixture_bytes - compact_fixture_bytes ==
+                    expected_compaction,
+            "devicegraph v7 did not compact EdgeAttr/PIP disk records exactly");
+    write_legacy_v4_fixture(split_version_six_path, version_four_path);
     write_legacy_v3_fixture(version_four_path, version_three_path, expected);
     ri::DeviceRoutingGraph expected_v4 = expected;
     expected_v4.format_version = 4;
@@ -872,7 +1222,8 @@ int main() {
     compare_graphs(expected_v3, version_three_routing, false, true);
 
     for (const std::filesystem::path& stale_path :
-         {version_five_path, version_four_path, version_three_path}) {
+         {version_six_path, version_five_path, version_four_path,
+          version_three_path}) {
       bool rejected_stale_routing = false;
       try {
         (void)ri::read_device_routing_graph_for_routing(stale_path);
@@ -893,7 +1244,7 @@ int main() {
             std::string::npos;
       }
       require(rejected_stale_filtering,
-              "required-v6 filtering reader accepted a stale device graph");
+              "required-v7 filtering reader accepted a stale device graph");
     }
     bool rejected_stale_write = false;
     try {
@@ -903,7 +1254,7 @@ int main() {
           std::string(error.what()).find("regenerate") != std::string::npos;
     }
     require(rejected_stale_write,
-            "writer silently upgraded a stale device graph to version 6");
+            "writer silently upgraded a stale device graph to version 7");
 
     // Truncate one byte before the end of the skipped 40-byte/node block.
     // The projection must check the available file extent instead of letting
@@ -1103,6 +1454,103 @@ int main() {
                     attachment_roundtrip, 99, "BITSLICE_RX_TX"),
             "traversed-site active-type authorization is wrong");
 
+    const ri::FixedEndpointAttachmentIndex fixed_attachment_index =
+        ri::build_fixed_endpoint_attachment_index(attachment_roundtrip);
+    require(ri::find_fixed_endpoint_attachment(
+                fixed_attachment_index, attachment_roundtrip.string_table,
+                "XIPHY_BYTE_L_X72Y45", "ATTACH_WIRE_1",
+                "ATTACH_WIRE_2", true, "BITSLICE_RX_TX_X1Y41") ==
+                std::optional<std::uint32_t>(0) &&
+                ri::find_fixed_endpoint_attachment(
+                    fixed_attachment_index,
+                    attachment_roundtrip.string_table,
+                    "XIPHY_BYTE_L_X72Y46", "ATTACH_WIRE_3",
+                    "ATTACH_WIRE_4", true,
+                    "BITSLICE_RX_TX_X1Y42") ==
+                    std::optional<std::uint32_t>(1),
+            "fixed endpoint-attachment index lost an exact PIP key");
+    require(!ri::find_fixed_endpoint_attachment(
+                 fixed_attachment_index, attachment_roundtrip.string_table,
+                 "INT_X72Y45", "ATTACH_WIRE_1", "ATTACH_WIRE_2", true,
+                 "BITSLICE_RX_TX_X1Y41")
+                 .has_value() &&
+                !ri::find_fixed_endpoint_attachment(
+                     fixed_attachment_index,
+                     attachment_roundtrip.string_table,
+                     "XIPHY_BYTE_L_X72Y45", "ATTACH_WIRE_2",
+                     "ATTACH_WIRE_1", true, "BITSLICE_RX_TX_X1Y41")
+                     .has_value() &&
+                !ri::find_fixed_endpoint_attachment(
+                     fixed_attachment_index,
+                     attachment_roundtrip.string_table,
+                     "XIPHY_BYTE_L_X72Y45", "ATTACH_WIRE_1",
+                     "ATTACH_WIRE_2", false, "BITSLICE_RX_TX_X1Y41")
+                     .has_value() &&
+                !ri::find_fixed_endpoint_attachment(
+                     fixed_attachment_index,
+                     attachment_roundtrip.string_table,
+                     "XIPHY_BYTE_L_X72Y45", "ATTACH_WIRE_1",
+                     "ATTACH_WIRE_2", true, "BITSLICE_RX_TX_X1Y42")
+                     .has_value(),
+            "fixed endpoint-attachment index accepted a partial key match");
+    const ri::FixedEndpointAttachmentSiteSlice source_site_slice =
+        ri::find_fixed_endpoint_attachment_site_slice(
+            fixed_attachment_index, attachment_roundtrip.string_table,
+            "BITSLICE_RX_TX_X1Y41");
+    require(source_site_slice.attachment_count == 1 &&
+                source_site_slice.attachment_begin <
+                    fixed_attachment_index.attachments_by_traversed_site
+                        .size() &&
+                fixed_attachment_index.attachments_by_traversed_site[
+                    source_site_slice.attachment_begin] == 0,
+            "fixed endpoint-attachment site slice is wrong");
+    require(ri::find_fixed_endpoint_attachment_site_slice(
+                fixed_attachment_index, attachment_roundtrip.string_table,
+                "UNKNOWN_TRAVERSED_SITE")
+                .attachment_count == 0,
+            "unknown traversed site produced attachment candidates");
+
+    ri::DeviceRoutingGraph shared_traversed_site = make_attachment_graph();
+    shared_traversed_site.endpoint_attachments[1].traversed_site_string =
+        shared_traversed_site.endpoint_attachments[0].traversed_site_string;
+    const ri::FixedEndpointAttachmentIndex shared_site_index =
+        ri::build_fixed_endpoint_attachment_index(shared_traversed_site);
+    const ri::FixedEndpointAttachmentSiteSlice shared_site_slice =
+        ri::find_fixed_endpoint_attachment_site_slice(
+            shared_site_index, shared_traversed_site.string_table,
+            "BITSLICE_RX_TX_X1Y41");
+    require(
+        shared_site_slice.attachment_count == 2 &&
+            shared_site_slice.attachment_begin <=
+                shared_site_index.attachments_by_traversed_site.size() &&
+            shared_site_slice.attachment_count <=
+                shared_site_index.attachments_by_traversed_site.size() -
+                    shared_site_slice.attachment_begin &&
+            shared_site_index.attachments_by_traversed_site[
+                shared_site_slice.attachment_begin] == 0 &&
+            shared_site_index.attachments_by_traversed_site[
+                shared_site_slice.attachment_begin + 1] == 1,
+        "fixed endpoint-attachment site slice lost conservative candidates");
+
+    bool rejected_duplicate_fixed_key = false;
+    try {
+      ri::DeviceRoutingGraph invalid = make_attachment_graph();
+      const std::uint64_t source_pip =
+          invalid.endpoint_attachments[0].pip_data_index;
+      const std::uint64_t sink_pip =
+          invalid.endpoint_attachments[1].pip_data_index;
+      invalid.pip_data[static_cast<std::size_t>(sink_pip)] =
+          invalid.pip_data[static_cast<std::size_t>(source_pip)];
+      invalid.edge_attrs[3].tile_string = invalid.edge_attrs[1].tile_string;
+      invalid.endpoint_attachments[1].traversed_site_string =
+          invalid.endpoint_attachments[0].traversed_site_string;
+      (void)ri::build_fixed_endpoint_attachment_index(invalid);
+    } catch (const std::runtime_error&) {
+      rejected_duplicate_fixed_key = true;
+    }
+    require(rejected_duplicate_fixed_key,
+            "fixed attachment index accepted a duplicate exact key");
+
     bool rejected_attachment_graph = false;
     try {
       ri::DeviceRoutingGraph invalid = make_attachment_graph();
@@ -1118,6 +1566,20 @@ int main() {
     rejected_attachment_graph = false;
     try {
       ri::DeviceRoutingGraph invalid = make_attachment_graph();
+      invalid.endpoint_attachments[0].pip_data_index =
+          invalid.pip_data.size();
+      const std::vector<std::uint8_t> no_nodes_blocked(6, 0);
+      (void)ri::filter_device_routing_graph(
+          invalid, no_nodes_blocked, no_nodes_blocked, no_nodes_blocked);
+    } catch (const std::runtime_error&) {
+      rejected_attachment_graph = true;
+    }
+    require(rejected_attachment_graph,
+            "dense attachment lookup accepted an out-of-range PIP data ID");
+
+    rejected_attachment_graph = false;
+    try {
+      ri::DeviceRoutingGraph invalid = make_attachment_graph();
       std::swap(invalid.edge_attrs[1].pip_data_index,
                 invalid.edge_attrs[2].pip_data_index);
       ri::validate_device_routing_graph(invalid);
@@ -1126,6 +1588,51 @@ int main() {
     }
     require(rejected_attachment_graph,
             "validation accepted an attachment PIP on the wrong directed edge");
+
+    rejected_attachment_graph = false;
+    try {
+      ri::DeviceRoutingGraph invalid = make_attachment_graph();
+      invalid.edge_attrs[1].pip_data_index = 0;
+      ri::validate_device_routing_graph(invalid);
+    } catch (const std::runtime_error&) {
+      rejected_attachment_graph = true;
+    }
+    require(rejected_attachment_graph,
+            "validation accepted a missing attachment PIP edge");
+
+    rejected_attachment_graph = false;
+    try {
+      ri::DeviceRoutingGraph invalid = make_attachment_graph();
+      invalid.colind[0] = 2;
+      ri::validate_device_routing_graph(invalid);
+    } catch (const std::runtime_error&) {
+      rejected_attachment_graph = true;
+    }
+    require(rejected_attachment_graph,
+            "validation accepted a missing source corridor edge");
+
+    rejected_attachment_graph = false;
+    try {
+      ri::DeviceRoutingGraph invalid = make_attachment_graph();
+      invalid.colind[4] = 2;
+      ri::validate_device_routing_graph(invalid);
+    } catch (const std::runtime_error&) {
+      rejected_attachment_graph = true;
+    }
+    require(rejected_attachment_graph,
+            "validation accepted a missing sink corridor edge");
+
+    rejected_attachment_graph = false;
+    try {
+      ri::DeviceRoutingGraph invalid = make_attachment_graph();
+      invalid.endpoint_attachments[1].to_node =
+          invalid.endpoint_attachments[0].from_node;
+      ri::validate_device_routing_graph(invalid);
+    } catch (const std::runtime_error&) {
+      rejected_attachment_graph = true;
+    }
+    require(rejected_attachment_graph,
+            "validation accepted attachments sharing a protected node");
 
     rejected_attachment_graph = false;
     try {
@@ -1237,8 +1744,6 @@ int main() {
             "filtered row pointers are wrong");
     require(filtered.colind == std::vector<std::int32_t>({1}),
             "filtered destinations are wrong");
-    require(filtered.values == std::vector<float>({1.0f}),
-            "filtered weights are wrong");
     require(filtered.edge_attrs.size() == 1 &&
                 filtered.edge_attrs[0].tile_string ==
                     expected.edge_attrs[0].tile_string &&
@@ -1353,6 +1858,38 @@ int main() {
                       attachment_expected.edge_attrs[edge].tile_string,
               "enabled attachment filtering misaligned an EdgeAttr");
     }
+    require(
+        attachments_enabled.retained_endpoint_attachment_edges.size() == 2 &&
+            attachments_enabled.retained_endpoint_attachment_edges[0]
+                    .attachment_index == 0 &&
+            attachments_enabled.retained_endpoint_attachment_edges[0]
+                    .csr_edge == 1 &&
+            attachments_enabled.retained_endpoint_attachment_edges[1]
+                    .attachment_index == 1 &&
+            attachments_enabled.retained_endpoint_attachment_edges[1]
+                    .csr_edge == 3,
+        "filter did not return exact, row-stable attachment CSR edge IDs");
+
+    std::vector<ri::RetainedEndpointAttachmentEdge> serialized_order = {
+        {1, 3}, {0, 1}, {2, 2}};
+    ri::sort_and_validate_retained_endpoint_attachment_edges(
+        serialized_order);
+    require(serialized_order.size() == 3 &&
+                serialized_order[0].attachment_index == 0 &&
+                serialized_order[0].csr_edge == 1 &&
+                serialized_order[1].attachment_index == 2 &&
+                serialized_order[1].csr_edge == 2 &&
+                serialized_order[2].attachment_index == 1 &&
+                serialized_order[2].csr_edge == 3,
+            "EndpointPip ordering is not stable in filtered CSR edge order");
+    require_throws(
+        [&] {
+          std::vector<ri::RetainedEndpointAttachmentEdge> duplicate_edge = {
+              {0, 1}, {1, 1}};
+          ri::sort_and_validate_retained_endpoint_attachment_edges(
+              duplicate_edge);
+        },
+        "EndpointPip ordering accepted two attachments for one CSR edge");
 
     const ri::CsrGraph attachments_disabled =
         ri::filter_device_routing_graph(
@@ -1369,6 +1906,8 @@ int main() {
                 attachments_disabled.edge_attrs[1].pip_data_index == 2 &&
                 attachments_disabled.edge_attrs[2].pip_data_index == 4,
             "disabled attachment filtering changed conventional edge policy");
+    require(attachments_disabled.retained_endpoint_attachment_edges.empty(),
+            "disabled attachment filtering returned a retained edge binding");
 
     const ri::CsrGraph branched_sink_disabled =
         ri::filter_device_routing_graph(
@@ -1396,6 +1935,14 @@ int main() {
     require(reachable(source_attachment_only, 0, 3) &&
                 !reachable(source_attachment_only, 0, 5),
             "source attachment was not directed away from its endpoint");
+    require(
+        source_attachment_only.retained_endpoint_attachment_edges.size() ==
+                1 &&
+            source_attachment_only.retained_endpoint_attachment_edges[0]
+                    .attachment_index == 0 &&
+            source_attachment_only.retained_endpoint_attachment_edges[0]
+                    .csr_edge == 1,
+        "source-only filtering returned the wrong attachment edge ID");
     const ri::CsrGraph sink_attachment_only =
         ri::filter_device_routing_graph(
             attachment_filtering, attachment_blocked,
@@ -1403,6 +1950,13 @@ int main() {
     require(reachable(sink_attachment_only, 3, 5) &&
                 !reachable(sink_attachment_only, 0, 5),
             "sink attachment was not directed toward its endpoint");
+    require(
+        sink_attachment_only.retained_endpoint_attachment_edges.size() == 1 &&
+            sink_attachment_only.retained_endpoint_attachment_edges[0]
+                    .attachment_index == 1 &&
+            sink_attachment_only.retained_endpoint_attachment_edges[0]
+                    .csr_edge == 2,
+        "sink-only filtering returned the wrong attachment edge ID");
 
     bool rejected_attachment_mask = false;
     try {

@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cerrno>
+#include <chrono>
 #include <cmath>
 #include <cstddef>
 #include <cstring>
@@ -21,13 +22,14 @@ constexpr char DEVICE_GRAPH_MAGIC[8] = {'R', 'I', 'P', 'S', 'D', 'R', 'G', '1'};
 // appended compact route-end X/Y and base-cost columns. Version 5 appends
 // sparse, concrete endpoint-attachment metadata after the legacy static
 // suffix. Version 6 retains that layout and completes the xcvu3p I/OP/TSP
-// endpoint policy. Generic readers retain v3-v5 compatibility; production
-// routing requires v6 explicitly.
+// endpoint policy. Version 7 narrows graph-sized edge attributes and PIP disk
+// records to uint32 fields. Generic readers retain v3-v6 compatibility;
+// production routing requires v7 explicitly.
 
 static_assert(sizeof(std::int64_t) == 8, "int64_t must be 8 bytes");
 static_assert(sizeof(std::int32_t) == 4, "int32_t must be 4 bytes");
 static_assert(sizeof(float) == 4, "float must be 4 bytes");
-static_assert(sizeof(EdgeAttr) == 16, "EdgeAttr disk layout changed");
+static_assert(sizeof(EdgeAttr) == 8, "compact EdgeAttr layout changed");
 static_assert(std::is_trivially_copyable<EdgeAttr>::value,
               "EdgeAttr must support bulk I/O");
 static_assert(sizeof(PairNodeLookup) == 16,
@@ -39,13 +41,57 @@ static_assert(sizeof(SitePinNodeLookup) == 16,
 static_assert(std::is_trivially_copyable<SitePinNodeLookup>::value,
               "SitePinNodeLookup must support bulk I/O");
 
-struct PipDataDisk {
+struct LegacyEdgeAttrDisk {
+  std::uint64_t tile_string = 0;
+  std::uint64_t pip_data_index = 0;
+};
+
+static_assert(sizeof(LegacyEdgeAttrDisk) == 16,
+              "legacy EdgeAttr disk layout changed");
+static_assert(std::is_trivially_copyable<LegacyEdgeAttrDisk>::value,
+              "legacy EdgeAttr records must support bulk I/O");
+
+struct LegacyPipDataDisk {
   std::uint64_t wire0_string = 0;
   std::uint64_t wire1_string = 0;
   std::uint64_t forward = 0;
 };
 
-static_assert(sizeof(PipDataDisk) == 24, "PipDataDisk layout changed");
+static_assert(sizeof(LegacyPipDataDisk) == 24,
+              "legacy PipData disk layout changed");
+
+struct CompactPipDataDisk {
+  std::uint32_t wire0_string = 0;
+  std::uint32_t wire1_string = 0;
+  std::uint32_t forward = 0;
+};
+
+static_assert(sizeof(CompactPipDataDisk) == 12,
+              "compact PipData disk layout changed");
+static_assert(std::is_trivially_copyable<CompactPipDataDisk>::value,
+              "compact PipData records must support bulk I/O");
+
+constexpr bool device_graph_has_authored_routing_sidecars(
+    std::uint64_t version) {
+  return version == 4 || version == 5 || version == 6 ||
+         version == kCompactEdgeDeviceRoutingGraphVersion;
+}
+
+constexpr bool device_graph_has_endpoint_attachment_trailer(
+    std::uint64_t version) {
+  return version == kEndpointAttachmentDeviceRoutingGraphVersion ||
+         version == kCompleteIobAttachmentDeviceRoutingGraphVersion ||
+         version == kCompactEdgeDeviceRoutingGraphVersion;
+}
+
+constexpr bool device_graph_has_legacy_wide_edge_records(
+    std::uint64_t version) {
+  return version == 3 || version == 4 || version == 5 || version == 6;
+}
+
+constexpr bool device_graph_has_compact_edge_records(std::uint64_t version) {
+  return version == kCompactEdgeDeviceRoutingGraphVersion;
+}
 
 struct EndpointAttachmentDisk {
   std::uint32_t endpoint_site_string = 0;
@@ -96,6 +142,26 @@ std::size_t checked_size(std::uint64_t count, const char* name) {
     throw std::runtime_error(std::string(name) + " exceeds host size_t");
   }
   return static_cast<std::size_t>(count);
+}
+
+std::uint32_t checked_u32_record_field(std::uint64_t value,
+                                       const char* name) {
+  if (value > std::numeric_limits<std::uint32_t>::max()) {
+    throw std::runtime_error(std::string(name) + " exceeds uint32");
+  }
+  return static_cast<std::uint32_t>(value);
+}
+
+void require_compact_record_counts(std::uint64_t string_count,
+                                   std::uint64_t pip_count) {
+  if (string_count > std::numeric_limits<std::uint32_t>::max()) {
+    throw std::runtime_error(
+        "device-graph string count exceeds UINT32_MAX");
+  }
+  if (pip_count > std::numeric_limits<std::uint32_t>::max()) {
+    throw std::runtime_error(
+        "device-graph PIP count exceeds UINT32_MAX");
+  }
 }
 
 template <typename T>
@@ -387,8 +453,7 @@ void validate_endpoint_attachment_metadata(
       graph.format_version > kCurrentDeviceRoutingGraphVersion) {
     throw std::runtime_error("device graph has an invalid format version");
   }
-  if (graph.format_version <
-      kEndpointAttachmentDeviceRoutingGraphVersion &&
+  if (!device_graph_has_endpoint_attachment_trailer(graph.format_version) &&
       (!graph.endpoint_attachments.empty() ||
        !graph.endpoint_attachment_traversed_site_types.empty() ||
        !graph.endpoint_attachment_pseudo_cell_pins.empty() ||
@@ -577,6 +642,11 @@ void validate_endpoint_attachment_metadata(
 void validate_static_metadata_common(const DeviceRoutingGraph& graph,
                                      std::size_t node_count) {
   const std::size_t string_count = graph.string_table.strings.size();
+  if (device_graph_has_compact_edge_records(graph.format_version)) {
+    require_compact_record_counts(
+        static_cast<std::uint64_t>(string_count),
+        static_cast<std::uint64_t>(graph.pip_data.size()));
+  }
   if (node_count == 0 ||
       node_count > static_cast<std::size_t>(
                        std::numeric_limits<NodeId>::max())) {
@@ -797,19 +867,21 @@ void write_header_and_static_prefix(std::ofstream& out,
 
 void write_static_suffix(std::ofstream& out,
                          const DeviceRoutingGraph& graph) {
-  std::vector<PipDataDisk> pip_disk;
+  std::vector<CompactPipDataDisk> pip_disk;
   pip_disk.reserve(graph.pip_data.size());
   for (const PipData& pip : graph.pip_data) {
     pip_disk.push_back(
-        {pip.wire0_string, pip.wire1_string, pip.forward ? 1ULL : 0ULL});
+        {checked_u32_record_field(pip.wire0_string, "PIP wire0 string"),
+         checked_u32_record_field(pip.wire1_string, "PIP wire1 string"),
+         pip.forward ? 1U : 0U});
   }
   write_array(out, pip_disk, "PIP data");
   write_array(out, graph.tile_wire_nodes, "tile-wire lookup");
   write_array(out, graph.site_pin_nodes, "site-pin lookup");
 
-  // Version-5+ extension trailer. Keeping this after the complete v4 suffix
-  // makes legacy inspection straightforward and prevents an old reader from
-  // silently accepting attachment-aware topology as conventional-only data.
+  // The v5-v7 endpoint extension remains after the complete static suffix.
+  // Keeping its existing layout makes old graph readers explicit and prevents
+  // an attachment-aware topology from being treated as conventional-only.
   write_u64(out,
             static_cast<std::uint64_t>(graph.endpoint_attachments.size()),
             "endpoint attachment count");
@@ -1127,6 +1199,21 @@ void sort_and_deduplicate_endpoint_attachment_lookups(
   records.resize(write);
 }
 
+void sort_and_validate_retained_endpoint_attachment_edges(
+    std::vector<RetainedEndpointAttachmentEdge>& records) {
+  std::sort(records.begin(), records.end(), [](const auto& lhs,
+                                               const auto& rhs) {
+    return std::tie(lhs.csr_edge, lhs.attachment_index) <
+           std::tie(rhs.csr_edge, rhs.attachment_index);
+  });
+  for (std::size_t index = 1; index < records.size(); ++index) {
+    if (records[index - 1].csr_edge == records[index].csr_edge) {
+      throw std::runtime_error(
+          "filtered CSR edge names multiple endpoint attachments");
+    }
+  }
+}
+
 void rebuild_endpoint_attachment_lookups(DeviceRoutingGraph& graph) {
   if (graph.endpoint_attachments.size() >
       std::numeric_limits<std::uint32_t>::max()) {
@@ -1324,12 +1411,193 @@ bool endpoint_attachment_allows_traversed_site_type(
                             static_cast<std::uint32_t>(*type_id));
 }
 
+FixedEndpointAttachmentIndex build_fixed_endpoint_attachment_index(
+    const DeviceRoutingGraph& graph) {
+  if (graph.endpoint_attachments.size() >
+      std::numeric_limits<std::uint32_t>::max()) {
+    throw std::runtime_error(
+        "device graph has too many endpoint attachments for a fixed-PIP "
+        "index");
+  }
+  const std::size_t node_count = device_routing_graph_node_count(graph);
+  if (graph.rowptr.size() != node_count + 1 || graph.rowptr.empty() ||
+      graph.rowptr.front() != 0 || graph.rowptr.back() < 0 ||
+      static_cast<std::uint64_t>(graph.rowptr.back()) !=
+          graph.loaded_edges ||
+      graph.loaded_edges != graph.colind.size() ||
+      graph.colind.size() != graph.edge_attrs.size()) {
+    throw std::runtime_error(
+        "device graph CSR shape is inconsistent while indexing fixed "
+        "endpoint attachments");
+  }
+
+  FixedEndpointAttachmentIndex result;
+  result.exact_records.reserve(graph.endpoint_attachments.size());
+  std::vector<std::pair<std::uint64_t, std::uint32_t>> site_records;
+  site_records.reserve(graph.endpoint_attachments.size());
+
+  for (std::size_t index = 0; index < graph.endpoint_attachments.size();
+       ++index) {
+    const EndpointAttachment& attachment = graph.endpoint_attachments[index];
+    if (attachment.pip_data_index >= graph.pip_data.size() ||
+        attachment.traversed_site_string >=
+            graph.string_table.strings.size()) {
+      throw std::runtime_error(
+          "endpoint attachment references invalid PIP/site metadata");
+    }
+    const PipData& pip =
+        graph.pip_data[static_cast<std::size_t>(attachment.pip_data_index)];
+    if (pip.wire0_string >= graph.string_table.strings.size() ||
+        pip.wire1_string >= graph.string_table.strings.size()) {
+      throw std::runtime_error(
+          "endpoint attachment references invalid wire strings");
+    }
+    if (attachment.from_node < 0 ||
+        static_cast<std::size_t>(attachment.from_node) >= node_count) {
+      throw std::runtime_error(
+          "endpoint attachment source row is outside the device graph");
+    }
+    const std::size_t row = static_cast<std::size_t>(attachment.from_node);
+    const std::int64_t raw_begin = graph.rowptr[row];
+    const std::int64_t raw_end = graph.rowptr[row + 1];
+    if (raw_begin < 0 || raw_end < raw_begin ||
+        static_cast<std::uint64_t>(raw_end) > graph.loaded_edges) {
+      throw std::runtime_error(
+          "endpoint attachment source row is outside the device graph");
+    }
+
+    std::size_t exact_edge_count = 0;
+    std::uint64_t tile_string = 0;
+    for (std::int64_t edge = raw_begin; edge < raw_end; ++edge) {
+      const std::size_t edge_index = static_cast<std::size_t>(edge);
+      if (graph.colind[edge_index] != attachment.to_node ||
+          graph.edge_attrs[edge_index].pip_data_index !=
+              attachment.pip_data_index) {
+        continue;
+      }
+      tile_string = graph.edge_attrs[edge_index].tile_string;
+      ++exact_edge_count;
+    }
+    if (exact_edge_count != 1) {
+      throw std::runtime_error(
+          "endpoint attachment PIP must identify exactly one CSR edge");
+    }
+    if (tile_string >= graph.string_table.strings.size()) {
+      throw std::runtime_error(
+          "endpoint attachment edge references an invalid tile string");
+    }
+
+    const std::uint32_t attachment_index =
+        static_cast<std::uint32_t>(index);
+    result.exact_records.push_back(
+        {tile_string, pip.wire0_string, pip.wire1_string, pip.forward,
+         attachment.traversed_site_string, attachment_index});
+    site_records.emplace_back(attachment.traversed_site_string,
+                              attachment_index);
+  }
+
+  const auto exact_less = [](const FixedEndpointAttachmentExactRecord& lhs,
+                             const FixedEndpointAttachmentExactRecord& rhs) {
+    return std::tie(lhs.tile_string, lhs.wire0_string, lhs.wire1_string,
+                    lhs.forward, lhs.traversed_site_string) <
+           std::tie(rhs.tile_string, rhs.wire0_string, rhs.wire1_string,
+                    rhs.forward, rhs.traversed_site_string);
+  };
+  std::sort(result.exact_records.begin(), result.exact_records.end(),
+            exact_less);
+  for (std::size_t index = 1; index < result.exact_records.size(); ++index) {
+    if (!exact_less(result.exact_records[index - 1],
+                    result.exact_records[index]) &&
+        !exact_less(result.exact_records[index],
+                    result.exact_records[index - 1])) {
+      throw std::runtime_error(
+          "fixed site-bearing PIP matches multiple endpoint attachments");
+    }
+  }
+
+  std::sort(site_records.begin(), site_records.end());
+  result.attachments_by_traversed_site.reserve(site_records.size());
+  for (std::size_t begin = 0; begin < site_records.size();) {
+    std::size_t end = begin + 1;
+    while (end < site_records.size() &&
+           site_records[end].first == site_records[begin].first) {
+      ++end;
+    }
+    result.traversed_site_slices.push_back(
+        {site_records[begin].first,
+         result.attachments_by_traversed_site.size(), end - begin});
+    for (std::size_t record = begin; record < end; ++record) {
+      result.attachments_by_traversed_site.push_back(
+          site_records[record].second);
+    }
+    begin = end;
+  }
+  return result;
+}
+
+std::optional<std::uint32_t> find_fixed_endpoint_attachment(
+    const FixedEndpointAttachmentIndex& index,
+    const StringTable& strings,
+    const std::string& tile,
+    const std::string& wire0,
+    const std::string& wire1,
+    bool forward,
+    const std::string& traversed_site) {
+  const std::optional<std::uint64_t> tile_string = strings.find(tile);
+  const std::optional<std::uint64_t> wire0_string = strings.find(wire0);
+  const std::optional<std::uint64_t> wire1_string = strings.find(wire1);
+  const std::optional<std::uint64_t> site_string = strings.find(traversed_site);
+  if (!tile_string.has_value() || !wire0_string.has_value() ||
+      !wire1_string.has_value() || !site_string.has_value()) {
+    return std::nullopt;
+  }
+
+  const FixedEndpointAttachmentExactRecord key{
+      *tile_string, *wire0_string, *wire1_string, forward, *site_string, 0};
+  const auto exact_less = [](const FixedEndpointAttachmentExactRecord& lhs,
+                             const FixedEndpointAttachmentExactRecord& rhs) {
+    return std::tie(lhs.tile_string, lhs.wire0_string, lhs.wire1_string,
+                    lhs.forward, lhs.traversed_site_string) <
+           std::tie(rhs.tile_string, rhs.wire0_string, rhs.wire1_string,
+                    rhs.forward, rhs.traversed_site_string);
+  };
+  const auto found = std::lower_bound(index.exact_records.begin(),
+                                      index.exact_records.end(), key,
+                                      exact_less);
+  if (found == index.exact_records.end() || exact_less(key, *found) ||
+      exact_less(*found, key)) {
+    return std::nullopt;
+  }
+  return found->attachment_index;
+}
+
+FixedEndpointAttachmentSiteSlice find_fixed_endpoint_attachment_site_slice(
+    const FixedEndpointAttachmentIndex& index,
+    const StringTable& strings,
+    const std::string& traversed_site) {
+  const std::optional<std::uint64_t> site_string = strings.find(traversed_site);
+  if (!site_string.has_value()) {
+    return {};
+  }
+  const auto found = std::lower_bound(
+      index.traversed_site_slices.begin(),
+      index.traversed_site_slices.end(), *site_string,
+      [](const FixedEndpointAttachmentSiteSlice& slice,
+         std::uint64_t value) {
+        return slice.traversed_site_string < value;
+      });
+  if (found == index.traversed_site_slices.end() ||
+      found->traversed_site_string != *site_string) {
+    return {};
+  }
+  return *found;
+}
+
 void require_endpoint_attachment_device_graph(
     const DeviceRoutingGraph& graph) {
-  if (graph.format_version <
-      kCompleteIobAttachmentDeviceRoutingGraphVersion) {
+  if (graph.format_version != kCurrentDeviceRoutingGraphVersion) {
     throw std::runtime_error(
-        "device-routing graph predates complete IOB endpoint attachments; "
+        "device-routing graph is stale for compact v7 routing; "
         "regenerate it with device_to_routing_graph");
   }
 }
@@ -1344,44 +1612,131 @@ class EndpointAttachmentCorridorValidator {
         attachment_edge_count_(graph.endpoint_attachments.size(), 0),
         corridor_edge_count_(graph.endpoint_attachments.size(), 0),
         boundary_edge_count_(graph.endpoint_attachments.size(), 0) {
-    attachment_by_pip_.reserve(graph.endpoint_attachments.size());
-    source_from_node_.reserve(graph.endpoint_attachments.size());
-    sink_to_node_.reserve(graph.endpoint_attachments.size());
-    protected_node_.reserve(graph.endpoint_attachments.size());
+    if (graph.endpoint_attachments.empty()) {
+      return;
+    }
+    if (graph.endpoint_attachments.size() >
+        std::numeric_limits<std::uint32_t>::max()) {
+      throw std::runtime_error(
+          "device graph has too many endpoint attachments for compact "
+          "corridor validation");
+    }
+    if (graph.pip_data.size() > attachment_by_pip_.max_size()) {
+      throw std::runtime_error(
+          "device graph has too many PIP records for corridor validation");
+    }
+    attachment_by_pip_.assign(graph.pip_data.size(), kNoAttachment);
+
+    const std::size_t node_count = device_routing_graph_node_count(graph);
+    std::vector<BoundaryRecord> protected_nodes;
+    protected_nodes.reserve(graph.endpoint_attachments.size());
+    source_boundaries_.reserve(graph.endpoint_attachments.size());
+    sink_boundaries_.reserve(graph.endpoint_attachments.size());
     for (std::size_t index = 0; index < graph.endpoint_attachments.size();
          ++index) {
       const EndpointAttachment& attachment =
           graph.endpoint_attachments[index];
-      if (!attachment_by_pip_
-               .emplace(attachment.pip_data_index, index)
-               .second) {
+      if (attachment.pip_data_index >= attachment_by_pip_.size()) {
+        throw std::runtime_error(
+            "endpoint attachment references an invalid PIP data ID");
+      }
+      const std::uint32_t compact_index =
+          static_cast<std::uint32_t>(index);
+      std::uint32_t& pip_attachment = attachment_by_pip_[
+          static_cast<std::size_t>(attachment.pip_data_index)];
+      if (pip_attachment != kNoAttachment) {
         throw std::runtime_error(
             "endpoint attachments share a PIP data ID");
       }
-      auto& boundary =
-          attachment.role == EndpointAttachmentRole::kSource
-              ? source_from_node_
-              : sink_to_node_;
+      pip_attachment = compact_index;
+
       const NodeId node =
           attachment.role == EndpointAttachmentRole::kSource
               ? attachment.from_node
               : attachment.to_node;
-      if (!protected_node_.emplace(node, index).second ||
-          !boundary.emplace(node, index).second) {
+      if (node < 0 || static_cast<std::size_t>(node) >= node_count) {
+        throw std::runtime_error(
+            "endpoint attachment has an invalid protected corridor node");
+      }
+      const BoundaryRecord boundary{node, compact_index};
+      protected_nodes.push_back(boundary);
+      if (attachment.role == EndpointAttachmentRole::kSource) {
+        source_boundaries_.push_back(boundary);
+      } else {
+        sink_boundaries_.push_back(boundary);
+      }
+    }
+
+    const auto by_node = [](const BoundaryRecord& lhs,
+                            const BoundaryRecord& rhs) {
+      return lhs.node < rhs.node;
+    };
+    std::sort(protected_nodes.begin(), protected_nodes.end(), by_node);
+    for (std::size_t index = 1; index < protected_nodes.size(); ++index) {
+      if (protected_nodes[index - 1].node == protected_nodes[index].node) {
         throw std::runtime_error(
             "endpoint attachments share a protected corridor node");
       }
     }
+    std::sort(source_boundaries_.begin(), source_boundaries_.end(), by_node);
+    std::sort(sink_boundaries_.begin(), sink_boundaries_.end(), by_node);
+    if (!source_boundaries_.empty()) {
+      const std::size_t bitmap_words =
+          node_count / kBitmapWordBits +
+          static_cast<std::size_t>(node_count % kBitmapWordBits != 0);
+      source_boundary_bitmap_.assign(bitmap_words, 0);
+      for (const BoundaryRecord& source : source_boundaries_) {
+        const std::size_t word =
+            static_cast<std::size_t>(source.node) / kBitmapWordBits;
+        const unsigned bit = static_cast<unsigned>(
+            static_cast<std::size_t>(source.node) % kBitmapWordBits);
+        source_boundary_bitmap_[word] |= std::uint64_t{1} << bit;
+      }
+    }
+  }
+
+  void begin_row(NodeId row, std::size_t row_edge_count) {
+    if (row < 0 || row <= previous_row_) {
+      throw std::runtime_error(
+          "endpoint attachment corridor rows are not strictly ordered");
+    }
+    previous_row_ = row;
+    current_sink_attachment_ = kNoAttachment;
+    while (sink_boundary_cursor_ < sink_boundaries_.size() &&
+           sink_boundaries_[sink_boundary_cursor_].node < row) {
+      ++sink_boundary_cursor_;
+    }
+    if (sink_boundary_cursor_ == sink_boundaries_.size() ||
+        sink_boundaries_[sink_boundary_cursor_].node != row) {
+      return;
+    }
+    current_sink_attachment_ =
+        sink_boundaries_[sink_boundary_cursor_].attachment_index;
+    ++sink_boundary_cursor_;
+    std::size_t& boundary_count =
+        boundary_edge_count_[current_sink_attachment_];
+    if (row_edge_count >
+        std::numeric_limits<std::size_t>::max() - boundary_count) {
+      throw std::runtime_error(
+          "endpoint attachment boundary edge count overflows size_t");
+    }
+    boundary_count += row_edge_count;
   }
 
   std::optional<std::size_t> observe(NodeId row,
                                     NodeId col,
                                     const EdgeAttr& attr) {
     std::optional<std::size_t> edge_attachment;
-    const auto found_attachment =
-        attachment_by_pip_.find(attr.pip_data_index);
-    if (found_attachment != attachment_by_pip_.end()) {
-      edge_attachment = found_attachment->second;
+    if (!attachment_by_pip_.empty()) {
+      if (attr.pip_data_index >= attachment_by_pip_.size()) {
+        throw std::runtime_error(
+            "device graph contains an invalid attachment PIP data ID");
+      }
+      const std::uint32_t found_attachment = attachment_by_pip_[
+          static_cast<std::size_t>(attr.pip_data_index)];
+      if (found_attachment != kNoAttachment) {
+        edge_attachment = found_attachment;
+      }
     }
     if (edge_attachment.has_value()) {
       const EndpointAttachment& attachment =
@@ -1393,9 +1748,23 @@ class EndpointAttachmentCorridorValidator {
       ++attachment_edge_count_[*edge_attachment];
     }
 
-    const auto source = source_from_node_.find(col);
-    if (source != source_from_node_.end()) {
-      const std::size_t index = source->second;
+    const std::size_t source_word =
+        static_cast<std::size_t>(col) / kBitmapWordBits;
+    const unsigned source_bit = static_cast<unsigned>(
+        static_cast<std::size_t>(col) % kBitmapWordBits);
+    if (source_word < source_boundary_bitmap_.size() &&
+        (source_boundary_bitmap_[source_word] &
+         (std::uint64_t{1} << source_bit)) != 0) {
+      const auto source = std::lower_bound(
+          source_boundaries_.begin(), source_boundaries_.end(), col,
+          [](const BoundaryRecord& record, NodeId node) {
+            return record.node < node;
+          });
+      if (source == source_boundaries_.end() || source->node != col) {
+        throw std::runtime_error(
+            "endpoint attachment source-boundary index is inconsistent");
+      }
+      const std::size_t index = source->attachment_index;
       ++boundary_edge_count_[index];
       const EndpointAttachment& attachment =
           graph_.endpoint_attachments[index];
@@ -1405,10 +1774,8 @@ class EndpointAttachmentCorridorValidator {
       }
     }
 
-    const auto sink = sink_to_node_.find(row);
-    if (sink != sink_to_node_.end()) {
-      const std::size_t index = sink->second;
-      ++boundary_edge_count_[index];
+    if (current_sink_attachment_ != kNoAttachment) {
+      const std::size_t index = current_sink_attachment_;
       const EndpointAttachment& attachment =
           graph_.endpoint_attachments[index];
       if (col == attachment.endpoint_node &&
@@ -1453,14 +1820,26 @@ class EndpointAttachmentCorridorValidator {
   }
 
  private:
+  static constexpr std::uint32_t kNoAttachment =
+      std::numeric_limits<std::uint32_t>::max();
+  static constexpr std::size_t kBitmapWordBits = 64;
+
+  struct BoundaryRecord {
+    NodeId node = kInvalidRouteNode;
+    std::uint32_t attachment_index = kNoAttachment;
+  };
+
   const DeviceRoutingGraph& graph_;
   std::vector<std::size_t> attachment_edge_count_;
   std::vector<std::size_t> corridor_edge_count_;
   std::vector<std::size_t> boundary_edge_count_;
-  std::unordered_map<std::uint64_t, std::size_t> attachment_by_pip_;
-  std::unordered_map<NodeId, std::size_t> source_from_node_;
-  std::unordered_map<NodeId, std::size_t> sink_to_node_;
-  std::unordered_map<NodeId, std::size_t> protected_node_;
+  std::vector<std::uint32_t> attachment_by_pip_;
+  std::vector<BoundaryRecord> source_boundaries_;
+  std::vector<BoundaryRecord> sink_boundaries_;
+  std::vector<std::uint64_t> source_boundary_bitmap_;
+  std::size_t sink_boundary_cursor_ = 0;
+  std::uint32_t current_sink_attachment_ = kNoAttachment;
+  NodeId previous_row_ = kInvalidRouteNode;
 };
 
 }  // namespace
@@ -1476,6 +1855,8 @@ void validate_device_routing_graph(const DeviceRoutingGraph& graph) {
         static_cast<std::size_t>(end) > edge_count) {
       throw std::runtime_error("device graph row pointers are not monotone");
     }
+    attachment_validator.begin_row(
+        static_cast<NodeId>(row), static_cast<std::size_t>(end - begin));
     std::int32_t previous = -1;
     for (std::int64_t edge = begin; edge < end; ++edge) {
       const std::int32_t col = graph.colind[static_cast<std::size_t>(edge)];
@@ -1572,10 +1953,81 @@ void read_legacy_route_sidecars_projection(std::ifstream& in,
                                      1.0f);
 }
 
+void read_edge_attributes(std::ifstream& in,
+                          std::uint64_t version,
+                          std::uint64_t edge_count,
+                          DeviceRoutingGraph& graph) {
+  if (device_graph_has_compact_edge_records(version)) {
+    read_array(in, graph.edge_attrs, edge_count,
+               "compact base CSR edge attributes");
+    return;
+  }
+  if (!device_graph_has_legacy_wide_edge_records(version)) {
+    throw std::runtime_error(
+        "device graph has no defined edge-attribute encoding");
+  }
+
+  const std::size_t host_edge_count =
+      checked_size(edge_count, "legacy base CSR edge attributes");
+  graph.edge_attrs.resize(host_edge_count);
+  constexpr std::size_t kChunkRecords = 1U << 20;
+  std::vector<LegacyEdgeAttrDisk> disk;
+  for (std::size_t begin = 0; begin < host_edge_count;
+       begin += kChunkRecords) {
+    const std::size_t count =
+        std::min(kChunkRecords, host_edge_count - begin);
+    read_array(in, disk, static_cast<std::uint64_t>(count),
+               "legacy base CSR edge attributes");
+    for (std::size_t offset = 0; offset < count; ++offset) {
+      graph.edge_attrs[begin + offset] = {
+          checked_u32_record_field(disk[offset].tile_string,
+                                   "legacy edge tile string"),
+          checked_u32_record_field(disk[offset].pip_data_index,
+                                   "legacy edge PIP data index")};
+    }
+  }
+}
+
+void read_pip_data(std::ifstream& in,
+                   std::uint64_t version,
+                   std::uint64_t pip_count,
+                   DeviceRoutingGraph& graph) {
+  if (device_graph_has_compact_edge_records(version)) {
+    std::vector<CompactPipDataDisk> disk;
+    read_array(in, disk, pip_count, "compact PIP data");
+    graph.pip_data.reserve(disk.size());
+    for (const CompactPipDataDisk& pip : disk) {
+      if (pip.forward > 1) {
+        throw std::runtime_error(
+            "device graph contains an invalid compact PIP flag");
+      }
+      graph.pip_data.push_back(
+          {pip.wire0_string, pip.wire1_string, pip.forward != 0});
+    }
+    return;
+  }
+  if (!device_graph_has_legacy_wide_edge_records(version)) {
+    throw std::runtime_error("device graph has no defined PIP encoding");
+  }
+
+  std::vector<LegacyPipDataDisk> disk;
+  read_array(in, disk, pip_count, "legacy PIP data");
+  graph.pip_data.reserve(disk.size());
+  for (const LegacyPipDataDisk& pip : disk) {
+    if (pip.forward > 1) {
+      throw std::runtime_error(
+          "device graph contains an invalid legacy PIP flag");
+    }
+    graph.pip_data.push_back(
+        {pip.wire0_string, pip.wire1_string, pip.forward != 0});
+  }
+}
+
 DeviceRoutingGraph read_device_routing_graph_impl(
     const std::filesystem::path& path,
     DeviceRoutingGraphReadProfile profile,
-    bool require_endpoint_attachments) {
+    bool require_endpoint_attachments,
+    DeviceRoutingGraphReadTelemetry* telemetry) {
   std::ifstream in(path, std::ios::binary);
   if (!in) {
     throw std::runtime_error("could not open device-routing graph: " +
@@ -1595,9 +2047,9 @@ DeviceRoutingGraph read_device_routing_graph_impl(
     throw std::runtime_error("unsupported device-routing graph version");
   }
   if (require_endpoint_attachments &&
-      version < kCompleteIobAttachmentDeviceRoutingGraphVersion) {
+      version != kCurrentDeviceRoutingGraphVersion) {
     throw std::runtime_error(
-        "device-routing graph predates complete IOB endpoint attachments; "
+        "device-routing graph is stale for compact v7 routing; "
         "regenerate it with device_to_routing_graph");
   }
 
@@ -1634,6 +2086,10 @@ DeviceRoutingGraph read_device_routing_graph_impl(
   graph.device_path_string = read_u64(in, "device path string");
   graph.device_name_string = read_u64(in, "device name string");
 
+  if (device_graph_has_compact_edge_records(version)) {
+    require_compact_record_counts(string_count, pip_count);
+  }
+
   if (node_count == 0 ||
       node_count > static_cast<std::uint64_t>(
                        std::numeric_limits<NodeId>::max()) ||
@@ -1646,11 +2102,24 @@ DeviceRoutingGraph read_device_routing_graph_impl(
       checked_size(node_count, "node count");
   graph.retained_node_count = retained_node_count;
 
+  const auto string_file_begin = in.tellg();
+  const auto string_load_begin = std::chrono::steady_clock::now();
   graph.string_table.strings.reserve(checked_size(string_count, "strings"));
+  std::uint64_t string_payload_bytes = 0;
   for (std::uint64_t index = 0; index < string_count; ++index) {
-    graph.string_table.strings.push_back(read_string(in));
+    std::string text = read_string(in);
+    if (text.size() >
+        std::numeric_limits<std::uint64_t>::max() - string_payload_bytes) {
+      throw std::runtime_error("device-graph string bytes overflow uint64");
+    }
+    string_payload_bytes += static_cast<std::uint64_t>(text.size());
+    graph.string_table.strings.push_back(std::move(text));
   }
+  const auto string_load_end = std::chrono::steady_clock::now();
+  const auto string_index_begin = string_load_end;
   graph.string_table.rebuild_index();
+  const auto string_index_end = std::chrono::steady_clock::now();
+  const auto bulk_file_begin = in.tellg();
 
   if (profile == DeviceRoutingGraphReadProfile::kFull) {
     read_array(in, graph.node_device_ids, node_count, "device node IDs");
@@ -1666,7 +2135,7 @@ DeviceRoutingGraph read_device_routing_graph_impl(
                "node tile type strings");
     read_array(in, graph.node_wire_type_strings, node_count,
                "node wire type strings");
-    if (version >= 4) {
+    if (device_graph_has_authored_routing_sidecars(version)) {
       read_array(in, graph.node_route_end_x, node_count,
                  "node representative route-end X coordinates");
       read_array(in, graph.node_route_end_y, node_count,
@@ -1687,7 +2156,7 @@ DeviceRoutingGraph read_device_routing_graph_impl(
                                   kPhysicalNodeBytes,
                                   "physical node arrays"),
                "physical node arrays");
-    if (version >= 4) {
+    if (device_graph_has_authored_routing_sidecars(version)) {
       constexpr std::size_t kRoutingSidecarBytes =
           2 * sizeof(std::int32_t) + sizeof(float);
       skip_bytes(in,
@@ -1696,7 +2165,7 @@ DeviceRoutingGraph read_device_routing_graph_impl(
                                     "routing node sidecars"),
                  "routing node sidecars");
     }
-  } else if (version >= 4) {
+  } else if (device_graph_has_authored_routing_sidecars(version)) {
     constexpr std::size_t kPhysicalNodeBytes =
         3 * sizeof(std::uint64_t) + 4 * sizeof(std::int32_t);
     skip_bytes(in,
@@ -1715,22 +2184,12 @@ DeviceRoutingGraph read_device_routing_graph_impl(
   }
   read_array(in, graph.rowptr, node_count + 1, "base CSR row pointers");
   read_array(in, graph.colind, edge_count, "base CSR destinations");
-  read_array(in, graph.edge_attrs, edge_count, "base CSR edge attributes");
-
-  std::vector<PipDataDisk> pip_disk;
-  read_array(in, pip_disk, pip_count, "PIP data");
-  graph.pip_data.reserve(pip_disk.size());
-  for (const PipDataDisk& pip : pip_disk) {
-    if (pip.forward > 1) {
-      throw std::runtime_error("device graph contains an invalid PIP flag");
-    }
-    graph.pip_data.push_back(
-        {pip.wire0_string, pip.wire1_string, pip.forward != 0});
-  }
+  read_edge_attributes(in, version, edge_count, graph);
+  read_pip_data(in, version, pip_count, graph);
   read_array(in, graph.tile_wire_nodes, tile_wire_count, "tile-wire lookup");
   read_array(in, graph.site_pin_nodes, site_pin_count, "site-pin lookup");
 
-  if (version >= kEndpointAttachmentDeviceRoutingGraphVersion) {
+  if (device_graph_has_endpoint_attachment_trailer(version)) {
     const std::uint64_t attachment_count =
         read_u64(in, "endpoint attachment count");
     const std::uint64_t traversed_type_count =
@@ -1809,6 +2268,7 @@ DeviceRoutingGraph read_device_routing_graph_impl(
     }
   }
 
+  const auto bulk_file_end = in.tellg();
   char trailing_byte = 0;
   in.read(&trailing_byte, 1);
   if (in.gcount() != 0) {
@@ -1832,6 +2292,42 @@ DeviceRoutingGraph read_device_routing_graph_impl(
       (void)validate_csr_arrays(graph);
       break;
   }
+  const auto bulk_load_end = std::chrono::steady_clock::now();
+
+  if (telemetry != nullptr) {
+    const auto checked_file_span = [](std::streampos begin,
+                                      std::streampos end,
+                                      const char* name) {
+      if (begin == std::streampos(-1) || end == std::streampos(-1) ||
+          end < begin) {
+        throw std::runtime_error(std::string("failed to measure ") + name);
+      }
+      const auto span = end - begin;
+      if (span < 0) {
+        throw std::runtime_error(std::string(name) +
+                                 " byte span overflows uint64");
+      }
+      return static_cast<std::uint64_t>(span);
+    };
+    telemetry->string_loading_seconds =
+        std::chrono::duration<double>(string_load_end - string_load_begin)
+            .count();
+    telemetry->string_index_seconds =
+        std::chrono::duration<double>(string_index_end - string_index_begin)
+            .count();
+    // Include the mandatory projection/CSR validation in this stage. It is
+    // part of the devicegraph load wall time and otherwise falls into an
+    // unreported gap before the converter receives the graph.
+    telemetry->bulk_array_loading_seconds =
+        std::chrono::duration<double>(bulk_load_end - string_index_end)
+            .count();
+    telemetry->string_count = string_count;
+    telemetry->string_payload_bytes = string_payload_bytes;
+    telemetry->string_file_bytes = checked_file_span(
+        string_file_begin, bulk_file_begin, "device-graph string table");
+    telemetry->bulk_file_bytes = checked_file_span(
+        bulk_file_begin, bulk_file_end, "device-graph bulk arrays");
+  }
   return graph;
 }
 
@@ -1840,7 +2336,7 @@ DeviceRoutingGraph read_device_routing_graph_impl(
 DeviceRoutingGraph read_device_routing_graph(
     const std::filesystem::path& path) {
   return read_device_routing_graph_impl(
-      path, DeviceRoutingGraphReadProfile::kFull, false);
+      path, DeviceRoutingGraphReadProfile::kFull, false, nullptr);
 }
 
 DeviceRoutingGraph read_device_routing_graph_for_filtering(
@@ -1848,22 +2344,23 @@ DeviceRoutingGraph read_device_routing_graph_for_filtering(
     bool require_endpoint_attachments) {
   return read_device_routing_graph_impl(
       path, DeviceRoutingGraphReadProfile::kFilteringProjection,
-      require_endpoint_attachments);
+      require_endpoint_attachments, nullptr);
 }
 
 DeviceRoutingGraph read_device_routing_graph_for_routing(
     const std::filesystem::path& path,
-    bool require_endpoint_attachments) {
+    bool require_endpoint_attachments,
+    DeviceRoutingGraphReadTelemetry* telemetry) {
   return read_device_routing_graph_impl(
       path, DeviceRoutingGraphReadProfile::kRoutingProjection,
-      require_endpoint_attachments);
+      require_endpoint_attachments, telemetry);
 }
 
 void write_device_routing_graph(const DeviceRoutingGraph& graph,
                                 const std::filesystem::path& path) {
   if (graph.format_version != kCurrentDeviceRoutingGraphVersion) {
     throw std::runtime_error(
-        "refusing to write a stale device graph as version 6; regenerate it "
+        "refusing to write a stale device graph as version 7; regenerate it "
         "with device_to_routing_graph");
   }
   validate_string_table_index(graph.string_table);
@@ -1887,7 +2384,7 @@ void write_device_routing_graph(
     const std::filesystem::path& path) {
   if (graph.format_version != kCurrentDeviceRoutingGraphVersion) {
     throw std::runtime_error(
-        "refusing to write a stale device graph as version 6; regenerate it "
+        "refusing to write a stale device graph as version 7; regenerate it "
         "with device_to_routing_graph");
   }
   validate_string_table_index(graph.string_table);
@@ -1903,6 +2400,7 @@ void write_device_routing_graph(
   for (std::size_t row = 0; row < graph.node_device_ids.size(); ++row) {
     const std::size_t begin = static_cast<std::size_t>(graph.rowptr[row]);
     const std::size_t end = static_cast<std::size_t>(graph.rowptr[row + 1]);
+    attachment_validator.begin_row(static_cast<NodeId>(row), end - begin);
     std::int32_t previous = -1;
     for (std::size_t edge = begin; edge < end; ++edge) {
       const StaticCsrEntry& entry = static_entries[edge];
@@ -2129,6 +2627,12 @@ CsrGraph filter_device_routing_graph(
   csr.rowptr.resize(node_count + 1, 0);
   csr.colind.reserve(graph.colind.size());
   csr.edge_attrs.reserve(graph.edge_attrs.size());
+  if (!enabled_endpoint_attachments.empty()) {
+    csr.retained_endpoint_attachment_edges.reserve(
+        static_cast<std::size_t>(std::count(
+            enabled_endpoint_attachments.begin(),
+            enabled_endpoint_attachments.end(), std::uint8_t{1})));
+  }
   EndpointAttachmentCorridorValidator attachment_validator(graph);
   std::size_t guarded_sink_cursor = 0;
 
@@ -2144,6 +2648,8 @@ CsrGraph filter_device_routing_graph(
         static_cast<std::uint64_t>(end) > graph.loaded_edges) {
       throw std::runtime_error("device graph row pointers are not monotone");
     }
+    attachment_validator.begin_row(
+        static_cast<NodeId>(row), static_cast<std::size_t>(end - begin));
     std::int32_t previous = -1;
     if (blocked_node[row] && !unavailable_destination_nodes[row]) {
       throw std::runtime_error(
@@ -2195,6 +2701,23 @@ CsrGraph filter_device_routing_graph(
           source_is_active &&
           !unavailable_destination_nodes[static_cast<std::size_t>(col)];
       if (retain) {
+        if (attachment_index.has_value()) {
+          if (*attachment_index >=
+              static_cast<std::size_t>(
+                  std::numeric_limits<std::uint32_t>::max())) {
+            throw std::runtime_error(
+                "retained endpoint attachment index overflows uint32");
+          }
+          if (csr.colind.size() >
+              static_cast<std::size_t>(
+                  std::numeric_limits<std::uint64_t>::max())) {
+            throw std::runtime_error(
+                "retained endpoint attachment CSR edge overflows uint64");
+          }
+          csr.retained_endpoint_attachment_edges.push_back(
+              {static_cast<std::uint32_t>(*attachment_index),
+               static_cast<std::uint64_t>(csr.colind.size())});
+        }
         csr.colind.push_back(col);
         csr.edge_attrs.push_back(attr);
       }
@@ -2255,7 +2778,6 @@ CsrGraph filter_device_routing_graph(
     }
   }
 
-  csr.values.assign(csr.colind.size(), 1.0f);
   return csr;
 }
 

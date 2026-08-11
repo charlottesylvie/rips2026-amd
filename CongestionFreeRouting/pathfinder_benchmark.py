@@ -53,6 +53,12 @@ _SCHEMA_CACHE_BY_ID: dict[str, tuple[Path, str, Any]] = {}
 _METADATA_MAGIC = b"RIPSIFM1"
 _NO_ENDPOINT_PIP = 2**64 - 1
 _ENDPOINT_PIP_METADATA_VERSION = 7
+_COMPACT_TABLE_METADATA_VERSION = 8
+
+
+def _metadata_has_endpoint_pips(version: int) -> bool:
+    return version in (_ENDPOINT_PIP_METADATA_VERSION,
+                       _COMPACT_TABLE_METADATA_VERSION)
 
 
 @dataclass(frozen=True)
@@ -582,7 +588,7 @@ def read_metadata_artifact_pair_id(metadata_path: Path) -> str | None:
             raise ValueError(f"{metadata_path} does not use outgoing CSR orientation")
         if version == 4:
             pair_id = None
-        elif version in (5, 6, 7):
+        elif version in (5, 6, 7, 8):
             raw_id = metadata_file.read(16)
             if len(raw_id) != 16:
                 raise ValueError(f"{metadata_path} has a truncated artifact pair id")
@@ -593,7 +599,8 @@ def read_metadata_artifact_pair_id(metadata_path: Path) -> str | None:
             pair_id = f"{high:016x}{low:016x}"
         else:
             raise ValueError(
-                f"{metadata_path} has unsupported metadata version {version}"
+                f"{metadata_path} has unsupported metadata version {version}; "
+                "regenerate it with interchange_to_csr"
             )
 
     generation_path = Path(str(metadata_path) + ".generation")
@@ -652,7 +659,7 @@ def _metadata_route_node(raw: int, label: str) -> int:
 
 
 def read_metadata_summary(metadata_path: Path) -> RoutingMetadataSummary:
-    """Read the sparse reconstruction subset of RIPS metadata v4-v7.
+    """Read the sparse reconstruction subset of RIPS metadata v4-v8.
 
     EdgeAttr and PipData are deliberately seek-skipped: on a full device those
     tables dominate memory, while each v7 EndpointPip repeats the exact tuple
@@ -666,14 +673,15 @@ def read_metadata_summary(metadata_path: Path) -> RoutingMetadataSummary:
             raise ValueError(f"{metadata_path} is not RIPS interchange metadata")
         version = _read_metadata_u64(metadata_file, "metadata version")
         orientation = _read_metadata_u64(metadata_file, "metadata orientation")
-        if version < 4 or version > 7:
+        if version not in (4, 5, 6, 7, 8):
             raise ValueError(
-                f"{metadata_path} has unsupported metadata version {version}"
+                f"{metadata_path} has unsupported metadata version {version}; "
+                "regenerate it with interchange_to_csr"
             )
         if orientation != 2:
             raise ValueError(f"{metadata_path} does not use outgoing CSR orientation")
 
-        if version >= 5:
+        if version in (5, 6, 7, 8):
             high = _read_metadata_u64(metadata_file, "artifact pair id high")
             low = _read_metadata_u64(metadata_file, "artifact pair id low")
             if high == 0 and low == 0:
@@ -690,7 +698,7 @@ def read_metadata_summary(metadata_path: Path) -> RoutingMetadataSummary:
         pip_data_count = _read_metadata_u64(metadata_file, "PIP data count")
         endpoint_pip_count = (
             _read_metadata_u64(metadata_file, "endpoint PIP count")
-            if version >= _ENDPOINT_PIP_METADATA_VERSION
+            if _metadata_has_endpoint_pips(version)
             else 0
         )
         site_pin_attr_count = _read_metadata_u64(
@@ -720,6 +728,20 @@ def read_metadata_summary(metadata_path: Path) -> RoutingMetadataSummary:
         logical_byte_count = _read_metadata_u64(
             metadata_file, "logical netlist byte count"
         )
+        if version == _COMPACT_TABLE_METADATA_VERSION:
+            if string_count > 2**32 - 1 or pip_data_count > 2**32 - 1:
+                raise ValueError(
+                    "metadata v8 string/PIP counts exceed compact uint32 limits"
+                )
+            if (
+                logical_cell_count != 0
+                or logical_port_instance_count != 0
+                or physical_byte_count != 0
+                or logical_byte_count != 0
+            ):
+                raise ValueError(
+                    "metadata v8 omitted hierarchy/payload counts must be zero"
+                )
         for label in (
             "device path string",
             "physical path string",
@@ -742,14 +764,18 @@ def read_metadata_summary(metadata_path: Path) -> RoutingMetadataSummary:
                 raise ValueError(f"{label} references an invalid string")
             return strings[index]
 
-        if version < 6:
+        if version in (4, 5):
             _skip_metadata_bytes(
                 metadata_file, node_count * 40, "legacy node metadata"
             )
+        edge_attr_bytes = 8 if version == _COMPACT_TABLE_METADATA_VERSION else 16
+        pip_data_bytes = 12 if version == _COMPACT_TABLE_METADATA_VERSION else 24
         _skip_metadata_bytes(
-            metadata_file, edge_attr_count * 16, "edge attributes"
+            metadata_file, edge_attr_count * edge_attr_bytes, "edge attributes"
         )
-        _skip_metadata_bytes(metadata_file, pip_data_count * 24, "PIP data")
+        _skip_metadata_bytes(
+            metadata_file, pip_data_count * pip_data_bytes, "PIP data"
+        )
 
         endpoint_pips: list[MetadataEndpointPip] = []
         endpoint_edges: set[int] = set()
@@ -818,12 +844,15 @@ def read_metadata_summary(metadata_path: Path) -> RoutingMetadataSummary:
         )
 
         requests: list[MetadataRouteRequest] = []
+        request_logical_indices: list[int] = []
         for _ in range(route_request_count):
             net = metadata_string(
                 _read_metadata_u64(metadata_file, "route request net"),
                 "route request net",
             )
-            _read_metadata_u64(metadata_file, "route request logical net")
+            logical_net_index = _read_metadata_u64(
+                metadata_file, "route request logical net"
+            )
 
             def read_site_pins(role: int, label: str) -> tuple[MetadataSitePin, ...]:
                 count = _read_metadata_u64(metadata_file, f"{label} count")
@@ -845,7 +874,7 @@ def read_metadata_summary(metadata_path: Path) -> RoutingMetadataSummary:
                         _read_metadata_u64(
                             metadata_file, f"{label} endpoint PIP index"
                         )
-                        if version >= _ENDPOINT_PIP_METADATA_VERSION
+                        if _metadata_has_endpoint_pips(version)
                         else _NO_ENDPOINT_PIP
                     )
                     if endpoint_index != _NO_ENDPOINT_PIP:
@@ -870,30 +899,57 @@ def read_metadata_summary(metadata_path: Path) -> RoutingMetadataSummary:
             sources = read_site_pins(0, "source")
             sinks = read_site_pins(1, "sink")
             requests.append(MetadataRouteRequest(net, sources, sinks))
+            request_logical_indices.append(logical_net_index)
 
-        _skip_metadata_bytes(
-            metadata_file, logical_cell_count * 24, "logical cells"
-        )
-        _skip_metadata_bytes(
-            metadata_file, logical_net_count * 32, "logical nets"
-        )
-        _skip_metadata_bytes(
-            metadata_file,
-            logical_port_instance_count * 56,
-            "logical port instances",
-        )
+        if version == _COMPACT_TABLE_METADATA_VERSION:
+            logical_net_name_strings = [
+                _read_metadata_u64(metadata_file, "logical net name string")
+                for _ in range(logical_net_count)
+            ]
+            for name_string in logical_net_name_strings:
+                metadata_string(name_string, "logical net name")
+            for request, logical_net_index in zip(
+                requests, request_logical_indices, strict=True
+            ):
+                if logical_net_index == _NO_ENDPOINT_PIP:
+                    continue
+                if logical_net_index >= len(logical_net_name_strings):
+                    raise ValueError(
+                        "metadata v8 route request references an invalid logical net"
+                    )
+                logical_name = metadata_string(
+                    logical_net_name_strings[logical_net_index],
+                    "logical net name",
+                )
+                if logical_name != request.net:
+                    raise ValueError(
+                        "metadata v8 physical/logical net-name correlation mismatch"
+                    )
+        else:
+            _skip_metadata_bytes(
+                metadata_file, logical_cell_count * 24, "logical cells"
+            )
+            _skip_metadata_bytes(
+                metadata_file, logical_net_count * 32, "logical nets"
+            )
+            _skip_metadata_bytes(
+                metadata_file,
+                logical_port_instance_count * 56,
+                "logical port instances",
+            )
         _skip_metadata_bytes(
             metadata_file, blocked_node_count * 8, "blocked nodes"
         )
         _skip_metadata_bytes(
             metadata_file, sink_stop_node_count * 8, "sink-stop nodes"
         )
-        _skip_metadata_bytes(
-            metadata_file, physical_byte_count, "physical netlist bytes"
-        )
-        _skip_metadata_bytes(
-            metadata_file, logical_byte_count, "logical netlist bytes"
-        )
+        if version != _COMPACT_TABLE_METADATA_VERSION:
+            _skip_metadata_bytes(
+                metadata_file, physical_byte_count, "physical netlist bytes"
+            )
+            _skip_metadata_bytes(
+                metadata_file, logical_byte_count, "logical netlist bytes"
+            )
         if metadata_file.read(1):
             raise ValueError("metadata has trailing bytes")
 
@@ -1135,7 +1191,7 @@ def validate_routes_against_metadata(
 
             if (
                 metadata is not None
-                and metadata.version >= _ENDPOINT_PIP_METADATA_VERSION
+                and _metadata_has_endpoint_pips(metadata.version)
                 and ("attachment" not in edge or "site" not in edge)
             ):
                 raise ValueError(

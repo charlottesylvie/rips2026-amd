@@ -49,15 +49,40 @@ namespace {
 
 constexpr char METADATA_MAGIC[8] = {'R', 'I', 'P', 'S', 'I', 'F', 'M', '1'};
 constexpr std::uint64_t LEGACY_METADATA_VERSION = 4;
-constexpr std::uint64_t CURRENT_METADATA_VERSION = 7;
+constexpr std::uint64_t CURRENT_METADATA_VERSION = 8;
 constexpr std::uint64_t ARTIFACT_PAIR_METADATA_VERSION = 5;
 constexpr std::uint64_t COMPACT_METADATA_VERSION = 6;
 constexpr std::uint64_t ENDPOINT_PIP_METADATA_VERSION = 7;
+constexpr std::uint64_t COMPACT_TABLE_METADATA_VERSION = 8;
 constexpr std::uint64_t EXPECTED_OUTGOING_EDGE_ORIENTATION = 2;
 constexpr std::uint64_t kInvalidRouteNode =
     std::numeric_limits<std::uint64_t>::max();
 constexpr std::uint64_t kNoEndpointPip =
     std::numeric_limits<std::uint64_t>::max();
+
+constexpr bool metadata_has_artifact_pair(std::uint64_t version) {
+  return version == ARTIFACT_PAIR_METADATA_VERSION ||
+         version == COMPACT_METADATA_VERSION ||
+         version == ENDPOINT_PIP_METADATA_VERSION ||
+         version == COMPACT_TABLE_METADATA_VERSION;
+}
+
+constexpr bool metadata_has_endpoint_pips(std::uint64_t version) {
+  return version == ENDPOINT_PIP_METADATA_VERSION ||
+         version == COMPACT_TABLE_METADATA_VERSION;
+}
+
+constexpr bool metadata_has_legacy_node_arrays(std::uint64_t version) {
+  return version == LEGACY_METADATA_VERSION ||
+         version == ARTIFACT_PAIR_METADATA_VERSION;
+}
+
+constexpr bool metadata_has_legacy_logical_payloads(std::uint64_t version) {
+  return version == LEGACY_METADATA_VERSION ||
+         version == ARTIFACT_PAIR_METADATA_VERSION ||
+         version == COMPACT_METADATA_VERSION ||
+         version == ENDPOINT_PIP_METADATA_VERSION;
+}
 
 struct SitePinKey {
   std::string site;
@@ -114,6 +139,7 @@ struct StubBranchStore {
 
 struct MetadataRouteRequest {
   std::string net;
+  std::uint64_t logical_net_index = kNoEndpointPip;
   std::vector<RouteSitePin> sources;
   std::vector<RouteSitePin> sinks;
 };
@@ -145,6 +171,7 @@ struct RoutingMetadataSummary {
   std::vector<std::string> strings;
   std::vector<MetadataEndpointPip> endpoint_pips;
   std::vector<MetadataRouteRequest> route_requests;
+  std::vector<std::uint64_t> logical_net_name_strings;
 };
 
 struct JsonValue {
@@ -491,7 +518,9 @@ RoutingMetadataSummary load_metadata_summary(const std::filesystem::path& path) 
   const std::uint64_t orientation = read_u64(in, "metadata orientation");
   if (version < LEGACY_METADATA_VERSION ||
       version > CURRENT_METADATA_VERSION) {
-    throw std::runtime_error("unsupported metadata version");
+    throw std::runtime_error(
+        "unsupported metadata version; regenerate it with "
+        "interchange_to_csr");
   }
   if (orientation != EXPECTED_OUTGOING_EDGE_ORIENTATION) {
     throw std::runtime_error("unsupported metadata orientation");
@@ -499,7 +528,7 @@ RoutingMetadataSummary load_metadata_summary(const std::filesystem::path& path) 
 
   std::optional<routing::interchange::InterchangeArtifactPairId>
       artifact_pair_id;
-  if (version >= ARTIFACT_PAIR_METADATA_VERSION) {
+  if (metadata_has_artifact_pair(version)) {
     routing::interchange::InterchangeArtifactPairId id;
     id.high = read_u64(in, "metadata artifact pair id high");
     id.low = read_u64(in, "metadata artifact pair id low");
@@ -513,10 +542,10 @@ RoutingMetadataSummary load_metadata_summary(const std::filesystem::path& path) 
   const std::uint64_t node_count = read_u64(in, "node count");
   const std::uint64_t edge_attr_count = read_u64(in, "edge attr count");
   const std::uint64_t pip_data_count = read_u64(in, "pip data count");
-  const std::uint64_t endpoint_pip_count =
-      version >= ENDPOINT_PIP_METADATA_VERSION
-          ? read_u64(in, "endpoint PIP count")
-          : 0;
+  const std::uint64_t endpoint_pip_count = metadata_has_endpoint_pips(version)
+                                               ? read_u64(in,
+                                                          "endpoint PIP count")
+                                               : 0;
   const std::uint64_t site_pin_attr_count = read_u64(in, "site pin attr count");
   const std::uint64_t route_request_count = read_u64(in, "route request count");
   const std::uint64_t blocked_node_count = read_u64(in, "blocked node count");
@@ -529,6 +558,19 @@ RoutingMetadataSummary load_metadata_summary(const std::filesystem::path& path) 
       read_u64(in, "physical netlist byte count");
   const std::uint64_t logical_netlist_byte_count =
       read_u64(in, "logical netlist byte count");
+  if (version == COMPACT_TABLE_METADATA_VERSION) {
+    if (string_count > std::numeric_limits<std::uint32_t>::max() ||
+        pip_data_count > std::numeric_limits<std::uint32_t>::max()) {
+      throw std::runtime_error(
+          "metadata v8 string/PIP counts exceed compact uint32 limits");
+    }
+    if (logical_cell_count != 0 || logical_port_instance_count != 0 ||
+        physical_netlist_byte_count != 0 ||
+        logical_netlist_byte_count != 0) {
+      throw std::runtime_error(
+          "metadata v8 omitted hierarchy/payload counts must be zero");
+    }
+  }
 
   (void)read_u64(in, "device path string");
   (void)read_u64(in, "physical path string");
@@ -545,7 +587,7 @@ RoutingMetadataSummary load_metadata_summary(const std::filesystem::path& path) 
     metadata.strings.push_back(read_metadata_string(in));
   }
 
-  if (version < COMPACT_METADATA_VERSION) {
+  if (metadata_has_legacy_node_arrays(version)) {
     skip_bytes(in,
                checked_byte_count(node_count, sizeof(std::uint64_t),
                                   "node ids"),
@@ -578,13 +620,21 @@ RoutingMetadataSummary load_metadata_summary(const std::filesystem::path& path) 
   // These full-device tables can contain tens of millions of records.  Route
   // reconstruction only needs the sparse, self-contained EndpointPip table,
   // so retain the original streaming behavior here.
+  const std::size_t edge_attr_record_bytes =
+      version == COMPACT_TABLE_METADATA_VERSION
+          ? 2 * sizeof(std::uint32_t)
+          : 2 * sizeof(std::uint64_t);
+  const std::size_t pip_record_bytes =
+      version == COMPACT_TABLE_METADATA_VERSION
+          ? 3 * sizeof(std::uint32_t)
+          : 3 * sizeof(std::uint64_t);
   skip_bytes(in,
-             checked_byte_count(edge_attr_count,
-                                2 * sizeof(std::uint64_t), "edge attrs"),
+             checked_byte_count(edge_attr_count, edge_attr_record_bytes,
+                                "edge attrs"),
              "edge attrs");
   skip_bytes(in,
-             checked_byte_count(pip_data_count,
-                                3 * sizeof(std::uint64_t), "PIP data"),
+             checked_byte_count(pip_data_count, pip_record_bytes,
+                                "PIP data"),
              "PIP data");
 
   metadata.endpoint_pips.reserve(
@@ -664,7 +714,7 @@ RoutingMetadataSummary load_metadata_summary(const std::filesystem::path& path) 
   for (std::uint64_t i = 0; i < route_request_count; ++i) {
     MetadataRouteRequest request;
     request.net = string_at(metadata, read_u64(in, "route request net"));
-    (void)read_u64(in, "route request logical net");
+    request.logical_net_index = read_u64(in, "route request logical net");
 
     const std::uint64_t source_count = read_u64(in, "source count");
     request.sources.reserve(checked_size_count(source_count, "source count"));
@@ -674,7 +724,7 @@ RoutingMetadataSummary load_metadata_summary(const std::filesystem::path& path) 
       source.site = string_at(metadata, read_u64(in, "source site"));
       source.pin = string_at(metadata, read_u64(in, "source pin"));
       source.endpoint_pip_index =
-          version >= ENDPOINT_PIP_METADATA_VERSION
+          metadata_has_endpoint_pips(version)
               ? read_u64(in, "source endpoint PIP index")
               : kNoEndpointPip;
       if (source.endpoint_pip_index != kNoEndpointPip) {
@@ -702,7 +752,7 @@ RoutingMetadataSummary load_metadata_summary(const std::filesystem::path& path) 
       sink.site = string_at(metadata, read_u64(in, "sink site"));
       sink.pin = string_at(metadata, read_u64(in, "sink pin"));
       sink.endpoint_pip_index =
-          version >= ENDPOINT_PIP_METADATA_VERSION
+          metadata_has_endpoint_pips(version)
               ? read_u64(in, "sink endpoint PIP index")
               : kNoEndpointPip;
       if (sink.endpoint_pip_index != kNoEndpointPip) {
@@ -724,19 +774,49 @@ RoutingMetadataSummary load_metadata_summary(const std::filesystem::path& path) 
     metadata.route_requests.push_back(std::move(request));
   }
 
-  skip_bytes(in,
-             checked_byte_count(logical_cell_count,
-                                3 * sizeof(std::uint64_t), "logical cells"),
-             "logical cells");
-  skip_bytes(in,
-             checked_byte_count(logical_net_count,
-                                4 * sizeof(std::uint64_t), "logical nets"),
-             "logical nets");
-  skip_bytes(in,
-             checked_byte_count(logical_port_instance_count,
-                                7 * sizeof(std::uint64_t),
-                                "logical port instances"),
-             "logical port instances");
+  if (metadata_has_legacy_logical_payloads(version)) {
+    skip_bytes(in,
+               checked_byte_count(logical_cell_count,
+                                  3 * sizeof(std::uint64_t),
+                                  "logical cells"),
+               "logical cells");
+    skip_bytes(in,
+               checked_byte_count(logical_net_count,
+                                  4 * sizeof(std::uint64_t),
+                                  "logical nets"),
+               "logical nets");
+    skip_bytes(in,
+               checked_byte_count(logical_port_instance_count,
+                                  7 * sizeof(std::uint64_t),
+                                  "logical port instances"),
+               "logical port instances");
+  } else {
+    metadata.logical_net_name_strings.reserve(
+        checked_size_count(logical_net_count, "logical net count"));
+    for (std::uint64_t i = 0; i < logical_net_count; ++i) {
+      const std::uint64_t name_string =
+          read_u64(in, "logical net name string");
+      (void)string_at(metadata, name_string);
+      metadata.logical_net_name_strings.push_back(name_string);
+    }
+    for (const MetadataRouteRequest& request : metadata.route_requests) {
+      if (request.logical_net_index == kNoEndpointPip) {
+        continue;
+      }
+      if (request.logical_net_index >=
+          metadata.logical_net_name_strings.size()) {
+        throw std::runtime_error(
+            "metadata v8 route request references an invalid logical net");
+      }
+      const std::uint64_t name_string =
+          metadata.logical_net_name_strings[static_cast<std::size_t>(
+              request.logical_net_index)];
+      if (string_at(metadata, name_string) != request.net) {
+        throw std::runtime_error(
+            "metadata v8 physical/logical net-name correlation mismatch");
+      }
+    }
+  }
   skip_bytes(in,
              checked_byte_count(blocked_node_count, sizeof(std::uint64_t),
                                 "blocked nodes"),
@@ -745,8 +825,19 @@ RoutingMetadataSummary load_metadata_summary(const std::filesystem::path& path) 
              checked_byte_count(sink_stop_node_count, sizeof(std::uint64_t),
                                 "sink stop nodes"),
              "sink stop nodes");
-  skip_bytes(in, physical_netlist_byte_count, "physical netlist bytes");
-  skip_bytes(in, logical_netlist_byte_count, "logical netlist bytes");
+  if (metadata_has_legacy_logical_payloads(version)) {
+    skip_bytes(in, physical_netlist_byte_count, "physical netlist bytes");
+    skip_bytes(in, logical_netlist_byte_count, "logical netlist bytes");
+  }
+
+  char trailing = 0;
+  in.read(&trailing, 1);
+  if (in.gcount() != 0) {
+    throw std::runtime_error("metadata has trailing bytes");
+  }
+  if (!in.eof()) {
+    throw std::runtime_error("failed while checking metadata end of file");
+  }
 
   return metadata;
 }
@@ -894,9 +985,7 @@ std::unordered_map<std::string, NetRoute> load_routes_jsonl(
 
   std::unordered_map<std::string, NetRoute> routes;
   std::string line;
-  int line_no = 0;
   while (std::getline(in, line)) {
-    ++line_no;
     if (line.find_first_not_of(" \t\r\n") == std::string::npos) continue;
     NetRoute route = parse_route_line(line);
     const std::string net = route.net;
@@ -931,7 +1020,9 @@ void validate_routes_against_metadata(
     }
   }
 
-  for (const auto& [net, route] : routes) {
+  for (const auto& route_entry : routes) {
+    const std::string& net = route_entry.first;
+    const NetRoute& route = route_entry.second;
     const auto found = requests_by_net.find(net);
     if (found == requests_by_net.end()) {
       throw std::runtime_error("route file contains net not present in metadata: " + net);
@@ -1029,7 +1120,7 @@ void validate_routes_against_metadata(
       }
       outgoing_by_node[edge.from].push_back(&edge);
 
-      if (metadata.version >= ENDPOINT_PIP_METADATA_VERSION &&
+      if (metadata_has_endpoint_pips(metadata.version) &&
           (!edge.attachment_field_present || !edge.site_field_present)) {
         throw std::runtime_error(
             "v7 route edge is missing attachment/site fields for net " + net);
@@ -1507,8 +1598,6 @@ void write_routed_phys(const std::filesystem::path& input_phys,
       copy_string_list(netlist.getStrList(), string_to_index);
 
   std::unordered_map<std::string, bool> routed_seen;
-  int total_pips = 0;
-  int total_nets = 0;
 
   auto phys_nets = netlist.getPhysNets();
   for (std::uint32_t net_index = 0; net_index < phys_nets.size(); ++net_index) {
@@ -1617,8 +1706,6 @@ void write_routed_phys(const std::filesystem::path& input_phys,
       copy_route_branch(old_stubs[stub.branch_index], new_stubs[stub_index++]);
     }
     routed_seen.emplace(net_name, true);
-    total_pips += emitted_edges;
-    ++total_nets;
   }
 
   for (const auto& [net, route] : routes) {

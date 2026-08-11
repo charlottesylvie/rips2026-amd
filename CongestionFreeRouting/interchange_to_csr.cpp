@@ -15,11 +15,11 @@
 //   node attribute "sp" = (siteName, pinName), for sink site pins
 //
 // The sidecar also records route requests extracted from PhysicalNetlist stubs
-// and source site pins, logical net summaries extracted from LogicalNetlist,
-// and the original decompressed .phys/.netlist payloads. That metadata is
-// intentionally CPU-side: the GPU CSR remains compact and compatible with the
-// routing kernels, while later post-processing has enough context
-// to turn SSSP paths back into PhysPIP route branches in a routed .phys file.
+// and source site pins plus the minimal logical-net name/index correlation
+// used by diagnostics. That metadata is intentionally CPU-side: the GPU CSR
+// remains compact and compatible with the routing kernels, while later
+// post-processing reloads the original .phys input to turn SSSP paths into
+// PhysPIP route branches.
 //
 // DeviceResources parsing and invariant graph construction live in
 // device_to_routing_graph.cpp and run once per (device, bounds, bounds mode).
@@ -55,11 +55,14 @@
 #include <capnp/serialize.h>
 #include <kj/array.h>
 #include <algorithm>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <iomanip>
+#include <initializer_list>
 #include <iostream>
 #include <limits>
 #include <optional>
@@ -69,6 +72,8 @@
 #include <unordered_set>
 #include <utility>
 #include <vector>
+
+#include <sys/resource.h>
 
 namespace {
 
@@ -80,15 +85,15 @@ static_assert(sizeof(std::int32_t) == 4, "int32_t must be 4 bytes");
 static_assert(sizeof(float) == 4, "float must be 4 bytes");
 
 struct PipDataDisk {
-  std::uint64_t wire0_string = 0;
-  std::uint64_t wire1_string = 0;
-  std::uint64_t forward = 0;
+  std::uint32_t wire0_string = 0;
+  std::uint32_t wire1_string = 0;
+  std::uint32_t forward = 0;
 };
 
-static_assert(sizeof(PipDataDisk) == 3 * sizeof(std::uint64_t),
+static_assert(sizeof(PipDataDisk) == 3 * sizeof(std::uint32_t),
               "PipDataDisk metadata layout changed");
 
-// Metadata v7 sparse endpoint-owned pseudo-PIP record. Keep this layout in
+// Metadata v7+ sparse endpoint-owned pseudo-PIP record. Keep this layout in
 // lockstep with pathfinder.cpp and routes_to_phys.cpp.
 struct EndpointPipDisk {
   std::uint64_t csr_edge = 0;
@@ -108,16 +113,22 @@ static_assert(sizeof(EndpointPipDisk) == 10 * sizeof(std::uint64_t),
 
 constexpr char CSR_MAGIC[8] = {'R', 'I', 'P', 'S', 'C', 'S', 'R', '1'};
 constexpr char METADATA_MAGIC[8] = {'R', 'I', 'P', 'S', 'I', 'F', 'M', '1'};
-constexpr std::uint64_t CSR_FORMAT_VERSION = 3;
-// Version 7 adds a sparse endpoint-owned pseudo-PIP table and binds each route
-// endpoint to its permitted attachment. The generic CSR stays at version 3.
-constexpr std::uint64_t METADATA_FORMAT_VERSION = 7;
+constexpr std::uint64_t CSR_IMPLICIT_UNIT_NO_SHARD_VERSION = 4;
+constexpr std::uint64_t CSR_FORMAT_VERSION =
+    CSR_IMPLICIT_UNIT_NO_SHARD_VERSION;
+// Metadata v8 retains the v7 endpoint-PIP policy while compacting graph-sized
+// records and dropping payloads/summaries unused by active readers. CSR v4 is
+// versioned independently.
+constexpr std::uint64_t METADATA_FORMAT_VERSION = 8;
 constexpr std::uint64_t OUTGOING_EDGE_ORIENTATION = 2;
 using routing::interchange::CsrGraph;
 using routing::interchange::DeviceRoutingGraph;
+using routing::interchange::DeviceRoutingGraphReadTelemetry;
 using routing::interchange::EdgeAttr;
 using routing::interchange::EndpointAttachment;
 using routing::interchange::EndpointAttachmentRole;
+using routing::interchange::FixedEndpointAttachmentIndex;
+using routing::interchange::FixedEndpointAttachmentSiteSlice;
 using routing::interchange::InterchangeArtifactPairId;
 using routing::interchange::NodeId;
 using routing::interchange::PipData;
@@ -201,37 +212,9 @@ struct RouteRequest {
   std::vector<SitePinNode> sinks;
 };
 
-// One logical port instance inside a LogicalNetlist net. This is CPU metadata
-// only; it lets a later routed-.phys writer relate physical route requests back
-// to logical connectivity if it needs to validate or annotate the result.
-struct LogicalPortInstanceSummary {
-  std::uint64_t port_string = 0;
-  std::uint64_t instance_string = kNoStringIndex;
-  std::uint32_t port_index = 0;
-  std::uint32_t instance_index = 0;
-  std::uint32_t bus_index = 0;
-  bool has_bus_index = false;
-  bool is_external_port = false;
-};
-
-// One LogicalNetlist net, stored with a slice into logical_port_instances.
-struct LogicalNetSummary {
-  std::uint64_t name_string = 0;
-  std::uint64_t cell_index = 0;
-  std::uint64_t port_instance_begin = 0;
-  std::uint64_t port_instance_count = 0;
-};
-
-// One LogicalNetlist cell, stored with a slice into logical_nets.
-struct LogicalCellSummary {
-  std::uint64_t declaration_name_string = 0;
-  std::uint64_t net_begin = 0;
-  std::uint64_t net_count = 0;
-};
-
 // Static device fields are loaded from the preprocessed artifact. This derived
-// structure adds only benchmark-specific masks, requests, logical summaries,
-// and provenance.
+// structure adds only benchmark-specific masks, requests, minimal logical-net
+// correlation, and provenance.
 struct RoutingGraph : DeviceRoutingGraph {
   explicit RoutingGraph(DeviceRoutingGraph&& device_graph)
       : DeviceRoutingGraph(std::move(device_graph)) {
@@ -262,12 +245,8 @@ struct RoutingGraph : DeviceRoutingGraph {
   std::uint64_t physical_path_string = 0;
   std::uint64_t logical_path_string = 0;
   std::uint64_t logical_design_name_string = 0;
-  std::vector<LogicalCellSummary> logical_cells;
-  std::vector<LogicalNetSummary> logical_nets;
-  std::vector<LogicalPortInstanceSummary> logical_port_instances;
+  std::vector<std::uint64_t> logical_net_name_strings;
   std::unordered_map<std::string, std::uint64_t> logical_net_index_by_name;
-  std::vector<std::uint8_t> physical_netlist_bytes;
-  std::vector<std::uint8_t> logical_netlist_bytes;
 };
 
 // Lightweight site-pin name pair used while walking PhysicalNetlist route
@@ -571,53 +550,117 @@ Options parse_options(int argc, char** argv) {
   return options;
 }
 
-// FPGAIF files used by the contest are gzipped Cap'n Proto messages. zlib's
-// gzopen also handles plain files, which makes this helper tolerant of either
-// compressed or already-decompressed inputs.
-std::vector<std::uint8_t> read_gzip_or_plain_file(
-    const std::filesystem::path& path) {
-  std::vector<std::uint8_t> bytes;
-  std::error_code size_error;
-  const std::uintmax_t encoded_size =
-      std::filesystem::file_size(path, size_error);
-  if (!size_error &&
-      encoded_size <= std::numeric_limits<std::size_t>::max()) {
-    bytes.reserve(static_cast<std::size_t>(encoded_size));
+struct WordAlignedPayload {
+  kj::Array<capnp::word> words;
+  std::size_t decoded_bytes = 0;
+  std::uint64_t peak_allocation_bytes = 0;
+
+  std::size_t word_count() const {
+    return decoded_bytes / sizeof(capnp::word);
   }
+};
+
+std::uint64_t word_aligned_payload_allocation_bytes(
+    const WordAlignedPayload& payload,
+    const char* name) {
+  if (payload.words.size() >
+      std::numeric_limits<std::uint64_t>::max() / sizeof(capnp::word)) {
+    throw std::runtime_error(std::string(name) +
+                             " allocation bytes overflow uint64");
+  }
+  const std::uint64_t resident_bytes =
+      static_cast<std::uint64_t>(payload.words.size()) * sizeof(capnp::word);
+  if (payload.peak_allocation_bytes < resident_bytes) {
+    throw std::runtime_error(std::string(name) +
+                             " peak allocation accounting is inconsistent");
+  }
+  return payload.peak_allocation_bytes;
+}
+
+// Decode directly into Cap'n Proto-aligned storage. read_gzip_or_plain_chunks
+// owns gzip terminal-status and truncation checks; this layer preserves exact
+// decoded length and rejects a partial final word instead of accepting padded
+// data. zlib also permits already-decompressed input through the same path.
+WordAlignedPayload read_word_aligned_payload(
+    const std::filesystem::path& path) {
+  WordAlignedPayload payload;
+  constexpr std::size_t kWordBytes = sizeof(capnp::word);
   read_gzip_or_plain_chunks(
       path, [&](const std::uint8_t* data, std::size_t byte_count) {
-        if (byte_count > bytes.max_size() - bytes.size()) {
+        if (byte_count == 0) {
+          return;
+        }
+        if (byte_count >
+            std::numeric_limits<std::size_t>::max() -
+                payload.decoded_bytes) {
           throw std::runtime_error("decoded input is too large: " +
                                    path.string());
         }
-        const std::size_t old_size = bytes.size();
-        bytes.resize(old_size + byte_count);
-        std::memcpy(bytes.data() + old_size, data, byte_count);
+        const std::size_t old_size = payload.decoded_bytes;
+        payload.decoded_bytes += byte_count;
+        if (payload.decoded_bytes >
+            std::numeric_limits<std::size_t>::max() - (kWordBytes - 1)) {
+          throw std::runtime_error(
+              "decoded Cap'n Proto word count overflows size_t: " +
+              path.string());
+        }
+        const std::size_t word_count =
+            (payload.decoded_bytes + kWordBytes - 1) / kWordBytes;
+        constexpr std::size_t kMaximumWordCount =
+            std::numeric_limits<std::size_t>::max() / sizeof(capnp::word);
+        if (word_count > kMaximumWordCount) {
+          throw std::runtime_error(
+              "decoded Cap'n Proto word count exceeds host capacity: " +
+              path.string());
+        }
+        if (word_count > payload.words.size()) {
+          std::size_t grown_word_count = payload.words.size();
+          if (grown_word_count == 0) {
+            grown_word_count = word_count;
+          } else if (grown_word_count > kMaximumWordCount / 2) {
+            grown_word_count = kMaximumWordCount;
+          } else {
+            grown_word_count *= 2;
+          }
+          grown_word_count = std::max(grown_word_count, word_count);
+          if (payload.words.size() >
+              std::numeric_limits<std::size_t>::max() - grown_word_count) {
+            throw std::runtime_error(
+                "decoded Cap'n Proto peak allocation overflows size_t: " +
+                path.string());
+          }
+          const std::size_t peak_words =
+              payload.words.size() + grown_word_count;
+          if (peak_words >
+              std::numeric_limits<std::uint64_t>::max() / kWordBytes) {
+            throw std::runtime_error(
+                "decoded Cap'n Proto peak allocation overflows uint64: " +
+                path.string());
+          }
+          payload.peak_allocation_bytes = std::max(
+              payload.peak_allocation_bytes,
+              static_cast<std::uint64_t>(peak_words) * kWordBytes);
+          kj::Array<capnp::word> grown =
+              kj::heapArray<capnp::word>(grown_word_count);
+          if (old_size != 0) {
+            std::memcpy(grown.begin(), payload.words.begin(), old_size);
+          }
+          payload.words = kj::mv(grown);
+        }
+        std::memcpy(reinterpret_cast<std::uint8_t*>(payload.words.begin()) +
+                        old_size,
+                    data, byte_count);
       });
 
-  if (bytes.empty()) {
+  if (payload.decoded_bytes == 0) {
     throw std::runtime_error("input file is empty: " + path.string());
   }
-
-  return bytes;
-}
-
-// Cap'n Proto's FlatArrayMessageReader expects exact word-aligned storage.
-// Copy only after rejecting a partial final word instead of hiding it with
-// zero-padding.
-std::vector<capnp::word> bytes_to_words(
-    const std::vector<std::uint8_t>& bytes,
-    const std::filesystem::path& path) {
-  const std::size_t word_size = sizeof(capnp::word);
-  if (bytes.size() % word_size != 0) {
+  if (payload.decoded_bytes % kWordBytes != 0) {
     throw std::runtime_error(
         "decoded Cap'n Proto input is not word-aligned: " + path.string() +
-        " has " + std::to_string(bytes.size()) + " bytes");
+        " has " + std::to_string(payload.decoded_bytes) + " bytes");
   }
-  const std::size_t word_count = bytes.size() / word_size;
-  std::vector<capnp::word> words(word_count);
-  std::memcpy(words.data(), bytes.data(), bytes.size());
-  return words;
+  return payload;
 }
 
 // Validate signed offsets before writing them into unsigned binary headers.
@@ -626,6 +669,13 @@ std::uint64_t as_u64(std::int64_t value, const char* name) {
     throw std::runtime_error(std::string(name) + " is negative");
   }
   return static_cast<std::uint64_t>(value);
+}
+
+std::uint32_t checked_narrow_u32(std::uint64_t value, const char* name) {
+  if (value > std::numeric_limits<std::uint32_t>::max()) {
+    throw std::runtime_error(std::string(name) + " exceeds uint32");
+  }
+  return static_cast<std::uint32_t>(value);
 }
 
 void write_u64(std::ofstream& out, std::uint64_t value, const char* name) {
@@ -670,6 +720,113 @@ std::uint64_t checked_add_u64(std::uint64_t lhs,
   }
   return lhs + rhs;
 }
+
+using TelemetryClock = std::chrono::steady_clock;
+
+double elapsed_seconds(TelemetryClock::time_point begin,
+                       TelemetryClock::time_point end) {
+  return std::chrono::duration<double>(end - begin).count();
+}
+
+std::uint64_t process_peak_rss_bytes() {
+  struct rusage usage {};
+  if (getrusage(RUSAGE_SELF, &usage) != 0 || usage.ru_maxrss < 0) {
+    return 0;
+  }
+  const std::uint64_t raw = static_cast<std::uint64_t>(usage.ru_maxrss);
+#if defined(__APPLE__)
+  return raw;
+#else
+  if (raw > std::numeric_limits<std::uint64_t>::max() / 1024) {
+    return std::numeric_limits<std::uint64_t>::max();
+  }
+  return raw * 1024;
+#endif
+}
+
+void emit_stage_telemetry(
+    const char* stage,
+    double seconds,
+    std::initializer_list<std::pair<const char*, std::uint64_t>> fields = {}) {
+  std::cout << std::setprecision(9)
+            << "{\"type\":\"interchange_to_csr_stage\","
+               "\"schema_version\":1,\"stage\":\""
+            << stage << "\",\"seconds\":" << seconds
+            << ",\"peak_rss_bytes\":" << process_peak_rss_bytes();
+  for (const auto& field : fields) {
+    std::cout << ",\"" << field.first << "\":" << field.second;
+  }
+  std::cout << "}\n";
+}
+
+template <typename T>
+std::uint64_t vector_allocation_bytes(const std::vector<T>& values,
+                                      const char* name) {
+  if (values.capacity() >
+      std::numeric_limits<std::uint64_t>::max() / sizeof(T)) {
+    throw std::runtime_error(std::string(name) +
+                             " allocation bytes overflow uint64");
+  }
+  return static_cast<std::uint64_t>(values.capacity()) * sizeof(T);
+}
+
+struct DecodeParseTelemetry {
+  double decode_seconds = 0.0;
+  double parse_seconds = 0.0;
+  std::uint64_t decoded_bytes = 0;
+  std::uint64_t decode_peak_allocation_bytes = 0;
+};
+
+// Declare this before the decode/parse working sets. Its destructor then runs
+// after their cleanup, so parse wall time does not leave a potentially large
+// unreported gap between the stage event and its caller.
+class DecodeParseTelemetryRecorder {
+ public:
+  explicit DecodeParseTelemetryRecorder(DecodeParseTelemetry* telemetry)
+      : telemetry_(telemetry), decode_begin_(TelemetryClock::now()) {}
+
+  void mark_decode_complete(std::uint64_t decoded_bytes,
+                            std::uint64_t peak_allocation_bytes) {
+    decode_end_ = TelemetryClock::now();
+    decoded_bytes_ = decoded_bytes;
+    decode_peak_allocation_bytes_ = peak_allocation_bytes;
+    decode_complete_ = true;
+  }
+
+  ~DecodeParseTelemetryRecorder() {
+    if (telemetry_ == nullptr || !decode_complete_) {
+      return;
+    }
+    const auto parse_end = TelemetryClock::now();
+    telemetry_->decode_seconds =
+        elapsed_seconds(decode_begin_, decode_end_);
+    telemetry_->parse_seconds = elapsed_seconds(decode_end_, parse_end);
+    telemetry_->decoded_bytes = decoded_bytes_;
+    telemetry_->decode_peak_allocation_bytes =
+        decode_peak_allocation_bytes_;
+  }
+
+ private:
+  DecodeParseTelemetry* telemetry_ = nullptr;
+  TelemetryClock::time_point decode_begin_;
+  TelemetryClock::time_point decode_end_;
+  std::uint64_t decoded_bytes_ = 0;
+  std::uint64_t decode_peak_allocation_bytes_ = 0;
+  bool decode_complete_ = false;
+};
+
+struct CsrBuildTelemetry {
+  double filtering_seconds = 0.0;
+  double endpoint_binding_seconds = 0.0;
+  double spatial_sidecar_seconds = 0.0;
+  std::uint64_t filtering_output_allocation_bytes = 0;
+  std::uint64_t endpoint_binding_allocation_bytes = 0;
+  std::uint64_t spatial_sidecar_allocation_bytes = 0;
+};
+
+struct MetadataWriteTelemetry {
+  std::uint64_t packing_allocation_bytes = 0;
+};
 
 void finish_output(std::ofstream& out,
                    const std::filesystem::path& path) {
@@ -904,77 +1061,6 @@ std::optional<NodeId> find_tile_wire_node(const RoutingGraph& graph,
                         wire_name);
 }
 
-std::optional<std::uint32_t> find_fixed_endpoint_attachment(
-    const RoutingGraph& graph,
-    const std::string& tile,
-    const std::string& wire0,
-    const std::string& wire1,
-    bool forward,
-    const std::string& traversed_site) {
-  std::optional<std::uint32_t> result;
-  for (std::uint32_t index = 0; index < graph.endpoint_attachments.size();
-       ++index) {
-    const EndpointAttachment& attachment = graph.endpoint_attachments[index];
-    if (attachment.pip_data_index >= graph.pip_data.size() ||
-        attachment.traversed_site_string >=
-            graph.string_table.strings.size()) {
-      throw std::runtime_error(
-          "endpoint attachment references invalid PIP/site metadata");
-    }
-    const PipData& data = graph.pip_data[
-        static_cast<std::size_t>(attachment.pip_data_index)];
-    if (data.wire0_string >= graph.string_table.strings.size() ||
-        data.wire1_string >= graph.string_table.strings.size()) {
-      throw std::runtime_error(
-          "endpoint attachment references invalid wire strings");
-    }
-    if (graph.string_table.strings[data.wire0_string] != wire0 ||
-        graph.string_table.strings[data.wire1_string] != wire1 ||
-        data.forward != forward ||
-        graph.string_table.strings[attachment.traversed_site_string] !=
-            traversed_site) {
-      continue;
-    }
-
-    if (attachment.from_node < 0 ||
-        static_cast<std::size_t>(attachment.from_node + 1) >=
-            graph.rowptr.size()) {
-      throw std::runtime_error(
-          "endpoint attachment source row is outside the device graph");
-    }
-    bool exact_edge = false;
-    for (std::int64_t edge =
-             graph.rowptr[static_cast<std::size_t>(attachment.from_node)];
-         edge < graph.rowptr[static_cast<std::size_t>(attachment.from_node) +
-                             1];
-         ++edge) {
-      const std::size_t edge_index = static_cast<std::size_t>(edge);
-      if (graph.colind[edge_index] != attachment.to_node ||
-          graph.edge_attrs[edge_index].pip_data_index !=
-              attachment.pip_data_index) {
-        continue;
-      }
-      const std::uint64_t tile_string =
-          graph.edge_attrs[edge_index].tile_string;
-      exact_edge =
-          tile_string < graph.string_table.strings.size() &&
-          graph.string_table.strings[tile_string] == tile;
-      if (exact_edge) {
-        break;
-      }
-    }
-    if (!exact_edge) {
-      continue;
-    }
-    if (result.has_value()) {
-      throw std::runtime_error(
-          "fixed site-bearing PIP matches multiple endpoint attachments");
-    }
-    result = index;
-  }
-  return result;
-}
-
 bool is_full_device_graph(const RoutingGraph& graph) {
   return graph.bounds.min_x == 0 && graph.bounds.min_y == 0 &&
          graph.bounds.max_x == std::numeric_limits<std::int32_t>::max() &&
@@ -1087,6 +1173,7 @@ void preserve_route_forest(
     const ActiveSiteTypes& active_site_types,
     const RouteEndpointOwners& endpoint_owners,
     RoutingGraph& graph,
+    const FixedEndpointAttachmentIndex& fixed_attachment_index,
     AttachmentResourceClaims& attachment_resource_claims,
     std::size_t owner,
     const std::string& net_name,
@@ -1152,8 +1239,9 @@ void preserve_route_forest(
       if (pip.isSite()) {
         const std::string& site = strings.get(pip.getSite());
         const std::optional<std::uint32_t> attachment =
-            find_fixed_endpoint_attachment(
-                graph, tile, wire0, wire1, pip.getForward(), site);
+            routing::interchange::find_fixed_endpoint_attachment(
+                fixed_attachment_index, graph.string_table, tile, wire0,
+                wire1, pip.getForward(), site);
         if (attachment.has_value()) {
           claim_attachment_resources(
               graph, graph.endpoint_attachments[*attachment],
@@ -1164,20 +1252,31 @@ void preserve_route_forest(
           // from the routable CSR. Conservatively reserve every audited
           // attachment resource at the same traversed site so newly routed
           // nets cannot overlap the fixed site's unknown pseudo resources.
-          for (const EndpointAttachment& candidate :
-               graph.endpoint_attachments) {
-            if (candidate.traversed_site_string >=
-                graph.string_table.strings.size()) {
+          const FixedEndpointAttachmentSiteSlice slice =
+              routing::interchange::find_fixed_endpoint_attachment_site_slice(
+                  fixed_attachment_index, graph.string_table, site);
+          if (slice.attachment_begin >
+                  fixed_attachment_index.attachments_by_traversed_site.size() ||
+              slice.attachment_count >
+                  fixed_attachment_index.attachments_by_traversed_site.size() -
+                      slice.attachment_begin) {
+            throw std::runtime_error(
+                "fixed endpoint attachment site slice is invalid");
+          }
+          const std::size_t slice_end =
+              slice.attachment_begin + slice.attachment_count;
+          for (std::size_t offset = slice.attachment_begin;
+               offset < slice_end; ++offset) {
+            const std::uint32_t candidate_index =
+                fixed_attachment_index.attachments_by_traversed_site[offset];
+            if (candidate_index >= graph.endpoint_attachments.size()) {
               throw std::runtime_error(
-                  "endpoint attachment traversed site is invalid");
+                  "fixed endpoint attachment site slice is invalid");
             }
-            if (graph.string_table.strings[
-                    candidate.traversed_site_string] == site) {
-              claim_attachment_resources(
-                  graph, candidate, active_site_types,
-                  attachment_resource_claims, owner,
-                  "fixed pseudo PIP on net " + net_name);
-            }
+            claim_attachment_resources(
+                graph, graph.endpoint_attachments[candidate_index],
+                active_site_types, attachment_resource_claims, owner,
+                "fixed pseudo PIP on net " + net_name);
           }
         }
       }
@@ -1201,6 +1300,7 @@ void preserve_physical_net(
     const ActiveSiteTypes& active_site_types,
     const RouteEndpointOwners& endpoint_owners,
     RoutingGraph& graph,
+    const FixedEndpointAttachmentIndex& fixed_attachment_index,
     AttachmentResourceClaims& attachment_resource_claims,
     std::size_t owner,
     const std::string& net_name,
@@ -1209,11 +1309,13 @@ void preserve_physical_net(
   const bool is_static =
       net.getType() != PhysicalNetlist::PhysNetlist::NetType::SIGNAL;
   preserve_route_forest(net.getSources(), strings, active_site_types,
-                        endpoint_owners, graph, attachment_resource_claims,
-                        owner, net_name, is_static, stats, stack);
+                        endpoint_owners, graph, fixed_attachment_index,
+                        attachment_resource_claims, owner, net_name,
+                        is_static, stats, stack);
   preserve_route_forest(net.getStubs(), strings, active_site_types,
-                        endpoint_owners, graph, attachment_resource_claims,
-                        owner, net_name, is_static, stats, stack);
+                        endpoint_owners, graph, fixed_attachment_index,
+                        attachment_resource_claims, owner, net_name,
+                        is_static, stats, stack);
   const auto stub_nodes = net.getStubNodes();
   for (std::uint32_t i = 0; i < stub_nodes.size(); ++i) {
     const auto stub_node = stub_nodes[i];
@@ -1239,15 +1341,22 @@ std::string capnp_text_to_string(capnp::Text::Reader text) {
 }
 
 void parse_logical_netlist(const std::filesystem::path& logical_path,
-                           RoutingGraph& graph) {
+                           RoutingGraph& graph,
+                           DecodeParseTelemetry* telemetry) {
   using Netlist = LogicalNetlist::Netlist;
 
   // LogicalNetlist is design connectivity: logical cells, nets, ports, and
-  // port instances. It does not contain routing wires or PIPs, but preserving
-  // it lets later tools relate physical route results back to logical nets.
-  std::vector<std::uint8_t> bytes = read_gzip_or_plain_file(logical_path);
-  std::vector<capnp::word> words = bytes_to_words(bytes, logical_path);
-  graph.logical_netlist_bytes = std::move(bytes);
+  // port instances. Metadata v8 retains only the ordered logical-net names,
+  // but this parser still traverses and validates the hierarchy references.
+  DecodeParseTelemetryRecorder telemetry_recorder(telemetry);
+  WordAlignedPayload payload = read_word_aligned_payload(logical_path);
+  const std::uint64_t decoded_bytes =
+      static_cast<std::uint64_t>(payload.decoded_bytes);
+  const std::uint64_t decode_peak_allocation_bytes =
+      word_aligned_payload_allocation_bytes(
+          payload, "logical Cap'n Proto words");
+  telemetry_recorder.mark_decode_complete(decoded_bytes,
+                                          decode_peak_allocation_bytes);
 
   capnp::ReaderOptions reader_options;
   reader_options.traversalLimitInWords =
@@ -1255,7 +1364,8 @@ void parse_logical_netlist(const std::filesystem::path& logical_path,
   reader_options.nestingLimit = 1 << 20;
 
   capnp::FlatArrayMessageReader reader(
-      kj::arrayPtr(words.data(), words.size()), reader_options);
+      kj::arrayPtr(payload.words.begin(), payload.word_count()),
+      reader_options);
   const auto netlist = reader.getRoot<Netlist>();
   TextCache strings(netlist.getStrList());
 
@@ -1271,9 +1381,8 @@ void parse_logical_netlist(const std::filesystem::path& logical_path,
   const auto cell_list = netlist.getCellList();
   std::unordered_set<std::string> ambiguous_logical_net_names;
 
-  // Walk every logical cell. Each cell summary stores a slice into the flat
-  // logical_nets array, keeping metadata compact and easy to stream from disk.
-  graph.logical_cells.reserve(cell_list.size());
+  // Walk every logical cell and validate the same declaration/port/instance
+  // references as older writers without allocating hierarchy summary tables.
   for (std::uint32_t cell_index = 0; cell_index < cell_list.size();
        ++cell_index) {
     const auto cell = cell_list[cell_index];
@@ -1282,107 +1391,82 @@ void parse_logical_netlist(const std::filesystem::path& logical_path,
       throw std::runtime_error(
           "LogicalNetlist cell refers to an invalid declaration");
     }
-
-    LogicalCellSummary cell_summary;
-    cell_summary.net_begin =
-        static_cast<std::uint64_t>(graph.logical_nets.size());
     const auto declaration = cell_decls[declaration_index];
-    cell_summary.declaration_name_string =
-        graph.string_table.intern(strings.get(declaration.getName()));
+    (void)strings.get(declaration.getName());
 
-    // Walk every logical net in this cell. Physical net names usually match
-    // logical net names; the name index map below lets route requests point
-    // back to these logical net summaries.
+    // Physical net names usually match logical net names. Preserve their flat
+    // deterministic order so a route request can retain one compact index.
     const auto nets = cell.getNets();
     for (std::uint32_t net_index = 0; net_index < nets.size(); ++net_index) {
       const auto net = nets[net_index];
       const std::string& net_name = strings.get(net.getName());
+      const std::uint64_t name_string =
+          graph.string_table.intern(net_name);
 
-      LogicalNetSummary net_summary;
-      net_summary.name_string = graph.string_table.intern(net_name);
-      net_summary.cell_index =
-          static_cast<std::uint64_t>(graph.logical_cells.size());
-      net_summary.port_instance_begin =
-          static_cast<std::uint64_t>(graph.logical_port_instances.size());
-
-      // Walk each port instance on the logical net. This captures which cell
-      // instance or top-level port participates in the net and which port/bus
-      // bit it uses.
+      // These records are intentionally not serialized in v8, but walking
+      // them preserves invalid-port/instance/string rejection.
       const auto port_insts = net.getPortInsts();
       for (std::uint32_t port_inst_index = 0;
            port_inst_index < port_insts.size();
            ++port_inst_index) {
         const auto port_inst = port_insts[port_inst_index];
-
-        LogicalPortInstanceSummary port_summary;
-        port_summary.port_index = port_inst.getPort();
-
-        if (port_summary.port_index >= port_list.size()) {
+        const std::uint32_t port_index = port_inst.getPort();
+        if (port_index >= port_list.size()) {
           throw std::runtime_error(
               "LogicalNetlist port instance refers to an invalid port");
         }
-        const auto port = port_list[port_summary.port_index];
-        port_summary.port_string =
-            graph.string_table.intern(strings.get(port.getName()));
+        (void)strings.get(port_list[port_index].getName());
 
         const auto bus_idx = port_inst.getBusIdx();
         if (bus_idx.isIdx()) {
-          port_summary.has_bus_index = true;
-          port_summary.bus_index = bus_idx.getIdx();
+          (void)bus_idx.getIdx();
         }
 
         if (port_inst.isInst()) {
-          port_summary.instance_index = port_inst.getInst();
-          if (port_summary.instance_index >= inst_list.size()) {
+          const std::uint32_t instance_index = port_inst.getInst();
+          if (instance_index >= inst_list.size()) {
             throw std::runtime_error(
                 "LogicalNetlist port instance refers to an invalid cell "
                 "instance");
           }
-          const auto inst = inst_list[port_summary.instance_index];
-          port_summary.instance_string =
-              graph.string_table.intern(strings.get(inst.getName()));
-        } else {
-          port_summary.is_external_port = true;
+          (void)strings.get(inst_list[instance_index].getName());
         }
-
-        graph.logical_port_instances.push_back(port_summary);
       }
 
-      net_summary.port_instance_count =
-          static_cast<std::uint64_t>(graph.logical_port_instances.size()) -
-          net_summary.port_instance_begin;
-
       const std::uint64_t logical_net_index =
-          static_cast<std::uint64_t>(graph.logical_nets.size());
-      graph.logical_nets.push_back(net_summary);
+          static_cast<std::uint64_t>(graph.logical_net_name_strings.size());
+      graph.logical_net_name_strings.push_back(name_string);
 
       routing::interchange::index_unambiguous_logical_net_name(
           graph.logical_net_index_by_name, ambiguous_logical_net_names,
           net_name, logical_net_index);
     }
-
-    cell_summary.net_count =
-        static_cast<std::uint64_t>(graph.logical_nets.size()) -
-        cell_summary.net_begin;
-    graph.logical_cells.push_back(cell_summary);
   }
 }
 
 PhysicalImportStats parse_physical_netlist(
     const std::filesystem::path& phys_path,
-    RoutingGraph& graph) {
+    RoutingGraph& graph,
+    DecodeParseTelemetry* telemetry) {
   using PhysNetlist = PhysicalNetlist::PhysNetlist;
 
-  std::vector<std::uint8_t> bytes = read_gzip_or_plain_file(phys_path);
-  std::vector<capnp::word> words = bytes_to_words(bytes, phys_path);
-  graph.physical_netlist_bytes = std::move(bytes);
+  DecodeParseTelemetryRecorder telemetry_recorder(telemetry);
+  WordAlignedPayload payload = read_word_aligned_payload(phys_path);
+  const std::uint64_t decoded_bytes =
+      static_cast<std::uint64_t>(payload.decoded_bytes);
+  const std::uint64_t decode_peak_allocation_bytes =
+      word_aligned_payload_allocation_bytes(
+          payload, "physical Cap'n Proto words");
+  telemetry_recorder.mark_decode_complete(decoded_bytes,
+                                          decode_peak_allocation_bytes);
 
   capnp::ReaderOptions reader_options;
   reader_options.traversalLimitInWords =
       std::numeric_limits<std::uint64_t>::max();
   reader_options.nestingLimit = 1 << 20;
   capnp::FlatArrayMessageReader reader(
-      kj::arrayPtr(words.data(), words.size()), reader_options);
+      kj::arrayPtr(payload.words.begin(), payload.word_count()),
+      reader_options);
   const auto netlist = reader.getRoot<PhysNetlist>();
   TextCache strings(netlist.getStrList());
 
@@ -1395,6 +1479,8 @@ PhysicalImportStats parse_physical_netlist(
                              " does not match cached device " +
                              device_name);
   }
+  const FixedEndpointAttachmentIndex fixed_attachment_index =
+      routing::interchange::build_fixed_endpoint_attachment_index(graph);
 
   ActiveSiteTypes active_site_types;
   const auto site_instances = netlist.getSiteInsts();
@@ -1483,7 +1569,7 @@ PhysicalImportStats parse_physical_netlist(
     if (routing::interchange::is_reserved_used_resource_net(
             physical_net_name, facts.is_signal)) {
       preserve_physical_net(net, strings, active_site_types,
-                            endpoint_owners, graph,
+                            endpoint_owners, graph, fixed_attachment_index,
                             attachment_resource_claims,
                             AttachmentResourceClaims::kExistingOccupancyOwner,
                             physical_net_name, &stats, route_branch_stack);
@@ -1530,7 +1616,7 @@ PhysicalImportStats parse_physical_netlist(
     if (disposition !=
         routing::interchange::PhysicalNetDisposition::kRouteSignal) {
       preserve_physical_net(net, strings, active_site_types,
-                            endpoint_owners, graph,
+                            endpoint_owners, graph, fixed_attachment_index,
                             attachment_resource_claims,
                             AttachmentResourceClaims::kExistingOccupancyOwner,
                             physical_net_name, &stats, route_branch_stack);
@@ -1707,7 +1793,9 @@ PhysicalImportStats parse_physical_netlist(
   return stats;
 }
 
-CsrGraph make_outgoing_csr(RoutingGraph& graph) {
+CsrGraph make_outgoing_csr(RoutingGraph& graph,
+                           CsrBuildTelemetry* telemetry) {
+  const auto filtering_begin = TelemetryClock::now();
   if (graph.unavailable_destination_nodes.size() !=
       graph.blocked_node.size()) {
     throw std::runtime_error(
@@ -1722,86 +1810,85 @@ CsrGraph make_outgoing_csr(RoutingGraph& graph) {
       graph, graph.blocked_node, graph.sink_node_stops,
       graph.unavailable_destination_nodes,
       graph.enabled_endpoint_attachments);
+  const auto filtering_end = TelemetryClock::now();
+  const auto endpoint_binding_begin = filtering_end;
 
   // Bind each enabled devicegraph attachment to its exact retained CSR edge.
   // The resulting sparse table is the only attachment identity exposed to
   // routing/reconstruction; disabled pseudo edges never enter this CSR.
-  std::unordered_map<std::uint64_t, std::uint32_t>
-      attachment_by_pip_data;
   std::vector<std::uint64_t> endpoint_pip_by_attachment(
       graph.endpoint_attachments.size(), kNoIndex);
-  for (std::uint32_t attachment_index = 0;
-       attachment_index < graph.endpoint_attachments.size();
-       ++attachment_index) {
-    if (graph.enabled_endpoint_attachments[attachment_index] == 0) {
-      continue;
-    }
-    const std::uint64_t pip_data_index =
-        graph.endpoint_attachments[attachment_index].pip_data_index;
-    if (!attachment_by_pip_data
-             .emplace(pip_data_index, attachment_index)
-             .second) {
-      throw std::runtime_error(
-          "enabled endpoint attachments share one PIP-data identity");
-    }
-  }
   if (csr.edge_attrs.size() != csr.colind.size()) {
     throw std::runtime_error(
         "filtered CSR edge attributes are not aligned with destinations");
   }
-  for (std::size_t row = 0; row + 1 < csr.rowptr.size(); ++row) {
-    for (std::int64_t edge = csr.rowptr[row]; edge < csr.rowptr[row + 1];
-         ++edge) {
-      if (edge < 0 || static_cast<std::size_t>(edge) >=
-                          csr.edge_attrs.size()) {
-        throw std::runtime_error("filtered CSR row points outside edge data");
-      }
-      const std::size_t edge_index = static_cast<std::size_t>(edge);
-      const EdgeAttr& attr = csr.edge_attrs[edge_index];
-      const auto found =
-          attachment_by_pip_data.find(attr.pip_data_index);
-      if (found == attachment_by_pip_data.end()) {
-        continue;
-      }
-      const std::uint32_t attachment_index = found->second;
-      const EndpointAttachment& attachment =
-          graph.endpoint_attachments[attachment_index];
-      if (row != static_cast<std::size_t>(attachment.from_node) ||
-          csr.colind[edge_index] != attachment.to_node ||
-          attr.pip_data_index >= graph.pip_data.size() ||
-          attr.tile_string >= graph.string_table.strings.size() ||
-          attachment.traversed_site_string >=
-              graph.string_table.strings.size()) {
-        throw std::runtime_error(
-            "filtered endpoint attachment edge does not match devicegraph");
-      }
-      if (endpoint_pip_by_attachment[attachment_index] != kNoIndex) {
-        throw std::runtime_error(
-            "filtered CSR contains an endpoint attachment more than once");
-      }
-      const PipData& pip = graph.pip_data[
-          static_cast<std::size_t>(attachment.pip_data_index)];
-      if (pip.wire0_string >= graph.string_table.strings.size() ||
-          pip.wire1_string >= graph.string_table.strings.size()) {
-        throw std::runtime_error(
-            "endpoint attachment PIP references invalid wire strings");
-      }
-      const std::uint64_t endpoint_pip_index = graph.endpoint_pips.size();
-      graph.endpoint_pips.push_back(
-          {static_cast<std::uint64_t>(edge_index),
-           attachment.from_node,
-           attachment.to_node,
-           attr.tile_string,
-           pip.wire0_string,
-           pip.wire1_string,
-           pip.forward,
-           attachment.traversed_site_string,
-           attachment.endpoint_node,
-           attachment.role});
-      endpoint_pip_by_attachment[attachment_index] = endpoint_pip_index;
+  routing::interchange::sort_and_validate_retained_endpoint_attachment_edges(
+      csr.retained_endpoint_attachment_edges);
+  for (const auto& retained : csr.retained_endpoint_attachment_edges) {
+    if (retained.attachment_index >= graph.endpoint_attachments.size() ||
+        retained.attachment_index >=
+            graph.enabled_endpoint_attachments.size() ||
+        graph.enabled_endpoint_attachments[retained.attachment_index] == 0 ||
+        retained.csr_edge >= csr.edge_attrs.size()) {
+      throw std::runtime_error(
+          "filtered endpoint attachment binding is invalid");
     }
+    const std::uint32_t attachment_index = retained.attachment_index;
+    const std::size_t edge_index =
+        static_cast<std::size_t>(retained.csr_edge);
+    const EndpointAttachment& attachment =
+        graph.endpoint_attachments[attachment_index];
+    if (attachment.from_node < 0 || csr.rowptr.empty() ||
+        static_cast<std::size_t>(attachment.from_node) >=
+            csr.rowptr.size() - 1) {
+      throw std::runtime_error(
+          "filtered endpoint attachment edge does not match devicegraph");
+    }
+    const std::size_t row = static_cast<std::size_t>(attachment.from_node);
+    const std::int64_t row_begin = csr.rowptr[row];
+    const std::int64_t row_end = csr.rowptr[row + 1];
+    if (row_begin < 0 || row_end < row_begin ||
+        retained.csr_edge < static_cast<std::uint64_t>(row_begin) ||
+        retained.csr_edge >= static_cast<std::uint64_t>(row_end)) {
+      throw std::runtime_error(
+          "filtered endpoint attachment edge does not match devicegraph");
+    }
+    const EdgeAttr& attr = csr.edge_attrs[edge_index];
+    if (csr.colind[edge_index] != attachment.to_node ||
+        attr.pip_data_index != attachment.pip_data_index ||
+        attr.pip_data_index >= graph.pip_data.size() ||
+        attr.tile_string >= graph.string_table.strings.size() ||
+        attachment.traversed_site_string >=
+            graph.string_table.strings.size()) {
+      throw std::runtime_error(
+          "filtered endpoint attachment edge does not match devicegraph");
+    }
+    if (endpoint_pip_by_attachment[attachment_index] != kNoIndex) {
+      throw std::runtime_error(
+          "filtered CSR contains an endpoint attachment more than once");
+    }
+    const PipData& pip = graph.pip_data[
+        static_cast<std::size_t>(attachment.pip_data_index)];
+    if (pip.wire0_string >= graph.string_table.strings.size() ||
+        pip.wire1_string >= graph.string_table.strings.size()) {
+      throw std::runtime_error(
+          "endpoint attachment PIP references invalid wire strings");
+    }
+    const std::uint64_t endpoint_pip_index = graph.endpoint_pips.size();
+    graph.endpoint_pips.push_back(
+        {retained.csr_edge,
+         attachment.from_node,
+         attachment.to_node,
+         attr.tile_string,
+         pip.wire0_string,
+         pip.wire1_string,
+         pip.forward,
+         attachment.traversed_site_string,
+         attachment.endpoint_node,
+         attachment.role});
+    endpoint_pip_by_attachment[attachment_index] = endpoint_pip_index;
   }
-  for (std::uint32_t attachment_index = 0;
+  for (std::size_t attachment_index = 0;
        attachment_index < graph.enabled_endpoint_attachments.size();
        ++attachment_index) {
     if (graph.enabled_endpoint_attachments[attachment_index] != 0 &&
@@ -1847,6 +1934,8 @@ CsrGraph make_outgoing_csr(RoutingGraph& graph) {
       }
     }
   }
+  const auto endpoint_binding_end = TelemetryClock::now();
+  const auto spatial_sidecar_begin = endpoint_binding_end;
 
   // The routing projection owns only these compact node columns. Move them
   // into the design-specific CSR artifact after edge filtering rather than
@@ -1860,21 +1949,50 @@ CsrGraph make_outgoing_csr(RoutingGraph& graph) {
   const std::size_t edge_count = csr.colind.size();
   validate_routing_csr_sidecars(csr.routing_sidecars, node_count, edge_count,
                                 false);
-  csr.routing_sidecars.spatial_edges =
-      routing::interchange::build_destination_spatial_edge_shards(
-          csr.routing_sidecars.route_end_x,
-          csr.routing_sidecars.route_end_y,
-          csr.colind);
+  const auto spatial_sidecar_end = TelemetryClock::now();
+  if (telemetry != nullptr) {
+    telemetry->filtering_seconds =
+        elapsed_seconds(filtering_begin, filtering_end);
+    telemetry->endpoint_binding_seconds =
+        elapsed_seconds(endpoint_binding_begin, endpoint_binding_end);
+    telemetry->spatial_sidecar_seconds =
+        elapsed_seconds(spatial_sidecar_begin, spatial_sidecar_end);
+    telemetry->filtering_output_allocation_bytes = checked_add_u64(
+        checked_add_u64(
+            vector_allocation_bytes(csr.rowptr, "filtered row pointers"),
+            vector_allocation_bytes(csr.colind, "filtered destinations"),
+            "filtered CSR allocation bytes"),
+        checked_add_u64(
+            vector_allocation_bytes(csr.edge_attrs,
+                                    "filtered edge attributes"),
+            vector_allocation_bytes(
+                csr.retained_endpoint_attachment_edges,
+                "retained endpoint attachment edges"),
+            "filtered CSR allocation bytes"),
+        "filtered CSR allocation bytes");
+    telemetry->endpoint_binding_allocation_bytes = checked_add_u64(
+        vector_allocation_bytes(endpoint_pip_by_attachment,
+                                "endpoint attachment binding table"),
+        vector_allocation_bytes(graph.endpoint_pips,
+                                "endpoint PIP metadata"),
+        "endpoint binding allocation bytes");
+    telemetry->spatial_sidecar_allocation_bytes = checked_add_u64(
+        vector_allocation_bytes(csr.routing_sidecars.spatial_edges.offsets,
+                                "spatial shard offsets"),
+        vector_allocation_bytes(csr.routing_sidecars.spatial_edges.edge_ids,
+                                "spatial shard edge IDs"),
+        "spatial sidecar allocation bytes");
+  }
   return csr;
 }
 
 void write_csr_graph(const CsrGraph& graph,
                      const InterchangeArtifactPairId& artifact_pair_id,
                      const std::filesystem::path& output_path) {
-  // Version 3 keeps the generic outgoing CSR first, then appends immutable
-  // GPU-routing sidecars: representative route-end coordinates, static vertex
-  // costs, and a destination-coordinate spatial edge permutation. FPGA routing
-  // names and PIP details remain in the RIPSIFM1 metadata sidecar.
+  // Version 4 keeps the v3 header shape but makes unit edge weights implicit
+  // and omits the destination-coordinate edge permutation. Representative
+  // route-end coordinates and static vertex costs remain explicit. Version-3
+  // readers must never infer these distinct payload semantics from ordering.
   if (artifact_pair_id.is_zero()) {
     throw std::runtime_error("cannot write CSR with a zero artifact pair id");
   }
@@ -1893,14 +2011,20 @@ void write_csr_graph(const CsrGraph& graph,
     throw std::runtime_error("failed while writing CSR magic");
   }
 
-  const std::uint64_t nnz = static_cast<std::uint64_t>(graph.values.size());
+  const std::uint64_t nnz = static_cast<std::uint64_t>(graph.colind.size());
   if (graph.rows < 0 || graph.cols < 0) {
     throw std::runtime_error("cannot write a CSR with negative dimensions");
   }
-  validate_destination_spatial_edge_shards(
+  validate_routing_csr_sidecars(
       graph.routing_sidecars, static_cast<std::size_t>(graph.rows),
-      graph.colind);
-  const SpatialEdgeShards& shards = graph.routing_sidecars.spatial_edges;
+      graph.colind.size(), false);
+  if (!graph.routing_sidecars.spatial_edges.offsets.empty() ||
+      !graph.routing_sidecars.spatial_edges.edge_ids.empty() ||
+      graph.routing_sidecars.spatial_edges.width != 0 ||
+      graph.routing_sidecars.spatial_edges.height != 0) {
+    throw std::runtime_error(
+        "CSR v4 writer received a destination spatial-edge permutation");
+  }
   write_u64(out, CSR_FORMAT_VERSION, "format version");
   write_u64(out, OUTGOING_EDGE_ORIENTATION, "orientation");
   write_u64(out, artifact_pair_id.high, "artifact pair id high");
@@ -1914,8 +2038,7 @@ void write_csr_graph(const CsrGraph& graph,
             "rowptr count");
   write_u64(out, static_cast<std::uint64_t>(graph.colind.size()),
             "colind count");
-  write_u64(out, static_cast<std::uint64_t>(graph.values.size()),
-            "values count");
+  write_u64(out, 0, "implicit values count");
   write_u64(out,
             static_cast<std::uint64_t>(
                 graph.routing_sidecars.route_end_x.size()),
@@ -1928,31 +2051,27 @@ void write_csr_graph(const CsrGraph& graph,
             static_cast<std::uint64_t>(
                 graph.routing_sidecars.base_vertex_cost.size()),
             "base vertex cost count");
-  write_i64(out, shards.min_x, "spatial shard minimum X");
-  write_i64(out, shards.min_y, "spatial shard minimum Y");
-  write_u64(out, shards.width, "spatial shard width");
-  write_u64(out, shards.height, "spatial shard height");
-  write_u64(out, static_cast<std::uint64_t>(shards.offsets.size()),
-            "spatial shard offset count");
-  write_u64(out, static_cast<std::uint64_t>(shards.edge_ids.size()),
-            "spatial shard edge ID count");
+  write_i64(out, 0, "unused spatial shard minimum X");
+  write_i64(out, 0, "unused spatial shard minimum Y");
+  write_u64(out, 0, "spatial shard width");
+  write_u64(out, 0, "spatial shard height");
+  write_u64(out, 0, "spatial shard offset count");
+  write_u64(out, 0, "spatial shard edge ID count");
 
   write_array(out, graph.rowptr, "rowptr");
   write_array(out, graph.colind, "colind");
-  write_array(out, graph.values, "values");
   write_array(out, graph.routing_sidecars.route_end_x, "route-end X values");
   write_array(out, graph.routing_sidecars.route_end_y, "route-end Y values");
   write_array(out, graph.routing_sidecars.base_vertex_cost,
               "base vertex costs");
-  write_array(out, shards.offsets, "spatial shard offsets");
-  write_array(out, shards.edge_ids, "spatial shard edge IDs");
   finish_output(out, output_path);
 }
 
 void write_metadata(const RoutingGraph& graph,
                     const CsrGraph& csr,
                     const InterchangeArtifactPairId& artifact_pair_id,
-                    const std::filesystem::path& metadata_path) {
+                    const std::filesystem::path& metadata_path,
+                    MetadataWriteTelemetry* telemetry) {
   // RIPSIFM1 sidecar layout:
   //   char[8] magic
   //   u64 version, orientation, artifact_pair_id_high, artifact_pair_id_low
@@ -1966,19 +2085,49 @@ void write_metadata(const RoutingGraph& graph,
   //   u64 logical_design_name_string
   //   repeated strings: u64 byte_length, bytes
   //   Version 4/5 only: seven node metadata arrays totaling 40 bytes/node.
-  //   Versions 6/7 omit them; node_count remains for CSR binding.
-  //   edge_attr_count records: u64 tile_string, u64 pip_data_index
-  //   pip_data_count records: u64 wire0_string, u64 wire1_string, u64 forward
+  //   Versions 6-8 omit them; node_count remains for CSR binding.
+  //   edge_attr_count records: u32 tile_string, u32 pip_data_index
+  //   pip_data_count records: u32 wire0_string, u32 wire1_string, u32 forward
   //   endpoint_pip_count records: ten u64 fields (EndpointPipDisk)
   //   site_pin_attr_count records: u64 node, u64 site_string, u64 pin_string
   //   route requests with logical net index and variable source/sink records
-  //   logical cell/net/port-instance summary records
+  //   logical_net_count records: u64 logical-net name string
   //   u64[blocked_node_count], u64[sink_stop_node_count]
-  //   physical_netlist_byte_count raw bytes from decompressed .phys
-  //   logical_netlist_byte_count raw bytes from decompressed .netlist
+  // Metadata v8 requires logical cell/port and both embedded payload counts to
+  // be zero. Reconstruction reloads the original paths named by the header.
   if (artifact_pair_id.is_zero()) {
     throw std::runtime_error(
         "cannot write metadata with a zero artifact pair id");
+  }
+  if (graph.string_table.strings.size() >
+      static_cast<std::size_t>(std::numeric_limits<std::uint32_t>::max())) {
+    throw std::runtime_error(
+        "metadata v8 string count exceeds uint32");
+  }
+  if (graph.pip_data.size() >
+      static_cast<std::size_t>(std::numeric_limits<std::uint32_t>::max())) {
+    throw std::runtime_error("metadata v8 PIP count exceeds uint32");
+  }
+  for (const std::uint64_t name_string : graph.logical_net_name_strings) {
+    if (name_string >= graph.string_table.strings.size()) {
+      throw std::runtime_error(
+          "metadata v8 logical net references an invalid string");
+    }
+  }
+  for (const RouteRequest& request : graph.route_requests) {
+    if (request.net_string >= graph.string_table.strings.size()) {
+      throw std::runtime_error(
+          "metadata v8 route request references an invalid net string");
+    }
+    if (request.logical_net_index == kNoLogicalNetIndex) {
+      continue;
+    }
+    if (request.logical_net_index >= graph.logical_net_name_strings.size() ||
+        graph.logical_net_name_strings[static_cast<std::size_t>(
+            request.logical_net_index)] != request.net_string) {
+      throw std::runtime_error(
+          "metadata v8 physical/logical net-name correlation mismatch");
+    }
   }
   if (metadata_path.has_parent_path()) {
     std::filesystem::create_directories(metadata_path.parent_path());
@@ -2044,20 +2193,14 @@ void write_metadata(const RoutingGraph& graph,
             "blocked node count");
   write_u64(out, static_cast<std::uint64_t>(sink_stop_nodes.size()),
             "sink stop node count");
-  write_u64(out, static_cast<std::uint64_t>(graph.logical_cells.size()),
-            "logical cell count");
-  write_u64(out, static_cast<std::uint64_t>(graph.logical_nets.size()),
-            "logical net count");
+  write_u64(out, 0, "logical cell count");
   write_u64(out,
             static_cast<std::uint64_t>(
-                graph.logical_port_instances.size()),
-            "logical port instance count");
-  write_u64(out,
-            static_cast<std::uint64_t>(graph.physical_netlist_bytes.size()),
-            "physical netlist byte count");
-  write_u64(out,
-            static_cast<std::uint64_t>(graph.logical_netlist_bytes.size()),
-            "logical netlist byte count");
+                graph.logical_net_name_strings.size()),
+            "logical net count");
+  write_u64(out, 0, "logical port instance count");
+  write_u64(out, 0, "physical netlist byte count");
+  write_u64(out, 0, "logical netlist byte count");
   write_u64(out, graph.device_path_string, "device path string");
   write_u64(out, graph.physical_path_string, "physical path string");
   write_u64(out, graph.logical_path_string, "logical path string");
@@ -2068,9 +2211,9 @@ void write_metadata(const RoutingGraph& graph,
     write_string(out, text);
   }
 
-  // Edge attributes are aligned exactly with CSR colind/values order. For edge
-  // k, csr.colind[k], csr.values[k], and edge_attrs[k] describe one PIP edge.
-  static_assert(sizeof(EdgeAttr) == 2 * sizeof(std::uint64_t),
+  // Edge attributes are aligned exactly with CSR colind order. For edge k,
+  // csr.colind[k] and edge_attrs[k] describe one implicit-unit PIP edge.
+  static_assert(sizeof(EdgeAttr) == 2 * sizeof(std::uint32_t),
                 "EdgeAttr metadata layout changed");
   write_array(out, csr.edge_attrs, "edge attributes");
 
@@ -2080,8 +2223,12 @@ void write_metadata(const RoutingGraph& graph,
   std::vector<PipDataDisk> pip_data;
   pip_data.reserve(graph.pip_data.size());
   for (const PipData& data : graph.pip_data) {
-    pip_data.push_back(
-        {data.wire0_string, data.wire1_string, data.forward ? 1ULL : 0ULL});
+    pip_data.push_back({
+        checked_narrow_u32(data.wire0_string,
+                           "metadata PIP wire0 string"),
+        checked_narrow_u32(data.wire1_string,
+                           "metadata PIP wire1 string"),
+        static_cast<std::uint32_t>(data.forward ? 1 : 0)});
   }
   write_array(out, pip_data, "pip data");
 
@@ -2145,52 +2292,31 @@ void write_metadata(const RoutingGraph& graph,
     }
   }
 
-  // Logical cell summaries are slices into the flat logical_nets array.
-  for (const LogicalCellSummary& cell : graph.logical_cells) {
-    write_u64(out, cell.declaration_name_string,
-              "logical cell declaration name");
-    write_u64(out, cell.net_begin, "logical cell net begin");
-    write_u64(out, cell.net_count, "logical cell net count");
-  }
-
-  // Logical net summaries are slices into the flat logical_port_instances
-  // array. These records preserve logical connectivity without bloating CSR.
-  for (const LogicalNetSummary& net : graph.logical_nets) {
-    write_u64(out, net.name_string, "logical net name");
-    write_u64(out, net.cell_index, "logical net cell index");
-    write_u64(out, net.port_instance_begin,
-              "logical net port instance begin");
-    write_u64(out, net.port_instance_count,
-              "logical net port instance count");
-  }
-
-  // Logical port-instance summaries say which port and instance/top-level port
-  // participates in each logical net.
-  for (const LogicalPortInstanceSummary& port :
-       graph.logical_port_instances) {
-    write_u64(out, port.port_string, "logical port name");
-    write_u64(out, port.instance_string, "logical instance name");
-    write_u64(out, port.port_index, "logical port index");
-    write_u64(out, port.instance_index, "logical instance index");
-    write_u64(out, port.bus_index, "logical bus index");
-    write_u64(out, port.has_bus_index ? 1 : 0,
-              "logical has bus index");
-    write_u64(out, port.is_external_port ? 1 : 0,
-              "logical is external port");
-  }
+  // Minimal physical/logical correlation retained by v8 diagnostics. Route
+  // requests index this flat deterministic list.
+  write_array(out, graph.logical_net_name_strings,
+              "logical net name strings");
 
   // Write the node masks last because they are auxiliary metadata rather than
   // per-edge routing information.
   write_array(out, blocked_nodes, "blocked nodes");
   write_array(out, sink_stop_nodes, "sink stop nodes");
 
-  // Preserve original decompressed FPGAIF messages. A future writer can load
-  // the physical bytes as a PhysNetlist builder, insert routed PhysPIP
-  // branches derived from CSR paths, and then serialize a routed .phys. The
-  // logical bytes provide the matching LogicalNetlist for validation or net
-  // correlation during that process.
-  write_array(out, graph.physical_netlist_bytes, "physical netlist bytes");
-  write_array(out, graph.logical_netlist_bytes, "logical netlist bytes");
+  if (telemetry != nullptr) {
+    std::uint64_t allocation_bytes = checked_add_u64(
+        vector_allocation_bytes(blocked_nodes, "packed blocked nodes"),
+        vector_allocation_bytes(sink_stop_nodes, "packed sink-stop nodes"),
+        "metadata packing allocation bytes");
+    allocation_bytes = checked_add_u64(
+        allocation_bytes,
+        vector_allocation_bytes(pip_data, "packed PIP data"),
+        "metadata packing allocation bytes");
+    allocation_bytes = checked_add_u64(
+        allocation_bytes,
+        vector_allocation_bytes(endpoint_pips, "packed endpoint PIPs"),
+        "metadata packing allocation bytes");
+    telemetry->packing_allocation_bytes = allocation_bytes;
+  }
   finish_output(out, metadata_path);
 }
 
@@ -2204,10 +2330,55 @@ void release_storage(Container& container) {
   container.swap(empty);
 }
 
+std::uint64_t routing_projection_bulk_allocation_bytes(
+    const RoutingGraph& graph) {
+  std::uint64_t bytes = 0;
+  const auto add = [&](std::uint64_t value) {
+    bytes = checked_add_u64(bytes, value,
+                            "devicegraph bulk allocation bytes");
+  };
+  add(vector_allocation_bytes(graph.node_route_end_x, "route-end X"));
+  add(vector_allocation_bytes(graph.node_route_end_y, "route-end Y"));
+  add(vector_allocation_bytes(graph.node_base_vertex_cost, "base costs"));
+  add(vector_allocation_bytes(graph.rowptr, "devicegraph row pointers"));
+  add(vector_allocation_bytes(graph.colind, "devicegraph destinations"));
+  add(vector_allocation_bytes(graph.edge_attrs, "devicegraph edge attrs"));
+  add(vector_allocation_bytes(graph.pip_data, "devicegraph PIP data"));
+  add(vector_allocation_bytes(graph.tile_wire_nodes,
+                              "tile-wire lookup"));
+  add(vector_allocation_bytes(graph.site_pin_nodes, "site-pin lookup"));
+  add(vector_allocation_bytes(graph.endpoint_attachments,
+                              "endpoint attachments"));
+  add(vector_allocation_bytes(
+      graph.endpoint_attachment_traversed_site_types,
+      "endpoint attachment traversed site types"));
+  add(vector_allocation_bytes(graph.endpoint_attachment_pseudo_cell_pins,
+                              "endpoint pseudo-cell pins"));
+  add(vector_allocation_bytes(graph.endpoint_attachment_lookups,
+                              "endpoint attachment lookups"));
+  return bytes;
+}
+
+std::uint64_t checked_file_size(const std::filesystem::path& path,
+                                const char* name) {
+  std::error_code error;
+  const std::uintmax_t bytes = std::filesystem::file_size(path, error);
+  if (error) {
+    throw std::runtime_error(std::string("could not measure ") + name +
+                             ": " + error.message());
+  }
+  if (bytes > std::numeric_limits<std::uint64_t>::max()) {
+    throw std::runtime_error(std::string(name) +
+                             " size exceeds uint64");
+  }
+  return static_cast<std::uint64_t>(bytes);
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
   try {
+    const auto total_begin = TelemetryClock::now();
     const Options options = parse_options(argc, argv);
     const std::filesystem::path csr_publication_marker_path =
         routing::interchange::interchange_publication_marker_path(
@@ -2262,8 +2433,28 @@ int main(int argc, char** argv) {
     std::cout << "device_graph: " << options.device_graph_path << "\n";
     std::cout << "physical_netlist: " << options.phys_path << "\n";
     std::cout << "logical_netlist: " << options.logical_path << "\n";
-    RoutingGraph graph(
-        read_device_routing_graph_for_routing(options.device_graph_path));
+    DeviceRoutingGraphReadTelemetry devicegraph_telemetry;
+    RoutingGraph graph(read_device_routing_graph_for_routing(
+        options.device_graph_path, true, &devicegraph_telemetry));
+    const std::uint64_t string_object_bytes =
+        vector_allocation_bytes(graph.string_table.strings,
+                                "devicegraph string objects");
+    emit_stage_telemetry(
+        "devicegraph_strings",
+        devicegraph_telemetry.string_loading_seconds +
+            devicegraph_telemetry.string_index_seconds,
+        {{"string_count", devicegraph_telemetry.string_count},
+         {"payload_bytes", devicegraph_telemetry.string_payload_bytes},
+         {"file_bytes", devicegraph_telemetry.string_file_bytes},
+         {"string_object_bytes", string_object_bytes},
+         {"index_entries",
+          static_cast<std::uint64_t>(graph.string_table.ids.size())}});
+    emit_stage_telemetry(
+        "devicegraph_bulk_arrays",
+        devicegraph_telemetry.bulk_array_loading_seconds,
+        {{"file_bytes", devicegraph_telemetry.bulk_file_bytes},
+         {"allocation_bytes",
+          routing_projection_bulk_allocation_bytes(graph)}});
     std::cout << "device_fingerprint: " << graph.device_fingerprint << "\n";
     std::cout << "bounds: X" << graph.bounds.min_x << "..X"
               << graph.bounds.max_x << ", Y" << graph.bounds.min_y << "..Y"
@@ -2284,13 +2475,39 @@ int main(int argc, char** argv) {
 
     // LogicalNetlist parsing records logical cells/nets/port instances and
     // builds a name index that physical route requests can reference.
-    parse_logical_netlist(options.logical_path, graph);
+    DecodeParseTelemetry logical_telemetry;
+    parse_logical_netlist(options.logical_path, graph, &logical_telemetry);
+    emit_stage_telemetry(
+        "logical_decode", logical_telemetry.decode_seconds,
+        {{"decoded_bytes", logical_telemetry.decoded_bytes},
+         {"allocation_bytes",
+          logical_telemetry.decode_peak_allocation_bytes}});
+    emit_stage_telemetry(
+        "logical_parse", logical_telemetry.parse_seconds,
+        {{"logical_nets", static_cast<std::uint64_t>(
+                              graph.logical_net_name_strings.size())}});
 
     // PhysicalNetlist parsing adds design-specific route requests and blockage.
-    // It also stores the original .phys payload so later code can patch routes
-    // into that exact physical netlist structure.
+    // Metadata v8 retains its input path; reconstruction reloads that exact
+    // .phys instead of embedding a decompressed copy in every sidecar.
+    DecodeParseTelemetry physical_telemetry;
     const PhysicalImportStats import_stats =
-        parse_physical_netlist(options.phys_path, graph);
+        parse_physical_netlist(options.phys_path, graph,
+                               &physical_telemetry);
+    emit_stage_telemetry(
+        "physical_decode", physical_telemetry.decode_seconds,
+        {{"decoded_bytes", physical_telemetry.decoded_bytes},
+         {"allocation_bytes",
+          physical_telemetry.decode_peak_allocation_bytes}});
+    emit_stage_telemetry(
+        "physical_parse", physical_telemetry.parse_seconds,
+        {{"route_requests",
+          static_cast<std::uint64_t>(import_stats.route_requests)},
+         {"enabled_attachments",
+          static_cast<std::uint64_t>(std::count(
+              graph.enabled_endpoint_attachments.begin(),
+              graph.enabled_endpoint_attachments.end(),
+              static_cast<std::uint8_t>(1)))}});
     std::cout << "route_requests: " << import_stats.route_requests << "\n";
     std::cout << "excluded_driverless_nets: "
               << import_stats.excluded_driverless_nets << "\n";
@@ -2332,11 +2549,35 @@ int main(int argc, char** argv) {
 
     // CSR is the GPU-facing graph. Metadata is the CPU-facing FPGA context
     // needed to map CSR edges back to tile/wire PIPs and site-pin targets.
-    CsrGraph csr = make_outgoing_csr(graph);
+    CsrBuildTelemetry csr_build_telemetry;
+    CsrGraph csr = make_outgoing_csr(graph, &csr_build_telemetry);
+    emit_stage_telemetry(
+        "graph_filtering", csr_build_telemetry.filtering_seconds,
+        {{"base_edges", graph.loaded_edges},
+         {"retained_edges", static_cast<std::uint64_t>(csr.colind.size())},
+         {"allocation_bytes",
+          csr_build_telemetry.filtering_output_allocation_bytes}});
+    emit_stage_telemetry(
+        "endpoint_pip_binding",
+        csr_build_telemetry.endpoint_binding_seconds,
+        {{"endpoint_pips",
+          static_cast<std::uint64_t>(graph.endpoint_pips.size())},
+         {"allocation_bytes",
+          csr_build_telemetry.endpoint_binding_allocation_bytes}});
+    emit_stage_telemetry(
+        "spatial_sidecar", csr_build_telemetry.spatial_sidecar_seconds,
+        {{"spatial_offset_count",
+          static_cast<std::uint64_t>(
+              csr.routing_sidecars.spatial_edges.offsets.size())},
+         {"spatial_edge_count",
+          static_cast<std::uint64_t>(
+              csr.routing_sidecars.spatial_edges.edge_ids.size())},
+         {"allocation_bytes",
+          csr_build_telemetry.spatial_sidecar_allocation_bytes}});
     std::cout << "enabled_endpoint_pips: " << graph.endpoint_pips.size()
               << "\n";
 
-    // Versions 6/7 do not serialize the seven physical node-metadata arrays.
+    // Versions 6-8 do not serialize the seven physical node-metadata arrays.
     // The filtering reader normally projected them out before this point;
     // release them defensively if a full graph is ever supplied here.
     release_storage(graph.node_device_ids);
@@ -2365,8 +2606,7 @@ int main(int argc, char** argv) {
     const std::uint64_t colind_bytes = static_cast<std::uint64_t>(
         checked_array_bytes<std::int32_t>(csr.colind.size(),
                                           "CSR destinations"));
-    const std::uint64_t values_bytes = static_cast<std::uint64_t>(
-        checked_array_bytes<float>(csr.values.size(), "CSR values"));
+    constexpr std::uint64_t values_bytes = 0;
     const std::uint64_t route_x_bytes = static_cast<std::uint64_t>(
         checked_array_bytes<std::int32_t>(
             csr.routing_sidecars.route_end_x.size(), "route-end X values"));
@@ -2377,14 +2617,8 @@ int main(int argc, char** argv) {
         checked_array_bytes<float>(
             csr.routing_sidecars.base_vertex_cost.size(),
             "base vertex costs"));
-    const std::uint64_t shard_offset_bytes = static_cast<std::uint64_t>(
-        checked_array_bytes<std::uint64_t>(
-            csr.routing_sidecars.spatial_edges.offsets.size(),
-            "spatial shard offsets"));
-    const std::uint64_t shard_edge_bytes = static_cast<std::uint64_t>(
-        checked_array_bytes<std::uint32_t>(
-            csr.routing_sidecars.spatial_edges.edge_ids.size(),
-            "spatial shard edge IDs"));
+    constexpr std::uint64_t shard_offset_bytes = 0;
+    constexpr std::uint64_t shard_edge_bytes = 0;
     const std::uint64_t attr_bytes = static_cast<std::uint64_t>(
         checked_array_bytes<EdgeAttr>(csr.edge_attrs.size(),
                                       "metadata edge attributes"));
@@ -2398,13 +2632,17 @@ int main(int argc, char** argv) {
           checked_add_u64(csr_bytes, sidecar_bytes, "CSR byte count");
     }
     const std::int64_t csr_rows = csr.rows;
-    const std::size_t csr_nnz = csr.values.size();
+    const std::size_t csr_nnz = csr.colind.size();
 
     const std::filesystem::path staged_csr_path =
         routing::interchange::create_unique_staging_path(
             options.output_path);
     std::filesystem::path staged_metadata_path;
     std::filesystem::path staged_generation_path;
+    std::uint64_t csr_output_bytes = 0;
+    std::uint64_t metadata_output_bytes = 0;
+    std::uint64_t generation_output_bytes = 0;
+    std::uint64_t output_bytes = 0;
     try {
       staged_metadata_path =
           routing::interchange::create_unique_staging_path(
@@ -2414,19 +2652,42 @@ int main(int argc, char** argv) {
               publication_generation_path);
       const InterchangeArtifactPairId artifact_pair_id =
           make_artifact_pair_id();
+      const auto csr_write_begin = TelemetryClock::now();
       write_csr_graph(csr, artifact_pair_id, staged_csr_path);
+      const auto csr_write_end = TelemetryClock::now();
+      csr_output_bytes =
+          checked_file_size(staged_csr_path, "staged CSR");
+      emit_stage_telemetry(
+          "csr_writing", elapsed_seconds(csr_write_begin, csr_write_end),
+          {{"output_bytes", csr_output_bytes},
+           {"row_count", static_cast<std::uint64_t>(csr.rows)},
+           {"retained_edges", static_cast<std::uint64_t>(csr.colind.size())}});
 
       // The metadata sidecar needs edge attributes, but not the three generic
       // CSR arrays that were just written.
       release_storage(csr.rowptr);
       release_storage(csr.colind);
-      release_storage(csr.values);
+      release_storage(csr.retained_endpoint_attachment_edges);
       release_storage(csr.routing_sidecars.route_end_x);
       release_storage(csr.routing_sidecars.route_end_y);
       release_storage(csr.routing_sidecars.base_vertex_cost);
       release_storage(csr.routing_sidecars.spatial_edges.offsets);
       release_storage(csr.routing_sidecars.spatial_edges.edge_ids);
-      write_metadata(graph, csr, artifact_pair_id, staged_metadata_path);
+      MetadataWriteTelemetry metadata_write_telemetry;
+      const auto metadata_write_begin = TelemetryClock::now();
+      write_metadata(graph, csr, artifact_pair_id, staged_metadata_path,
+                     &metadata_write_telemetry);
+      const auto metadata_write_end = TelemetryClock::now();
+      metadata_output_bytes =
+          checked_file_size(staged_metadata_path, "staged metadata");
+      emit_stage_telemetry(
+          "metadata_packing_writing",
+          elapsed_seconds(metadata_write_begin, metadata_write_end),
+          {{"output_bytes", metadata_output_bytes},
+           {"allocation_bytes",
+            metadata_write_telemetry.packing_allocation_bytes},
+           {"pip_count",
+            static_cast<std::uint64_t>(graph.pip_data.size())}});
       std::ofstream generation(staged_generation_path,
                                std::ios::binary | std::ios::trunc);
       if (!generation) {
@@ -2438,6 +2699,12 @@ int main(int argc, char** argv) {
                         artifact_pair_id)
                  << '\n';
       finish_output(generation, staged_generation_path);
+      generation_output_bytes = checked_file_size(
+          staged_generation_path, "staged generation file");
+      output_bytes = checked_add_u64(
+          checked_add_u64(csr_output_bytes, metadata_output_bytes,
+                          "published output bytes"),
+          generation_output_bytes, "published output bytes");
     } catch (...) {
       std::error_code ignored;
       std::filesystem::remove(staged_csr_path, ignored);
@@ -2450,6 +2717,7 @@ int main(int argc, char** argv) {
       throw;
     }
 
+    const auto publication_begin = TelemetryClock::now();
     std::vector<std::filesystem::path> publication_marker_paths = {
         csr_publication_marker_path, metadata_publication_marker_path};
     std::sort(publication_marker_paths.begin(),
@@ -2538,10 +2806,25 @@ int main(int argc, char** argv) {
       }
       throw;
     }
+    const auto publication_end = TelemetryClock::now();
+    emit_stage_telemetry(
+        "publication", elapsed_seconds(publication_begin, publication_end),
+        {{"csr_bytes", csr_output_bytes},
+         {"metadata_bytes", metadata_output_bytes},
+         {"generation_bytes", generation_output_bytes},
+         {"output_bytes", output_bytes}});
+    emit_stage_telemetry(
+        "total", elapsed_seconds(total_begin, TelemetryClock::now()),
+        {{"nodes", static_cast<std::uint64_t>(csr_rows)},
+         {"base_edges", graph.loaded_edges},
+         {"retained_edges", static_cast<std::uint64_t>(csr_nnz)},
+         {"pip_count", static_cast<std::uint64_t>(graph.pip_data.size())},
+         {"output_bytes", output_bytes}});
 
     std::cout << "csr_rows: " << csr_rows << "\n";
     std::cout << "csr_nnz: " << csr_nnz << "\n";
-    std::cout << "csr_total_mib: " << mib(csr_bytes) << "\n";
+    std::cout << "csr_total_mib: " << mib(csr_output_bytes) << "\n";
+    std::cout << "csr_payload_mib: " << mib(csr_bytes) << "\n";
     std::cout << "csr_rowptr_mib: " << mib(rowptr_bytes) << "\n";
     std::cout << "csr_colind_mib: " << mib(colind_bytes) << "\n";
     std::cout << "csr_values_mib: " << mib(values_bytes) << "\n";

@@ -216,6 +216,57 @@ def make_legacy_metadata(path: Path) -> None:
     path.write_bytes(payload)
 
 
+def make_v8_metadata(path: Path) -> str:
+    strings = [
+        "net0",
+        "SRC_SITE",
+        "SRC_PIN",
+        "SINK_SITE",
+        "SINK_PIN",
+        "TILE_A",
+        "WIRE_0",
+        "WIRE_1",
+    ]
+    pair_high = 0x123456789ABCDEF0
+    pair_low = 0x0FEDCBA987654321
+    pair_id = f"{pair_high:016x}{pair_low:016x}"
+    counts = [
+        len(strings),
+        2,  # node count
+        1,  # compact edge attr count
+        1,  # compact PIP count
+        0,  # endpoint PIPs
+        0,  # site-pin attrs
+        1,  # route requests
+        0,  # blocked nodes
+        0,  # sink-stop nodes
+        0,  # omitted logical cells
+        1,  # flat logical-net names
+        0,  # omitted logical port instances
+        0,  # omitted physical payload
+        0,  # omitted logical payload
+    ]
+    payload = bytearray(b"RIPSIFM1")
+    payload.extend(struct.pack("=4Q", 8, 2, pair_high, pair_low))
+    payload.extend(struct.pack(f"={len(counts)}Q", *counts))
+    payload.extend(struct.pack("=4Q", 0, 0, 0, 0))
+    for text in strings:
+        encoded = text.encode()
+        payload.extend(struct.pack("=Q", len(encoded)))
+        payload.extend(encoded)
+    payload.extend(struct.pack("=2I", 5, 0))
+    payload.extend(struct.pack("=3I", 6, 7, 1))
+    no_endpoint = 2**64 - 1
+    payload.extend(struct.pack("=3Q", 0, 0, 1))
+    payload.extend(struct.pack("=4Q", 0, 1, 2, no_endpoint))
+    payload.extend(struct.pack("=Q", 1))
+    payload.extend(struct.pack("=4Q", 1, 3, 4, no_endpoint))
+    payload.extend(struct.pack("=Q", 0))  # logical net 0 -> "net0"
+    path.write_bytes(payload)
+    Path(str(path) + ".generation").write_text(pair_id + "\n", encoding="ascii")
+    return pair_id
+
+
 def make_attachment_case():
     pair_id = "00000000000000010000000000000002"
     endpoints = (
@@ -477,6 +528,53 @@ def main() -> int:
         device.write_bytes(b"device")
         metadata_fixture = tmp_path / "legacy.ifmeta.bin"
         make_legacy_metadata(metadata_fixture)
+
+        v8_metadata = tmp_path / "compact-v8.ifmeta.bin"
+        v8_pair_id = make_v8_metadata(v8_metadata)
+        assert benchmark.read_metadata_artifact_pair_id(v8_metadata) == v8_pair_id
+        v8_summary = benchmark.read_metadata_summary(v8_metadata)
+        assert v8_summary.version == 8
+        assert v8_summary.artifact_pair_id == v8_pair_id
+        assert v8_summary.node_count == 2
+        assert v8_summary.edge_attr_count == 1
+        assert len(v8_summary.route_requests) == 1
+        assert v8_summary.route_requests[0].net == "net0"
+
+        malformed_v8_count = tmp_path / "compact-v8-bad-count.ifmeta.bin"
+        make_v8_metadata(malformed_v8_count)
+        malformed_bytes = bytearray(malformed_v8_count.read_bytes())
+        struct.pack_into("=Q", malformed_bytes, 40 + 9 * 8, 1)
+        malformed_v8_count.write_bytes(malformed_bytes)
+        try:
+            benchmark.read_metadata_summary(malformed_v8_count)
+        except ValueError as exc:
+            assert "must be zero" in str(exc)
+        else:
+            raise AssertionError("metadata v8 accepted a nonzero omitted count")
+
+        malformed_v8_correlation = (
+            tmp_path / "compact-v8-bad-correlation.ifmeta.bin"
+        )
+        make_v8_metadata(malformed_v8_correlation)
+        correlation_bytes = bytearray(malformed_v8_correlation.read_bytes())
+        struct.pack_into("=Q", correlation_bytes, len(correlation_bytes) - 8, 1)
+        malformed_v8_correlation.write_bytes(correlation_bytes)
+        try:
+            benchmark.read_metadata_summary(malformed_v8_correlation)
+        except ValueError as exc:
+            assert "correlation mismatch" in str(exc)
+        else:
+            raise AssertionError("metadata v8 accepted a mismatched logical net")
+
+        trailing_v8 = tmp_path / "compact-v8-trailing.ifmeta.bin"
+        make_v8_metadata(trailing_v8)
+        trailing_v8.write_bytes(trailing_v8.read_bytes() + b"x")
+        try:
+            benchmark.read_metadata_summary(trailing_v8)
+        except ValueError as exc:
+            assert "trailing bytes" in str(exc)
+        else:
+            raise AssertionError("metadata v8 accepted trailing bytes")
 
         fake_converter = tmp_path / "fake_interchange_to_csr.py"
         fake_converter.write_text(

@@ -218,7 +218,7 @@ test "$(git -C "$BASE_TREE" rev-parse HEAD)" = "$BASE_COMMIT"
 )
 ```
 
-Use an already converted CSR v3/metadata pair. Omitting `--routes-out` prevents
+Use an already converted CSR v3/v4 metadata pair. Omitting `--routes-out` prevents
 route-output metadata loading; conversion is not part of these runs. The
 following K=1, Graph-off run isolates the relaxed atomic load from its CAS
 control with one warm-up and five measured repetitions:

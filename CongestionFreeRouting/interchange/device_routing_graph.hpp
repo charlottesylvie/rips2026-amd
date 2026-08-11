@@ -26,7 +26,12 @@ constexpr std::uint64_t kMinimumDeviceRoutingGraphVersion = 3;
 // production conversion must reject v5 graphs generated without TSP sinks.
 constexpr std::uint64_t kEndpointAttachmentDeviceRoutingGraphVersion = 5;
 constexpr std::uint64_t kCompleteIobAttachmentDeviceRoutingGraphVersion = 6;
-constexpr std::uint64_t kCurrentDeviceRoutingGraphVersion = 6;
+// Version 7 narrows the graph-sized edge-attribute records and the on-disk PIP
+// records to checked uint32 fields. Version 6 remains the first format with
+// the complete endpoint policy, but production conversion requires v7 so a
+// stale wide-record cache cannot silently retain the old I/O cost.
+constexpr std::uint64_t kCompactEdgeDeviceRoutingGraphVersion = 7;
+constexpr std::uint64_t kCurrentDeviceRoutingGraphVersion = 7;
 
 enum class NodeBoundsMode : std::uint64_t {
   kPocBaseWire = 0,
@@ -68,12 +73,12 @@ struct PipData {
   bool forward = true;
 };
 
-// This record is intentionally two adjacent u64s. Both the static cache and
-// final metadata file can serialize large edge-attribute arrays with one bulk
-// write instead of two stream calls per edge.
+// Devicegraph v7 stores this exact compact runtime/disk record. Generic
+// readers explicitly widen v3-v6's two-u64 disk record before checked
+// narrowing into this representation.
 struct EdgeAttr {
-  std::uint64_t tile_string = 0;
-  std::uint64_t pip_data_index = 0;
+  std::uint32_t tile_string = 0;
+  std::uint32_t pip_data_index = 0;
 };
 
 // Compact on-disk/runtime lookup record. Static cache string tables are
@@ -192,7 +197,7 @@ struct StaticCsrEntry {
 struct DeviceRoutingGraph {
   StringTable string_table;
   // The writer always emits kCurrentDeviceRoutingGraphVersion. Readers retain
-  // the original version so production callers can reject stale v3/v4 caches
+  // the original version so production callers can reject stale v3-v6 caches
   // while generic inspection remains backward compatible.
   std::uint64_t format_version = kCurrentDeviceRoutingGraphVersion;
   std::uint64_t device_fingerprint = 0;
@@ -245,13 +250,61 @@ struct DeviceRoutingGraph {
   std::vector<EndpointAttachmentLookup> endpoint_attachment_lookups;
 };
 
+// Optional converter-facing measurements for the two materially different
+// parts of devicegraph loading. Generic readers leave this null and retain
+// identical behavior; interchange_to_csr reports the populated fields as
+// structured stage telemetry.
+struct DeviceRoutingGraphReadTelemetry {
+  double string_loading_seconds = 0.0;
+  double string_index_seconds = 0.0;
+  double bulk_array_loading_seconds = 0.0;
+  std::uint64_t string_count = 0;
+  std::uint64_t string_payload_bytes = 0;
+  std::uint64_t string_file_bytes = 0;
+  std::uint64_t bulk_file_bytes = 0;
+};
+
+// One enabled endpoint-owned pseudo PIP retained by design filtering. The
+// attachment index remains in the immutable devicegraph namespace; csr_edge is
+// its exact edge in the compacted, design-specific outgoing CSR.
+struct RetainedEndpointAttachmentEdge {
+  std::uint32_t attachment_index = 0;
+  std::uint64_t csr_edge = 0;
+};
+
+// Fixed routed PhysPIPs use this validated index while importing preserved
+// nets. Exact records deliberately include every PhysPIP identity field; site
+// slices support the conservative unknown-pseudo fallback without rescanning
+// all endpoint attachments.
+struct FixedEndpointAttachmentExactRecord {
+  std::uint64_t tile_string = 0;
+  std::uint64_t wire0_string = 0;
+  std::uint64_t wire1_string = 0;
+  bool forward = true;
+  std::uint64_t traversed_site_string = 0;
+  std::uint32_t attachment_index = 0;
+};
+
+struct FixedEndpointAttachmentSiteSlice {
+  std::uint64_t traversed_site_string = 0;
+  std::size_t attachment_begin = 0;
+  std::size_t attachment_count = 0;
+};
+
+struct FixedEndpointAttachmentIndex {
+  std::vector<FixedEndpointAttachmentExactRecord> exact_records;
+  std::vector<std::uint32_t> attachments_by_traversed_site;
+  std::vector<FixedEndpointAttachmentSiteSlice> traversed_site_slices;
+};
+
 // Return the authoritative node count for either a full graph or the compact
 // filtering projection, rejecting a retained count that contradicts loaded
 // node IDs.
 std::size_t device_routing_graph_node_count(
     const DeviceRoutingGraph& graph);
 
-// Design-filtered outgoing CSR. Values are always exact unit weights.
+// Design-filtered outgoing CSR. Converter edges have implicit unit weights, so
+// this host representation does not materialize an nnz-sized values array.
 struct CsrGraph {
   std::int64_t rows = 0;
   std::int64_t cols = 0;
@@ -259,10 +312,18 @@ struct CsrGraph {
   std::uint64_t loaded_edges = 0;
   std::vector<std::int64_t> rowptr;
   std::vector<std::int32_t> colind;
-  std::vector<float> values;
   std::vector<EdgeAttr> edge_attrs;
+  // Converter-only sparse binding produced during edge filtering. This is not
+  // part of the CSR artifact payload.
+  std::vector<RetainedEndpointAttachmentEdge>
+      retained_endpoint_attachment_edges;
   RoutingCsrSidecars routing_sidecars;
 };
+
+// Establish the serialized EndpointPip order used by interchange_to_csr.
+// Each retained CSR edge may name at most one attachment.
+void sort_and_validate_retained_endpoint_attachment_edges(
+    std::vector<RetainedEndpointAttachmentEdge>& records);
 
 std::uint32_t checked_lookup_string_id(std::uint64_t id);
 
@@ -317,9 +378,28 @@ bool endpoint_attachment_allows_traversed_site_type(
     std::uint32_t attachment_index,
     const std::string& traversed_site_type);
 
+FixedEndpointAttachmentIndex build_fixed_endpoint_attachment_index(
+    const DeviceRoutingGraph& graph);
+
+std::optional<std::uint32_t> find_fixed_endpoint_attachment(
+    const FixedEndpointAttachmentIndex& index,
+    const StringTable& strings,
+    const std::string& tile,
+    const std::string& wire0,
+    const std::string& wire1,
+    bool forward,
+    const std::string& traversed_site);
+
+// Return an empty slice on a string/index miss. The returned offsets address
+// FixedEndpointAttachmentIndex::attachments_by_traversed_site.
+FixedEndpointAttachmentSiteSlice find_fixed_endpoint_attachment_site_slice(
+    const FixedEndpointAttachmentIndex& index,
+    const StringTable& strings,
+    const std::string& traversed_site);
+
 // Fail with an explicit regeneration diagnostic when a production path needs
-// complete I/OP/TSP endpoint-attachment semantics but was given a stale
-// v3-v5 cache.
+// complete I/OP/TSP endpoint-attachment semantics and compact graph records
+// but was given a stale v3-v6 cache.
 void require_endpoint_attachment_device_graph(
     const DeviceRoutingGraph& graph);
 
@@ -340,10 +420,11 @@ DeviceRoutingGraph read_device_routing_graph_for_filtering(
 // Per-design filtering needs the immutable CSR/lookups plus BF11's compact
 // route-end/cost columns, but not the legacy 40-byte physical-node columns.
 // Version-3 artifacts synthesize representative coordinates from node extents
-// and unit base costs; versions 4+ read the authored sidecars directly.
+// and unit base costs; versions 4 through 7 read authored sidecars directly.
 DeviceRoutingGraph read_device_routing_graph_for_routing(
     const std::filesystem::path& path,
-    bool require_endpoint_attachments = true);
+    bool require_endpoint_attachments = true,
+    DeviceRoutingGraphReadTelemetry* telemetry = nullptr);
 
 // Standard writer used by tests and tools that already own split arrays.
 void write_device_routing_graph(const DeviceRoutingGraph& graph,

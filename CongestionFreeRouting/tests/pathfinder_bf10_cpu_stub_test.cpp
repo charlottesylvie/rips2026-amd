@@ -305,6 +305,13 @@ void write_fixture_i32(std::ofstream& out, std::int32_t value) {
   }
 }
 
+void write_fixture_u32(std::ofstream& out, std::uint32_t value) {
+  out.write(reinterpret_cast<const char*>(&value), sizeof(value));
+  if (!out) {
+    throw std::runtime_error("failed to write binary loader fixture");
+  }
+}
+
 void write_fixture_string(std::ofstream& out, const std::string& value) {
   write_fixture_u64(out, static_cast<std::uint64_t>(value.size()));
   out.write(value.data(), static_cast<std::streamsize>(value.size()));
@@ -319,6 +326,10 @@ enum class MetadataFixtureTruncation {
   kEdgeAttrs,
   kPipData,
   kEndpointPips,
+  kLogicalNetNames,
+  kInvalidCompactEdgeString,
+  kInvalidCompactPipForward,
+  kLogicalCorrelation,
 };
 
 void write_metadata_loader_fixture(
@@ -326,9 +337,9 @@ void write_metadata_loader_fixture(
     std::uint64_t version,
     const routing::interchange::InterchangeArtifactPairId& id,
     MetadataFixtureTruncation truncation = MetadataFixtureTruncation::kNone) {
-  if (version < 4 || version > 7) {
+  if (version < 4 || version > 8) {
     throw std::invalid_argument(
-        "metadata loader fixture requires v4, v5, v6, or v7");
+        "metadata loader fixture requires v4 through v8");
   }
 
   std::ofstream out(path, std::ios::binary | std::ios::trunc);
@@ -345,23 +356,26 @@ void write_metadata_loader_fixture(
   constexpr std::uint64_t kNodeCount = 3;
   constexpr std::uint64_t kEdgeAttrCount = 4;
   constexpr std::uint64_t kPipDataCount = 2;
-  const std::uint64_t endpoint_pip_count = version >= 7 ? 1 : 0;
+  const bool has_endpoint_pips = version == 7 || version == 8;
+  const bool has_compact_tables = version == 8;
+  const std::uint64_t endpoint_pip_count = has_endpoint_pips ? 1 : 0;
   constexpr std::uint64_t kSitePinAttrCount = 1;
   constexpr std::uint64_t kRouteRequestCount = 1;
   constexpr std::uint64_t kBlockedNodeCount = 1;
   constexpr std::uint64_t kSinkStopNodeCount = 1;
-  constexpr std::uint64_t kLogicalCellCount = 1;
+  const std::uint64_t kLogicalCellCount = has_compact_tables ? 0 : 1;
   constexpr std::uint64_t kLogicalNetCount = 1;
-  constexpr std::uint64_t kLogicalPortInstanceCount = 1;
-  constexpr std::uint64_t kPhysicalBytes = 3;
-  constexpr std::uint64_t kLogicalBytes = 2;
+  const std::uint64_t kLogicalPortInstanceCount =
+      has_compact_tables ? 0 : 1;
+  const std::uint64_t kPhysicalBytes = has_compact_tables ? 0 : 3;
+  const std::uint64_t kLogicalBytes = has_compact_tables ? 0 : 2;
   std::vector<std::uint64_t> header_counts = {
       kStringCount,
       kNodeCount,
       kEdgeAttrCount,
       kPipDataCount,
   };
-  if (version >= 7) {
+  if (has_endpoint_pips) {
     header_counts.push_back(endpoint_pip_count);
   }
   const std::vector<std::uint64_t> trailing_header_counts = {
@@ -414,8 +428,8 @@ void write_metadata_loader_fixture(
     }
   }
 
-  // EdgeAttr is two adjacent u64s on disk. Distinctive valid values catch
-  // field swapping and record-order mistakes in the bulk reader.
+  // V4-v7 EdgeAttr uses two u64s; v8 narrows both fields to u32.
+  // Distinctive valid values catch field swapping and record-order mistakes.
   const std::uint64_t edge_attrs[][2] = {
       {4, 0},
       {5, 1},
@@ -423,11 +437,25 @@ void write_metadata_loader_fixture(
       {7, 1},
   };
   for (std::size_t index = 0; index < 4; ++index) {
-    write_fixture_u64(out, edge_attrs[index][0]);
+    const std::uint64_t tile =
+        truncation == MetadataFixtureTruncation::kInvalidCompactEdgeString &&
+                index == 0
+            ? std::numeric_limits<std::uint32_t>::max()
+            : edge_attrs[index][0];
+    if (has_compact_tables) {
+      write_fixture_u32(out, static_cast<std::uint32_t>(tile));
+    } else {
+      write_fixture_u64(out, tile);
+    }
     if (truncation == MetadataFixtureTruncation::kEdgeAttrs && index == 1) {
       return;
     }
-    write_fixture_u64(out, edge_attrs[index][1]);
+    if (has_compact_tables) {
+      write_fixture_u32(out,
+                        static_cast<std::uint32_t>(edge_attrs[index][1]));
+    } else {
+      write_fixture_u64(out, edge_attrs[index][1]);
+    }
   }
 
   const std::uint64_t pip_data[][3] = {
@@ -435,15 +463,29 @@ void write_metadata_loader_fixture(
       {6, 5, 0},
   };
   for (std::size_t index = 0; index < 2; ++index) {
-    write_fixture_u64(out, pip_data[index][0]);
-    write_fixture_u64(out, pip_data[index][1]);
+    if (has_compact_tables) {
+      write_fixture_u32(out, static_cast<std::uint32_t>(pip_data[index][0]));
+      write_fixture_u32(out, static_cast<std::uint32_t>(pip_data[index][1]));
+    } else {
+      write_fixture_u64(out, pip_data[index][0]);
+      write_fixture_u64(out, pip_data[index][1]);
+    }
     if (truncation == MetadataFixtureTruncation::kPipData && index == 0) {
       return;
     }
-    write_fixture_u64(out, pip_data[index][2]);
+    const std::uint64_t forward =
+        truncation == MetadataFixtureTruncation::kInvalidCompactPipForward &&
+                index == 0
+            ? 2
+            : pip_data[index][2];
+    if (has_compact_tables) {
+      write_fixture_u32(out, static_cast<std::uint32_t>(forward));
+    } else {
+      write_fixture_u64(out, forward);
+    }
   }
 
-  if (version >= 7) {
+  if (has_endpoint_pips) {
     // EndpointPipDisk: csr_edge, from, to, tile, wire0, wire1, forward,
     // traversed site, exact endpoint node, role (0 = source, 1 = sink).
     const std::uint64_t endpoint_pip[10] = {
@@ -467,58 +509,86 @@ void write_metadata_loader_fixture(
   write_fixture_u64(out, 0);
   write_fixture_u64(out, 8);
   write_fixture_u64(out, 5);
-  if (version >= 7) write_fixture_u64(out, routing::kNoIndex);
+  if (has_endpoint_pips) write_fixture_u64(out, routing::kNoIndex);
   write_fixture_u64(out, 2);
   write_fixture_u64(out, 8);
   write_fixture_u64(out, 6);
-  if (version >= 7) write_fixture_u64(out, 0);
+  if (has_endpoint_pips) write_fixture_u64(out, 0);
   write_fixture_u64(out, 2);  // sink count
   write_fixture_u64(out, 1);
   write_fixture_u64(out, 8);
   write_fixture_u64(out, 6);
-  if (version >= 7) write_fixture_u64(out, routing::kNoIndex);
+  if (has_endpoint_pips) write_fixture_u64(out, routing::kNoIndex);
   write_fixture_u64(out, routing::kNoIndex);  // unresolved sink
   write_fixture_u64(out, 8);
   write_fixture_u64(out, 5);
-  if (version >= 7) write_fixture_u64(out, routing::kNoIndex);
+  if (has_endpoint_pips) write_fixture_u64(out, routing::kNoIndex);
 
-  // The remaining v5-v7 sections are not needed by routing, but keeping them
-  // nonempty verifies that the loader lands on every following table exactly.
-  write_fixture_u64(out, 3);  // logical cell declaration
-  write_fixture_u64(out, 0);  // logical net begin
-  write_fixture_u64(out, 1);  // logical net count
-  write_fixture_u64(out, 7);  // logical net name
-  write_fixture_u64(out, 0);  // logical cell index
-  write_fixture_u64(out, 0);  // logical port begin
-  write_fixture_u64(out, 1);  // logical port count
-  write_fixture_u64(out, 5);  // logical port name
-  write_fixture_u64(out, 8);  // logical instance name
-  write_fixture_u64(out, 17); // logical port index
-  write_fixture_u64(out, 19); // logical instance index
-  write_fixture_u64(out, 23); // bus index
-  write_fixture_u64(out, 1);  // has bus
-  write_fixture_u64(out, 0);  // external port
+  if (has_compact_tables) {
+    const std::uint64_t logical_name =
+        truncation == MetadataFixtureTruncation::kLogicalCorrelation ? 6 : 7;
+    if (truncation == MetadataFixtureTruncation::kLogicalNetNames) {
+      write_fixture_u32(out, static_cast<std::uint32_t>(logical_name));
+      return;
+    }
+    write_fixture_u64(out, logical_name);
+  } else {
+    // Legacy sections are not needed by routing, but keeping them nonempty
+    // verifies that the loader lands on every following table exactly.
+    write_fixture_u64(out, 3);  // logical cell declaration
+    write_fixture_u64(out, 0);  // logical net begin
+    write_fixture_u64(out, 1);  // logical net count
+    write_fixture_u64(out, 7);  // logical net name
+    write_fixture_u64(out, 0);  // logical cell index
+    write_fixture_u64(out, 0);  // logical port begin
+    write_fixture_u64(out, 1);  // logical port count
+    write_fixture_u64(out, 5);  // logical port name
+    write_fixture_u64(out, 8);  // logical instance name
+    write_fixture_u64(out, 17); // logical port index
+    write_fixture_u64(out, 19); // logical instance index
+    write_fixture_u64(out, 23); // bus index
+    write_fixture_u64(out, 1);  // has bus
+    write_fixture_u64(out, 0);  // external port
+  }
   write_fixture_u64(out, 2);  // blocked node
   write_fixture_u64(out, 1);  // sink-stop node
-  const char physical_bytes[3] = {'P', 'H', 'Y'};
-  const char logical_bytes[2] = {'L', 'O'};
-  out.write(physical_bytes, sizeof(physical_bytes));
-  out.write(logical_bytes, sizeof(logical_bytes));
+  if (!has_compact_tables) {
+    const char physical_bytes[3] = {'P', 'H', 'Y'};
+    const char logical_bytes[2] = {'L', 'O'};
+    out.write(physical_bytes, sizeof(physical_bytes));
+    out.write(logical_bytes, sizeof(logical_bytes));
+  }
   if (!out) {
     throw std::runtime_error("failed to finish metadata loader fixture");
+  }
+}
+
+void overwrite_v8_metadata_count(const std::filesystem::path& path,
+                                 std::size_t count_index,
+                                 std::uint64_t value) {
+  constexpr std::streamoff kV8CountOffset =
+      8 + 2 * sizeof(std::uint64_t) + 2 * sizeof(std::uint64_t);
+  std::fstream file(path, std::ios::binary | std::ios::in | std::ios::out);
+  file.seekp(kV8CountOffset +
+             static_cast<std::streamoff>(count_index *
+                                         sizeof(std::uint64_t)));
+  file.write(reinterpret_cast<const char*>(&value), sizeof(value));
+  if (!file) {
+    throw std::runtime_error("failed to corrupt metadata v8 header fixture");
   }
 }
 
 void write_minimal_csr_fixture(
     const std::filesystem::path& path,
     std::uint64_t version,
-    const std::optional<routing::interchange::InterchangeArtifactPairId>& id) {
+    const std::optional<routing::interchange::InterchangeArtifactPairId>& id,
+    bool omit_v3_spatial_payload = false) {
   std::ofstream out(path, std::ios::binary | std::ios::trunc);
   const char magic[8] = {'R', 'I', 'P', 'S', 'C', 'S', 'R', '1'};
   out.write(magic, sizeof(magic));
   write_fixture_u64(out, version);
   write_fixture_u64(out, 2);
-  if (version >= 2) {
+  if (version == 2 || version == 3) {
     const auto value = id.value_or(
         routing::interchange::InterchangeArtifactPairId{});
     write_fixture_u64(out, value.high);
@@ -532,28 +602,192 @@ void write_minimal_csr_fixture(
   write_fixture_u64(out, 2);  // rowptr count
   write_fixture_u64(out, 0);  // colind count
   write_fixture_u64(out, 0);  // values count
-  if (version >= 3) {
+  if (version == 3) {
     write_fixture_u64(out, 1);  // route-end x count
     write_fixture_u64(out, 1);  // route-end y count
     write_fixture_u64(out, 1);  // base vertex cost count
     write_fixture_u64(out, 0);  // signed spatial minimum x
     write_fixture_u64(out, 0);  // signed spatial minimum y
-    write_fixture_u64(out, 1);  // spatial width
-    write_fixture_u64(out, 1);  // spatial height
-    write_fixture_u64(out, 3);  // regular + spill + terminal offset
+    write_fixture_u64(out, omit_v3_spatial_payload ? 0 : 1);  // spatial width
+    write_fixture_u64(out, omit_v3_spatial_payload ? 0 : 1);  // spatial height
+    write_fixture_u64(out,
+                      omit_v3_spatial_payload
+                          ? 0
+                          : 3);  // regular + spill + terminal offset
     write_fixture_u64(out, 0);  // spatial edge-id count
   }
   const std::int64_t rowptr[2] = {0, 0};
   out.write(reinterpret_cast<const char*>(rowptr), sizeof(rowptr));
-  if (version >= 3) {
+  if (version == 3) {
     const std::int32_t route_end = 0;
     const float base_cost = 1.0f;
     const std::uint64_t shard_offsets[3] = {0, 0, 0};
     out.write(reinterpret_cast<const char*>(&route_end), sizeof(route_end));
     out.write(reinterpret_cast<const char*>(&route_end), sizeof(route_end));
     out.write(reinterpret_cast<const char*>(&base_cost), sizeof(base_cost));
+    if (!omit_v3_spatial_payload) {
+      out.write(reinterpret_cast<const char*>(shard_offsets),
+                sizeof(shard_offsets));
+    }
+  }
+}
+
+void write_weighted_legacy_csr_fixture(
+    const std::filesystem::path& path,
+    std::uint64_t version,
+    const routing::interchange::InterchangeArtifactPairId& id) {
+  if (version < 1 || version > 3) {
+    throw std::invalid_argument("legacy CSR fixture version must be 1, 2, or 3");
+  }
+  std::ofstream out(path, std::ios::binary | std::ios::trunc);
+  const char magic[8] = {'R', 'I', 'P', 'S', 'C', 'S', 'R', '1'};
+  out.write(magic, sizeof(magic));
+  write_fixture_u64(out, version);
+  write_fixture_u64(out, 2);  // outgoing orientation
+  if (version == 2 || version == 3) {
+    write_fixture_u64(out, id.high);
+    write_fixture_u64(out, id.low);
+  }
+  write_fixture_u64(out, 2);  // rows
+  write_fixture_u64(out, 2);  // cols
+  write_fixture_u64(out, 1);  // declared edges
+  write_fixture_u64(out, 1);  // loaded edges
+  write_fixture_u64(out, 1);  // nnz
+  write_fixture_u64(out, 3);  // rowptr count
+  write_fixture_u64(out, 1);  // colind count
+  write_fixture_u64(out, 1);  // explicit values count
+  if (version == 3) {
+    write_fixture_u64(out, 2);  // route-end x count
+    write_fixture_u64(out, 2);  // route-end y count
+    write_fixture_u64(out, 2);  // base vertex cost count
+    write_fixture_u64(out, 0);  // signed spatial minimum x
+    write_fixture_u64(out, 0);  // signed spatial minimum y
+    write_fixture_u64(out, 1);  // spatial width
+    write_fixture_u64(out, 1);  // spatial height
+    write_fixture_u64(out, 3);  // regular + spill + terminal offset
+    write_fixture_u64(out, 1);  // spatial edge-id count
+  }
+
+  const std::int64_t rowptr[3] = {0, 1, 1};
+  const std::int32_t colind[1] = {1};
+  const float value[1] = {2.5f};
+  out.write(reinterpret_cast<const char*>(rowptr), sizeof(rowptr));
+  out.write(reinterpret_cast<const char*>(colind), sizeof(colind));
+  out.write(reinterpret_cast<const char*>(value), sizeof(value));
+  if (version == 3) {
+    const std::int32_t route_end_x[2] = {0, 0};
+    const std::int32_t route_end_y[2] = {0, 0};
+    const float base_cost[2] = {1.0f, 1.0f};
+    const std::uint64_t shard_offsets[3] = {0, 1, 1};
+    const std::uint32_t shard_edge_ids[1] = {0};
+    out.write(reinterpret_cast<const char*>(route_end_x), sizeof(route_end_x));
+    out.write(reinterpret_cast<const char*>(route_end_y), sizeof(route_end_y));
+    out.write(reinterpret_cast<const char*>(base_cost), sizeof(base_cost));
     out.write(reinterpret_cast<const char*>(shard_offsets),
               sizeof(shard_offsets));
+    out.write(reinterpret_cast<const char*>(shard_edge_ids),
+              sizeof(shard_edge_ids));
+  }
+  if (!out) {
+    throw std::runtime_error("failed to finish weighted legacy CSR fixture");
+  }
+}
+
+struct CsrV4HeaderOverrides {
+  std::uint64_t values_count = 0;
+  std::uint64_t route_x_count = 2;
+  std::uint64_t route_y_count = 2;
+  std::uint64_t base_cost_count = 2;
+  std::uint64_t spatial_width = 0;
+  std::uint64_t spatial_height = 0;
+  std::uint64_t spatial_offset_count = 0;
+  std::uint64_t spatial_edge_id_count = 0;
+};
+
+void write_v4_unit_csr_fixture(
+    const std::filesystem::path& path,
+    const routing::interchange::InterchangeArtifactPairId& id,
+    const CsrV4HeaderOverrides& overrides = {}) {
+  std::ofstream out(path, std::ios::binary | std::ios::trunc);
+  const char magic[8] = {'R', 'I', 'P', 'S', 'C', 'S', 'R', '1'};
+  out.write(magic, sizeof(magic));
+  write_fixture_u64(out, 4);  // format version
+  write_fixture_u64(out, 2);  // outgoing orientation
+  write_fixture_u64(out, id.high);
+  write_fixture_u64(out, id.low);
+  write_fixture_u64(out, 2);  // rows
+  write_fixture_u64(out, 2);  // cols
+  write_fixture_u64(out, 1);  // declared edges
+  write_fixture_u64(out, 1);  // loaded edges
+  write_fixture_u64(out, 1);  // nnz
+  write_fixture_u64(out, 3);  // rowptr count
+  write_fixture_u64(out, 1);  // colind count
+  write_fixture_u64(out, overrides.values_count);
+  write_fixture_u64(out, overrides.route_x_count);
+  write_fixture_u64(out, overrides.route_y_count);
+  write_fixture_u64(out, overrides.base_cost_count);
+  write_fixture_u64(out, 17);  // ignored spatial minimum x
+  write_fixture_u64(out, 29);  // ignored spatial minimum y
+  write_fixture_u64(out, overrides.spatial_width);
+  write_fixture_u64(out, overrides.spatial_height);
+  write_fixture_u64(out, overrides.spatial_offset_count);
+  write_fixture_u64(out, overrides.spatial_edge_id_count);
+
+  const std::int64_t rowptr[3] = {0, 1, 1};
+  const std::int32_t colind[1] = {1};
+  const std::int32_t route_end_x[2] = {3, 4};
+  const std::int32_t route_end_y[2] = {5, 6};
+  const float base_cost[2] = {1.0f, 2.0f};
+  out.write(reinterpret_cast<const char*>(rowptr), sizeof(rowptr));
+  out.write(reinterpret_cast<const char*>(colind), sizeof(colind));
+  out.write(reinterpret_cast<const char*>(route_end_x), sizeof(route_end_x));
+  out.write(reinterpret_cast<const char*>(route_end_y), sizeof(route_end_y));
+  out.write(reinterpret_cast<const char*>(base_cost), sizeof(base_cost));
+  if (!out) {
+    throw std::runtime_error("failed to finish CSR v4 fixture");
+  }
+}
+
+void write_v4_mutable_weight_csr_fixture(
+    const std::filesystem::path& path,
+    const routing::interchange::InterchangeArtifactPairId& id) {
+  std::ofstream out(path, std::ios::binary | std::ios::trunc);
+  const char magic[8] = {'R', 'I', 'P', 'S', 'C', 'S', 'R', '1'};
+  out.write(magic, sizeof(magic));
+  write_fixture_u64(out, 4);  // format version
+  write_fixture_u64(out, 2);  // outgoing orientation
+  write_fixture_u64(out, id.high);
+  write_fixture_u64(out, id.low);
+  write_fixture_u64(out, 4);  // rows
+  write_fixture_u64(out, 4);  // cols
+  write_fixture_u64(out, 4);  // declared edges
+  write_fixture_u64(out, 4);  // loaded edges
+  write_fixture_u64(out, 4);  // nnz
+  write_fixture_u64(out, 5);  // rowptr count
+  write_fixture_u64(out, 4);  // colind count
+  write_fixture_u64(out, 0);  // implicit values count
+  write_fixture_u64(out, 4);  // route-end x count
+  write_fixture_u64(out, 4);  // route-end y count
+  write_fixture_u64(out, 4);  // base vertex cost count
+  write_fixture_u64(out, 0);  // unused spatial minimum x
+  write_fixture_u64(out, 0);  // unused spatial minimum y
+  write_fixture_u64(out, 0);  // spatial width
+  write_fixture_u64(out, 0);  // spatial height
+  write_fixture_u64(out, 0);  // spatial offset count
+  write_fixture_u64(out, 0);  // spatial edge-id count
+
+  const std::int64_t rowptr[5] = {0, 2, 4, 4, 4};
+  const std::int32_t colind[4] = {1, 3, 2, 3};
+  const std::int32_t route_end_x[4] = {0, 1, 2, 3};
+  const std::int32_t route_end_y[4] = {0, 0, 0, 0};
+  const float base_cost[4] = {1.0f, 1.0f, 1.0f, 1.0f};
+  out.write(reinterpret_cast<const char*>(rowptr), sizeof(rowptr));
+  out.write(reinterpret_cast<const char*>(colind), sizeof(colind));
+  out.write(reinterpret_cast<const char*>(route_end_x), sizeof(route_end_x));
+  out.write(reinterpret_cast<const char*>(route_end_y), sizeof(route_end_y));
+  out.write(reinterpret_cast<const char*>(base_cost), sizeof(base_cost));
+  if (!out) {
+    throw std::runtime_error("failed to finish mutable-weight CSR v4 fixture");
   }
 }
 
@@ -572,7 +806,7 @@ void write_minimal_metadata_fixture(
     write_fixture_u64(out, value.high);
     write_fixture_u64(out, value.low);
   }
-  const int header_count = version >= 7 ? 14 : 13;
+  const int header_count = (version == 7 || version == 8) ? 14 : 13;
   for (int count = 0; count < header_count; ++count) {
     write_fixture_u64(out, 0);
   }
@@ -643,6 +877,55 @@ void test_interchange_artifact_pair_loaders() {
   // graph-sized geometry or shard arrays.
   (void)routing::load_csrbin(csr, &csr_id);
 
+  write_v4_unit_csr_fixture(csr, pair);
+  routing::interchange::RoutingCsrSidecars csr_v4_sidecars;
+  csr_id.reset();
+  const HostCsrF32 graph_v4 =
+      routing::load_csrbin(csr, &csr_id, &csr_v4_sidecars);
+  require(graph_v4.rows == 2 && graph_v4.nnz == 1 &&
+              graph_v4.rowptr ==
+                  std::vector<minplus_sparse::Offset>({0, 1, 1}) &&
+              graph_v4.colind == std::vector<minplus_sparse::Index>({1}) &&
+              graph_v4.values == std::vector<float>({1.0f}) &&
+              csr_id == pair &&
+              csr_v4_sidecars.route_end_x ==
+                  std::vector<std::int32_t>({3, 4}) &&
+              csr_v4_sidecars.route_end_y ==
+                  std::vector<std::int32_t>({5, 6}) &&
+              csr_v4_sidecars.base_vertex_cost ==
+                  std::vector<float>({1.0f, 2.0f}) &&
+              csr_v4_sidecars.spatial_edges.width == 0 &&
+              csr_v4_sidecars.spatial_edges.height == 0 &&
+              csr_v4_sidecars.spatial_edges.offsets.empty() &&
+              csr_v4_sidecars.spatial_edges.edge_ids.empty(),
+          "CSR v4 implicit-unit node sidecars did not load exactly");
+  routing::interchange::RoutingCsrSidecars csr_v4_node_sidecars_only;
+  (void)routing::load_csrbin(csr, &csr_id, &csr_v4_node_sidecars_only, false);
+  require(csr_v4_node_sidecars_only.route_end_x ==
+                  std::vector<std::int32_t>({3, 4}) &&
+              csr_v4_node_sidecars_only.route_end_y ==
+                  std::vector<std::int32_t>({5, 6}) &&
+              csr_v4_node_sidecars_only.base_vertex_cost ==
+                  std::vector<float>({1.0f, 2.0f}) &&
+              csr_v4_node_sidecars_only.spatial_edges.offsets.empty() &&
+              csr_v4_node_sidecars_only.spatial_edges.edge_ids.empty(),
+          "CSR v4 node-only loading did not retain its BF11 sidecars");
+  (void)routing::load_csrbin(csr, &csr_id);
+
+  for (std::uint64_t version = 1; version <= 3; ++version) {
+    write_weighted_legacy_csr_fixture(csr, version, pair);
+    csr_id.reset();
+    const HostCsrF32 weighted_legacy = routing::load_csrbin(csr, &csr_id);
+    require(weighted_legacy.rows == 2 && weighted_legacy.nnz == 1 &&
+                weighted_legacy.rowptr ==
+                    std::vector<minplus_sparse::Offset>({0, 1, 1}) &&
+                weighted_legacy.colind ==
+                    std::vector<minplus_sparse::Index>({1}) &&
+                weighted_legacy.values == std::vector<float>({2.5f}) &&
+                (version == 1 ? !csr_id.has_value() : csr_id == pair),
+            "CSR v1-v3 explicit non-unit values did not load exactly");
+  }
+
   write_minimal_csr_fixture(csr, 1, std::nullopt);
   write_minimal_metadata_fixture(metadata, 4, std::nullopt);
   csr_id = pair;
@@ -664,6 +947,18 @@ void test_interchange_artifact_pair_loaders() {
     }
     require(failed, message);
   };
+  write_v4_unit_csr_fixture(csr, pair);
+  (void)routing::load_csrbin(csr, &csr_id);
+  write_minimal_metadata_fixture(
+      metadata, 5, routing::interchange::InterchangeArtifactPairId{9, 10});
+  const routing::RoutingMetadata mismatched_metadata =
+      routing::load_interchange_metadata(metadata);
+  require_failure(
+      [&] {
+        routing::interchange::require_matching_interchange_pair_ids(
+            csr_id, mismatched_metadata.artifact_pair_id, pair);
+      },
+      "loaded CSR v4/metadata artifact-pair mismatch was accepted");
   require_failure(
       [&] {
         routing::interchange::require_matching_interchange_pair_ids(
@@ -678,6 +973,11 @@ void test_interchange_artifact_pair_loaders() {
       },
       "mixed legacy/current artifact pair was accepted");
 
+  write_minimal_csr_fixture(csr, 3, pair, true);
+  require_failure(
+      [&] { (void)routing::load_csrbin(csr); },
+      "CSR v3 without its required spatial payload was reinterpreted as v4");
+
   write_minimal_csr_fixture(csr, 3, pair);
   std::filesystem::resize_file(csr, std::filesystem::file_size(csr) - 1);
   require_failure(
@@ -689,6 +989,48 @@ void test_interchange_artifact_pair_loaders() {
         (void)routing::load_csrbin(csr, nullptr, &node_sidecars, false);
       },
       "node-only CSR loading accepted a truncated v3 spatial payload");
+
+  const std::vector<CsrV4HeaderOverrides> malformed_v4_headers = {
+      CsrV4HeaderOverrides{1, 2, 2, 2, 0, 0, 0, 0},
+      CsrV4HeaderOverrides{0, 1, 2, 2, 0, 0, 0, 0},
+      CsrV4HeaderOverrides{0, 2, 1, 2, 0, 0, 0, 0},
+      CsrV4HeaderOverrides{0, 2, 2, 1, 0, 0, 0, 0},
+      CsrV4HeaderOverrides{0, 2, 2, 2, 1, 0, 0, 0},
+      CsrV4HeaderOverrides{0, 2, 2, 2, 0, 1, 0, 0},
+      CsrV4HeaderOverrides{0, 2, 2, 2, 0, 0, 1, 0},
+      CsrV4HeaderOverrides{0, 2, 2, 2, 0, 0, 0, 1},
+  };
+  for (const CsrV4HeaderOverrides& malformed : malformed_v4_headers) {
+    write_v4_unit_csr_fixture(csr, pair, malformed);
+    require_failure(
+        [&] { (void)routing::load_csrbin(csr); },
+        "malformed nonzero CSR v4 counts were accepted");
+  }
+
+  write_v4_unit_csr_fixture(csr, pair);
+  std::filesystem::resize_file(csr, std::filesystem::file_size(csr) - 1);
+  require_failure(
+      [&] { (void)routing::load_csrbin(csr); },
+      "graph-only CSR loading accepted a truncated v4 node payload");
+  require_failure(
+      [&] {
+        routing::interchange::RoutingCsrSidecars sidecars;
+        (void)routing::load_csrbin(csr, nullptr, &sidecars);
+      },
+      "sidecar CSR loading accepted a truncated v4 node payload");
+
+  write_v4_unit_csr_fixture(csr, pair);
+  {
+    std::ofstream trailing(csr, std::ios::binary | std::ios::app);
+    const char byte = '\x7f';
+    trailing.write(&byte, sizeof(byte));
+    if (!trailing) {
+      throw std::runtime_error("failed to append trailing CSR fixture byte");
+    }
+  }
+  require_failure(
+      [&] { (void)routing::load_csrbin(csr); },
+      "CSR v4 loader accepted trailing bytes after the declared payload");
 
   write_minimal_csr_fixture(csr, 2, std::nullopt);
   require_failure(
@@ -715,13 +1057,14 @@ void require_metadata_loader_fixture(
     bool expects_legacy_node_arrays,
     bool expects_route_output_tables,
     bool expects_auxiliary_tables,
-    bool expects_v7_endpoint_records) {
+    bool expects_endpoint_records,
+    bool expects_v8_logical_names = false) {
   require(metadata.artifact_pair_id == pair,
           "metadata loader lost the artifact pair id");
   require(metadata.declared_node_count == 3 &&
               metadata.declared_edge_attr_count == 4 &&
               metadata.declared_endpoint_pip_count ==
-                  (expects_v7_endpoint_records ? 1 : 0),
+                  (expects_endpoint_records ? 1 : 0),
           "metadata loader lost routing-only declared graph counts");
   require(metadata.strings ==
               std::vector<std::string>({"device", "physical", "logical",
@@ -780,7 +1123,7 @@ void require_metadata_loader_fixture(
                 metadata.pip_data[1].wire1_string == 5 &&
                 !metadata.pip_data[1].forward,
             "bulk PIP-data loading changed record order or direction");
-    if (expects_v7_endpoint_records) {
+    if (expects_endpoint_records) {
       require(metadata.endpoint_pips.size() == 1,
               "v7 metadata loader changed the endpoint-PIP count");
       const routing::EndpointPip& endpoint_pip =
@@ -827,7 +1170,7 @@ void require_metadata_loader_fixture(
               request.sources[1].site_string == 8 &&
               request.sources[1].pin_string == 6 &&
               request.sources[1].endpoint_pip_index ==
-                  (expects_v7_endpoint_records ? 0 : routing::kNoIndex),
+                  (expects_endpoint_records ? 0 : routing::kNoIndex),
           "metadata loader changed source endpoint records");
   require(request.sinks[0].node == 1 &&
               request.sinks[0].site_string == 8 &&
@@ -847,6 +1190,11 @@ void require_metadata_loader_fixture(
                 metadata.sink_stop_nodes.empty(),
             "routing projection retained unused node-mask records");
   }
+  require(metadata.logical_net_name_strings ==
+              (expects_v8_logical_names
+                   ? std::vector<std::uint64_t>({7})
+                   : std::vector<std::uint64_t>{}),
+          "metadata loader changed the logical-net name correlation table");
 }
 
 void test_compact_metadata_loader() {
@@ -871,10 +1219,12 @@ void test_compact_metadata_loader() {
   const std::filesystem::path v5_path = directory / "metadata-v5.ifmeta.bin";
   const std::filesystem::path v6_path = directory / "metadata-v6.ifmeta.bin";
   const std::filesystem::path v7_path = directory / "metadata-v7.ifmeta.bin";
+  const std::filesystem::path v8_path = directory / "metadata-v8.ifmeta.bin";
   write_metadata_loader_fixture(v4_path, 4, pair);
   write_metadata_loader_fixture(v5_path, 5, pair);
   write_metadata_loader_fixture(v6_path, 6, pair);
   write_metadata_loader_fixture(v7_path, 7, pair);
+  write_metadata_loader_fixture(v8_path, 8, pair);
 
   const routing::RoutingMetadata v5_full =
       routing::load_interchange_metadata(
@@ -885,9 +1235,14 @@ void test_compact_metadata_loader() {
   const routing::RoutingMetadata v7_full =
       routing::load_interchange_metadata(
           v7_path, routing::InterchangeMetadataLoadMode::kFull);
+  const routing::RoutingMetadata v8_full =
+      routing::load_interchange_metadata(
+          v8_path, routing::InterchangeMetadataLoadMode::kFull);
   require_metadata_loader_fixture(v5_full, pair, true, true, true, false);
   require_metadata_loader_fixture(v6_full, pair, false, true, true, false);
   require_metadata_loader_fixture(v7_full, pair, false, true, true, true);
+  require_metadata_loader_fixture(v8_full, pair, false, true, true, true,
+                                  true);
 
   const routing::RoutingMetadata v5_routing =
       routing::load_interchange_metadata(
@@ -898,12 +1253,17 @@ void test_compact_metadata_loader() {
   const routing::RoutingMetadata v7_routing =
       routing::load_interchange_metadata(
           v7_path, routing::InterchangeMetadataLoadMode::kRoutingOnly);
+  const routing::RoutingMetadata v8_routing =
+      routing::load_interchange_metadata(
+          v8_path, routing::InterchangeMetadataLoadMode::kRoutingOnly);
   require_metadata_loader_fixture(v5_routing, pair, false, false, false,
                                   false);
   require_metadata_loader_fixture(v6_routing, pair, false, false, false,
                                   false);
   require_metadata_loader_fixture(v7_routing, pair, false, false, false,
                                   true);
+  require_metadata_loader_fixture(v8_routing, pair, false, false, false,
+                                  true, true);
 
   const routing::RoutingMetadata v4_route_output =
       routing::load_interchange_metadata(
@@ -925,6 +1285,12 @@ void test_compact_metadata_loader() {
           routing::InterchangeMetadataLoadMode::kRoutingWithRouteOutput);
   require_metadata_loader_fixture(
       v7_route_output, pair, false, true, false, true);
+  const routing::RoutingMetadata v8_route_output =
+      routing::load_interchange_metadata(
+          v8_path,
+          routing::InterchangeMetadataLoadMode::kRoutingWithRouteOutput);
+  require_metadata_loader_fixture(
+      v8_route_output, pair, false, true, false, true, true);
 
   const auto require_truncated_failure =
       [&](std::uint64_t version,
@@ -964,6 +1330,66 @@ void test_compact_metadata_loader() {
       7,
       MetadataFixtureTruncation::kEndpointPips,
       "v7 metadata truncated inside endpoint-PIP data was accepted");
+  require_truncated_failure(
+      8,
+      MetadataFixtureTruncation::kEdgeAttrs,
+      "v8 metadata truncated inside compact EdgeAttr data was accepted");
+  require_truncated_failure(
+      8,
+      MetadataFixtureTruncation::kPipData,
+      "v8 metadata truncated inside compact PIP data was accepted");
+  require_truncated_failure(
+      8,
+      MetadataFixtureTruncation::kEndpointPips,
+      "v8 metadata truncated inside endpoint-PIP data was accepted");
+  require_truncated_failure(
+      8,
+      MetadataFixtureTruncation::kLogicalNetNames,
+      "v8 metadata truncated inside logical-net names was accepted");
+  require_truncated_failure(
+      8,
+      MetadataFixtureTruncation::kInvalidCompactEdgeString,
+      "v8 metadata accepted an out-of-range compact edge string");
+  require_truncated_failure(
+      8,
+      MetadataFixtureTruncation::kInvalidCompactPipForward,
+      "v8 metadata accepted an invalid compact PIP direction");
+  require_truncated_failure(
+      8,
+      MetadataFixtureTruncation::kLogicalCorrelation,
+      "v8 metadata accepted a mismatched logical-net correlation");
+
+  // Count indexes 9/11/12/13 are logical cells, logical port instances, and
+  // the two omitted embedded FPGAIF payloads in the common v8 header.
+  for (const std::size_t count_index : {9U, 11U, 12U, 13U}) {
+    const std::filesystem::path malformed =
+        directory / ("malformed-v8-count-" + std::to_string(count_index));
+    write_metadata_loader_fixture(malformed, 8, pair);
+    overwrite_v8_metadata_count(malformed, count_index, 1);
+    bool failed = false;
+    try {
+      (void)routing::load_interchange_metadata(malformed);
+    } catch (const std::exception&) {
+      failed = true;
+    }
+    require(failed, "v8 metadata accepted a nonzero omitted payload count");
+  }
+
+  const std::filesystem::path trailing_v8 =
+      directory / "trailing-v8.ifmeta.bin";
+  write_metadata_loader_fixture(trailing_v8, 8, pair);
+  {
+    std::ofstream trailing(trailing_v8, std::ios::binary | std::ios::app);
+    const char junk = '\x42';
+    trailing.write(&junk, sizeof(junk));
+  }
+  bool accepted_trailing = true;
+  try {
+    (void)routing::load_interchange_metadata(trailing_v8);
+  } catch (const std::exception&) {
+    accepted_trailing = false;
+  }
+  require(!accepted_trailing, "v8 metadata accepted trailing bytes");
 }
 
 void test_endpoint_pip_route_output() {
@@ -2266,8 +2692,114 @@ UnitBfsCsrResult UnitBfsCsrWorkspace::run(
              progress_user_data);
 }
 
+void test_loaded_v4_mutable_weight_routing() {
+  const auto nonce = std::chrono::steady_clock::now()
+                         .time_since_epoch()
+                         .count();
+  const std::filesystem::path directory =
+      std::filesystem::temp_directory_path() /
+      ("pathfinder_v4_mutable_weights_" + std::to_string(nonce));
+  std::filesystem::create_directory(directory);
+  struct Cleanup {
+    std::filesystem::path path;
+    ~Cleanup() {
+      std::error_code ignored;
+      std::filesystem::remove_all(path, ignored);
+    }
+  } cleanup{directory};
+
+  const routing::interchange::InterchangeArtifactPairId pair{
+      0x123456789abcdef0ULL, 0x0fedcba987654321ULL};
+  const std::filesystem::path csr = directory / "mutable.csrbin";
+  write_v4_mutable_weight_csr_fixture(csr, pair);
+  HostCsrF32 graph = routing::load_csrbin(csr);
+  require(graph.values == std::vector<float>({1.0f, 1.0f, 1.0f, 1.0f}),
+          "CSR v4 did not materialize mutable unit values");
+
+  DeltaSteppingCsrWorkspace workspace(graph, nullptr);
+  const std::vector<int> sources = {0};
+  const std::vector<int> targets = {2, 3};
+  DeltaSteppingCsrTelemetry unit_telemetry;
+  const DeltaSteppingCsrResult unit_result = workspace.run(
+      sources,
+      targets,
+      1.0f,
+      -1,
+      DeltaSteppingCsrRunOptions{&unit_telemetry},
+      nullptr,
+      nullptr,
+      nullptr);
+  require(unit_telemetry.execution_path ==
+                  DeltaSteppingCsrExecutionPath::kExactUnit &&
+              unit_result.target_distances ==
+                  std::vector<float>({2.0f, 1.0f}),
+          "freshly loaded CSR v4 did not take the exact-unit reference path");
+
+  graph.values = {0.0f, 2.0f, 0.25f, 0.5f};
+  workspace.update_values(graph.values, nullptr);
+  DeltaSteppingCsrTelemetry weighted_telemetry;
+  const DeltaSteppingCsrResult weighted_result = workspace.run(
+      sources,
+      targets,
+      1.0f,
+      -1,
+      DeltaSteppingCsrRunOptions{&weighted_telemetry},
+      nullptr,
+      nullptr,
+      nullptr);
+  require(weighted_telemetry.execution_path ==
+                  DeltaSteppingCsrExecutionPath::kCompactGeneric &&
+              weighted_result.target_distances ==
+                  std::vector<float>({0.25f, 0.5f}) &&
+              weighted_result.target_path_edges ==
+                  std::vector<minplus_sparse::Offset>({0, 2, 0, 3}),
+          "mutated fractional/zero CSR v4 weights did not use generic routing");
+
+  DeltaSteppingCsrTelemetry repeated_telemetry;
+  const DeltaSteppingCsrResult repeated_result = workspace.run(
+      sources,
+      targets,
+      1.0f,
+      -1,
+      DeltaSteppingCsrRunOptions{&repeated_telemetry},
+      nullptr,
+      nullptr,
+      nullptr);
+  require(repeated_telemetry.execution_path ==
+                  DeltaSteppingCsrExecutionPath::kCompactGeneric &&
+              repeated_result.target_distances ==
+                  weighted_result.target_distances &&
+              repeated_result.target_path_edges ==
+                  weighted_result.target_path_edges,
+          "repeated routing lost the updated CSR v4 weight state");
+
+  routing::apply_delta_benchmark_weights(
+      graph, routing::DeltaBenchmarkWeights::kMixed, 2.0f, 17);
+  const std::vector<float> first_override = graph.values;
+  routing::apply_delta_benchmark_weights(
+      graph, routing::DeltaBenchmarkWeights::kMixed, 2.0f, 17);
+  require(graph.values == first_override &&
+              std::any_of(graph.values.begin(), graph.values.end(),
+                          [](float value) { return value != 1.0f; }),
+          "loaded CSR v4 lost deterministic benchmark weight overrides");
+  workspace.update_values(graph.values, nullptr);
+  DeltaSteppingCsrTelemetry override_telemetry;
+  (void)workspace.run(sources,
+                      targets,
+                      2.0f,
+                      -1,
+                      DeltaSteppingCsrRunOptions{&override_telemetry},
+                      nullptr,
+                      nullptr,
+                      nullptr);
+  require(override_telemetry.execution_path ==
+              DeltaSteppingCsrExecutionPath::kCompactGeneric,
+          "benchmark-overridden CSR v4 weights re-entered a permanent unit path");
+}
+
 int main() {
   test_interchange_artifact_pair_loaders();
+  test_loaded_v4_mutable_weight_routing();
   test_compact_metadata_loader();
   test_endpoint_pip_route_output();
 

@@ -22,8 +22,8 @@ namespace routing {
 constexpr std::uint64_t kNoIndex = std::numeric_limits<std::uint64_t>::max();
 
 struct EdgeAttr {
-  std::uint64_t tile_string = 0;
-  std::uint64_t pip_data_index = 0;
+  std::uint32_t tile_string = 0;
+  std::uint32_t pip_data_index = 0;
 };
 
 struct PipData {
@@ -86,6 +86,9 @@ struct RoutingMetadata {
   std::vector<EndpointPip> endpoint_pips;
   std::vector<SitePinNode> site_pin_attrs;
   std::vector<RouteRequest> route_requests;
+  // Metadata v8 retains only the logical-net ordinal -> name mapping needed
+  // to authenticate each physical route request's logical correlation.
+  std::vector<std::uint64_t> logical_net_name_strings;
   std::vector<std::uint64_t> blocked_nodes;
   std::vector<std::uint64_t> sink_stop_nodes;
   std::uint64_t device_path_string = kNoIndex;

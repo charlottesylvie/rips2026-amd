@@ -63,21 +63,101 @@ constexpr char CSR_MAGIC[8] = {'R', 'I', 'P', 'S', 'C', 'S', 'R', '1'};
 constexpr char METADATA_MAGIC[8] = {'R', 'I', 'P', 'S', 'I', 'F', 'M', '1'};
 constexpr std::uint64_t LEGACY_CSR_VERSION = 1;
 constexpr std::uint64_t PAIRED_CSR_VERSION = 2;
-constexpr std::uint64_t CURRENT_CSR_VERSION = 3;
+constexpr std::uint64_t SPATIAL_SHARD_CSR_VERSION = 3;
+constexpr std::uint64_t IMPLICIT_UNIT_CSR_VERSION = 4;
+constexpr std::uint64_t CURRENT_CSR_VERSION = IMPLICIT_UNIT_CSR_VERSION;
 constexpr std::uint64_t LEGACY_METADATA_VERSION = 4;
 constexpr std::uint64_t FIRST_PAIRED_METADATA_VERSION = 5;
 constexpr std::uint64_t COMPACT_METADATA_VERSION = 6;
 constexpr std::uint64_t ENDPOINT_PIP_METADATA_VERSION = 7;
-constexpr std::uint64_t CURRENT_METADATA_VERSION = 7;
+constexpr std::uint64_t COMPACT_TABLE_METADATA_VERSION = 8;
+constexpr std::uint64_t CURRENT_METADATA_VERSION =
+    COMPACT_TABLE_METADATA_VERSION;
 constexpr std::uint64_t EXPECTED_OUTGOING_EDGE_ORIENTATION = 2;
 
-struct PipDataDisk {
+constexpr bool metadata_has_artifact_pair(std::uint64_t version) {
+  return version == FIRST_PAIRED_METADATA_VERSION ||
+         version == COMPACT_METADATA_VERSION ||
+         version == ENDPOINT_PIP_METADATA_VERSION ||
+         version == COMPACT_TABLE_METADATA_VERSION;
+}
+
+constexpr bool metadata_has_endpoint_pips(std::uint64_t version) {
+  return version == ENDPOINT_PIP_METADATA_VERSION ||
+         version == COMPACT_TABLE_METADATA_VERSION;
+}
+
+constexpr bool metadata_has_legacy_node_arrays(std::uint64_t version) {
+  return version == LEGACY_METADATA_VERSION ||
+         version == FIRST_PAIRED_METADATA_VERSION;
+}
+
+constexpr bool metadata_has_compact_edge_pip_tables(std::uint64_t version) {
+  return version == COMPACT_TABLE_METADATA_VERSION;
+}
+
+constexpr bool metadata_has_legacy_logical_payloads(std::uint64_t version) {
+  return version == LEGACY_METADATA_VERSION ||
+         version == FIRST_PAIRED_METADATA_VERSION ||
+         version == COMPACT_METADATA_VERSION ||
+         version == ENDPOINT_PIP_METADATA_VERSION;
+}
+
+constexpr bool is_supported_metadata_version(std::uint64_t version) {
+  return version == LEGACY_METADATA_VERSION ||
+         version == FIRST_PAIRED_METADATA_VERSION ||
+         version == COMPACT_METADATA_VERSION ||
+         version == ENDPOINT_PIP_METADATA_VERSION ||
+         version == COMPACT_TABLE_METADATA_VERSION;
+}
+
+constexpr bool csr_has_artifact_pair(std::uint64_t version) {
+  return version == PAIRED_CSR_VERSION ||
+         version == SPATIAL_SHARD_CSR_VERSION ||
+         version == IMPLICIT_UNIT_CSR_VERSION;
+}
+
+constexpr bool csr_has_routing_node_sidecars(std::uint64_t version) {
+  return version == SPATIAL_SHARD_CSR_VERSION ||
+         version == IMPLICIT_UNIT_CSR_VERSION;
+}
+
+constexpr bool csr_has_explicit_values(std::uint64_t version) {
+  return version == LEGACY_CSR_VERSION || version == PAIRED_CSR_VERSION ||
+         version == SPATIAL_SHARD_CSR_VERSION;
+}
+
+constexpr bool csr_has_spatial_edge_shards(std::uint64_t version) {
+  return version == SPATIAL_SHARD_CSR_VERSION;
+}
+
+constexpr bool csr_has_implicit_unit_values(std::uint64_t version) {
+  return version == IMPLICIT_UNIT_CSR_VERSION;
+}
+
+struct LegacyEdgeAttrDisk {
+  std::uint64_t tile_string = 0;
+  std::uint64_t pip_data_index = 0;
+};
+
+struct CompactEdgeAttrDisk {
+  std::uint32_t tile_string = 0;
+  std::uint32_t pip_data_index = 0;
+};
+
+struct LegacyPipDataDisk {
   std::uint64_t wire0_string = 0;
   std::uint64_t wire1_string = 0;
   std::uint64_t forward = 0;
 };
 
-// Metadata v7 ABI: ten adjacent u64 fields, in declaration order.
+struct CompactPipDataDisk {
+  std::uint32_t wire0_string = 0;
+  std::uint32_t wire1_string = 0;
+  std::uint32_t forward = 0;
+};
+
+// Metadata v7-v8 ABI: ten adjacent u64 fields, in declaration order.
 struct EndpointPipDisk {
   std::uint64_t csr_edge = 0;
   std::uint64_t from = 0;
@@ -98,14 +178,23 @@ struct SitePinNodeDisk {
   std::uint64_t pin_string = 0;
 };
 
-static_assert(sizeof(EdgeAttr) == 2 * sizeof(std::uint64_t),
-              "EdgeAttr metadata layout changed");
-static_assert(std::is_trivially_copyable<EdgeAttr>::value,
-              "EdgeAttr must remain bulk-readable");
-static_assert(sizeof(PipDataDisk) == 3 * sizeof(std::uint64_t),
-              "PipData disk layout changed");
-static_assert(std::is_trivially_copyable<PipDataDisk>::value,
-              "PipData disk records must remain bulk-readable");
+static_assert(sizeof(LegacyEdgeAttrDisk) == 2 * sizeof(std::uint64_t),
+              "legacy EdgeAttr metadata layout changed");
+static_assert(sizeof(CompactEdgeAttrDisk) == 2 * sizeof(std::uint32_t),
+              "compact EdgeAttr metadata layout changed");
+static_assert(sizeof(EdgeAttr) == sizeof(CompactEdgeAttrDisk) &&
+                  alignof(EdgeAttr) == alignof(CompactEdgeAttrDisk) &&
+                  std::is_trivially_copyable<EdgeAttr>::value,
+              "runtime EdgeAttr must match metadata v8 compact layout");
+static_assert(sizeof(LegacyPipDataDisk) == 3 * sizeof(std::uint64_t),
+              "legacy PipData disk layout changed");
+static_assert(sizeof(CompactPipDataDisk) == 3 * sizeof(std::uint32_t),
+              "compact PipData disk layout changed");
+static_assert(std::is_trivially_copyable<LegacyEdgeAttrDisk>::value &&
+                  std::is_trivially_copyable<CompactEdgeAttrDisk>::value &&
+                  std::is_trivially_copyable<LegacyPipDataDisk>::value &&
+                  std::is_trivially_copyable<CompactPipDataDisk>::value,
+              "metadata edge/PIP disk records must remain bulk-readable");
 static_assert(sizeof(EndpointPipDisk) == 10 * sizeof(std::uint64_t),
               "endpoint-PIP disk layout changed");
 static_assert(std::is_trivially_copyable<EndpointPipDisk>::value,
@@ -215,7 +304,7 @@ void skip_array(std::ifstream& in, std::uint64_t count, const char* name) {
   skip_bytes(in, sssp_capacity::checked_bytes<T>(host_count), name);
 }
 
-void require_position_within_file(std::ifstream& in, const char* name) {
+void require_position_at_end_of_file(std::ifstream& in, const char* name) {
   const std::ifstream::pos_type position = in.tellg();
   if (position == std::ifstream::pos_type(-1)) {
     throw std::runtime_error(std::string("failed while checking ") + name);
@@ -227,6 +316,9 @@ void require_position_within_file(std::ifstream& in, const char* name) {
   const std::ifstream::pos_type end = in.tellg();
   if (end == std::ifstream::pos_type(-1) || position > end) {
     throw std::runtime_error(std::string(name) + " is truncated");
+  }
+  if (position != end) {
+    throw std::runtime_error(std::string(name) + " contains trailing bytes");
   }
 }
 
@@ -2390,7 +2482,7 @@ HostCsrF32 load_csrbin(
   }
 
   std::optional<interchange::InterchangeArtifactPairId> parsed_pair_id;
-  if (version >= PAIRED_CSR_VERSION) {
+  if (csr_has_artifact_pair(version)) {
     interchange::InterchangeArtifactPairId id;
     id.high = read_u64(in, "CSR artifact pair id high");
     id.low = read_u64(in, "CSR artifact pair id low");
@@ -2418,7 +2510,7 @@ HostCsrF32 load_csrbin(
   std::uint64_t spatial_height = 0;
   std::uint64_t spatial_offset_count = 0;
   std::uint64_t spatial_edge_id_count = 0;
-  if (version >= CURRENT_CSR_VERSION) {
+  if (csr_has_routing_node_sidecars(version)) {
     route_x_count = read_u64(in, "CSR route-end x count");
     route_y_count = read_u64(in, "CSR route-end y count");
     base_cost_count = read_u64(in, "CSR base vertex cost count");
@@ -2438,12 +2530,23 @@ HostCsrF32 load_csrbin(
       nnz > static_cast<std::uint64_t>(std::numeric_limits<minplus_sparse::Offset>::max())) {
     throw std::runtime_error("CSR graph is too large for this API");
   }
-  if (rowptr_count != rows + 1 || colind_count != nnz || values_count != nnz) {
+  if (rowptr_count != rows + 1 || colind_count != nnz) {
     throw std::runtime_error("CSR header counts are inconsistent");
   }
-  if (version >= CURRENT_CSR_VERSION) {
+  if (csr_has_explicit_values(version) && values_count != nnz) {
+    throw std::runtime_error("CSR explicit values count is inconsistent");
+  }
+  if (csr_has_implicit_unit_values(version) && values_count != 0) {
+    throw std::runtime_error("CSR v4 values count must be zero");
+  }
+  if (csr_has_routing_node_sidecars(version)) {
     if (route_x_count != rows || route_y_count != rows ||
-        base_cost_count != rows || spatial_edge_id_count != nnz) {
+        base_cost_count != rows) {
+      throw std::runtime_error("CSR routing sidecar counts are inconsistent");
+    }
+  }
+  if (csr_has_spatial_edge_shards(version)) {
+    if (spatial_edge_id_count != nnz) {
       throw std::runtime_error("CSR routing sidecar counts are inconsistent");
     }
     if (spatial_min_x < std::numeric_limits<std::int32_t>::min() ||
@@ -2467,6 +2570,11 @@ HostCsrF32 load_csrbin(
       throw std::runtime_error("CSR spatial shard offset count is inconsistent");
     }
   }
+  if (csr_has_implicit_unit_values(version) &&
+      (spatial_width != 0 || spatial_height != 0 ||
+       spatial_offset_count != 0 || spatial_edge_id_count != 0)) {
+    throw std::runtime_error("CSR v4 spatial shard fields must be zero");
+  }
 
   HostCsrF32 graph;
   graph.rows = static_cast<minplus_sparse::Offset>(rows);
@@ -2474,10 +2582,20 @@ HostCsrF32 load_csrbin(
   graph.nnz = static_cast<minplus_sparse::Offset>(nnz);
   read_array(in, graph.rowptr, rowptr_count, "CSR rowptr");
   read_array(in, graph.colind, colind_count, "CSR colind");
-  read_array(in, graph.values, values_count, "CSR values");
+  if (csr_has_explicit_values(version)) {
+    read_array(in, graph.values, values_count, "CSR values");
+  } else {
+    const std::size_t implicit_value_count =
+        checked_vector_count<float>(nnz, "CSR implicit unit values");
+    if (implicit_value_count > graph.values.max_size()) {
+      throw std::overflow_error(
+          "CSR implicit unit values count exceeds vector capacity");
+    }
+    graph.values.assign(implicit_value_count, 1.0f);
+  }
 
   interchange::RoutingCsrSidecars parsed_sidecars;
-  if (version >= CURRENT_CSR_VERSION) {
+  if (csr_has_routing_node_sidecars(version)) {
     if (routing_sidecars != nullptr) {
       read_array(in, parsed_sidecars.route_end_x, route_x_count,
                  "CSR route-end x coordinates");
@@ -2485,7 +2603,8 @@ HostCsrF32 load_csrbin(
                  "CSR route-end y coordinates");
       read_array(in, parsed_sidecars.base_vertex_cost, base_cost_count,
                  "CSR base vertex costs");
-      if (load_spatial_edge_shards) {
+      if (csr_has_spatial_edge_shards(version) &&
+          load_spatial_edge_shards) {
         parsed_sidecars.spatial_edges.min_x =
             static_cast<std::int32_t>(spatial_min_x);
         parsed_sidecars.spatial_edges.min_y =
@@ -2496,13 +2615,14 @@ HostCsrF32 load_csrbin(
                    spatial_offset_count, "CSR spatial shard offsets");
         read_array(in, parsed_sidecars.spatial_edges.edge_ids,
                    spatial_edge_id_count, "CSR spatial shard edge IDs");
-      } else {
+      } else if (csr_has_spatial_edge_shards(version)) {
         skip_array<std::uint64_t>(in, spatial_offset_count,
                                   "CSR spatial shard offsets");
         skip_array<std::uint32_t>(in, spatial_edge_id_count,
                                   "CSR spatial shard edge IDs");
       }
-      if (load_spatial_edge_shards) {
+      if (csr_has_spatial_edge_shards(version) &&
+          load_spatial_edge_shards) {
         interchange::validate_destination_spatial_edge_shards(
             parsed_sidecars, static_cast<std::size_t>(rows), graph.colind);
       } else {
@@ -2518,13 +2638,15 @@ HostCsrF32 load_csrbin(
       skip_array<std::int32_t>(in, route_y_count,
                                "CSR route-end y coordinates");
       skip_array<float>(in, base_cost_count, "CSR base vertex costs");
-      skip_array<std::uint64_t>(in, spatial_offset_count,
-                                "CSR spatial shard offsets");
-      skip_array<std::uint32_t>(in, spatial_edge_id_count,
-                                "CSR spatial shard edge IDs");
+      if (csr_has_spatial_edge_shards(version)) {
+        skip_array<std::uint64_t>(in, spatial_offset_count,
+                                  "CSR spatial shard offsets");
+        skip_array<std::uint32_t>(in, spatial_edge_id_count,
+                                  "CSR spatial shard edge IDs");
+      }
     }
   }
-  require_position_within_file(in, "CSR payload");
+  require_position_at_end_of_file(in, "CSR payload");
   validate_csr(graph);
   if (artifact_pair_id != nullptr) {
     *artifact_pair_id = parsed_pair_id;
@@ -2559,16 +2681,18 @@ RoutingMetadata load_interchange_metadata(
 
   const std::uint64_t version = read_u64(in, "metadata format version");
   const std::uint64_t orientation = read_u64(in, "metadata orientation");
-  if (version < LEGACY_METADATA_VERSION ||
-      version > CURRENT_METADATA_VERSION) {
-    throw std::runtime_error("unsupported metadata format version");
+  if (version > CURRENT_METADATA_VERSION ||
+      !is_supported_metadata_version(version)) {
+    throw std::runtime_error(
+        "unsupported metadata format version; regenerate it with "
+        "interchange_to_csr");
   }
   if (orientation != EXPECTED_OUTGOING_EDGE_ORIENTATION) {
     throw std::runtime_error("unsupported metadata orientation");
   }
 
   std::optional<interchange::InterchangeArtifactPairId> parsed_pair_id;
-  if (version >= FIRST_PAIRED_METADATA_VERSION) {
+  if (metadata_has_artifact_pair(version)) {
     interchange::InterchangeArtifactPairId id;
     id.high = read_u64(in, "metadata artifact pair id high");
     id.low = read_u64(in, "metadata artifact pair id low");
@@ -2582,10 +2706,11 @@ RoutingMetadata load_interchange_metadata(
   const std::uint64_t node_count = read_u64(in, "metadata node count");
   const std::uint64_t edge_attr_count = read_u64(in, "metadata edge attribute count");
   const std::uint64_t pip_data_count = read_u64(in, "metadata pip data count");
-  const std::uint64_t endpoint_pip_count =
-      version >= ENDPOINT_PIP_METADATA_VERSION
-          ? read_u64(in, "metadata endpoint PIP count")
-          : 0;
+  const std::uint64_t endpoint_pip_count = metadata_has_endpoint_pips(version)
+                                               ? read_u64(
+                                                     in,
+                                                     "metadata endpoint PIP count")
+                                               : 0;
   const std::uint64_t site_pin_attr_count = read_u64(in, "metadata site pin attr count");
   const std::uint64_t route_request_count = read_u64(in, "metadata route request count");
   const std::uint64_t blocked_node_count = read_u64(in, "metadata blocked node count");
@@ -2598,6 +2723,19 @@ RoutingMetadata load_interchange_metadata(
       read_u64(in, "metadata physical byte count");
   const std::uint64_t logical_netlist_byte_count =
       read_u64(in, "metadata logical byte count");
+  if (version == COMPACT_TABLE_METADATA_VERSION) {
+    if (string_count > std::numeric_limits<std::uint32_t>::max() ||
+        pip_data_count > std::numeric_limits<std::uint32_t>::max()) {
+      throw std::runtime_error(
+          "metadata v8 string/PIP counts exceed compact uint32 limits");
+    }
+    if (logical_cell_count != 0 || logical_port_instance_count != 0 ||
+        physical_netlist_byte_count != 0 ||
+        logical_netlist_byte_count != 0) {
+      throw std::runtime_error(
+          "metadata v8 omitted hierarchy/payload counts must be zero");
+    }
+  }
 
   RoutingMetadata metadata;
   metadata.artifact_pair_id = parsed_pair_id;
@@ -2615,7 +2753,7 @@ RoutingMetadata load_interchange_metadata(
     metadata.strings.push_back(read_string(in));
   }
 
-  const bool has_node_arrays = version < COMPACT_METADATA_VERSION;
+  const bool has_node_arrays = metadata_has_legacy_node_arrays(version);
   const bool load_node_arrays =
       mode == InterchangeMetadataLoadMode::kFull && has_node_arrays;
   if (has_node_arrays) {
@@ -2653,25 +2791,82 @@ RoutingMetadata load_interchange_metadata(
 
   const bool load_route_output_tables =
       mode != InterchangeMetadataLoadMode::kRoutingOnly;
-  if (load_route_output_tables) {
-    read_array(in, metadata.edge_attrs, edge_attr_count,
-               "metadata edge attributes");
-  } else {
-    skip_array<EdgeAttr>(in, edge_attr_count, "metadata edge attributes");
-  }
-
-  if (load_route_output_tables) {
-    std::vector<PipDataDisk> disk_pip_data;
-    read_array(in, disk_pip_data, pip_data_count, "metadata pip data");
-    metadata.pip_data.resize(disk_pip_data.size());
-    for (std::size_t i = 0; i < disk_pip_data.size(); ++i) {
-      metadata.pip_data[i] = {
-          disk_pip_data[i].wire0_string,
-          disk_pip_data[i].wire1_string,
-          disk_pip_data[i].forward != 0};
+  if (metadata_has_compact_edge_pip_tables(version)) {
+    if (load_route_output_tables) {
+      read_array(in, metadata.edge_attrs, edge_attr_count,
+                 "metadata compact edge attributes");
+      for (const EdgeAttr& attr : metadata.edge_attrs) {
+        if (attr.tile_string >= string_count ||
+            attr.pip_data_index >= pip_data_count) {
+          throw std::runtime_error(
+              "metadata compact edge attribute references an invalid "
+              "string/PIP");
+        }
+      }
+    } else {
+      skip_array<CompactEdgeAttrDisk>(in, edge_attr_count,
+                                      "metadata compact edge attributes");
+    }
+  } else if (load_route_output_tables) {
+    std::vector<LegacyEdgeAttrDisk> disk_edge_attrs;
+    read_array(in, disk_edge_attrs, edge_attr_count,
+               "metadata legacy edge attributes");
+    metadata.edge_attrs.reserve(disk_edge_attrs.size());
+    for (const LegacyEdgeAttrDisk& disk : disk_edge_attrs) {
+      if (disk.tile_string >= string_count ||
+          disk.pip_data_index >= pip_data_count ||
+          disk.tile_string > std::numeric_limits<std::uint32_t>::max() ||
+          disk.pip_data_index >
+              std::numeric_limits<std::uint32_t>::max()) {
+        throw std::runtime_error(
+            "metadata legacy edge attribute references an invalid "
+            "or non-compact string/PIP; regenerate with interchange_to_csr");
+      }
+      metadata.edge_attrs.push_back(
+          {static_cast<std::uint32_t>(disk.tile_string),
+           static_cast<std::uint32_t>(disk.pip_data_index)});
     }
   } else {
-    skip_array<PipDataDisk>(in, pip_data_count, "metadata pip data");
+    skip_array<LegacyEdgeAttrDisk>(in, edge_attr_count,
+                                   "metadata legacy edge attributes");
+  }
+
+  if (metadata_has_compact_edge_pip_tables(version)) {
+    if (load_route_output_tables) {
+      std::vector<CompactPipDataDisk> disk_pip_data;
+      read_array(in, disk_pip_data, pip_data_count,
+                 "metadata compact pip data");
+      metadata.pip_data.reserve(disk_pip_data.size());
+      for (const CompactPipDataDisk& disk : disk_pip_data) {
+        if (disk.forward > 1 || disk.wire0_string >= string_count ||
+            disk.wire1_string >= string_count) {
+          throw std::runtime_error(
+              "metadata compact PIP has an invalid string/direction");
+        }
+        metadata.pip_data.push_back(
+            {disk.wire0_string, disk.wire1_string, disk.forward != 0});
+      }
+    } else {
+      skip_array<CompactPipDataDisk>(in, pip_data_count,
+                                     "metadata compact pip data");
+    }
+  } else if (load_route_output_tables) {
+    std::vector<LegacyPipDataDisk> disk_pip_data;
+    read_array(in, disk_pip_data, pip_data_count,
+               "metadata legacy pip data");
+    metadata.pip_data.reserve(disk_pip_data.size());
+    for (const LegacyPipDataDisk& disk : disk_pip_data) {
+      if (disk.forward > 1 || disk.wire0_string >= string_count ||
+          disk.wire1_string >= string_count) {
+        throw std::runtime_error(
+            "metadata legacy PIP has an invalid string/direction");
+      }
+      metadata.pip_data.push_back(
+          {disk.wire0_string, disk.wire1_string, disk.forward != 0});
+    }
+  } else {
+    skip_array<LegacyPipDataDisk>(in, pip_data_count,
+                                  "metadata legacy pip data");
   }
 
   if (load_route_output_tables) {
@@ -2792,7 +2987,7 @@ RoutingMetadata load_interchange_metadata(
       source.site_string = read_u64(in, "metadata source site");
       source.pin_string = read_u64(in, "metadata source pin");
       source.endpoint_pip_index =
-          version >= ENDPOINT_PIP_METADATA_VERSION
+          metadata_has_endpoint_pips(version)
               ? read_u64(in, "metadata source endpoint PIP index")
               : kNoIndex;
       if (source.endpoint_pip_index != kNoIndex &&
@@ -2823,7 +3018,7 @@ RoutingMetadata load_interchange_metadata(
       sink.site_string = read_u64(in, "metadata sink site");
       sink.pin_string = read_u64(in, "metadata sink pin");
       sink.endpoint_pip_index =
-          version >= ENDPOINT_PIP_METADATA_VERSION
+          metadata_has_endpoint_pips(version)
               ? read_u64(in, "metadata sink endpoint PIP index")
               : kNoIndex;
       if (sink.endpoint_pip_index != kNoIndex &&
@@ -2845,12 +3040,45 @@ RoutingMetadata load_interchange_metadata(
     }
   }
 
-  skip_array<std::array<std::uint64_t, 3>>(
-      in, logical_cell_count, "metadata logical cells");
-  skip_array<std::array<std::uint64_t, 4>>(
-      in, logical_net_count, "metadata logical nets");
-  skip_array<std::array<std::uint64_t, 7>>(
-      in, logical_port_instance_count, "metadata logical port instances");
+  if (metadata_has_legacy_logical_payloads(version)) {
+    skip_array<std::array<std::uint64_t, 3>>(
+        in, logical_cell_count, "metadata logical cells");
+    skip_array<std::array<std::uint64_t, 4>>(
+        in, logical_net_count, "metadata logical nets");
+    skip_array<std::array<std::uint64_t, 7>>(
+        in, logical_port_instance_count,
+        "metadata logical port instances");
+  } else {
+    read_array(in, metadata.logical_net_name_strings, logical_net_count,
+               "metadata logical net names");
+    for (const std::uint64_t name_string :
+         metadata.logical_net_name_strings) {
+      if (name_string >= string_count) {
+        throw std::runtime_error(
+            "metadata v8 logical net references an invalid string");
+      }
+    }
+    for (const RouteRequest& request : metadata.route_requests) {
+      if (request.net_string >= string_count) {
+        throw std::runtime_error(
+            "metadata v8 route request references an invalid net string");
+      }
+      if (request.logical_net_index == kNoIndex) {
+        continue;
+      }
+      if (request.logical_net_index >=
+          metadata.logical_net_name_strings.size()) {
+        throw std::runtime_error(
+            "metadata v8 route request references an invalid logical net");
+      }
+      if (metadata.logical_net_name_strings[
+              static_cast<std::size_t>(request.logical_net_index)] !=
+          request.net_string) {
+        throw std::runtime_error(
+            "metadata v8 physical/logical net-name correlation mismatch");
+      }
+    }
+  }
 
   if (mode == InterchangeMetadataLoadMode::kFull) {
     read_array(in, metadata.blocked_nodes, blocked_node_count,
@@ -2864,11 +3092,13 @@ RoutingMetadata load_interchange_metadata(
                               "metadata sink stop nodes");
   }
 
-  skip_array<std::uint8_t>(in, physical_netlist_byte_count,
-                           "metadata physical bytes");
-  skip_array<std::uint8_t>(in, logical_netlist_byte_count,
-                           "metadata logical bytes");
-  require_position_within_file(in, "interchange metadata");
+  if (metadata_has_legacy_logical_payloads(version)) {
+    skip_array<std::uint8_t>(in, physical_netlist_byte_count,
+                             "metadata physical bytes");
+    skip_array<std::uint8_t>(in, logical_netlist_byte_count,
+                             "metadata logical bytes");
+  }
+  require_position_at_end_of_file(in, "interchange metadata");
 
   return metadata;
 }
@@ -3244,7 +3474,7 @@ PathfinderResult run_pathfinder(const HostCsrF32& base_graph,
           !routing_sidecars->route_end_x.empty();
       if (!has_routing_sidecars && options.bf11_bounds_enabled) {
         throw std::runtime_error(
-            "bounded BF11 requires CSR v3 route-end sidecars; regenerate the "
+            "bounded BF11 requires CSR v3/v4 route-end sidecars; regenerate the "
             "CSR or pass --bf11-unbounded for a legacy artifact");
       }
 
@@ -4371,9 +4601,9 @@ int main(int argc, char** argv) {
 
     // V5+ artifacts carry a pair ID and publication generation, so their
     // graph-sized route-output tables can be loaded safely after routing.
-    // Legacy v4 artifacts have neither identity token. Retain their output
-    // tables before routing rather than risk combining routes from one
-    // sidecar with edge/PIP records from a replacement sidecar later.
+    // Legacy metadata-v4/CSR-v1 artifacts have neither identity token. Retain
+    // their output tables before routing rather than risk combining routes
+    // from one sidecar with edge/PIP records from a replacement sidecar later.
     const bool defer_route_output_metadata =
         !routes_out_path.empty() && metadata.artifact_pair_id.has_value();
     if (!routes_out_path.empty() && !defer_route_output_metadata) {
