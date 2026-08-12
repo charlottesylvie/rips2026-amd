@@ -830,12 +830,34 @@ hipcc -std=c++17 -O3 -pthread -x hip -DBF11_NO_MAIN \
   -o /tmp/bf11_vs_delta_unbounded_benchmark
 
 /tmp/bf11_vs_delta_unbounded_benchmark 100000 8 4 2 10 32 123
+
+# Full convergence from each source, returning all vertex distances:
+/tmp/bf11_vs_delta_unbounded_benchmark 20000000 4 4 1 5 3 123 full
 ```
 
 The positional arguments are vertices, average out degree, delta, warmup query
 sets, measured query-set repetitions, queries per set, and random seed. The
+optional final mode is `target` (the default) or `full`. Full mode disables
+target termination, runs to frontier exhaustion, returns one distance per
+vertex, and compares the complete BF11 and Delta distance vectors. The
 benchmark reports per-query HIP-event and end-to-end wall latency and rejects
-any paired BF11/Delta target-distance mismatch.
+any paired BF11/Delta distance mismatch.
+
+Sweep full-convergence SSSP across multiple graph sizes and save both engines'
+complete timing statistics to CSV:
+
+```bash
+python3 CongestionFreeRouting/profiling/sweep_bf11_vs_delta_sssp.py \
+  --vertices 100000 500000 1000000 5000000 10000000 20000000 \
+  --degree 4 --delta 4 --warmups 1 --repeats 5 --queries 3 --seed 123 \
+  --mode full \
+  --output bf11_vs_delta_full_sssp.csv \
+  --log-dir bf11_vs_delta_full_sssp_logs
+```
+
+The sweep writes and flushes each graph-size row immediately, so completed
+sizes remain in the CSV if a later large graph fails. Use `--append` to retain
+existing rows across invocations.
 
 Host-only BF11 automatic-worker policy, exact retained-layout accounting, and
 conservative allocation-peak estimator test:

@@ -1177,6 +1177,7 @@ __global__ void frontier_controller_kernel(
     }
 
     const bool check_targets =
+        target_count > 0 &&
         completed_iteration % target_check_interval == 0;
     unsigned long long target_check_start = 0;
     if constexpr (CollectTelemetry) {
@@ -2085,6 +2086,7 @@ SsspStatus run_host_controller(const DeviceGraph& graph,
     check_hip(hipGetLastError(), "launch BF11 frontier relaxation");
     end_telemetry_event(workspace, workspace.relaxation_events);
     const bool check_targets =
+        target_count > 0 &&
         (iteration + 1) % options.target_check_interval == 0;
     if (check_targets) {
       begin_telemetry_event(workspace, workspace.target_check_events);
@@ -2444,6 +2446,57 @@ struct BellmanFord11CsrWorkspace::Impl {
     }
   }
 
+  BellmanFordCsrResult run_distances_once(
+      const std::vector<int>& sources,
+      int max_iters) {
+    using namespace rips_sssp_bf11;
+    ScopedQueryTelemetry query_telemetry(workspace.telemetry_enabled);
+    const std::vector<int> unique_sources =
+        deduplicate_nodes(sources, graph->rows, "source");
+    const Offset source_count = static_cast<Offset>(unique_sources.size());
+    ensure_source_capacity(workspace, source_count);
+    note_workspace_size();
+    if (workspace.needs_full_state_reset) {
+      fully_reset_workspace_state(workspace);
+    }
+    workspace.needs_full_state_reset = true;
+    DrainStreamOnException drain(stream);
+    check_hip(hipMemcpyAsync(workspace.source_nodes, unique_sources.data(),
+                             unique_sources.size() * sizeof(Index),
+                             hipMemcpyHostToDevice, stream),
+              "copy BF11 distance-only sources");
+
+    // A zero target count disables the target certificate in both BF11
+    // controllers. The search therefore ends only at frontier exhaustion or
+    // max_iters. Bounds remain disabled for this full-graph API.
+    const BellmanFord11RunOptions run_options{};
+    const SsspStatus status = run_sssp(graph->device.view, workspace,
+                                       source_count, 0, max_iters,
+                                       run_options);
+
+    std::vector<unsigned long long> host_state(
+        static_cast<std::size_t>(graph->rows));
+    check_hip(hipMemcpyAsync(host_state.data(), workspace.best_state,
+                             host_state.size() * sizeof(unsigned long long),
+                             hipMemcpyDeviceToHost, stream),
+              "copy BF11 full distance state");
+    synchronize_query_stream(workspace,
+                             "synchronize BF11 full distances");
+    aggregate_query_work_telemetry(workspace, status.iterations_used);
+
+    BellmanFordCsrResult result;
+    result.dist.resize(host_state.size());
+    for (std::size_t node = 0; node < host_state.size(); ++node) {
+      result.dist[node] = host_state_distance(host_state[node]);
+    }
+    result.iterations_used = status.iterations_used;
+    result.converged = status.converged;
+    result.stopped_on_target = false;
+    workspace.needs_full_state_reset = false;
+    query_telemetry.mark_completed();
+    return result;
+  }
+
   BellmanFordCsrResult run_once(const std::vector<int>& sources,
                                 const std::vector<int>& targets,
                                 int max_iters,
@@ -2793,6 +2846,26 @@ void BellmanFord11CsrWorkspace::update_vertex_costs_sparse(
                             "apply BF11 sparse vertex costs");
   rips_sssp_bf11::check_hip(hipStreamSynchronize(stream),
                             "synchronize BF11 sparse vertex costs");
+}
+
+BellmanFordCsrResult BellmanFord11CsrWorkspace::run_distances(
+    const std::vector<int>& sources,
+    float delta,
+    int max_iters,
+    hipStream_t stream,
+    BellmanFordCsrProgressCallback progress_callback,
+    void* progress_user_data) {
+  PATHFINDER_PROFILE_RANGE("bf11.run_distances");
+  (void)delta;
+  (void)progress_user_data;
+  if (!impl_) throw std::runtime_error("BF11 workspace has no implementation");
+  std::lock_guard<std::mutex> operation_lock(impl_->operation_mutex);
+  impl_->require_stream(stream);
+  if (progress_callback) {
+    throw std::invalid_argument(
+        "BF11 persistent controller does not expose per-round callbacks");
+  }
+  return impl_->run_distances_once(sources, max_iters);
 }
 
 BellmanFordCsrResult BellmanFord11CsrWorkspace::run(

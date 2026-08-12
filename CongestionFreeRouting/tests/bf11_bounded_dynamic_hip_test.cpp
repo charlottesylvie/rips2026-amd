@@ -1250,6 +1250,38 @@ void test_explicit_stream_worker_count_invariance() {
   }
 }
 
+void test_full_distance_output_and_reuse() {
+  const HostCsrF32 graph = make_graph(
+      7, {{0, 1, 2.0f}, {0, 2, 7.0f}, {1, 2, 1.0f},
+          {1, 3, 4.0f}, {2, 3, 1.0f}, {3, 4, 3.0f},
+          {5, 6, 1.0f}});
+  const ri::RoutingCsrSidecars sidecars = make_sidecars(
+      {0, 1, 2, 3, 4, 5, 6}, {0, 0, 0, 0, 0, 0, 0});
+  const std::vector<float> dynamic_cost(static_cast<std::size_t>(graph.rows),
+                                        1.0f);
+  BellmanFord11CsrWorkspace workspace(graph, sidecars, nullptr);
+
+  for (const int source : {0, 5}) {
+    const BellmanFordCsrResult result =
+        workspace.run_distances(source, 1.0f, -1, nullptr, nullptr, nullptr);
+    const std::vector<float> expected = cpu_bounded_dijkstra(
+        graph, sidecars, dynamic_cost, {source});
+    require(result.converged && !result.stopped_on_target,
+            "BF11 full-distance run did not finish by convergence");
+    require(result.dist.size() == expected.size(),
+            "BF11 full-distance result has the wrong size");
+    require(result.pred_node.empty() && result.pred_edge.empty() &&
+                result.target_distances.empty() &&
+                result.target_path_nodes.empty(),
+            "BF11 full-distance result unexpectedly contains path output");
+    for (std::size_t node = 0; node < expected.size(); ++node) {
+      require(close_enough(expected[node], result.dist[node]),
+              "BF11 full-distance mismatch at node " +
+                  std::to_string(node));
+    }
+  }
+}
+
 }  // namespace
 
 int main() {
@@ -1263,6 +1295,7 @@ int main() {
     test_opt_in_telemetry();
     test_parallel_explicit_stream_host_controller();
     test_explicit_stream_worker_count_invariance();
+    test_full_distance_output_and_reuse();
     std::cout << "BF11 bounded dynamic HIP tests passed\n";
     return 0;
   } catch (const std::exception& error) {

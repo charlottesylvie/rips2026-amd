@@ -161,6 +161,28 @@ class BellmanFord11CsrWorkspace {
                                   const std::vector<float>& vertex_costs,
                                   hipStream_t stream = nullptr);
 
+  // Run unbounded to full single-source convergence and return one distance
+  // per graph vertex. No target certificate or path reconstruction is used.
+  // delta is retained for interface symmetry with Delta-Stepping and ignored.
+  BellmanFordCsrResult run_distances(
+      const std::vector<int>& sources,
+      float delta,
+      int max_iters,
+      hipStream_t stream = nullptr,
+      BellmanFordCsrProgressCallback progress_callback = nullptr,
+      void* progress_user_data = nullptr);
+
+  BellmanFordCsrResult run_distances(
+      int source,
+      float delta,
+      int max_iters,
+      hipStream_t stream = nullptr,
+      BellmanFordCsrProgressCallback progress_callback = nullptr,
+      void* progress_user_data = nullptr) {
+    return run_distances(std::vector<int>{source}, delta, max_iters, stream,
+                         progress_callback, progress_user_data);
+  }
+
   // Legacy-shaped entry point. It applies this workspace's auto-bound/fallback
   // policy. delta is retained for PathFinder interface compatibility and is not
   // used by Bellman-Ford.

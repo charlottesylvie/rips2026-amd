@@ -12,6 +12,8 @@
 //
 // Example (vertices, degree, delta, warmups, repeats, queries, seed):
 //   /tmp/bf11_vs_delta_unbounded_benchmark 100000 8 4 2 10 32 123
+// Full convergence and all vertex distances (use fewer large-graph queries):
+//   /tmp/bf11_vs_delta_unbounded_benchmark 20000000 4 4 1 5 3 123 full
 
 #include "../bellman_ford/bf11.hpp"
 #include "../delta_stepping/delta_stepping_hip_CSR.hpp"
@@ -196,7 +198,40 @@ auto time_call(hipStream_t stream,
 
 void require_matching_results(const BellmanFordCsrResult& bf11,
                               const DeltaSteppingCsrResult& delta,
-                              int query_index) {
+                              int query_index,
+                              bool full_sssp,
+                              std::size_t vertex_count) {
+  if (full_sssp) {
+    if (!bf11.converged || !delta.converged) {
+      throw std::runtime_error("full query " +
+                               std::to_string(query_index) +
+                               " did not converge in both engines");
+    }
+    if (bf11.dist.size() != vertex_count ||
+        delta.dist.size() != vertex_count) {
+      throw std::runtime_error("full query " +
+                               std::to_string(query_index) +
+                               " did not return one distance per vertex");
+    }
+    for (std::size_t node = 0; node < vertex_count; ++node) {
+      const float left = bf11.dist[node];
+      const float right = delta.dist[node];
+      if (std::isinf(left) || std::isinf(right)) {
+        if (std::isinf(left) && std::isinf(right)) continue;
+      } else {
+        const float scale =
+            std::max({1.0f, std::fabs(left), std::fabs(right)});
+        if (std::fabs(left - right) <= 1e-5f * scale) continue;
+      }
+      throw std::runtime_error("full query " +
+                               std::to_string(query_index) +
+                               " differs at vertex " +
+                               std::to_string(node) + ": BF11=" +
+                               std::to_string(left) + " Delta=" +
+                               std::to_string(right));
+    }
+    return;
+  }
   if (bf11.target_distances.size() != 1 ||
       delta.target_distances.size() != 1) {
     throw std::runtime_error("query " + std::to_string(query_index) +
@@ -272,7 +307,7 @@ void print_usage(const char* executable) {
   std::cerr
       << "Usage: " << executable
       << " [vertices=100000] [degree=8] [delta=4] [warmups=2]"
-         " [repeats=10] [queries=32] [seed=1]\n";
+         " [repeats=10] [queries=32] [seed=1] [mode=target|full]\n";
 }
 
 }  // namespace
@@ -292,6 +327,11 @@ int main(int argc, char** argv) {
     const int repeats = parse_int(argv, argc, 5, 10);
     const int query_count = parse_int(argv, argc, 6, 32);
     const int seed = parse_int(argv, argc, 7, 1);
+    const std::string mode = argc > 8 ? argv[8] : "target";
+    const bool full_sssp = mode == "full";
+    if (!full_sssp && mode != "target") {
+      throw std::invalid_argument("mode must be target or full");
+    }
     if (!(delta_value > 0.0f) || warmups < 0 || repeats < 1) {
       throw std::invalid_argument(
           "delta and repeats must be positive; warmups must be nonnegative");
@@ -314,6 +354,10 @@ int main(int argc, char** argv) {
     DeltaSteppingCsrWorkspace delta(graph, stream.get());
 
     std::cout << "Unbounded production SSSP benchmark\n"
+              << "  mode:     "
+              << (full_sssp ? "full convergence/all distances"
+                            : "target-terminated")
+              << "\n"
               << "  vertices: " << graph.rows << "\n"
               << "  edges:    " << graph.nnz << "\n"
               << "  degree:   " << degree << "\n"
@@ -323,14 +367,31 @@ int main(int argc, char** argv) {
               << "  repeats:  " << repeats << " full query sets\n"
               << "  timed calls per engine: " << repeats * query_count << "\n\n";
 
+    auto run_bf11 = [&](const std::vector<int>& sources,
+                        const std::vector<int>& targets) {
+      if (full_sssp) {
+        return bf11.run_distances(sources, delta_value, -1, stream.get(),
+                                  nullptr, nullptr);
+      }
+      return bf11.run(sources, targets, delta_value, -1, stream.get(),
+                      nullptr, nullptr);
+    };
+    auto run_delta = [&](const std::vector<int>& sources,
+                         const std::vector<int>& targets) {
+      if (full_sssp) {
+        return delta.run_distances(sources, delta_value, -1, stream.get(),
+                                   nullptr, nullptr);
+      }
+      return delta.run(sources, targets, delta_value, -1, stream.get(),
+                       nullptr, nullptr);
+    };
+
     for (int warmup = 0; warmup < warmups; ++warmup) {
       for (const Query& query : queries) {
         const std::vector<int> sources{query.source};
         const std::vector<int> targets{query.target};
-        (void)bf11.run(sources, targets, delta_value, -1, stream.get(),
-                       nullptr, nullptr);
-        (void)delta.run(sources, targets, delta_value, -1, stream.get(),
-                        nullptr, nullptr);
+        (void)run_bf11(sources, targets);
+        (void)run_delta(sources, targets);
       }
     }
 
@@ -362,34 +423,35 @@ int main(int argc, char** argv) {
         // Alternate order to reduce systematic thermal/clock bias.
         if ((repetition + static_cast<int>(query_index)) % 2 == 0) {
           auto measured_bf11 = time_call(stream.get(), start, stop, [&] {
-            return bf11.run(sources, targets, delta_value, -1, stream.get(),
-                            nullptr, nullptr);
+            return run_bf11(sources, targets);
           });
           bf11_result = std::move(measured_bf11.first);
           bf11_timing = measured_bf11.second;
           auto measured_delta = time_call(stream.get(), start, stop, [&] {
-            return delta.run(sources, targets, delta_value, -1, stream.get(),
-                             nullptr, nullptr);
+            return run_delta(sources, targets);
           });
           delta_result = std::move(measured_delta.first);
           delta_timing = measured_delta.second;
         } else {
           auto measured_delta = time_call(stream.get(), start, stop, [&] {
-            return delta.run(sources, targets, delta_value, -1, stream.get(),
-                             nullptr, nullptr);
+            return run_delta(sources, targets);
           });
           delta_result = std::move(measured_delta.first);
           delta_timing = measured_delta.second;
           auto measured_bf11 = time_call(stream.get(), start, stop, [&] {
-            return bf11.run(sources, targets, delta_value, -1, stream.get(),
-                            nullptr, nullptr);
+            return run_bf11(sources, targets);
           });
           bf11_result = std::move(measured_bf11.first);
           bf11_timing = measured_bf11.second;
         }
 
-        require_matching_results(bf11_result, delta_result,
-                                 static_cast<int>(query_index));
+        // Full-vector comparison is O(V), so check every distinct source once
+        // rather than repeating the same validation for every timing sample.
+        if (!full_sssp || repetition == 0) {
+          require_matching_results(bf11_result, delta_result,
+                                   static_cast<int>(query_index), full_sssp,
+                                   static_cast<std::size_t>(graph.rows));
+        }
         bf11_gpu.push_back(bf11_timing.gpu_ms);
         bf11_wall.push_back(bf11_timing.wall_ms);
         delta_gpu.push_back(delta_timing.gpu_ms);
@@ -418,7 +480,11 @@ int main(int argc, char** argv) {
               << bf11_gpu_stats.mean / delta_gpu_stats.mean << "x\n"
               << "  Wall mean: "
               << bf11_wall_stats.mean / delta_wall_stats.mean << "x\n"
-              << "Correctness: all paired target distances matched\n";
+              << "Correctness: "
+              << (full_sssp
+                      ? "all BF11/Delta vertex distances matched"
+                      : "all paired target distances matched")
+              << "\n";
     return 0;
   } catch (const std::exception& error) {
     std::cerr << "BF11 versus Delta benchmark failed: " << error.what()
