@@ -1084,8 +1084,10 @@ void test_target_check_interval_and_settlement() {
   });
 
   // A direct expensive target label is tentative: the two-edge route improves
-  // it in the following round. A check interval must never turn discovery into
-  // settlement, including when the frontier converges before the first check.
+  // it in the following round. An interval-controlled certificate must never
+  // turn discovery into settlement. When V-1 is reached before the next
+  // configured certificate, the exact BF result retains max-iteration status;
+  // the mandatory final reachability scan is not an out-of-interval certificate.
   const HostCsrF32 tentative_graph =
       make_graph(3, {{0, 1, 10.0f}, {0, 2, 1.0f}, {2, 1, 1.0f}});
   const ri::RoutingCsrSidecars tentative_sidecars =
@@ -1102,8 +1104,15 @@ void test_target_check_interval_and_settlement() {
     require(close_enough(2.0f, result.target_distances[0]) &&
                 result.target_path_nodes == std::vector<int>({0, 2, 1}),
             "BF11 accepted a tentative direct target label");
-    require(result.converged || result.stopped_on_target,
-            "BF11 returned an exact tentative-target path without certifying it");
+    if (interval <= 2) {
+      require(result.iterations_used == 2 && result.stopped_on_target &&
+                  !result.converged,
+              "BF11 missed an interval-controlled exact target certificate");
+    } else {
+      require(result.iterations_used == 2 && !result.stopped_on_target &&
+                  !result.converged,
+              "BF11 final reachability scan bypassed target-check interval semantics");
+    }
   }
 
   const BellmanFordCsrResult iteration_limited = tentative_workspace.run(
