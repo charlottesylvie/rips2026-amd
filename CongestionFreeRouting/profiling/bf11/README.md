@@ -46,6 +46,15 @@ The build creates three `-O3` binaries:
 The ordinary `pathfinder` target remains free of profiler headers and link
 dependencies.
 
+On a host without `make`, select the runner's direct build mode. It executes
+and journals equivalent `hipcc` commands, writes binaries under the run output
+instead of the repository, preserves `-O3`, and keeps the ROCTx library last:
+
+```bash
+python3 CongestionFreeRouting/profiling/bf11/run.py build \
+  --build-mode direct --output ../bf11-run/build
+```
+
 ## Required run separation
 
 Correctness, telemetry, tracing, counters, ATT, streaming reference, and

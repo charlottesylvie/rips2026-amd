@@ -25,6 +25,19 @@ ROOT = Path(__file__).resolve().parents[3]
 HERE = Path(__file__).resolve().parent
 DEFAULT_BIN = HERE / "bin"
 GROUPS_FILE = HERE / "counter_groups.json"
+DIRECT_BUILD_SOURCES = (
+    "CongestionFreeRouting/pathfinder.cpp",
+    "CongestionFreeRouting/bellman_ford/bf10.cpp",
+    "CongestionFreeRouting/bellman_ford/bf11.cpp",
+    "CongestionFreeRouting/delta_stepping/delta_stepping_hip_CSR.cpp",
+    "CongestionFreeRouting/unit_bfs/unit_bfs_hip_CSR.cpp",
+)
+DIRECT_BUILD_INCLUDES = (
+    "HIP_kernel/bellman_ford/src",
+    "CongestionFreeRouting/bellman_ford",
+    "CongestionFreeRouting/delta_stepping",
+    "CongestionFreeRouting/unit_bfs",
+)
 
 MATRIX = (
     ("w3-k1-graph-off", 3, 1, "off"),
@@ -216,15 +229,54 @@ def capture_provenance(run: Run, args: argparse.Namespace) -> None:
 
 
 def build(run: Run, args: argparse.Namespace) -> dict[str, Path]:
-    targets = ["bf11-profile-timing", "bf11-profile-trace", "bf11-profile-thread-trace"]
-    run.command(["make", "-B", "-n", *targets],
-                capture=run.output / "provenance" / "build-commands.txt")
-    run.command(["make", "-B", *targets])
-    bins = {
-        "timing": DEFAULT_BIN / "pathfinder-bf11-timing",
-        "trace": DEFAULT_BIN / "pathfinder-bf11-roctx",
-        "thread_trace": DEFAULT_BIN / "pathfinder-bf11-thread-trace",
-    }
+    if args.build_mode == "make":
+        targets = [
+            "bf11-profile-timing", "bf11-profile-trace",
+            "bf11-profile-thread-trace",
+        ]
+        run.command(
+            ["make", "-B", "-n", *targets],
+            capture=run.output / "provenance" / "build-commands.txt",
+        )
+        run.command(["make", "-B", *targets])
+        bins = {
+            "timing": DEFAULT_BIN / "pathfinder-bf11-timing",
+            "trace": DEFAULT_BIN / "pathfinder-bf11-roctx",
+            "thread_trace": DEFAULT_BIN / "pathfinder-bf11-thread-trace",
+        }
+    else:
+        bin_dir = run.output / "bin"
+        bin_dir.mkdir(parents=True, exist_ok=True)
+        bins = {
+            "timing": bin_dir / "pathfinder-bf11-timing",
+            "trace": bin_dir / "pathfinder-bf11-roctx",
+            "thread_trace": bin_dir / "pathfinder-bf11-thread-trace",
+        }
+        common = [
+            "hipcc", "-std=c++17", "-O3", "-x", "hip",
+            "-DBF10_NO_MAIN", "-DBF11_NO_MAIN", "-DBF11_ENABLE_HIP_GRAPHS",
+        ]
+        includes = [item for path in DIRECT_BUILD_INCLUDES for item in ("-I", path)]
+        sources = list(DIRECT_BUILD_SOURCES)
+        run.command(
+            [*common, *includes, *sources, "-pthread", "-o", bins["timing"]],
+            capture=run.output / "provenance" / "direct-build-timing.log",
+        )
+        diagnostics = [
+            "-DPATHFINDER_ENABLE_BF11_DIAGNOSTICS",
+            "-DPATHFINDER_ENABLE_ROCTX",
+        ]
+        run.command(
+            [*common, *diagnostics, *includes, *sources, "-pthread", "-o",
+             bins["trace"], "-lrocprofiler-sdk-roctx"],
+            capture=run.output / "provenance" / "direct-build-trace.log",
+        )
+        run.command(
+            [*common, "-gline-tables-only", *diagnostics, *includes, *sources,
+             "-pthread", "-o", bins["thread_trace"],
+             "-lrocprofiler-sdk-roctx"],
+            capture=run.output / "provenance" / "direct-build-thread-trace.log",
+        )
     hashes = {}
     for name, path in bins.items():
         if not run.dry_run and not path.is_file():
@@ -452,6 +504,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--allow-dirty", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument(
+        "--build-mode", choices=("make", "direct"), default="make",
+        help="use direct hipcc commands on hosts without make",
+    )
     parser.add_argument("--device", type=int, default=0)
     parser.add_argument("--workers", type=int, default=3)
     parser.add_argument("--rounds", type=int, choices=(1, 2, 4, 8, 16), default=8)
