@@ -3,6 +3,7 @@
 #include "bellman_ford/bf10.hpp"
 #include "bellman_ford/bf11.hpp"
 #include "bellman_ford/bf11_worker_policy.hpp"
+#include "profiling/bf11/query_selection.hpp"
 #include "delta_stepping/delta_stepping_hip_CSR.hpp"
 #include "interchange/import_policy.hpp"
 #include "profiling/roctx_ranges.hpp"
@@ -48,6 +49,7 @@
 #include <iostream>
 #include <limits>
 #include <mutex>
+#include <numeric>
 #include <sstream>
 #include <stdexcept>
 #include <thread>
@@ -547,12 +549,28 @@ void validate_options(const PathfinderOptions& options) {
   }
   if (options.sssp_engine != SsspEngine::kBellmanFord11 &&
       (options.bf11_controls_explicit || options.bf11_telemetry ||
+       options.bf11_query_telemetry ||
        options.bf11_segment_rounds != 1 ||
        options.bf11_hip_graph_mode != BellmanFord11HipGraphMode::kAuto ||
        options.bf11_adaptive_reset_threshold != 0.25)) {
     throw std::invalid_argument(
         "BF11 controls require --sssp-engine bf11");
   }
+  if (options.net_indices_explicit && options.net_indices.empty()) {
+    throw std::invalid_argument("explicit net-index selection is empty");
+  }
+  if (options.net_indices_explicit &&
+      options.sssp_engine != SsspEngine::kBellmanFord11) {
+    throw std::invalid_argument(
+        "exact net-index selection requires --sssp-engine bf11");
+  }
+#if !defined(PATHFINDER_ENABLE_BF11_DIAGNOSTICS) && \
+    !defined(PATHFINDER_ENABLE_ROCTX)
+  if (options.bf11_query_telemetry) {
+    throw std::invalid_argument(
+        "--bf11-query-telemetry requires a BF11 diagnostic build");
+  }
+#endif
 }
 
 bool valid_node(int node, minplus_sparse::Offset rows) {
@@ -1790,7 +1808,8 @@ void route_all_nets_with_workspace(const HostCsrF32& base_graph,
                                    const RoutingMetadata& metadata,
                                    const PathfinderOptions& options,
                                    hipStream_t stream,
-                                   std::size_t route_request_count,
+                                   const std::vector<std::size_t>&
+                                       route_request_indices,
                                    std::size_t progress_interval,
                                    std::vector<RoutedNet>& nets,
                                    WorkspaceFactory workspace_factory,
@@ -1798,6 +1817,7 @@ void route_all_nets_with_workspace(const HostCsrF32& base_graph,
                                        delta_telemetry_records = nullptr,
                                    UnitBfsPathDiagnostic*
                                        unit_bfs_diagnostic = nullptr) {
+  const std::size_t route_request_count = route_request_indices.size();
   if (delta_telemetry_records != nullptr &&
       delta_telemetry_records->size() != route_request_count) {
     throw std::invalid_argument(
@@ -1817,12 +1837,16 @@ void route_all_nets_with_workspace(const HostCsrF32& base_graph,
     std::vector<std::uint32_t> route_parent_seen(static_cast<std::size_t>(base_graph.rows), 0);
     std::uint32_t route_tree_stamp = 0;
 
-    for (std::size_t net_index = 0; net_index < route_request_count; ++net_index) {
+    for (std::size_t selection_index = 0;
+         selection_index < route_request_count;
+         ++selection_index) {
+      const std::size_t net_index = route_request_indices[selection_index];
+      PATHFINDER_PROFILE_QUERY_IDENTITY(net_index, 0);
       const RouteRequest& request = metadata.route_requests[net_index];
       const std::uint32_t tree_stamp =
           next_tree_stamp(route_tree_seen, &route_tree_stamp);
       try {
-        nets[net_index] =
+        nets[selection_index] =
             route_net(base_graph,
                       sssp_workspace,
                       request,
@@ -1834,7 +1858,7 @@ void route_all_nets_with_workspace(const HostCsrF32& base_graph,
                       stream,
                       delta_telemetry_records == nullptr
                           ? nullptr
-                          : &(*delta_telemetry_records)[net_index],
+                          : &(*delta_telemetry_records)[selection_index],
                       unit_bfs_diagnostic != nullptr &&
                               unit_bfs_diagnostic->net_index == net_index
                           ? unit_bfs_diagnostic
@@ -1845,9 +1869,10 @@ void route_all_nets_with_workspace(const HostCsrF32& base_graph,
             error.what());
       }
 
-      if ((net_index + 1) == route_request_count ||
-          (net_index + 1) % progress_interval == 0) {
-        print_pathfinder_progress(1, 1, net_index + 1, route_request_count);
+      if ((selection_index + 1) == route_request_count ||
+          (selection_index + 1) % progress_interval == 0) {
+        print_pathfinder_progress(1, 1, selection_index + 1,
+                                  route_request_count);
       }
     }
     return;
@@ -1893,7 +1918,7 @@ void route_all_nets_with_workspace(const HostCsrF32& base_graph,
     }
   };
 
-  auto worker = [&]() {
+  auto worker = [&](std::size_t worker_index) {
     try {
       select_worker_device(worker_device);
       WorkerStream worker_stream(stream == nullptr);
@@ -1925,17 +1950,20 @@ void route_all_nets_with_workspace(const HostCsrF32& base_graph,
       std::uint32_t route_tree_stamp = 0;
 
       while (!failed.load(std::memory_order_relaxed)) {
-        const std::size_t net_index =
+        const std::size_t selection_index =
             next_net.fetch_add(1, std::memory_order_relaxed);
-        if (net_index >= route_request_count) {
+        if (selection_index >= route_request_count) {
           break;
         }
 
+        const std::size_t net_index =
+            route_request_indices[selection_index];
+        PATHFINDER_PROFILE_QUERY_IDENTITY(net_index, worker_index);
         const RouteRequest& request = metadata.route_requests[net_index];
         const std::uint32_t tree_stamp =
             next_tree_stamp(route_tree_seen, &route_tree_stamp);
         try {
-          nets[net_index] =
+          nets[selection_index] =
               route_net(base_graph,
                         sssp_workspace,
                         request,
@@ -1947,7 +1975,7 @@ void route_all_nets_with_workspace(const HostCsrF32& base_graph,
                         local_stream,
                         delta_telemetry_records == nullptr
                             ? nullptr
-                            : &(*delta_telemetry_records)[net_index],
+                            : &(*delta_telemetry_records)[selection_index],
                         unit_bfs_diagnostic != nullptr &&
                                 unit_bfs_diagnostic->net_index == net_index
                             ? unit_bfs_diagnostic
@@ -1982,7 +2010,7 @@ void route_all_nets_with_workspace(const HostCsrF32& base_graph,
   };
   try {
     for (std::size_t i = 0; i < worker_count; ++i) {
-      workers.emplace_back(worker);
+      workers.emplace_back(worker, i);
     }
   } catch (...) {
     // If std::thread construction fails after one or more workers have
@@ -2199,6 +2227,21 @@ SsspQueryCapacityHints derive_query_capacity_hints(
   for (std::size_t request_index = 0;
        request_index < routed_request_count;
        ++request_index) {
+    const RouteRequest& request = metadata.route_requests[request_index];
+    sssp_capacity::accumulate_query_counts(
+        hints, request.sources.size(), request.sinks.size());
+  }
+  return hints;
+}
+
+SsspQueryCapacityHints derive_query_capacity_hints_for_indices(
+    const RoutingMetadata& metadata,
+    const std::vector<std::size_t>& request_indices) {
+  SsspQueryCapacityHints hints;
+  for (const std::size_t request_index : request_indices) {
+    if (request_index >= metadata.route_requests.size()) {
+      throw std::out_of_range("selected route request is outside metadata");
+    }
     const RouteRequest& request = metadata.route_requests[request_index];
     sssp_capacity::accumulate_query_counts(
         hints, request.sources.size(), request.sinks.size());
@@ -2430,6 +2473,7 @@ void print_usage(const char* program) {
       << "                                  Dense-reset touched fraction in (0, 1]. Default: 0.25\n"
       << "  --bf11-no-unbounded-fallback    Do not retry an unreachable bounded query unbounded.\n"
       << "  --bf11-telemetry                Emit one aggregate BF11 phase/work/memory telemetry record.\n"
+      << "  --bf11-query-telemetry          Also emit diagnostic per-SSSP-call JSON keyed by net index.\n"
       << "  --delta-force-generic           Bypass exact-unit specialization; retain weights and delta.\n"
       << "  --delta-force-legacy-parent     Force generic Delta predecessor recovery for A/B comparison.\n"
       << "  --delta-controller <host-checked|reduced-round-trip>\n"
@@ -2443,6 +2487,8 @@ void print_usage(const char* program) {
       << "                                  Seed for the mixed benchmark family. Default: 0\n"
       << "  --capacity <int>                Capacity used only for overuse diagnostics. Default: 1\n"
       << "  --net-limit <count>             Route only the first count requests.\n"
+      << "  --net-indices <i,j,...>         Route an exact ordered BF11 query selection.\n"
+      << "  --net-manifest <path>           Read exact BF11 query indices from a manifest.\n"
       << "  --parallel-net-workers <count>  Independent net workers. Default: 0 (engine-dependent auto).\n"
       << "  --diagnose-net <zero-based>     Replay through one request and emit UnitBFS path diagnostics.\n"
       << "  --diagnose-sink <zero-based>    Sink within --diagnose-net; both diagnostic options are required.\n"
@@ -3252,12 +3298,22 @@ PathfinderResult run_pathfinder(const HostCsrF32& base_graph,
 
   PathfinderResult result;
 
-  const std::size_t route_request_count =
-      options.net_limit == 0
-          ? metadata.route_requests.size()
-          : std::min(options.net_limit, metadata.route_requests.size());
+  std::vector<std::size_t> route_request_indices;
+  if (options.net_indices_explicit) {
+    bf11_profile::validate_query_indices(options.net_indices,
+                                         metadata.route_requests.size());
+    route_request_indices = options.net_indices;
+  } else {
+    const std::size_t prefix_count =
+        options.net_limit == 0
+            ? metadata.route_requests.size()
+            : std::min(options.net_limit, metadata.route_requests.size());
+    route_request_indices.resize(prefix_count);
+    std::iota(route_request_indices.begin(), route_request_indices.end(), 0);
+  }
+  const std::size_t route_request_count = route_request_indices.size();
   const SsspQueryCapacityHints query_capacity_hints =
-      derive_query_capacity_hints(metadata, route_request_count);
+      derive_query_capacity_hints_for_indices(metadata, route_request_indices);
   if (unit_bfs_diagnostic != nullptr) {
     if (options.sssp_engine != SsspEngine::kUnitBfs) {
       throw std::invalid_argument(
@@ -3268,7 +3324,8 @@ PathfinderResult run_pathfinder(const HostCsrF32& base_graph,
     if (diagnostic_net >= metadata.route_requests.size()) {
       throw std::out_of_range("diagnostic net index is outside route requests");
     }
-    if (diagnostic_net >= route_request_count) {
+    if (std::find(route_request_indices.begin(), route_request_indices.end(),
+                  diagnostic_net) == route_request_indices.end()) {
       throw std::invalid_argument(
           "diagnostic net is excluded by the configured net limit");
     }
@@ -3289,6 +3346,9 @@ PathfinderResult run_pathfinder(const HostCsrF32& base_graph,
     }
   }
   result.nets.resize(route_request_count);
+  if (options.net_indices_explicit) {
+    result.net_indices = route_request_indices;
+  }
 
   const std::size_t progress_interval =
       std::max<std::size_t>(1, route_request_count / 100);
@@ -3317,7 +3377,7 @@ PathfinderResult run_pathfinder(const HostCsrF32& base_graph,
           metadata,
           unit_options,
           stream,
-          route_request_count,
+          route_request_indices,
           progress_interval,
           result.nets,
           [shared_graph, query_capacity_hints](hipStream_t worker_stream) {
@@ -3405,7 +3465,7 @@ PathfinderResult run_pathfinder(const HostCsrF32& base_graph,
           metadata,
           delta_options,
           stream,
-          route_request_count,
+          route_request_indices,
           progress_interval,
           result.nets,
           [shared_graph, workspace_options](hipStream_t worker_stream) {
@@ -3457,7 +3517,7 @@ PathfinderResult run_pathfinder(const HostCsrF32& base_graph,
           metadata,
           bellman_ford_options,
           stream,
-          route_request_count,
+          route_request_indices,
           progress_interval,
           result.nets,
           [shared_graph](hipStream_t worker_stream) {
@@ -3572,12 +3632,14 @@ PathfinderResult run_pathfinder(const HostCsrF32& base_graph,
       workspace_options.adaptive_reset_threshold =
           bf11_options.bf11_adaptive_reset_threshold;
       workspace_options.telemetry = bf11_options.bf11_telemetry;
+      workspace_options.query_telemetry =
+          bf11_options.bf11_query_telemetry;
       route_all_nets_with_workspace(
           base_graph,
           metadata,
           bf11_options,
           stream,
-          route_request_count,
+          route_request_indices,
           progress_interval,
           result.nets,
           [shared_graph, workspace_options,
@@ -4166,7 +4228,9 @@ void write_routes_jsonl_impl(const std::filesystem::path& path,
   if (metadata.edge_attrs.size() != static_cast<std::size_t>(graph.nnz)) {
     throw std::runtime_error("metadata edge attributes do not match CSR nnz");
   }
-  if (result.nets.size() > metadata.route_requests.size()) {
+  if (result.nets.size() > metadata.route_requests.size() ||
+      (!result.net_indices.empty() &&
+       result.net_indices.size() != result.nets.size())) {
     throw std::runtime_error("pathfinder result has more nets than metadata requests");
   }
   const EndpointPipByCsrEdge endpoint_pips_by_edge =
@@ -4180,9 +4244,17 @@ void write_routes_jsonl_impl(const std::filesystem::path& path,
     throw std::runtime_error("could not open routes output file: " + path.string());
   }
 
-  for (std::size_t net_index = 0; net_index < result.nets.size(); ++net_index) {
+  for (std::size_t result_index = 0; result_index < result.nets.size();
+       ++result_index) {
+    const std::size_t net_index = result.net_indices.empty()
+                                      ? result_index
+                                      : result.net_indices[result_index];
+    if (net_index >= metadata.route_requests.size()) {
+      throw std::runtime_error(
+          "pathfinder result references an out-of-range net index");
+    }
     const RouteRequest& request = metadata.route_requests[net_index];
-    const RoutedNet& net = result.nets[net_index];
+    const RoutedNet& net = result.nets[result_index];
     if (net.sinks.size() > request.sinks.size()) {
       throw std::runtime_error(
           "pathfinder result has more sinks than its route request");
@@ -4337,6 +4409,7 @@ int main(int argc, char** argv) {
     bool delta_benchmark_weights_seen = false;
     bool delta_benchmark_weight_seed_seen = false;
     bool net_limit_seen = false;
+    bool net_selection_seen = false;
     bool diagnose_net_seen = false;
     bool diagnose_sink_seen = false;
     routing::UnitBfsPathDiagnostic unit_bfs_diagnostic;
@@ -4429,6 +4502,10 @@ int main(int argc, char** argv) {
       } else if (option == "--bf11-telemetry") {
         options.bf11_telemetry = true;
         options.bf11_controls_explicit = true;
+      } else if (option == "--bf11-query-telemetry") {
+        options.bf11_query_telemetry = true;
+        options.bf11_telemetry = true;
+        options.bf11_controls_explicit = true;
       } else if (option == "--delta-force-legacy-parent") {
         options.delta_force_legacy_parent = true;
       } else if (option == "--delta-force-generic") {
@@ -4467,9 +4544,31 @@ int main(int argc, char** argv) {
       } else if (option == "--history-factor") {
         (void)routing::parse_float_arg(require_value("--history-factor"), "history-factor");
       } else if (option == "--net-limit") {
+        if (net_selection_seen) {
+          throw std::runtime_error(
+              "--net-limit cannot be combined with exact net selection");
+        }
         options.net_limit =
             routing::parse_size_arg(require_value("--net-limit"), "net-limit");
         net_limit_seen = true;
+      } else if (option == "--net-indices") {
+        if (net_limit_seen || net_selection_seen) {
+          throw std::runtime_error(
+              "specify exactly one of --net-limit, --net-indices, or --net-manifest");
+        }
+        options.net_indices = bf11_profile::parse_query_indices(
+            require_value("--net-indices"), "--net-indices");
+        options.net_indices_explicit = true;
+        net_selection_seen = true;
+      } else if (option == "--net-manifest") {
+        if (net_limit_seen || net_selection_seen) {
+          throw std::runtime_error(
+              "specify exactly one of --net-limit, --net-indices, or --net-manifest");
+        }
+        options.net_indices = bf11_profile::load_query_manifest(
+            require_value("--net-manifest"));
+        options.net_indices_explicit = true;
+        net_selection_seen = true;
       } else if (option == "--route-batch-size") {
         (void)routing::parse_size_arg(require_value("--route-batch-size"),
                                       "route-batch-size");
@@ -4537,6 +4636,10 @@ int main(int argc, char** argv) {
       if (net_limit_seen) {
         throw std::runtime_error(
             "--net-limit cannot be combined with --diagnose-net");
+      }
+      if (net_selection_seen) {
+        throw std::runtime_error(
+            "exact net selection cannot be combined with --diagnose-net");
       }
       if (!routes_out_path.empty()) {
         throw std::runtime_error(

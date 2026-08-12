@@ -1,0 +1,10 @@
+Agent_Id,Queue_Id,Dispatch_Id,Kernel_Name,Counter_Name,Counter_Value,Start_Timestamp,End_Timestamp,Grid_Size,Workgroup_Size,VGPR_Count,SGPR_Count,LDS_Block_Size,Scratch_Size
+Agent 1,1,1,segmented_frontier_relax_kernel,FETCH_SIZE,8,100,300,1024,256,32,64,0,0
+Agent 1,1,1,segmented_frontier_relax_kernel,WRITE_SIZE,4,100,300,1024,256,32,64,0,0
+Agent 1,1,1,segmented_frontier_relax_kernel,SQ_WAVES,16,100,300,1024,256,32,64,0,0
+Agent 1,1,1,segmented_frontier_relax_kernel,SQ_WAVE_CYCLES,3200,100,300,1024,256,32,64,0,0
+Agent 1,1,1,segmented_frontier_relax_kernel,SQ_INSTS_VALU,1600,100,300,1024,256,32,64,0,0
+Agent 1,1,1,segmented_frontier_relax_kernel,MemUnitBusy,75,100,300,1024,256,32,64,0,0
+Agent 1,1,1,segmented_frontier_relax_kernel,WriteUnitStalled,25,100,300,1024,256,32,64,0,0
+Agent 1,1,2,streaming_copy,FETCH_SIZE,1024,400,500,1024,256,8,16,0,0
+Agent 1,1,2,streaming_copy,WRITE_SIZE,1024,400,500,1024,256,8,16,0,0

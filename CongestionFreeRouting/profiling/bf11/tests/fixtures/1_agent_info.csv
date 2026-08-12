@@ -1,0 +1,2 @@
+Agent_Type,Name,Cu_Count,Wave_Front_Size,Max_Waves_Per_Cu,Lds_Size_In_Kb,Max_Engine_Clk_Fcompute
+GPU,gfx1151,40,32,32,64,2900

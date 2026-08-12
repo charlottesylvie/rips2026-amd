@@ -29,6 +29,7 @@
 #include <limits>
 #include <memory>
 #include <mutex>
+#include <sstream>
 #include <stdexcept>
 #include <string>
 #include <unordered_map>
@@ -91,6 +92,8 @@ std::atomic<std::uint64_t> g_bf11_workspace_device_bytes_current_total{0};
 std::atomic<std::uint64_t> g_bf11_gpu_free_before_workers{0};
 std::atomic<std::uint64_t> g_bf11_gpu_free_after_workers{0};
 std::atomic<std::uint64_t> g_bf11_constructed_workers{0};
+std::atomic<std::uint64_t> g_bf11_query_telemetry_sequence{0};
+std::mutex g_bf11_query_telemetry_output_mutex;
 // Tests can force the wrap path without allocating a 32-bit number of rounds.
 // Production retains the full nonzero uint32 token range.
 std::atomic<std::uint64_t> g_bf11_mark_generation_limit{
@@ -208,6 +211,7 @@ void reset_bellman_ford11_runtime_stats() {
                                                 std::memory_order_relaxed);
   g_bf11_defensive_dense_state_resets.store(0,
                                              std::memory_order_relaxed);
+  g_bf11_query_telemetry_sequence.store(0, std::memory_order_relaxed);
   reset_bf11_telemetry_counters();
 }
 
@@ -541,6 +545,25 @@ struct TelemetryEventPair {
   bool pending = false;
 };
 
+struct QueryTelemetry {
+  std::uint64_t attempts = 0;
+  std::uint64_t iterations = 0;
+  std::uint64_t rounds = 0;
+  std::uint64_t no_op_rounds = 0;
+  std::uint64_t target_checks = 0;
+  std::uint64_t frontier_vertices_processed = 0;
+  std::uint64_t edges_examined = 0;
+  std::uint64_t successful_relaxations = 0;
+  std::uint64_t first_discoveries = 0;
+  std::uint64_t mark_cas_attempts = 0;
+  std::uint64_t mark_cas_wins = 0;
+  std::uint64_t queue_reservations = 0;
+  std::uint64_t touched_vertices = 0;
+  std::uint64_t reset_seed_gpu_nanoseconds = 0;
+  std::uint64_t relaxation_gpu_nanoseconds = 0;
+  std::uint64_t target_check_gpu_nanoseconds = 0;
+};
+
 struct DeviceGraphOwner {
   DeviceGraph view{};
   DeviceOffset* rowptr = nullptr;
@@ -627,6 +650,7 @@ struct DeviceWorkspace {
   // workspace goes direct. Keep this outside the compile guard so a graph-on
   // request in a graph-disabled binary also records only one sticky fallback.
   bool graph_disabled = false;
+  QueryTelemetry query_telemetry;
 #if defined(BF11_ENABLE_HIP_GRAPHS)
   enum class GraphFailureInjection {
     kNone,
@@ -911,6 +935,15 @@ void aggregate_query_work_telemetry(DeviceWorkspace& workspace,
                                     int iterations_used) {
   if (!workspace.telemetry_enabled) return;
   const DeviceTelemetryCounters counters = *workspace.host_telemetry_counters;
+  QueryTelemetry& query = workspace.query_telemetry;
+  query.iterations += static_cast<std::uint64_t>(std::max(0, iterations_used));
+  query.frontier_vertices_processed += counters.frontier_vertices_processed;
+  query.edges_examined += counters.edges_examined;
+  query.successful_relaxations += counters.successful_relaxations;
+  query.first_discoveries += counters.first_discoveries;
+  query.mark_cas_attempts += counters.mark_cas_attempts;
+  query.mark_cas_wins += counters.mark_cas_wins;
+  query.queue_reservations += counters.queue_reservations;
   g_bf11_telemetry_iterations.fetch_add(
       static_cast<std::uint64_t>(std::max(0, iterations_used)),
       std::memory_order_relaxed);
@@ -934,21 +967,28 @@ void aggregate_query_work_telemetry(DeviceWorkspace& workspace,
       : std::min<std::uint64_t>(
             static_cast<std::uint64_t>(observed_touched),
             static_cast<std::uint64_t>(workspace.rows));
+  query.touched_vertices += touched;
   g_bf11_touched_vertices.fetch_add(touched, std::memory_order_relaxed);
   atomic_max(g_bf11_maximum_touched_vertices, touched);
   g_bf11_telemetry_graph_rows.store(
       static_cast<std::uint64_t>(workspace.rows), std::memory_order_relaxed);
+  const std::uint64_t reset_seed_ns = wall_ticks_to_nanoseconds(
+      counters.reset_seed_wall_ticks, workspace.wall_clock_rate_khz);
+  const std::uint64_t relaxation_ns = wall_ticks_to_nanoseconds(
+      counters.relaxation_wall_ticks, workspace.wall_clock_rate_khz);
+  const std::uint64_t target_check_ns = wall_ticks_to_nanoseconds(
+      counters.target_check_wall_ticks, workspace.wall_clock_rate_khz);
+  query.reset_seed_gpu_nanoseconds += reset_seed_ns;
+  query.relaxation_gpu_nanoseconds += relaxation_ns;
+  query.target_check_gpu_nanoseconds += target_check_ns;
   g_bf11_reset_seed_gpu_nanoseconds.fetch_add(
-      wall_ticks_to_nanoseconds(counters.reset_seed_wall_ticks,
-                                workspace.wall_clock_rate_khz),
+      reset_seed_ns,
       std::memory_order_relaxed);
   g_bf11_relaxation_gpu_nanoseconds.fetch_add(
-      wall_ticks_to_nanoseconds(counters.relaxation_wall_ticks,
-                                workspace.wall_clock_rate_khz),
+      relaxation_ns,
       std::memory_order_relaxed);
   g_bf11_target_check_gpu_nanoseconds.fetch_add(
-      wall_ticks_to_nanoseconds(counters.target_check_wall_ticks,
-                                workspace.wall_clock_rate_khz),
+      target_check_ns,
       std::memory_order_relaxed);
 }
 
@@ -2327,6 +2367,7 @@ std::uint64_t workspace_device_bytes(const DeviceWorkspace& workspace) {
 }
 
 void fully_reset_workspace_state(DeviceWorkspace& workspace) {
+  PATHFINDER_PROFILE_RANGE("bf11.reset.defensive_dense");
   begin_telemetry_event(workspace, workspace.reset_seed_events);
   hipLaunchKernelGGL(clear_state_kernel, grid_for_items(workspace.rows),
                      dim3(kBlockSize), 0, workspace.stream, workspace.rows,
@@ -2704,6 +2745,7 @@ void prepare_query_controller(const DeviceGraph& graph,
                               const BellmanFord11RunOptions& options,
                               double adaptive_reset_threshold,
                               DeviceCostMode cost_mode) {
+  PATHFINDER_PROFILE_RANGE("bf11.reset_seed");
   if (workspace.telemetry_enabled) {
     check_hip(hipMemsetAsync(workspace.telemetry_counters, 0,
                              sizeof(DeviceTelemetryCounters),
@@ -3150,6 +3192,7 @@ bf11_graph_execution_policy::AttemptResult enqueue_graph_segment(
 
 ControllerDescriptor copy_controller_to_host(DeviceWorkspace& workspace,
                                              const char* synchronization) {
+  PATHFINDER_PROFILE_RANGE("bf11.runtime_copy.controller_status");
   begin_telemetry_event(workspace, workspace.status_copy_events);
   check_hip(hipMemcpyAsync(workspace.host_controller, workspace.controller,
                            sizeof(ControllerDescriptor), hipMemcpyDeviceToHost,
@@ -3181,7 +3224,7 @@ ControllerDescriptor copy_controller_to_host(DeviceWorkspace& workspace,
 void record_controller_result(const DeviceGraph& graph,
                               const ControllerDescriptor& descriptor,
                               int max_iters,
-                              bool collect_telemetry) {
+                              DeviceWorkspace* workspace) {
   if (descriptor.queue.error_status != 0) {
     throw_controller_error(descriptor.queue.error_status);
   }
@@ -3197,7 +3240,14 @@ void record_controller_result(const DeviceGraph& graph,
       descriptor.target_checks < 0 || termination_count != 1) {
     throw std::runtime_error("BF11 device controller returned bad status");
   }
-  if (collect_telemetry) {
+  if (workspace != nullptr && workspace->telemetry_enabled) {
+    workspace->query_telemetry.attempts += 1;
+    workspace->query_telemetry.rounds +=
+        static_cast<std::uint64_t>(descriptor.rounds_executed);
+    workspace->query_telemetry.no_op_rounds +=
+        static_cast<std::uint64_t>(descriptor.no_op_rounds);
+    workspace->query_telemetry.target_checks +=
+        static_cast<std::uint64_t>(descriptor.target_checks);
     g_bf11_rounds.fetch_add(
         static_cast<std::uint64_t>(descriptor.rounds_executed),
         std::memory_order_relaxed);
@@ -3296,7 +3346,7 @@ SsspStatus run_gpu_controller(const DeviceGraph& graph,
       copy_controller_to_host(workspace,
                               "synchronize BF11 cooperative controller");
   record_controller_result(graph, descriptor, max_iters,
-                           workspace.telemetry_enabled);
+                           &workspace);
   return {descriptor.iterations_used, descriptor.converged != 0,
           descriptor.early_stopped != 0, descriptor.hit_max_iters != 0,
           descriptor.all_targets_reached != 0};
@@ -3354,7 +3404,7 @@ SegmentedControllerRunResult run_segmented_controller(
     descriptor.done = 1;
   }
   record_controller_result(graph, descriptor, max_iters,
-                           workspace.telemetry_enabled);
+                           &workspace);
   return {{descriptor.iterations_used, descriptor.converged != 0,
            descriptor.early_stopped != 0, descriptor.hit_max_iters != 0,
            descriptor.all_targets_reached != 0},
@@ -3644,6 +3694,10 @@ struct BellmanFord11CsrWorkspace::Impl {
        BellmanFord11WorkspaceOptions options_in,
        SsspQueryCapacityHints capacity_hints)
       : graph(std::move(graph_in)), stream(stream_in), options(options_in) {
+    if (options.query_telemetry && !options.telemetry) {
+      throw std::invalid_argument(
+          "BF11 query telemetry requires aggregate telemetry collection");
+    }
     if (options.auto_margin_x < 0 || options.auto_margin_y < 0 ||
         options.target_check_interval <= 0 ||
         !(options.adaptive_reset_threshold > 0.0) ||
@@ -3770,17 +3824,96 @@ struct BellmanFord11CsrWorkspace::Impl {
     }
   }
 
+  void begin_query_telemetry() noexcept {
+    if (options.query_telemetry) {
+      workspace.query_telemetry = {};
+    }
+  }
+
+  void emit_query_telemetry() const {
+    if (!options.query_telemetry) return;
+    const rips_sssp_bf11::QueryTelemetry& query =
+        workspace.query_telemetry;
+    const pathfinder_profile::QueryIdentity identity =
+        pathfinder_profile::query_identity();
+    const std::uint64_t sequence =
+        g_bf11_query_telemetry_sequence.fetch_add(
+            1, std::memory_order_relaxed);
+    std::ostringstream out;
+    out << "{\"type\":\"bf11_query_telemetry\",\"schema_version\":1"
+        << ",\"sequence\":" << sequence << ",\"net_index\":";
+    if (identity.valid) {
+      out << identity.net_index;
+    } else {
+      out << "null";
+    }
+    out << ",\"worker_index\":";
+    if (identity.valid) {
+      out << identity.worker_index;
+    } else {
+      out << "null";
+    }
+    out << ",\"attempts\":" << query.attempts
+        << ",\"iterations\":" << query.iterations
+        << ",\"rounds\":" << query.rounds
+        << ",\"no_op_rounds\":" << query.no_op_rounds
+        << ",\"target_checks\":" << query.target_checks
+        << ",\"frontier_vertices_processed\":"
+        << query.frontier_vertices_processed
+        << ",\"edges_examined\":" << query.edges_examined
+        << ",\"successful_relaxations\":"
+        << query.successful_relaxations
+        << ",\"first_discoveries\":" << query.first_discoveries
+        << ",\"mark_cas_attempts\":" << query.mark_cas_attempts
+        << ",\"mark_cas_wins\":" << query.mark_cas_wins
+        << ",\"queue_reservations\":" << query.queue_reservations
+        << ",\"touched_vertices\":" << query.touched_vertices
+        << ",\"reset_seed_gpu_nanoseconds\":"
+        << query.reset_seed_gpu_nanoseconds
+        << ",\"relaxation_gpu_nanoseconds\":"
+        << query.relaxation_gpu_nanoseconds
+        << ",\"target_check_gpu_nanoseconds\":"
+        << query.target_check_gpu_nanoseconds << "}\n";
+    std::lock_guard<std::mutex> lock(g_bf11_query_telemetry_output_mutex);
+    std::cout << out.str();
+  }
+
   rips_sssp_bf11::SsspStatus search_once(
                          const std::vector<int>& unique_sources,
                          const std::vector<int>& unique_targets,
                          int max_iters,
                          const BellmanFord11RunOptions& run_options,
+                         const char* attempt_type,
                          bool allow_missing_bounded_sources = false) {
     using namespace rips_sssp_bf11;
     validate_run_options(run_options);
     validate_terminal_bounds(graph->host_sidecars, unique_sources,
                              unique_targets, run_options.bounds,
                              allow_missing_bounded_sources);
+#if defined(PATHFINDER_ENABLE_ROCTX)
+    const int effective_max_iters =
+        max_iters < 0 ? static_cast<int>(graph->rows) - 1 : max_iters;
+    const bool cooperative_candidate =
+        workspace.stream == nullptr && options.segment_rounds == 1 &&
+        options.hip_graph_mode == BellmanFord11HipGraphMode::kAuto;
+    const int cooperative_blocks =
+        cooperative_candidate ? cooperative_block_count(workspace) : 0;
+    const pathfinder_profile::QueryIdentity identity =
+        pathfinder_profile::query_identity();
+    std::string identity_range = "bf11.query net=" +
+        std::string(identity.valid ? std::to_string(identity.net_index)
+                                   : "unknown") +
+        " worker=" +
+        std::string(identity.valid ? std::to_string(identity.worker_index)
+                                   : "unknown") +
+        (cooperative_blocks > 0 && effective_max_iters != 0
+             ? " controller=cooperative"
+             : " controller=segmented") +
+        " attempt=" + std::string(attempt_type);
+    PATHFINDER_PROFILE_RANGE(identity_range.c_str());
+#else
+    (void)attempt_type;
+#endif
     const Offset source_count = static_cast<Offset>(unique_sources.size());
     const Offset target_count = static_cast<Offset>(unique_targets.size());
     ensure_source_capacity(workspace, source_count);
@@ -3836,6 +3969,7 @@ struct BellmanFord11CsrWorkspace::Impl {
   void enqueue_extraction(bool include_summary,
                           rips_sssp_bf11::Offset target_count,
                           rips_sssp_bf11::DeviceCostMode cost_mode) {
+    PATHFINDER_PROFILE_RANGE("bf11.extraction");
     using namespace rips_sssp_bf11;
     if (include_summary) {
       begin_telemetry_event(workspace, workspace.target_summary_events);
@@ -3952,6 +4086,19 @@ struct BellmanFord11CsrWorkspace::Impl {
       const std::vector<int>& unique_targets,
       const std::vector<int>& requested_targets,
       rips_sssp_bf11::SsspStatus status) {
+    PATHFINDER_PROFILE_RANGE("bf11.extract_result");
+#if defined(PATHFINDER_ENABLE_ROCTX)
+    const pathfinder_profile::QueryIdentity identity =
+        pathfinder_profile::query_identity();
+    std::string extraction_range = "bf11.query net=" +
+        std::string(identity.valid ? std::to_string(identity.net_index)
+                                   : "unknown") +
+        " worker=" +
+        std::string(identity.valid ? std::to_string(identity.worker_index)
+                                   : "unknown") +
+        " controller=extraction attempt=extraction";
+    PATHFINDER_PROFILE_RANGE(extraction_range.c_str());
+#endif
     using namespace rips_sssp_bf11;
     const Offset target_count = static_cast<Offset>(unique_targets.size());
     ensure_reconstruction_capacity(workspace, target_count);
@@ -4374,6 +4521,7 @@ BellmanFordCsrResult BellmanFord11CsrWorkspace::run(
       sources, impl_->graph->rows, "source");
   const std::vector<int> unique_targets = rips_sssp_bf11::deduplicate_nodes(
       targets, impl_->graph->rows, "target");
+  impl_->begin_query_telemetry();
   rips_sssp_bf11::ScopedQueryTelemetry query_telemetry(
       impl_->workspace.telemetry_enabled);
 
@@ -4381,9 +4529,11 @@ BellmanFordCsrResult BellmanFord11CsrWorkspace::run(
   run_options.target_check_interval = impl_->options.target_check_interval;
   if (!impl_->options.auto_bounds) {
     const auto status = impl_->search_once(
-        unique_sources, unique_targets, max_iters, run_options);
+        unique_sources, unique_targets, max_iters, run_options,
+        "unbounded");
     BellmanFordCsrResult result =
         impl_->extract_result(unique_targets, targets, status);
+    impl_->emit_query_telemetry();
     query_telemetry.mark_completed();
     return result;
   }
@@ -4398,19 +4548,23 @@ BellmanFordCsrResult BellmanFord11CsrWorkspace::run(
     }
     run_options.bounds = {};
     const auto status = impl_->search_once(
-        unique_sources, unique_targets, max_iters, run_options);
+        unique_sources, unique_targets, max_iters, run_options,
+        "unbounded");
     BellmanFordCsrResult result =
         impl_->extract_result(unique_targets, targets, status);
+    impl_->emit_query_telemetry();
     query_telemetry.mark_completed();
     return result;
   }
 
   auto bounded_status = impl_->search_once(
-      unique_sources, unique_targets, max_iters, run_options, true);
+      unique_sources, unique_targets, max_iters, run_options, "bounded",
+      true);
   if (bounded_status.all_targets_reached ||
       !impl_->options.unbounded_fallback) {
     BellmanFordCsrResult result =
         impl_->extract_result(unique_targets, targets, bounded_status);
+    impl_->emit_query_telemetry();
     query_telemetry.mark_completed();
     return result;
   }
@@ -4422,11 +4576,13 @@ BellmanFordCsrResult BellmanFord11CsrWorkspace::run(
   }
   run_options.bounds = {};
   auto unbounded_status = impl_->search_once(
-      unique_sources, unique_targets, max_iters, run_options);
+      unique_sources, unique_targets, max_iters, run_options,
+      "unbounded_retry");
   unbounded_status.iterations_used = rips_sssp_bf11::saturated_add(
       bounded_status.iterations_used, unbounded_status.iterations_used);
   BellmanFordCsrResult result =
       impl_->extract_result(unique_targets, targets, unbounded_status);
+  impl_->emit_query_telemetry();
   query_telemetry.mark_completed();
   return result;
 }
@@ -4454,12 +4610,15 @@ BellmanFordCsrResult BellmanFord11CsrWorkspace::run(
       sources, impl_->graph->rows, "source");
   const std::vector<int> unique_targets = rips_sssp_bf11::deduplicate_nodes(
       targets, impl_->graph->rows, "target");
+  impl_->begin_query_telemetry();
   rips_sssp_bf11::ScopedQueryTelemetry query_telemetry(
       impl_->workspace.telemetry_enabled);
   const auto status = impl_->search_once(
-      unique_sources, unique_targets, max_iters, run_options);
+      unique_sources, unique_targets, max_iters, run_options,
+      run_options.bounds.enabled ? "bounded" : "unbounded");
   BellmanFordCsrResult result =
       impl_->extract_result(unique_targets, targets, status);
+  impl_->emit_query_telemetry();
   query_telemetry.mark_completed();
   return result;
 }

@@ -1,0 +1,4 @@
+Kernel_Name,Agent_Id,Queue_Id,Dispatch_Id,Start_Timestamp,End_Timestamp,Grid_Size_X,Workgroup_Size_X,VGPR_Count,SGPR_Count,LDS_Block_Size,Scratch_Size
+segmented_frontier_relax_kernel,Agent 1,1,1,100,300,1024,256,32,64,0,0
+update_target_status_kernel,Agent 1,2,2,150,250,256,256,16,32,0,0
+prefix_target_paths_kernel,Agent 1,1,3,320,340,1,1,8,16,0,0

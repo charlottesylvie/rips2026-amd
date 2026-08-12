@@ -179,6 +179,60 @@ PATHFINDER_DEVICE_GRAPH ?= xcvu3p.full-poc-base-wire.devicegraph
 PATHFINDER_COMPONENT_BINS := $(PATHFINDER_ROUTER_BIN) $(INTERCHANGE_TO_CSR) $(PATHFINDER_BIN) $(ROUTES_TO_PHYS)
 export INTERCHANGE_TO_CSR PATHFINDER_BIN ROUTES_TO_PHYS
 
+# BF11 profiling binaries are explicit opt-in artifacts. The timing build has
+# HIP Graph support but no profiler headers/library. Trace builds add both
+# diagnostic identity and ROCTx, with rocprofiler-sdk-roctx deliberately kept
+# as the final link input. All three retain the production -O3 flag set.
+BF11_PROFILE_BIN_DIR ?= CongestionFreeRouting/profiling/bf11/bin
+BF11_PROFILE_GPU_SOURCES := \
+	CongestionFreeRouting/pathfinder.cpp \
+	CongestionFreeRouting/bellman_ford/bf10.cpp \
+	CongestionFreeRouting/bellman_ford/bf11.cpp \
+	CongestionFreeRouting/delta_stepping/delta_stepping_hip_CSR.cpp \
+	CongestionFreeRouting/unit_bfs/unit_bfs_hip_CSR.cpp
+BF11_PROFILE_HEADERS := \
+	CongestionFreeRouting/pathfinder.hpp \
+	CongestionFreeRouting/profiling/roctx_ranges.hpp \
+	CongestionFreeRouting/profiling/bf11/query_selection.hpp \
+	$(wildcard CongestionFreeRouting/bellman_ford/*.hpp) \
+	$(wildcard CongestionFreeRouting/delta_stepping/*.hpp) \
+	$(wildcard CongestionFreeRouting/unit_bfs/*.hpp)
+BF11_PROFILE_INCLUDES := \
+	-I HIP_kernel/bellman_ford/src \
+	-I CongestionFreeRouting/bellman_ford \
+	-I CongestionFreeRouting/delta_stepping \
+	-I CongestionFreeRouting/unit_bfs
+BF11_PROFILE_COMMON_FLAGS := $(PATHFINDER_HIP_FLAGS) \
+	-DBF10_NO_MAIN -DBF11_NO_MAIN -DBF11_ENABLE_HIP_GRAPHS
+BF11_PROFILE_TIMING_BIN := $(BF11_PROFILE_BIN_DIR)/pathfinder-bf11-timing
+BF11_PROFILE_TRACE_BIN := $(BF11_PROFILE_BIN_DIR)/pathfinder-bf11-roctx
+BF11_PROFILE_THREAD_TRACE_BIN := $(BF11_PROFILE_BIN_DIR)/pathfinder-bf11-thread-trace
+
+.PHONY: bf11-profile-binaries bf11-profile-timing bf11-profile-trace bf11-profile-thread-trace
+bf11-profile-binaries: bf11-profile-timing bf11-profile-trace bf11-profile-thread-trace
+bf11-profile-timing: $(BF11_PROFILE_TIMING_BIN)
+bf11-profile-trace: $(BF11_PROFILE_TRACE_BIN)
+bf11-profile-thread-trace: $(BF11_PROFILE_THREAD_TRACE_BIN)
+
+$(BF11_PROFILE_BIN_DIR):
+	mkdir -p $@
+
+$(BF11_PROFILE_TIMING_BIN): $(BF11_PROFILE_GPU_SOURCES) $(BF11_PROFILE_HEADERS) | $(BF11_PROFILE_BIN_DIR)
+	$(PATHFINDER_HIPCC) $(BF11_PROFILE_COMMON_FLAGS) \
+		$(BF11_PROFILE_INCLUDES) $(BF11_PROFILE_GPU_SOURCES) -pthread -o $@
+
+$(BF11_PROFILE_TRACE_BIN): $(BF11_PROFILE_GPU_SOURCES) $(BF11_PROFILE_HEADERS) | $(BF11_PROFILE_BIN_DIR)
+	$(PATHFINDER_HIPCC) $(BF11_PROFILE_COMMON_FLAGS) \
+		-DPATHFINDER_ENABLE_BF11_DIAGNOSTICS -DPATHFINDER_ENABLE_ROCTX \
+		$(BF11_PROFILE_INCLUDES) $(BF11_PROFILE_GPU_SOURCES) -pthread -o $@ \
+		-lrocprofiler-sdk-roctx
+
+$(BF11_PROFILE_THREAD_TRACE_BIN): $(BF11_PROFILE_GPU_SOURCES) $(BF11_PROFILE_HEADERS) | $(BF11_PROFILE_BIN_DIR)
+	$(PATHFINDER_HIPCC) $(BF11_PROFILE_COMMON_FLAGS) -gline-tables-only \
+		-DPATHFINDER_ENABLE_BF11_DIAGNOSTICS -DPATHFINDER_ENABLE_ROCTX \
+		$(BF11_PROFILE_INCLUDES) $(BF11_PROFILE_GPU_SOURCES) -pthread -o $@ \
+		-lrocprofiler-sdk-roctx
+
 ifeq ($(PATHFINDER_BUILD_COMPONENTS),1)
 PATHFINDER_GPU_SOURCES := \
 	CongestionFreeRouting/pathfinder.cpp \
@@ -191,6 +245,7 @@ PATHFINDER_GPU_HEADERS := \
 	CongestionFreeRouting/interchange/import_policy.hpp \
 	CongestionFreeRouting/interchange/routing_csr_sidecars.hpp \
 	CongestionFreeRouting/profiling/roctx_ranges.hpp \
+	CongestionFreeRouting/profiling/bf11/query_selection.hpp \
 	CongestionFreeRouting/sssp_query_capacity.hpp \
 	$(wildcard CongestionFreeRouting/bellman_ford/*.hpp) \
 	$(wildcard CongestionFreeRouting/delta_stepping/*.hpp) \

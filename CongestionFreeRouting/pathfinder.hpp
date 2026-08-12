@@ -199,6 +199,13 @@ struct PathfinderOptions {
   BellmanFord11HipGraphMode bf11_hip_graph_mode =
       BellmanFord11HipGraphMode::kAuto;
   double bf11_adaptive_reset_threshold = 0.25;
+  // Profiling-only exact replay selection. Empty retains the historical
+  // prefix behavior; an explicit selection is validated after metadata load.
+  std::vector<std::size_t> net_indices;
+  bool net_indices_explicit = false;
+  // Emit diagnostic per-SSSP-call telemetry keyed by the selected net index.
+  // This implies bf11_telemetry and is never enabled by production defaults.
+  bool bf11_query_telemetry = false;
 };
 
 struct PathfinderResult {
@@ -209,6 +216,9 @@ struct PathfinderResult {
   int max_occupancy = 0;
   std::vector<int> occupancy;
   std::vector<RoutedNet> nets;
+  // Original metadata request index for each entry in nets. Empty means the
+  // legacy contiguous mapping 0..nets.size()-1.
+  std::vector<std::size_t> net_indices;
 };
 
 struct UnitBfsPathObservation {

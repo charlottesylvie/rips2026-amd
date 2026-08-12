@@ -220,7 +220,10 @@ void print_usage(const char* program) {
       << "                                 Forward BF11 dense-reset touched fraction.\n"
       << "  --bf11-no-unbounded-fallback   Keep an unreachable BF11 query bounded.\n"
       << "  --bf11-telemetry               Forward opt-in aggregate BF11 telemetry.\n"
+      << "  --bf11-query-telemetry         Forward per-query BF11 diagnostic telemetry.\n"
       << "  --net-limit <count>            Forwarded to pathfinder.\n"
+      << "  --net-indices <i,j,...>        Forward exact ordered BF11 query indices.\n"
+      << "  --net-manifest <path>          Forward an exact BF11 query manifest.\n"
       << "  --parallel-net-workers <count> Forwarded to pathfinder; 0 enables engine-dependent auto-selection.\n"
       << "  --capacity <int>               Forwarded for overuse diagnostics.\n"
       << "  --max-pathfinder-iters <int>   Compatibility-only; accepted by pathfinder and ignored.\n"
@@ -255,6 +258,7 @@ Options parse_args(int argc, char** argv) {
   bool delta_benchmark_weight_seed_provided = false;
   bool delta_telemetry = false;
   bool bf11_telemetry = false;
+  bool bf11_query_telemetry = false;
 
   for (int i = 3; i < argc; ++i) {
     const std::string option = argv[i];
@@ -298,6 +302,11 @@ Options parse_args(int argc, char** argv) {
         options.pathfinder_args.push_back(option);
         bf11_telemetry = true;
       }
+    } else if (option == "--bf11-query-telemetry") {
+      if (!bf11_query_telemetry) {
+        options.pathfinder_args.push_back(option);
+        bf11_query_telemetry = true;
+      }
     } else if (option == "--delta-benchmark-weights") {
       delta_benchmark_weights = require_value("--delta-benchmark-weights");
       options.pathfinder_args.push_back(option);
@@ -322,6 +331,8 @@ Options parse_args(int argc, char** argv) {
                option == "--max-pathfinder-iters" ||
                option == "--max-sssp-iters" ||
                option == "--net-limit" ||
+               option == "--net-indices" ||
+               option == "--net-manifest" ||
                option == "--route-batch-size" ||
                option == "--parallel-net-workers" ||
                option == "--capacity" ||

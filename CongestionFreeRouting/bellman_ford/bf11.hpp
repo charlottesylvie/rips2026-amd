@@ -69,6 +69,9 @@ struct BellmanFord11WorkspaceOptions {
   // controls so historical positional aggregate initialization retains its
   // meaning.
   bool telemetry = false;
+  // Emit one diagnostic JSON record per BF11 workspace run. This is separate
+  // from aggregate telemetry and remains false for production/default runs.
+  bool query_telemetry = false;
   // Explicit-stream controllers enqueue this many relaxation/finalize rounds
   // before copying controller status to the host. Supported values are
   // 1, 2, 4, 8, and 16; one is the compatibility/control path.

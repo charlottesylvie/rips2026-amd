@@ -89,7 +89,9 @@ def main() -> None:
             "CongestionFreeRouting/interchange/import_policy.hpp",
             "CongestionFreeRouting/interchange/routing_csr_sidecars.hpp",
             "CongestionFreeRouting/profiling/roctx_ranges.hpp",
+            "CongestionFreeRouting/profiling/bf11/query_selection.hpp",
             "CongestionFreeRouting/sssp_query_capacity.hpp",
+            "CongestionFreeRouting/profiling/bf11/query_selection.hpp",
             "HIP_kernel/bellman_ford/src/bf_hip_CSR.hpp",
             "HIP_kernel/minplus_mm/src/minplus_sparse_hip.hpp",
         ):

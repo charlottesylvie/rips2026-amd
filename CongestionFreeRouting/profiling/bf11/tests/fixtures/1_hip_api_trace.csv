@@ -1,0 +1,4 @@
+Function,Start_Timestamp,End_Timestamp
+hipGraphLaunch,90,95
+hipStreamSynchronize,300,315
+hipStreamSynchronize,340,360

@@ -981,6 +981,54 @@ int main() {
                   std::vector<int>({1, 2, 5}),
           "bounded BF11 should preserve compact route paths");
 
+  routing::PathfinderOptions selected_bf11_options = bf11_options;
+  selected_bf11_options.net_indices_explicit = true;
+  selected_bf11_options.net_indices = {1};
+  const routing::PathfinderResult selected_bf11_result =
+      routing::run_pathfinder(congestion_graph,
+                              congestion_metadata,
+                              selected_bf11_options,
+                              nullptr,
+                              nullptr,
+                              &bf11_sidecars);
+  require(selected_bf11_result.nets.size() == 1 &&
+              selected_bf11_result.net_indices ==
+                  std::vector<std::size_t>({1}) &&
+              selected_bf11_result.nets[0].net_string ==
+                  congestion_metadata.route_requests[1].net_string,
+          "exact BF11 query selection lost its original net identity");
+  const std::filesystem::path selected_routes_path =
+      "/tmp/pathfinder_cpu_stub_selected_routes.jsonl";
+  routing::write_routes_jsonl(selected_routes_path,
+                              congestion_graph,
+                              congestion_metadata,
+                              selected_bf11_result);
+  std::ifstream selected_routes_file(selected_routes_path);
+  const std::string selected_routes_json(
+      (std::istreambuf_iterator<char>(selected_routes_file)),
+      std::istreambuf_iterator<char>());
+  require(selected_routes_json.find("\"net\":\"net_b\"") !=
+              std::string::npos &&
+              selected_routes_json.find("\"net\":\"net_a\"") ==
+                  std::string::npos,
+          "selected BF11 routes were written against the wrong metadata net");
+  std::filesystem::remove(selected_routes_path);
+
+  selected_bf11_options.net_indices = {2};
+  bool out_of_range_selection_rejected = false;
+  try {
+    (void)routing::run_pathfinder(congestion_graph,
+                                  congestion_metadata,
+                                  selected_bf11_options,
+                                  nullptr,
+                                  nullptr,
+                                  &bf11_sidecars);
+  } catch (const std::out_of_range&) {
+    out_of_range_selection_rejected = true;
+  }
+  require(out_of_range_selection_rejected,
+          "out-of-range BF11 query selection was accepted");
+
   routing::interchange::RoutingCsrSidecars weighted_bf11_sidecars =
       bf11_sidecars;
   weighted_bf11_sidecars.base_vertex_cost =

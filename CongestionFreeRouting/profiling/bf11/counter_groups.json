@@ -1,0 +1,39 @@
+{
+  "schema_version": 1,
+  "rules": [
+    "Every proposed group is checked with rocprofv3-avail pmc-check before use.",
+    "Missing counters remove a group; they are never silently replaced with zero.",
+    "Dispatch-counter runs use one worker, K=8, and HIP Graphs off."
+  ],
+  "groups": {
+    "fetch_size": ["FETCH_SIZE"],
+    "write_size": ["WRITE_SIZE"],
+    "l2_hit": ["L2CacheHit"],
+    "memory_pipeline": ["MemUnitBusy", "WriteUnitStalled"],
+    "memory_unit_busy": ["MemUnitBusy"],
+    "write_unit_stalled": ["WriteUnitStalled"],
+    "wave_cycles": ["SQ_WAVES", "SQ_WAVE_CYCLES"],
+    "wave_legacy": ["VALUInsts", "SALUInsts", "SFetchInsts", "Wavefronts"],
+    "wave_sq": ["SQ_INSTS_VALU", "SQ_BUSY_CYCLES", "SQ_WAVE_CYCLES"],
+    "instruction_mix": ["SQ_INSTS_VALU", "SQ_INSTS_SALU", "SQ_INSTS_SMEM", "SQ_INSTS_FLAT", "SQ_INSTS_LDS", "SQ_INSTS_TEX_LOAD", "SQ_INSTS_TEX_STORE"],
+    "occupancy": ["MeanOccupancyPerActiveCU", "OccupancyPercent"]
+  },
+  "optional_name_patterns": {
+    "wgp": ["WGP", "SQ_"],
+    "gl0": ["GL0", "L0"],
+    "gl1": ["GL1", "L1"],
+    "gl2": ["GL2", "L2"],
+    "gcea": ["GCEA", "FABRIC", "MEMORY_CONTROLLER"],
+    "command_processor": ["CP_", "COMMAND_PROCESSOR"],
+    "grbm": ["GRBM"],
+    "wait_stall": ["WAIT", "STALL", "VMEM", "SCOREBOARD", "WAVE_CYCLE"],
+    "issue_occupancy": ["ISSUE", "ELIGIBLE", "OCCUP", "RESIDENT", "WAVE"]
+  },
+  "kernel_families": {
+    "relaxation": "segmented_frontier_relax_kernel|frontier_controller_kernel",
+    "reset_seed": "clear_state_kernel|clear_touched_state_kernel|initialize_state_kernel|seed_sources_kernel",
+    "target_check": "update_target_status_kernel|finalize_segment_round_kernel",
+    "reconstruction": "summarize_target_paths_kernel|prefix_target_paths_kernel|materialize_target_paths_kernel",
+    "runtime_copy_fill": "fill_cost_kernel|sparse_cost_update_kernel"
+  }
+}

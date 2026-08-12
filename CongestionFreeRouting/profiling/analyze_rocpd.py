@@ -9,13 +9,13 @@ multiple streams and therefore must not be reported as wall-time shares.
 from __future__ import annotations
 
 import argparse
-import heapq
 import json
-import math
 import sqlite3
 from collections import defaultdict
 from pathlib import Path
 from typing import Any, Iterable
+
+from trace_utils import concurrency_distribution, interval_union, percentile
 
 
 NANOSECONDS_PER_SECOND = 1_000_000_000
@@ -39,86 +39,6 @@ def parse_args() -> argparse.Namespace:
 
 def seconds(nanoseconds: int | float | None) -> float:
     return float(nanoseconds or 0) / NANOSECONDS_PER_SECOND
-
-
-def percentile(sorted_values: list[int], quantile: float) -> float:
-    if not sorted_values:
-        return 0.0
-    index = max(0, min(len(sorted_values) - 1, math.ceil(quantile * len(sorted_values)) - 1))
-    return float(sorted_values[index])
-
-
-def interval_union(rows: Iterable[tuple[int, int]]) -> tuple[int, int]:
-    total = 0
-    islands = 0
-    union_start: int | None = None
-    union_end: int | None = None
-    for start, end in rows:
-        if end <= start:
-            continue
-        if union_start is None:
-            union_start, union_end = start, end
-            continue
-        assert union_end is not None
-        if start > union_end:
-            total += union_end - union_start
-            islands += 1
-            union_start, union_end = start, end
-        elif end > union_end:
-            union_end = end
-    if union_start is not None and union_end is not None:
-        total += union_end - union_start
-        islands += 1
-    return total, islands
-
-
-def concurrency_distribution(
-    rows: Iterable[tuple[int, int]],
-) -> dict[int, int]:
-    """Return nanoseconds spent at each interval concurrency.
-
-    Input must be ordered by start time.  A min-heap keeps memory proportional
-    to maximum concurrency rather than to the number of trace records.
-    """
-
-    ends: list[int] = []
-    active = 0
-    cursor: int | None = None
-    distribution: dict[int, int] = defaultdict(int)
-
-    for start, end in rows:
-        if end <= start:
-            continue
-        if cursor is None:
-            cursor = start
-
-        while ends and ends[0] <= start:
-            next_end = ends[0]
-            if next_end > cursor:
-                distribution[active] += next_end - cursor
-                cursor = next_end
-            while ends and ends[0] == next_end:
-                heapq.heappop(ends)
-                active -= 1
-
-        if start > cursor:
-            distribution[active] += start - cursor
-            cursor = start
-
-        heapq.heappush(ends, end)
-        active += 1
-
-    while ends:
-        next_end = ends[0]
-        assert cursor is not None
-        if next_end > cursor:
-            distribution[active] += next_end - cursor
-            cursor = next_end
-        while ends and ends[0] == next_end:
-            heapq.heappop(ends)
-            active -= 1
-
-    return dict(distribution)
 
 
 def classify_kernel(name: str) -> str:
