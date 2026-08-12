@@ -1882,8 +1882,8 @@ void test_hip_graph_non_unit_cost_modes_and_updates() {
             "BF11 dynamic Graph update/replay accounting is wrong");
   }
 
-  // Force real active-capture invalidation once in each non-unit mode, then
-  // reuse the sticky-direct workspace and compare with the graph-off oracle.
+  // Force a captured-enqueue failure once in each non-unit mode, then reuse
+  // the sticky-direct workspace and compare with the graph-off oracle.
   for (const bool dynamic : {false, true}) {
     ScopedGraphFailureStage failure("enqueue");
     HipStream stream;
@@ -1893,8 +1893,8 @@ void test_hip_graph_non_unit_cost_modes_and_updates() {
     reset_bellman_ford11_runtime_stats();
     for (int reuse = 0; reuse < 2; ++reuse) {
       require_same_result(
-          dynamic ? "BF11 dynamic Graph invalidation fallback"
-                  : "BF11 static Graph invalidation fallback",
+          dynamic ? "BF11 dynamic Graph captured-enqueue fallback"
+                  : "BF11 static Graph captured-enqueue fallback",
           dynamic ? dynamic_heavy_control : static_control,
           workspace.run(std::vector<int>{0}, std::vector<int>{3}, 1.0f, -1,
                         stream.get(), nullptr, nullptr));
@@ -1906,11 +1906,10 @@ void test_hip_graph_non_unit_cost_modes_and_updates() {
                 stats.segments == 2 && stats.direct_segments == 2 &&
                 stats.hip_graph_segments == 0 &&
                 stats.graph_fallbacks == 1 &&
-                (stats.stream_synchronizations == 4 ||
-                 stats.stream_synchronizations == 5) &&
+                stats.stream_synchronizations == 4 &&
                 (dynamic ? stats.dynamic_cost_queries == 2
                          : stats.static_cost_queries == 2),
-            "BF11 non-unit Graph invalidation was not exact sticky direct");
+            "BF11 non-unit Graph captured-enqueue failure was not exact sticky direct");
   }
 }
 
@@ -1962,7 +1961,6 @@ void test_forced_hip_graph_failures_and_workspace_reuse() {
     const BellmanFord11RuntimeStats stats =
         bellman_ford11_runtime_stats();
     const bool stage_can_add_synchronization =
-        std::strcmp(stage, "enqueue") == 0 ||
         std::strcmp(stage, "launch-after-submit") == 0;
     require(stats.telemetry_queries == 2 &&
                 stats.telemetry_completed_queries == 2 &&

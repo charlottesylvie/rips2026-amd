@@ -75,9 +75,10 @@ then runs sticky-direct. If quiescence itself reports an asynchronous device
 failure, the query is not replayed. For deterministic policy validation,
 `begin`, `end`, `instantiate`, and `launch` in
 `BF11_TEST_HIP_GRAPH_FAILURE_STAGE` are synthetic stage failures. `enqueue`
-calls a capture-prohibited synchronous stream wait while capture is active,
-forcing the runtime's real invalidation/error path; EndCapture must then return
-the stream to non-capturing state before direct fallback.
+simulates a captured-enqueue failure while allowing EndCapture to release the
+partial graph normally. This avoids deliberately corrupting a caller-owned
+stream on ROCm releases that do not restore invalidated capture state. The
+host policy regression separately covers invalidated capture/no-graph cleanup.
 `launch-after-submit` performs a real graph launch, then deliberately enters
 the quiesce and whole-query restart path so target tests cover the
 non-atomic-launch recovery integration.
@@ -563,7 +564,7 @@ for label in labels:
 PY
 ```
 
-Force active-capture invalidation, require a successful sticky-direct run, and
+Force a captured-enqueue failure, require a successful sticky-direct run, and
 compare its route output with the K=1 Graph-off control. The concurrent K=8 HIP
 regression separately tests actual cross-worker first capture and reuse:
 

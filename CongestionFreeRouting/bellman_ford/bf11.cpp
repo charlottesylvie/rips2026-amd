@@ -2952,12 +2952,12 @@ class HipGraphSegmentBackend {
 
   bool enqueue_captured_segment() {
     if (injected(DeviceWorkspace::GraphFailureInjection::kCapturedEnqueue)) {
-      // Force the runtime's real active-capture invalidation path. A
-      // synchronous stream wait is prohibited during non-relaxed capture;
-      // EndCapture below must still terminate the invalidated capture before
-      // direct fallback uses the stream.
-      const hipError_t status = synchronize_graph_stream();
-      if (status != hipSuccess) record_explicit_failure(status);
+      // Simulate a recoverable captured-enqueue failure without deliberately
+      // invalidating the runtime stream. Some supported ROCm releases do not
+      // restore an invalidated stream after EndCapture, so using a prohibited
+      // synchronization here would make this test hook corrupt an otherwise
+      // healthy caller-owned stream. EndCapture still releases the partial
+      // capture, and the policy tests cover the invalidated/no-graph branch.
       return false;
     }
     const SegmentEnqueueResult result = try_enqueue_direct_segment(
