@@ -302,11 +302,12 @@ PATHFINDER_REFERENCES_SCHEMA_FILES := \
 		CongestionFreeRouting/interchange/gzip_io.hpp \
 		CongestionFreeRouting/interchange/import_policy.hpp \
 		$(PATHFINDER_PHYSICAL_SCHEMA_FILES) \
-		$(PATHFINDER_SCHEMA_DIR)/References.capnp.h
+		$(PATHFINDER_REFERENCES_SCHEMA_FILES)
 	$(PATHFINDER_HOST_CXX) $(PATHFINDER_INTERCHANGE_FLAGS) \
 		-I"$(PATHFINDER_SCHEMA_DIR)" \
 		CongestionFreeRouting/routes_to_phys.cpp \
 		$(PATHFINDER_SCHEMA_DIR)/PhysicalNetlist.capnp.c++ \
+		$(PATHFINDER_SCHEMA_DIR)/References.capnp.c++ \
 		$(PATHFINDER_INTERCHANGE_LIBS) -o $@
 endif
 endif

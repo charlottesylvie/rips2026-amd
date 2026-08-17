@@ -313,6 +313,7 @@ hipcc -std=c++17 -O3 -x hip -DBF10_NO_MAIN -DBF11_NO_MAIN \
 g++ -std=c++17 -O3 -I"$SCHEMA_DIR" \
   CongestionFreeRouting/routes_to_phys.cpp \
   "$SCHEMA_DIR"/PhysicalNetlist.capnp.c++ \
+  "$SCHEMA_DIR"/References.capnp.c++ \
   -lcapnp -lkj -lz -o routes_to_phys
 
 g++ -std=c++17 -O2 CongestionFreeRouting/pathfinder_router.cpp -o PathFinderFile
@@ -715,6 +716,20 @@ g++ -std=c++17 -O2 \
   -lz -o /tmp/gzip_io_test
 
 /tmp/gzip_io_test
+```
+
+PhysicalNetlist reconstruction regression test (requires generated FPGA
+Interchange C++ schemas):
+
+```bash
+g++ -std=c++17 -O2 -Wall -Wextra -Wpedantic \
+  -I"$PATHFINDER_SCHEMA_DIR" \
+  CongestionFreeRouting/tests/routes_to_phys_test.cpp \
+  "$PATHFINDER_SCHEMA_DIR/PhysicalNetlist.capnp.c++" \
+  "$PATHFINDER_SCHEMA_DIR/References.capnp.c++" \
+  -lcapnp -lkj -lz -o /tmp/routes_to_phys_test
+
+/tmp/routes_to_phys_test
 ```
 
 CPU-only PathFinder logic test:
